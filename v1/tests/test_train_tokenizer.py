@@ -105,6 +105,19 @@ class TrainTokenizerTest(unittest.TestCase):
             texts,
         )
 
+    def test_filtered_text_iterable_filters_text_longer_than_max_utf8_bytes(self):
+        tokenizer = load_script()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "sample-0000.jsonl.zst"
+            byte_long_text = "\u3042" * (tokenizer.MAX_TEXT_LENGTH // 2 + 1)
+            valid_text = "a" * tokenizer.MIN_TEXT_LENGTH
+            write_zst_rows(path, [{"text": byte_long_text}, {"text": valid_text}])
+
+            texts = collect_filtered_texts(tokenizer, [path])
+
+        self.assertEqual([valid_text], texts)
+
     def test_filtered_text_iterable_normalizes_multiline_text_to_one_line(self):
         tokenizer = load_script()
 

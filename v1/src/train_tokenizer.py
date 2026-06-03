@@ -151,7 +151,10 @@ def filter_text(value: object) -> str | None:
         return None
 
     text = normalize_text(value)
-    if len(text) < MIN_TEXT_LENGTH or len(text) > MAX_TEXT_LENGTH:
+    if (
+        len(text) < MIN_TEXT_LENGTH
+        or len(text.encode(TEXT_ENCODING)) > MAX_TEXT_LENGTH
+    ):
         return None
 
     return text
