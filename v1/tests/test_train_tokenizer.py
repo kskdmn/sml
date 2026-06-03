@@ -15,6 +15,15 @@ EXPECTED_NORMALIZED_TEXT_COUNT = 1
 REPEATED_WORD_COUNT = 60
 
 
+def write_zst_text(path: Path, text: str) -> None:
+    compressed = zstd.ZstdCompressor().compress(text.encode("utf-8"))
+    path.write_bytes(compressed)
+
+
+def write_zst_rows(path: Path, rows: list[dict[str, object]]) -> None:
+    write_zst_text(path, "\n".join(json.dumps(row) for row in rows))
+
+
 def load_script():
     spec = importlib.util.spec_from_file_location("train_tokenizer", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -40,35 +49,38 @@ class TrainTokenizerTest(unittest.TestCase):
 
         self.assertEqual(PROJECT_DIR / "output", tokenizer.OUTPUT_DIR)
 
-    def test_discover_input_files_sorts_supported_files_and_skips_hidden_files(self):
+    def test_discover_input_files_sorts_matching_zst_shards_and_skips_others(self):
         tokenizer = load_script()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
-            (root / "z.jsonl").write_text("", encoding="utf-8")
-            (root / "a.jsonl.zst").write_text("", encoding="utf-8")
-            (root / ".DS_Store").write_text("", encoding="utf-8")
+            (root / "dataset-0009.jsonl.zst").write_text("", encoding="utf-8")
+            (root / "dataset-0000.jsonl.zst").write_text("", encoding="utf-8")
+            (root / "dataset-0010.jsonl.zst").write_text("", encoding="utf-8")
+            (root / "dataset-0000.jsonl").write_text("", encoding="utf-8")
+            (root / "dataset.jsonl.zst").write_text("", encoding="utf-8")
+            (root / ".dataset-0001.jsonl.zst").write_text("", encoding="utf-8")
             (root / "notes.txt").write_text("", encoding="utf-8")
 
             files = tokenizer.discover_input_files(root)
 
-        self.assertEqual(["a.jsonl.zst", "z.jsonl"], [path.name for path in files])
+        self.assertEqual(
+            ["dataset-0000.jsonl.zst", "dataset-0009.jsonl.zst"],
+            [path.name for path in files],
+        )
 
     def test_iter_filtered_texts_reads_only_first_rows_and_filters_text_length(self):
         tokenizer = load_script()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "sample.jsonl"
+            path = Path(tmp_dir) / "sample-0000.jsonl.zst"
             rows = [
                 {"text": "a" * tokenizer.MIN_TEXT_LENGTH},
                 {"text": "too short"},
                 {"text": "b" * tokenizer.MAX_TEXT_LENGTH},
                 {"text": "c" * tokenizer.MIN_TEXT_LENGTH},
             ]
-            path.write_text(
-                "\n".join(json.dumps(row) for row in rows),
-                encoding="utf-8",
-            )
+            write_zst_rows(path, rows)
 
             texts = list(
                 tokenizer.iter_filtered_texts(
@@ -86,9 +98,9 @@ class TrainTokenizerTest(unittest.TestCase):
         tokenizer = load_script()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "sample.jsonl"
+            path = Path(tmp_dir) / "sample-0000.jsonl.zst"
             text = "word\n" * REPEATED_WORD_COUNT
-            path.write_text(json.dumps({"text": text}), encoding="utf-8")
+            write_zst_rows(path, [{"text": text}])
 
             texts = list(tokenizer.iter_filtered_texts([path]))
 
@@ -96,14 +108,36 @@ class TrainTokenizerTest(unittest.TestCase):
         self.assertNotIn("\n", texts[0])
         self.assertGreaterEqual(len(texts[0]), tokenizer.MIN_TEXT_LENGTH)
 
+    def test_iter_filtered_texts_removes_null_characters(self):
+        tokenizer = load_script()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "sample-0000.jsonl.zst"
+            text = ("a" * 50) + "\x00" + ("b" * 50)
+            write_zst_rows(path, [{"text": text}])
+
+            texts = list(tokenizer.iter_filtered_texts([path]))
+
+        self.assertEqual(EXPECTED_NORMALIZED_TEXT_COUNT, len(texts))
+        self.assertNotIn("\x00", texts[0])
+
+    def test_iter_jsonl_lines_rejects_plain_jsonl_files(self):
+        tokenizer = load_script()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "sample-0000.jsonl"
+            path.write_text(json.dumps({"text": "plain jsonl"}), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Unsupported input file"):
+                list(tokenizer.iter_jsonl_lines(path, max_rows_per_file=1))
+
     def test_iter_jsonl_lines_reads_zst_files_without_subprocess(self):
         tokenizer = load_script()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "sample.jsonl.zst"
+            path = Path(tmp_dir) / "sample-0000.jsonl.zst"
             text = "\n".join(json.dumps({"text": value}) for value in ("first", "second"))
-            compressed = zstd.ZstdCompressor().compress(text.encode("utf-8"))
-            path.write_bytes(compressed)
+            write_zst_text(path, text)
 
             with mock.patch(
                 "subprocess.Popen",

@@ -40,9 +40,8 @@ TEXT_COLUMN = "text"
 TEXT_ENCODING = "utf-8"
 TEXT_DECODE_ERRORS = "replace"
 HIDDEN_FILE_PREFIX = "."
-JSONL_SUFFIX = ".jsonl"
-JSONL_ZST_SUFFIX = ".jsonl.zst"
-SUPPORTED_INPUT_SUFFIXES = (JSONL_SUFFIX, JSONL_ZST_SUFFIX)
+INPUT_FILE_NAME_PATTERN = re.compile(r".*-000[0-9]\.jsonl\.zst\Z")
+NULL_CHARACTER = "\x00"
 
 SHUFFLE_INPUT_SENTENCE = False
 HARD_VOCAB_LIMIT = True
@@ -97,7 +96,7 @@ def discover_input_files(input_dir: Path = INPUT_DIR) -> tuple[Path, ...]:
         for path in root.iterdir()
         if path.is_file()
         and not path.name.startswith(HIDDEN_FILE_PREFIX)
-        and path.name.endswith(SUPPORTED_INPUT_SUFFIXES)
+        and INPUT_FILE_NAME_PATTERN.fullmatch(path.name) is not None
     ]
     return tuple(sorted(files, key=lambda path: path.name))
 
@@ -125,12 +124,10 @@ def iter_jsonl_records(path: Path, max_rows_per_file: int) -> Iterator[dict[str,
 
 
 def iter_jsonl_lines(path: Path, max_rows_per_file: int) -> Iterator[tuple[int, str]]:
-    if path.name.endswith(JSONL_ZST_SUFFIX):
-        yield from iter_zstd_jsonl_lines(path, max_rows_per_file)
-        return
+    if INPUT_FILE_NAME_PATTERN.fullmatch(path.name) is None:
+        raise ValueError(f"Unsupported input file: {path}")
 
-    with path.open("rt", encoding=TEXT_ENCODING, errors=TEXT_DECODE_ERRORS) as stream:
-        yield from enumerate_limited_lines(stream, max_rows_per_file)
+    yield from iter_zstd_jsonl_lines(path, max_rows_per_file)
 
 
 def iter_zstd_jsonl_lines(path: Path, max_rows_per_file: int) -> Iterator[tuple[int, str]]:
@@ -168,6 +165,7 @@ def filter_text(value: object) -> str | None:
 
 
 def normalize_text(text: str) -> str:
+    text = text.replace(NULL_CHARACTER, " ")
     return WHITESPACE_PATTERN.sub(" ", text).strip()
 
 
