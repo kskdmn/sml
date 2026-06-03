@@ -40,7 +40,7 @@ TEXT_COLUMN = "text"
 TEXT_ENCODING = "utf-8"
 TEXT_DECODE_ERRORS = "replace"
 HIDDEN_FILE_PREFIX = "."
-INPUT_FILE_NAME_PATTERN = re.compile(r".*-000[0-9]\.jsonl\.zst\Z")
+INPUT_FILE_NAME_PATTERN = re.compile(r".*-00[01][0-9]\.jsonl\.zst\Z")
 NULL_CHARACTER = "\x00"
 
 SHUFFLE_INPUT_SENTENCE = False
