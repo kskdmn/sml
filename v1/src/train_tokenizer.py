@@ -101,13 +101,6 @@ def discover_input_files(input_dir: Path = INPUT_DIR) -> tuple[Path, ...]:
     return tuple(sorted(files, key=lambda path: path.name))
 
 
-def iter_filtered_texts(
-    input_files: Sequence[Path],
-    max_rows_per_file: int = MAX_ROWS_PER_FILE,
-) -> Iterator[str]:
-    yield from FilteredTextIterable(input_files, max_rows_per_file)
-
-
 def iter_jsonl_records(path: Path, max_rows_per_file: int) -> Iterator[dict[str, object]]:
     for line_number, line in iter_jsonl_lines(path, max_rows_per_file):
         line = line.strip()
