@@ -5,11 +5,11 @@ import itertools
 import json
 import random
 import re
-import subprocess
 from pathlib import Path
 from typing import Iterable, Iterator, NamedTuple, Sequence
 
 import sentencepiece as spm
+import zstandard as zstd
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -21,15 +21,14 @@ MAX_ROWS_PER_FILE = 10_000
 MIN_TEXT_LENGTH = 100
 MAX_TEXT_LENGTH = 2_000
 RANDOM_SEED = 42
-NUM_THREADS = 16
+NUM_THREADS = 8
 INPUT_SENTENCE_SIZE = 0
 SELF_TEST_SAMPLE_SIZE = 0
 CHARACTER_COVERAGE = 1.0
 UNK_ID = 0
 BOS_ID = 1
 EOS_ID = 2
-PAD_ID = -1
-PROCESS_TERMINATION_TIMEOUT_SECONDS = 2
+PAD_ID = 3
 SUCCESS_RETURN_CODE = 0
 FIRST_LINE_NUMBER = 1
 NO_ROWS = 0
@@ -44,8 +43,6 @@ HIDDEN_FILE_PREFIX = "."
 JSONL_SUFFIX = ".jsonl"
 JSONL_ZST_SUFFIX = ".jsonl.zst"
 SUPPORTED_INPUT_SUFFIXES = (JSONL_SUFFIX, JSONL_ZST_SUFFIX)
-ZSTD_EXECUTABLE = "zstd"
-ZSTD_DECOMPRESS_ARGS = ("-dc",)
 
 SHUFFLE_INPUT_SENTENCE = False
 HARD_VOCAB_LIMIT = True
@@ -138,50 +135,17 @@ def iter_jsonl_lines(path: Path, max_rows_per_file: int) -> Iterator[tuple[int, 
 
 def iter_zstd_jsonl_lines(path: Path, max_rows_per_file: int) -> Iterator[tuple[int, str]]:
     try:
-        process = subprocess.Popen(
-            [ZSTD_EXECUTABLE, *ZSTD_DECOMPRESS_ARGS, str(path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            f"Could not find '{ZSTD_EXECUTABLE}'. Install zstd or change ZSTD_EXECUTABLE."
-        ) from exc
-
-    rows_read = NO_ROWS
-    stream = None
-    try:
-        if process.stdout is None:
-            raise RuntimeError(f"Could not read decompressed output from {path}")
-
-        stream = io.TextIOWrapper(
-            process.stdout,
-            encoding=TEXT_ENCODING,
-            errors=TEXT_DECODE_ERRORS,
-        )
-        for line_number, line in enumerate_limited_lines(stream, max_rows_per_file):
-            rows_read += ROW_INCREMENT
-            yield line_number, line
-    finally:
-        if stream is not None:
-            stream.close()
-
-        stopped_early = rows_read >= max_rows_per_file
-        if stopped_early and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=PROCESS_TERMINATION_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-        else:
-            return_code = process.wait()
-            if return_code != SUCCESS_RETURN_CODE:
-                stderr = read_process_stderr(process)
-                raise RuntimeError(f"zstd failed for {path}: {stderr}")
-
-        if process.stderr is not None:
-            process.stderr.close()
+        with path.open("rb") as compressed_stream:
+            decompressor = zstd.ZstdDecompressor()
+            with decompressor.stream_reader(compressed_stream) as zstd_stream:
+                with io.TextIOWrapper(
+                    zstd_stream,
+                    encoding=TEXT_ENCODING,
+                    errors=TEXT_DECODE_ERRORS,
+                ) as text_stream:
+                    yield from enumerate_limited_lines(text_stream, max_rows_per_file)
+    except zstd.ZstdError as exc:
+        raise RuntimeError(f"zstd failed for {path}: {exc}") from exc
 
 
 def enumerate_limited_lines(
@@ -190,13 +154,6 @@ def enumerate_limited_lines(
 ) -> Iterator[tuple[int, str]]:
     limited_stream = itertools.islice(stream, max_rows_per_file)
     yield from enumerate(limited_stream, start=FIRST_LINE_NUMBER)
-
-
-def read_process_stderr(process: subprocess.Popen[bytes]) -> str:
-    if process.stderr is None:
-        return ""
-
-    return process.stderr.read().decode(TEXT_ENCODING, errors=TEXT_DECODE_ERRORS).strip()
 
 
 def filter_text(value: object) -> str | None:

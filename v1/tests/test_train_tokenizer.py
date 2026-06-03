@@ -4,7 +4,9 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from unittest import mock
 
+import zstandard as zstd
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_DIR / "src" / "train_tokenizer.py"
@@ -93,6 +95,23 @@ class TrainTokenizerTest(unittest.TestCase):
         self.assertEqual(EXPECTED_NORMALIZED_TEXT_COUNT, len(texts))
         self.assertNotIn("\n", texts[0])
         self.assertGreaterEqual(len(texts[0]), tokenizer.MIN_TEXT_LENGTH)
+
+    def test_iter_jsonl_lines_reads_zst_files_without_subprocess(self):
+        tokenizer = load_script()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "sample.jsonl.zst"
+            text = "\n".join(json.dumps({"text": value}) for value in ("first", "second"))
+            compressed = zstd.ZstdCompressor().compress(text.encode("utf-8"))
+            path.write_bytes(compressed)
+
+            with mock.patch(
+                "subprocess.Popen",
+                side_effect=AssertionError("zstd files must not shell out"),
+            ):
+                lines = list(tokenizer.iter_jsonl_lines(path, max_rows_per_file=1))
+
+        self.assertEqual([(1, '{"text": "first"}\n')], lines)
 
 
 if __name__ == "__main__":

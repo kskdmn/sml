@@ -6,4 +6,5 @@ readme = "README.md"
 requires-python = ">=3.12.13"
 dependencies = [
     "sentencepiece>=0.2.1",
+    "zstandard>=0.25.0",
 ]
