@@ -24,7 +24,8 @@ RANDOM_SEED = 42
 NUM_THREADS = 8
 INPUT_SENTENCE_SIZE = 0
 SELF_TEST_SAMPLE_SIZE = 0
-CHARACTER_COVERAGE = 1.0
+CHARACTER_COVERAGE = 0.9995  # 1.0 for small character sets (e.g. English clean datasets), 0.9995 for Pile/web-like datasets
+BYTE_FALLBACK = True
 UNK_ID = 0
 BOS_ID = 1
 EOS_ID = 2
@@ -102,7 +103,7 @@ def discover_input_files(input_dir: Path = INPUT_DIR) -> tuple[Path, ...]:
 
 
 def iter_jsonl_records(path: Path, max_rows_per_file: int) -> Iterator[dict[str, object]]:
-    for line_number, line in iter_jsonl_lines(path, max_rows_per_file):
+    for line_number, line in iter_zstd_jsonl_lines(path, max_rows_per_file):
         line = line.strip()
         if not line:
             continue
@@ -114,13 +115,6 @@ def iter_jsonl_records(path: Path, max_rows_per_file: int) -> Iterator[dict[str,
 
         if isinstance(row, dict):
             yield row
-
-
-def iter_jsonl_lines(path: Path, max_rows_per_file: int) -> Iterator[tuple[int, str]]:
-    if INPUT_FILE_NAME_PATTERN.fullmatch(path.name) is None:
-        raise ValueError(f"Unsupported input file: {path}")
-
-    yield from iter_zstd_jsonl_lines(path, max_rows_per_file)
 
 
 def iter_zstd_jsonl_lines(path: Path, max_rows_per_file: int) -> Iterator[tuple[int, str]]:
@@ -196,6 +190,7 @@ def train_tokenizer() -> TrainingResult:
         vocab_size=VOCAB_SIZE,
         model_type=MODEL_TYPE,
         character_coverage=CHARACTER_COVERAGE,
+        byte_fallback=BYTE_FALLBACK,
         num_threads=NUM_THREADS,
         input_sentence_size=INPUT_SENTENCE_SIZE,
         shuffle_input_sentence=SHUFFLE_INPUT_SENTENCE,
