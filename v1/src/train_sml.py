@@ -16,10 +16,6 @@ from torch.utils.data import DataLoader, IterableDataset
 
 from sml import SMLLanguageModel, count_parameters, lr_lambda
 from sml_config import (
-    INPUT_DIR,
-    INPUT_FILE_NAME_REGEX,
-    OUTPUT_DIR,
-    TOKENIZER_MODEL_PATH,
     SMLConfig,
     TrainingConfig,
 )
@@ -44,8 +40,8 @@ class TextTokenizer(Protocol):
 
 
 def discover_input_files(
-    input_dir: Path = INPUT_DIR,
-    file_name_regex: str = INPUT_FILE_NAME_REGEX,
+    input_dir: Path,
+    file_name_regex: str,
 ) -> tuple[Path, ...]:
     root = resolve_path(input_dir)
     if not root.exists():
@@ -149,6 +145,14 @@ class TokenBlockDataset(IterableDataset[dict[str, torch.Tensor]]):
         )
 
         for text in self.texts:
+            """
+            Current: Add BOS and EOS tokens to the buffer.
+
+            Other options:
+            - Add EOS to the buffer only.
+            - Add document-boundary attention masks.
+            - Add padding tokens.
+            """
             token_ids = self.tokenizer.encode(text, out_type=int)
             if bos_token_id is not None:
                 buffer.append(bos_token_id)

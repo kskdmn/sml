@@ -8,7 +8,7 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = PROJECT_DIR / "output"
 TOKENIZER_MODEL_PATH = OUTPUT_DIR / "bpe_tokenizer.model"
 INPUT_DIR = Path("~/Documents/data-common_pile/")
-INPUT_FILE_NAME_REGEX = r".*-000[0-9]\.jsonl\.zst\Z"
+INPUT_FILE_NAME_REGEX = r".*-0000\.jsonl\.zst\Z"
 
 
 @dataclass(slots=True)
