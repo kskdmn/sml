@@ -6,6 +6,7 @@ import json
 import random
 import re
 from dataclasses import asdict, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol
 
@@ -258,6 +259,22 @@ def is_step_limit_reached(global_step: int, max_steps: int | None) -> bool:
     return max_steps is not None and global_step >= max_steps
 
 
+def format_training_log(
+    epoch: int,
+    global_step: int,
+    lr: float,
+    avg_loss: float,
+    grad_norm: float,
+    timestamp: datetime,
+) -> str:
+    return (
+        f"time={timestamp:%Y-%m-%d %H:%M:%S} "
+        f"epoch={epoch} step={global_step} "
+        f"lr={lr:.3e} loss={avg_loss:.4f} "
+        f"grad_norm={grad_norm:.3f} (before clipping)"
+    )
+
+
 def train_model(
     training_config: TrainingConfig | None = None,
     model_config: SMLConfig | None = None,
@@ -363,9 +380,14 @@ def train_model(
                 avg_loss = loss_sum / training_config.gradient_accumulation_steps
                 lr = scheduler.get_last_lr()[0]
                 print(
-                    f"epoch={epoch + 1} step={global_step} "
-                    f"lr={lr:.3e} loss={avg_loss:.4f} "
-                    f"grad_norm={float(grad_norm):.3f}"
+                    format_training_log(
+                        epoch=epoch + 1,
+                        global_step=global_step,
+                        lr=lr,
+                        avg_loss=avg_loss,
+                        grad_norm=float(grad_norm),
+                        timestamp=datetime.now(),
+                    )
                 )
             loss_sum = 0.0
 

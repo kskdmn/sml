@@ -73,7 +73,7 @@ class TrainingConfig:
     warmup_steps: int = 100
     min_lr_ratio: float = 0.1
     log_every: int = 100
-    save_every: int = 100
+    save_every: int = 0  # 0 for never, positive for every N steps
     seed: int = 42
     device: str = "auto"
     autocast_dtype: str = "bfloat16"

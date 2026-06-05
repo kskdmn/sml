@@ -3,6 +3,7 @@ import inspect
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 import zstandard as zstd
@@ -107,6 +108,24 @@ class TrainDataTest(unittest.TestCase):
         import train_sml
 
         self.assertFalse(train_sml.is_step_limit_reached(global_step=10_000, max_steps=None))
+
+    def test_format_training_log_includes_timestamp(self):
+        import train_sml
+
+        log_line = train_sml.format_training_log(
+            epoch=2,
+            global_step=3,
+            lr=0.0003,
+            avg_loss=1.23456,
+            grad_norm=5.859,
+            timestamp=datetime(2026, 6, 5, 12, 34, 56),
+        )
+
+        self.assertEqual(
+            "time=2026-06-05 12:34:56 epoch=2 step=3 "
+            "lr=3.000e-04 loss=1.2346 grad_norm=5.859 (before clipping)",
+            log_line,
+        )
 
     @unittest.skipIf(torch is None, "torch is not installed")
     def test_token_block_dataset_yields_fixed_length_input_label_pairs(self):
