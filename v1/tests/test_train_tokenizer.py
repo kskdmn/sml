@@ -61,6 +61,11 @@ class TrainTokenizerTest(unittest.TestCase):
 
         self.assertFalse(hasattr(tokenizer, "iter_filtered_texts"))
 
+    def test_module_does_not_export_jsonl_lines_wrapper(self):
+        tokenizer = load_script()
+
+        self.assertFalse(hasattr(tokenizer, "iter_jsonl_lines"))
+
     def test_discover_input_files_sorts_matching_zst_shards_and_skips_others(self):
         tokenizer = load_script()
 
@@ -145,17 +150,32 @@ class TrainTokenizerTest(unittest.TestCase):
         self.assertEqual(EXPECTED_NORMALIZED_TEXT_COUNT, len(texts))
         self.assertNotIn("\x00", texts[0])
 
-    def test_iter_jsonl_lines_rejects_plain_jsonl_files(self):
+    def test_filtered_text_iterable_does_not_recheck_discovered_file_names(self):
         tokenizer = load_script()
 
+        class MatchCountingPattern:
+            def __init__(self):
+                self.names = []
+
+            def fullmatch(self, name):
+                self.names.append(name)
+                return object()
+
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "sample-0000.jsonl"
-            path.write_text(json.dumps({"text": "plain jsonl"}), encoding="utf-8")
+            root = Path(tmp_dir)
+            input_path = root / "sample-0000.jsonl.zst"
+            expected_text = "a" * tokenizer.MIN_TEXT_LENGTH
+            write_zst_rows(input_path, [{"text": expected_text}])
+            pattern = MatchCountingPattern()
 
-            with self.assertRaisesRegex(ValueError, "Unsupported input file"):
-                list(tokenizer.iter_jsonl_lines(path, max_rows_per_file=1))
+            with mock.patch.object(tokenizer, "INPUT_FILE_NAME_PATTERN", pattern):
+                input_files = tokenizer.discover_input_files(root)
+                texts = collect_filtered_texts(tokenizer, input_files)
 
-    def test_iter_jsonl_lines_reads_zst_files_without_subprocess(self):
+        self.assertEqual([expected_text], texts)
+        self.assertEqual(["sample-0000.jsonl.zst"], pattern.names)
+
+    def test_iter_zstd_jsonl_lines_reads_zst_files_without_subprocess(self):
         tokenizer = load_script()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -167,9 +187,26 @@ class TrainTokenizerTest(unittest.TestCase):
                 "subprocess.Popen",
                 side_effect=AssertionError("zstd files must not shell out"),
             ):
-                lines = list(tokenizer.iter_jsonl_lines(path, max_rows_per_file=1))
+                lines = list(tokenizer.iter_zstd_jsonl_lines(path, max_rows_per_file=1))
 
         self.assertEqual([(1, '{"text": "first"}\n')], lines)
+
+    def test_train_tokenizer_enables_byte_fallback(self):
+        tokenizer = load_script()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            input_path = root / "sample-0000.jsonl.zst"
+            write_zst_rows(input_path, [{"text": "a" * tokenizer.MIN_TEXT_LENGTH}])
+
+            with (
+                mock.patch.object(tokenizer, "INPUT_DIR", root),
+                mock.patch.object(tokenizer, "OUTPUT_DIR", root / "output"),
+                mock.patch.object(tokenizer.spm.SentencePieceTrainer, "train") as train,
+            ):
+                tokenizer.train_tokenizer()
+
+        self.assertIs(True, train.call_args.kwargs.get("byte_fallback"))
 
 
 if __name__ == "__main__":
