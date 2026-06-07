@@ -64,6 +64,7 @@ class TrainingConfig:
     sequence_length: int = 1_024
     batch_size: int = 1
     max_steps: int | None = 1_000  # Maximum optimizer steps. Set to None to train until epochs/data end.
+    lr_total_steps: int | None = None  # LR schedule horizon. Falls back to max_steps when None.
     epochs: int = 1
     max_rows_per_file: int | None = 10_000  # Maximum rows read from each input file per epoch. Set to None for all rows.
     learning_rate: float = 3e-4

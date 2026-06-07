@@ -340,8 +340,8 @@ class SMLLanguageModel(nn.Module):
 
 
 def compute_causal_lm_loss(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
+    logits: torch.Tensor,  # [batch_size, seq_len, vocab_size]
+    labels: torch.Tensor,  # [batch_size, seq_len]
     pad_token_id: int,
 ) -> torch.Tensor:
     if logits.shape[:-1] != labels.shape:
@@ -349,8 +349,8 @@ def compute_causal_lm_loss(
             "labels must have the same batch and sequence shape as logits"
         )
     return F.cross_entropy(
-        logits.reshape(-1, logits.size(-1)),
-        labels.reshape(-1),
+        logits.reshape(-1, logits.size(-1)),  # [batch_size * seq_len, vocab_size]
+        labels.reshape(-1),  # [batch_size * seq_len]
         ignore_index=pad_token_id,
     )
 

@@ -259,6 +259,14 @@ def is_step_limit_reached(global_step: int, max_steps: int | None) -> bool:
     return max_steps is not None and global_step >= max_steps
 
 
+def resolve_lr_total_steps(training_config: TrainingConfig) -> int | None:
+    if training_config.lr_total_steps is not None:
+        return training_config.lr_total_steps
+    if training_config.max_steps is not None:
+        return training_config.max_steps
+    return None
+
+
 def format_training_log(
     epoch: int,
     global_step: int,
@@ -318,7 +326,7 @@ def train_model(
         optimizer,
         lambda step: lr_lambda(
             step=step,
-            total_steps=training_config.max_steps,
+            total_steps=resolve_lr_total_steps(training_config),
             warmup_steps=training_config.warmup_steps,
             min_lr_ratio=training_config.min_lr_ratio,
         ),

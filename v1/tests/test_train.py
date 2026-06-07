@@ -109,6 +109,33 @@ class TrainDataTest(unittest.TestCase):
 
         self.assertFalse(train_sml.is_step_limit_reached(global_step=10_000, max_steps=None))
 
+    def test_resolve_lr_total_steps_prefers_lr_total_steps(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        training_config = TrainingConfig(
+            lr_total_steps=5_000,
+            max_steps=1_000,
+        )
+
+        self.assertEqual(5_000, train_sml.resolve_lr_total_steps(training_config))
+
+    def test_resolve_lr_total_steps_falls_back_to_max_steps(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        training_config = TrainingConfig(lr_total_steps=None, max_steps=1_000)
+
+        self.assertEqual(1_000, train_sml.resolve_lr_total_steps(training_config))
+
+    def test_resolve_lr_total_steps_is_none_without_lr_or_max_steps(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        training_config = TrainingConfig(lr_total_steps=None, max_steps=None)
+
+        self.assertIsNone(train_sml.resolve_lr_total_steps(training_config))
+
     def test_format_training_log_includes_timestamp(self):
         import train_sml
 
