@@ -113,6 +113,138 @@ class InferenceInterfaceTest(unittest.TestCase):
 
         self.assertEqual("6", text)
 
+    def test_create_completion_response_uses_openai_compatible_shape(self):
+        import infer_sml
+
+        with mock.patch.object(
+            infer_sml,
+            "generate_text",
+            return_value="6",
+        ) as generate_text:
+            response = infer_sml.create_completion_response(
+                {
+                    "model": "sml-test",
+                    "prompt": "4 5",
+                    "max_tokens": 2,
+                }
+            )
+
+        generate_text.assert_called_once_with(
+            prompt="4 5",
+            max_new_tokens=2,
+            include_prompt=False,
+        )
+        self.assertEqual("text_completion", response["object"])
+        self.assertEqual("sml-test", response["model"])
+        self.assertEqual(
+            {
+                "index": 0,
+                "text": "6",
+                "finish_reason": "length",
+            },
+            response["choices"][0],
+        )
+        self.assertEqual(
+            {
+                "prompt_tokens": 2,
+                "completion_tokens": 1,
+                "total_tokens": 3,
+            },
+            response["usage"],
+        )
+
+    def test_create_chat_completion_response_formats_messages(self):
+        import infer_sml
+
+        with mock.patch.object(
+            infer_sml,
+            "generate_text",
+            return_value="6",
+        ) as generate_text:
+            response = infer_sml.create_chat_completion_response(
+                {
+                    "model": "sml-test",
+                    "messages": [
+                        {"role": "system", "content": "be terse"},
+                        {"role": "user", "content": "4 5"},
+                    ],
+                    "max_tokens": 3,
+                }
+            )
+
+        generate_text.assert_called_once_with(
+            prompt="system: be terse\nuser: 4 5\nassistant:",
+            max_new_tokens=3,
+            include_prompt=False,
+        )
+        self.assertEqual("chat.completion", response["object"])
+        self.assertEqual("sml-test", response["model"])
+        self.assertEqual(
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "6",
+                },
+                "finish_reason": "length",
+            },
+            response["choices"][0],
+        )
+        self.assertEqual(
+            {
+                "prompt_tokens": 7,
+                "completion_tokens": 1,
+                "total_tokens": 8,
+            },
+            response["usage"],
+        )
+
+    def test_create_models_response_lists_default_model(self):
+        import infer_sml
+
+        response = infer_sml.create_models_response("sml-test")
+
+        self.assertEqual("list", response["object"])
+        self.assertEqual("sml-test", response["data"][0]["id"])
+        self.assertEqual("model", response["data"][0]["object"])
+
+    def test_route_openai_request_dispatches_chat_completions(self):
+        import infer_sml
+
+        with mock.patch.object(
+            infer_sml,
+            "generate_text",
+            return_value="6",
+        ) as generate_text:
+            status_code, response = infer_sml.route_openai_request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "sml-test",
+                    "messages": [{"role": "user", "content": "4 5"}],
+                    "max_tokens": 2,
+                },
+            )
+
+        self.assertEqual(200, status_code)
+        generate_text.assert_called_once_with(
+            prompt="user: 4 5\nassistant:",
+            max_new_tokens=2,
+            include_prompt=False,
+        )
+        self.assertEqual("chat.completion", response["object"])
+
+    def test_route_openai_request_returns_404_for_unknown_paths(self):
+        import infer_sml
+
+        status_code, response = infer_sml.route_openai_request(
+            "GET",
+            "/v1/unknown",
+        )
+
+        self.assertEqual(404, status_code)
+        self.assertEqual("not_found", response["error"]["type"])
+
     def test_main_omits_prompt_by_default(self):
         import infer_sml
 
@@ -160,6 +292,29 @@ class InferenceInterfaceTest(unittest.TestCase):
             include_prompt=True,
         )
         print_.assert_called_once_with("hello world")
+
+    def test_main_can_start_openai_compatible_server(self):
+        import infer_sml
+
+        with mock.patch.object(infer_sml, "run_openai_compatible_server") as run_server:
+            exit_code = infer_sml.main(
+                [
+                    "--serve",
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "9000",
+                    "--model",
+                    "sml-test",
+                ]
+            )
+
+        self.assertEqual(0, exit_code)
+        run_server.assert_called_once_with(
+            host="0.0.0.0",
+            port=9000,
+            model_name="sml-test",
+        )
 
     def test_parse_args_rejects_fixed_inference_defaults(self):
         import infer_sml

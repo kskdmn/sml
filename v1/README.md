@@ -1,0 +1,117 @@
+# SML v1
+
+This version contains the first SML model, tokenizer, training scripts, and
+inference entrypoint.
+
+## Inference Files
+
+`infer_sml.py` uses these files by default:
+
+- Checkpoint: `v1/output/sml.pt`
+- Tokenizer: `v1/output/bpe_tokenizer.model`
+
+Both files must exist before inference works. Run commands from the repository
+root.
+
+## One-Shot Text Generation
+
+Use this when you want to pass one prompt and print one completion:
+
+```bash
+uv run python v1/src/infer_sml.py "Hello" --max-new-tokens 50
+```
+
+By default, the output contains only newly generated text. To print the prompt
+plus the generated continuation:
+
+```bash
+uv run python v1/src/infer_sml.py "Hello" --include-prompt
+```
+
+Useful options:
+
+- `prompt`: prompt text to continue. Required unless `--serve` is set.
+- `--max-new-tokens`: maximum number of tokens to generate. Defaults to `100`.
+- `--include-prompt`: include the prompt in the printed output.
+
+## OpenAI-Compatible API
+
+Use `--serve` when you want a vLLM-style HTTP API:
+
+```bash
+uv run python v1/src/infer_sml.py --serve --host 127.0.0.1 --port 8000 --model sml
+```
+
+The server exposes:
+
+- `GET /v1/models`
+- `POST /v1/completions`
+- `POST /v1/chat/completions`
+
+### List Models
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+```
+
+### Text Completion
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sml",
+    "prompt": "Hello",
+    "max_tokens": 50
+  }'
+```
+
+The generated text is returned at:
+
+```text
+choices[0].text
+```
+
+### Chat Completion
+
+```bash
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sml",
+    "messages": [
+      {"role": "system", "content": "Be concise."},
+      {"role": "user", "content": "Explain SML in one sentence."}
+    ],
+    "max_tokens": 50
+  }'
+```
+
+The assistant message is returned at:
+
+```text
+choices[0].message.content
+```
+
+Chat messages do not use special role tokens. `infer_sml.py` formats them as
+ordinary text labels before generation:
+
+```text
+system: Be concise.
+user: Explain SML in one sentence.
+assistant:
+```
+
+The tokenizer encodes `system`, `user`, and `assistant` like normal text. The
+only special token automatically added for inference is the BOS token at the
+start of the whole prompt.
+
+## API Notes
+
+- The API shape is OpenAI/vLLM-style, so clients can target `/v1/...`.
+- Streaming is not implemented yet.
+- Chat message `content` must be a string.
+- Role markers are plain text labels, not special tokens.
+- `max_tokens` maps to the model's `max_new_tokens`.
+- Token usage is an estimate based on whitespace splitting, not tokenizer-exact
+  accounting.
