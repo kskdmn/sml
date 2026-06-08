@@ -15,6 +15,7 @@ import torch
 import zstandard as zstd
 from torch.utils.data import DataLoader, IterableDataset
 
+from config import SUCCESS_RETURN_CODE
 from sml import SMLLanguageModel, count_parameters, lr_lambda
 from sml_config import (
     SMLConfig,
@@ -31,7 +32,6 @@ from train_tokenizer import (
 )
 
 
-SUCCESS_RETURN_CODE = 0
 ROW_INCREMENT = 1
 
 

@@ -3,10 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from config import OUTPUT_DIR, PROJECT_DIR, TOKENIZER_MODEL_PATH
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = PROJECT_DIR / "output"
-TOKENIZER_MODEL_PATH = OUTPUT_DIR / "bpe_tokenizer.model"
 INPUT_DIR = Path("~/Documents/data-common_pile/")
 INPUT_FILE_NAME_REGEX = r".*-0000\.jsonl\.zst\Z"
 

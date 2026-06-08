@@ -20,15 +20,26 @@ class SMLForwardOutput:
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight = nn.Parameter(torch.ones(hidden_size))  # [hidden_size]
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        RMSNorm normalizes each hidden vector by its root mean square.
+        Assume `x.shape = (batch_size, seq_len, hidden_size)`.
+
+        mean_square = average(x^2)
+        RMS = sqrt(mean_square)
+        x_norm = x / RMS
+        output = weight * x_norm = x * (weight / RMS)
+        The output has the same shape as the input, but the RMS of the output is approximately 1.
+        RMSNorm scales the vector so its RMS is approximately 1, but it does not force mean 0 or variance 1.
+        """
         dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return (self.weight * x).to(dtype)
+        x = x.float()  # Convert to float32 for numerical stability. [batch_size, seq_len, hidden_size]
+        mean_square = x.pow(2).mean(dim=-1, keepdim=True)  # [batch_size, seq_len, 1]; `x` will be `average(x^2)` along the last dimension.
+        x = x * torch.rsqrt(mean_square + self.eps)  # [batch_size, seq_len, hidden_size]; `x` will be `x / sqrt(mean_square + eps)` along the last dimension.
+        return (self.weight * x).to(dtype)  # [batch_size, seq_len, hidden_size]
 
 
 class RotaryEmbedding(nn.Module):

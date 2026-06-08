@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 import warnings
@@ -9,6 +10,7 @@ from unittest import mock
 import zstandard as zstd
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_DIR / "src"
 SCRIPT_PATH = PROJECT_DIR / "src" / "train_tokenizer.py"
 MAX_ROWS_IN_TEST = 3
 EXPECTED_NORMALIZED_TEXT_COUNT = 1
@@ -32,6 +34,8 @@ def collect_filtered_texts(tokenizer, input_files, max_rows_per_file=None):
 
 
 def load_script():
+    if str(SRC_DIR) not in sys.path:
+        sys.path.insert(0, str(SRC_DIR))
     spec = importlib.util.spec_from_file_location("train_tokenizer", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

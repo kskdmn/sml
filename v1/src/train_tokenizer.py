@@ -11,9 +11,8 @@ from typing import Iterable, Iterator, NamedTuple, Sequence
 import sentencepiece as spm
 import zstandard as zstd
 
+from config import OUTPUT_DIR, PROJECT_DIR, SUCCESS_RETURN_CODE
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = PROJECT_DIR / "output"
 INPUT_DIR = Path("~/Documents/data-common_pile/")
 
 VOCAB_SIZE = 49_152
@@ -30,7 +29,6 @@ UNK_ID = 0
 BOS_ID = 1
 EOS_ID = 2
 PAD_ID = 3
-SUCCESS_RETURN_CODE = 0
 FIRST_LINE_NUMBER = 1
 NO_ROWS = 0
 ROW_INCREMENT = 1
