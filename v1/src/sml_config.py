@@ -23,7 +23,7 @@ class SMLConfig:
     attention_dropout: float = 0.0  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
     hidden_dropout: float = 0.0  # If overfitting, try 0.1
     initializer_range: float = 0.02
-    gradient_checkpointing: bool = True  # Trade extra compute for lower activation memory during training.
+    gradient_checkpointing: bool = False  # Trade extra compute for lower activation memory during training.
     pad_token_id: int = 3
     bos_token_id: int = 1
     eos_token_id: int = 2
