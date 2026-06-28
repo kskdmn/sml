@@ -38,7 +38,8 @@ class InferenceInterfaceTest(unittest.TestCase):
             num_q_heads=2,
             num_kv_heads=1,
             intermediate_size=16,
-            max_position_embeddings=16,
+            original_max_position_embeddings=16,
+            rope_scaling_factor=2.0,
             attention_dropout=0.0,
             hidden_dropout=0.0,
             gradient_checkpointing=False,
@@ -94,6 +95,36 @@ class InferenceInterfaceTest(unittest.TestCase):
         self.assertFalse(loaded.training)
         output = loaded(torch.tensor([[1, 4, 5]]))
         self.assertEqual((1, 3, config.vocab_size), tuple(output.logits.shape))
+
+    def test_load_model_maps_legacy_max_position_embeddings_config(self):
+        import infer_sml
+        from sml import SMLLanguageModel
+
+        config = self.tiny_config()
+        model = SMLLanguageModel(config)
+        legacy_model_config = asdict(config)
+        legacy_model_config["max_position_embeddings"] = legacy_model_config.pop(
+            "original_max_position_embeddings"
+        )
+        legacy_model_config.pop("rope_scaling_factor")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = Path(tmp_dir) / "sml.pt"
+            torch.save(
+                {
+                    "model_config": legacy_model_config,
+                    "model_state_dict": model.state_dict(),
+                },
+                checkpoint_path,
+            )
+
+            loaded = infer_sml.load_model(checkpoint_path, torch.device("cpu"))
+
+        self.assertEqual(
+            config.original_max_position_embeddings,
+            loaded.config.original_max_position_embeddings,
+        )
+        self.assertEqual(2.0, loaded.config.rope_scaling_factor)
 
     def test_generate_text_omits_prompt_by_default(self):
         import infer_sml

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,13 +18,14 @@ class SMLConfig:
     num_q_heads: int = 8
     num_kv_heads: int = 2
     intermediate_size: int = 1_536
-    max_position_embeddings: int = 1_024
+    original_max_position_embeddings: int = 1_024
     rope_theta: float = 10_000.0
+    rope_scaling_factor: float = 2.0
     rms_norm_eps: float = 1e-6
     attention_dropout: float = 0.0  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
     hidden_dropout: float = 0.0  # If overfitting, try 0.1
     initializer_range: float = 0.02
-    gradient_checkpointing: bool = False  # Trade extra compute for lower activation memory during training.
+    gradient_checkpointing: bool = True  # Trade extra compute for lower activation memory during training.
     pad_token_id: int = 3
     bos_token_id: int = 1
     eos_token_id: int = 2
@@ -32,6 +34,10 @@ class SMLConfig:
     use_cache: bool = True  # For inference/generation.
 
     def __post_init__(self) -> None:
+        """
+        Validate shape and context-scaling invariants before model code relies on
+        derived head dimensions and effective context length.
+        """
         if self.vocab_size <= 0:
             raise ValueError("vocab_size must be positive")
         if self.hidden_size <= 0:
@@ -44,12 +50,31 @@ class SMLConfig:
             raise ValueError("head_dim must be even for rotary embeddings")
         if self.intermediate_size <= 0:
             raise ValueError("intermediate_size must be positive")
-        if self.max_position_embeddings <= 0:
-            raise ValueError("max_position_embeddings must be positive")
+        if self.original_max_position_embeddings <= 0:
+            raise ValueError("original_max_position_embeddings must be positive")
+        if (
+            not math.isfinite(self.rope_scaling_factor)
+            or self.rope_scaling_factor < 1.0
+        ):
+            raise ValueError("rope_scaling_factor must be at least 1.0")
 
     @property
     def head_dim(self) -> int:
+        """
+        Grouped-query attention uses this derived width for both query and key/value
+        projections.
+        """
         return self.hidden_size // self.num_q_heads
+
+    @property
+    def effective_max_position_embeddings(self) -> int:
+        """
+        Round scaled context upward so fractional RoPE scaling never shortens the usable
+        window.
+        """
+        return math.ceil(
+            self.original_max_position_embeddings * self.rope_scaling_factor
+        )
 
 
 @dataclass(slots=True)

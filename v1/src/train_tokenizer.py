@@ -64,12 +64,20 @@ class FilteredTextIterable:
         input_files: Sequence[Path],
         max_rows_per_file: int = MAX_ROWS_PER_FILE,
     ) -> None:
+        """
+        Counters live on the iterable so training can report rows read versus texts kept
+        after filtering.
+        """
         self.input_files = input_files
         self.max_rows_per_file = max_rows_per_file
         self.rows_read = NO_ROWS
         self.texts_used = NO_ROWS
 
     def __iter__(self) -> Iterator[str]:
+        """
+        Each shard is streamed once; rows_read counts JSON objects while texts_used
+        counts only rows that survive text filters.
+        """
         for input_file in self.input_files:
             for row in iter_jsonl_records(input_file, self.max_rows_per_file):
                 self.rows_read += ROW_INCREMENT
@@ -82,10 +90,17 @@ class FilteredTextIterable:
 
 
 def resolve_path(path: Path) -> Path:
+    """
+    Only expand `~`; callers decide separately whether the resulting path must exist.
+    """
     return path.expanduser()
 
 
 def discover_input_files(input_dir: Path = INPUT_DIR) -> tuple[Path, ...]:
+    """
+    Use the fixed shard naming pattern and skip hidden files that may appear on local
+    filesystems.
+    """
     root = resolve_path(input_dir)
     if not root.exists():
         raise FileNotFoundError(f"Input directory does not exist: {root}")
@@ -101,6 +116,10 @@ def discover_input_files(input_dir: Path = INPUT_DIR) -> tuple[Path, ...]:
 
 
 def iter_jsonl_records(path: Path, max_rows_per_file: int) -> Iterator[dict[str, object]]:
+    """
+    Blank lines and non-object JSON are ignored; malformed JSON includes the compressed
+    file line number.
+    """
     for line_number, line in iter_zstd_jsonl_lines(path, max_rows_per_file):
         line = line.strip()
         if not line:
@@ -116,6 +135,10 @@ def iter_jsonl_records(path: Path, max_rows_per_file: int) -> Iterator[dict[str,
 
 
 def iter_zstd_jsonl_lines(path: Path, max_rows_per_file: int) -> Iterator[tuple[int, str]]:
+    """
+    Decode zstd streams as replacement-tolerant UTF-8 so rare bad bytes do not abort
+    tokenizer training.
+    """
     try:
         with path.open("rb") as compressed_stream:
             decompressor = zstd.ZstdDecompressor()
@@ -134,11 +157,19 @@ def enumerate_limited_lines(
     stream: Iterable[str],
     max_rows_per_file: int,
 ) -> Iterator[tuple[int, str]]:
+    """
+    Line numbers stay one-based after applying the row cap for readable JSON error
+    messages.
+    """
     limited_stream = itertools.islice(stream, max_rows_per_file)
     yield from enumerate(limited_stream, start=FIRST_LINE_NUMBER)
 
 
 def filter_text(value: object) -> str | None:
+    """
+    Reject non-strings, too-short strings, and UTF-8 byte-long rows before SentencePiece
+    sees them.
+    """
     if not isinstance(value, str):
         return None
 
@@ -153,11 +184,19 @@ def filter_text(value: object) -> str | None:
 
 
 def normalize_text(text: str) -> str:
+    """
+    Convert null bytes to spaces before whitespace collapse to avoid embedded
+    terminators in tokenizer input.
+    """
     text = text.replace(NULL_CHARACTER, " ")
     return WHITESPACE_PATTERN.sub(" ", text).strip()
 
 
 def require_non_empty_iterator(iterator: Iterator[str]) -> Iterator[str]:
+    """
+    SentencePiece fails obscurely on empty input, so raise a project-level error before
+    training starts.
+    """
     try:
         first_text = next(iterator)
     except StopIteration as exc:
@@ -169,6 +208,10 @@ def require_non_empty_iterator(iterator: Iterator[str]) -> Iterator[str]:
 
 
 def train_tokenizer() -> TrainingResult:
+    """
+    Feed SentencePiece from a lazy filtered iterator so compressed shards do not need to
+    be materialized.
+    """
     random.seed(RANDOM_SEED)
 
     output_dir = resolve_path(OUTPUT_DIR)
@@ -212,6 +255,7 @@ def train_tokenizer() -> TrainingResult:
 
 
 def main() -> int:
+    """Print generated artifacts and corpus counters for the tokenizer training CLI."""
     result = train_tokenizer()
     print(f"Model: {result.model_path}")
     print(f"Vocab: {result.vocab_path}")

@@ -34,6 +34,10 @@ class SMLHumanEvalLM(LM):
         tokenizer: InferenceTokenizer,
         device: torch.device,
     ) -> None:
+        """
+        The lm-eval base class supplies cache hooks; this adapter keeps the local model,
+        tokenizer, and torch device together for generation.
+        """
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
@@ -46,6 +50,10 @@ class SMLHumanEvalLM(LM):
         tokenizer_model_path: Path,
         device_name: str = "auto",
     ) -> SMLHumanEvalLM:
+        """
+        Resolve the device once so checkpoint weights and tokenized prompts land on the
+        same runtime target.
+        """
         device = resolve_device(device_name)
         return cls(
             model=load_model(checkpoint_path, device),
@@ -57,14 +65,26 @@ class SMLHumanEvalLM(LM):
         self,
         requests: list[Instance],
     ) -> list[tuple[float, bool]]:
+        """
+        HumanEval is a generation task, so scoring continuations by likelihood would
+        indicate the adapter is being used for the wrong benchmark.
+        """
         del requests
         raise NotImplementedError("SMLHumanEvalLM only supports generation tasks")
 
     def loglikelihood_rolling(self, requests: list[Instance]) -> list[float]:
+        """
+        Rolling likelihood is intentionally unsupported because this adapter only
+        implements the generation surface lm-eval needs for HumanEval.
+        """
         del requests
         raise NotImplementedError("SMLHumanEvalLM only supports generation tasks")
 
     def generate_until(self, requests: list[Instance]) -> list[str]:
+        """
+        lm-eval stores each prompt and generation kwargs in Instance.args; generation is
+        clamped to the remaining context window before decoding.
+        """
         completions: list[str] = []
         for request in requests:
             context, generation_kwargs = request.args
@@ -78,7 +98,7 @@ class SMLHumanEvalLM(LM):
                 device=self.device,
             )
             prompt_length = input_ids.shape[1]
-            max_length = self.model.config.max_position_embeddings
+            max_length = self.model.config.effective_max_position_embeddings
             if prompt_length > max_length:
                 raise ValueError(
                     "HumanEval prompt exceeds the checkpoint context window: "
@@ -111,6 +131,10 @@ class SMLHumanEvalLM(LM):
 
 
 def _truncate_at_stop(text: str, until: str | list[str] | None) -> str:
+    """
+    The `until` value may be absent, a single string, or several strings; the earliest
+    match wins so overlapping stops behave deterministically.
+    """
     stop_sequences = [until] if isinstance(until, str) else until or []
     stop_positions = [
         position
@@ -125,6 +149,10 @@ def evaluate_humaneval(
     checkpoint_path: Path = DEFAULT_CHECKPOINT_PATH,
     limit: int | None = None,
 ) -> dict[str, Any] | None:
+    """
+    HumanEval executes generated Python, so lm-eval requires both the environment flag
+    and the explicit unsafe-code confirmation.
+    """
     os.environ["HF_ALLOW_CODE_EVAL"] = "1"
     return simple_evaluate(
         model=lm,
@@ -139,6 +167,10 @@ def evaluate_humaneval(
 
 
 def write_results(output_path: Path, results: dict[str, Any]) -> None:
+    """
+    lm-eval results can contain Path and numpy-like values, so JSON serialization goes
+    through lm-eval's non-serializable handler.
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         json.dumps(
@@ -153,6 +185,10 @@ def write_results(output_path: Path, results: dict[str, Any]) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """
+    Accept an explicit argv for tests while keeping the unsafe-code warning visible in
+    CLI help.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate the local SML checkpoint on HumanEval. "
@@ -192,6 +228,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """
+    Wire checkpoint loading, evaluation, JSON output, and table printing for the
+    HumanEval CLI.
+    """
     args = parse_args(argv)
     lm = SMLHumanEvalLM.from_checkpoint(
         checkpoint_path=args.checkpoint,

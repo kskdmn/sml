@@ -26,13 +26,22 @@ DEFAULT_MODEL_NAME = "sml"
 
 class InferenceTokenizer(Protocol):
     def encode(self, text: str, out_type: type = int) -> list[int]:
+        """
+        Inference relies on the SentencePiece-style `out_type=int` contract and does not
+        need the concrete tokenizer type.
+        """
         ...
 
     def decode(self, ids: list[int]) -> str:
+        """Decode receives integer IDs after caller-side special-token filtering."""
         ...
 
 
 def load_checkpoint(checkpoint_path: Path, device: torch.device) -> dict[str, Any]:
+    """
+    Allow POSIX paths inside older checkpoint payloads while mapping tensor storage to
+    the selected torch device.
+    """
     path = resolve_path(checkpoint_path)
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint does not exist: {path}")
@@ -44,7 +53,26 @@ def load_checkpoint(checkpoint_path: Path, device: torch.device) -> dict[str, An
     return checkpoint
 
 
+def normalize_model_config(model_config: dict[str, Any]) -> dict[str, Any]:
+    """
+    Older checkpoints used `max_position_embeddings` and may omit newer RoPE fields;
+    rename legacy keys and let dataclass defaults fill gaps.
+    """
+    normalized = dict(model_config)
+    if "max_position_embeddings" in normalized:
+        legacy_max_position_embeddings = normalized.pop("max_position_embeddings")
+        normalized.setdefault(
+            "original_max_position_embeddings",
+            legacy_max_position_embeddings,
+        )
+    return normalized
+
+
 def load_model(checkpoint_path: Path, device: torch.device) -> SMLLanguageModel:
+    """
+    Checkpoint files must contain both shape config and weights; returned models are
+    moved to the requested device and switched to eval mode.
+    """
     checkpoint = load_checkpoint(checkpoint_path, device)
     model_config = checkpoint.get("model_config")
     model_state_dict = checkpoint.get("model_state_dict")
@@ -53,7 +81,7 @@ def load_model(checkpoint_path: Path, device: torch.device) -> SMLLanguageModel:
     if not isinstance(model_state_dict, dict):
         raise ValueError("Checkpoint is missing model_state_dict")
 
-    model = SMLLanguageModel(SMLConfig(**model_config))
+    model = SMLLanguageModel(SMLConfig(**normalize_model_config(model_config)))
     model.load_state_dict(model_state_dict)
     model.to(device)
     model.eval()
@@ -66,6 +94,10 @@ def encode_prompt(
     bos_token_id: int | None,
     device: torch.device,
 ) -> torch.Tensor:
+    """
+    Insert BOS before batching because training may have taught the model to expect an
+    explicit document-start token.
+    """
     token_ids = tokenizer.encode(prompt, out_type=int)
     if bos_token_id is not None:
         token_ids = [bos_token_id, *token_ids]
@@ -79,6 +111,10 @@ def decode_token_ids(
     eos_token_id: int | None,
     pad_token_id: int | None,
 ) -> str:
+    """
+    Generation can include echoed BOS, padding, or EOS; remove those control tokens
+    before handing IDs back to SentencePiece.
+    """
     decoded_ids: list[int] = []
     skipped_ids = {
         token_id for token_id in (bos_token_id, pad_token_id) if token_id is not None
@@ -100,6 +136,10 @@ def generate_text(
     device_name: str = "auto",
     include_prompt: bool = False,
 ) -> str:
+    """
+    This one-shot path loads model and tokenizer per call, then decodes only the
+    continuation unless the caller asks to include the prompt.
+    """
     if max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative")
 
@@ -132,12 +172,20 @@ def generate_text(
 
 
 def estimate_token_count(text: str) -> int:
+    """
+    The OpenAI-compatible shim reports approximate usage without keeping a tokenizer
+    object in the response-construction layer.
+    """
     if not text.strip():
         return 0
     return len(text.split())
 
 
 def resolve_max_tokens(request: Mapping[str, Any]) -> int:
+    """
+    Accept OpenAI's `max_tokens` and the local `max_new_tokens` alias, falling back to
+    the CLI default when neither is present.
+    """
     max_tokens = request.get("max_tokens", request.get("max_new_tokens"))
     if max_tokens is None:
         return DEFAULT_MAX_NEW_TOKENS
@@ -149,6 +197,10 @@ def resolve_max_tokens(request: Mapping[str, Any]) -> int:
 
 
 def resolve_model_name(request: Mapping[str, Any]) -> str:
+    """
+    The model field is echoed in responses for client compatibility; it does not select
+    among multiple local checkpoints.
+    """
     model = request.get("model", DEFAULT_MODEL_NAME)
     if not isinstance(model, str) or not model:
         raise ValueError("model must be a non-empty string")
@@ -156,6 +208,9 @@ def resolve_model_name(request: Mapping[str, Any]) -> str:
 
 
 def create_usage(prompt: str, completion: str) -> dict[str, int]:
+    """
+    Use the same lightweight token estimate for every OpenAI-compatible response shape.
+    """
     prompt_tokens = estimate_token_count(prompt)
     completion_tokens = estimate_token_count(completion)
     return {
@@ -166,6 +221,10 @@ def create_usage(prompt: str, completion: str) -> dict[str, int]:
 
 
 def format_chat_messages(messages: Sequence[Mapping[str, Any]]) -> str:
+    """
+    Flatten role/content pairs into a deterministic transcript and append an assistant
+    cue when the client has not already provided one.
+    """
     if not messages:
         raise ValueError("messages must contain at least one message")
 
@@ -187,6 +246,10 @@ def format_chat_messages(messages: Sequence[Mapping[str, Any]]) -> str:
 def resolve_generator(
     generator: Callable[..., str] | None,
 ) -> Callable[..., str]:
+    """
+    Tests and HTTP handlers can inject a generator, while production requests fall back
+    to checkpoint-backed generation.
+    """
     return generate_text if generator is None else generator
 
 
@@ -194,6 +257,10 @@ def create_completion_response(
     request: Mapping[str, Any],
     generator: Callable[..., str] | None = None,
 ) -> dict[str, Any]:
+    """
+    Mirror the legacy completions schema while forcing generation to return completion
+    text rather than prompt-plus-completion.
+    """
     prompt = request.get("prompt")
     if not isinstance(prompt, str):
         raise ValueError("prompt must be a string")
@@ -225,6 +292,10 @@ def create_chat_completion_response(
     request: Mapping[str, Any],
     generator: Callable[..., str] | None = None,
 ) -> dict[str, Any]:
+    """
+    Convert chat messages into the plain-text prompt format SML can consume, then wrap
+    the result in OpenAI's chat response shape.
+    """
     messages = request.get("messages")
     if not isinstance(messages, list):
         raise ValueError("messages must be a list")
@@ -257,6 +328,10 @@ def create_chat_completion_response(
 
 
 def create_models_response(model_name: str = DEFAULT_MODEL_NAME) -> dict[str, Any]:
+    """
+    Expose a single configured model name so OpenAI clients can discover the local
+    endpoint.
+    """
     if not model_name:
         raise ValueError("model_name must be non-empty")
     return {
@@ -276,6 +351,10 @@ def create_error_response(
     message: str,
     error_type: str = "invalid_request_error",
 ) -> dict[str, Any]:
+    """
+    Keep unused `param` and `code` keys so simple OpenAI clients can parse errors
+    without special casing this server.
+    """
     return {
         "error": {
             "message": message,
@@ -293,6 +372,10 @@ def route_openai_request(
     model_name: str = DEFAULT_MODEL_NAME,
     generator: Callable[..., str] | None = None,
 ) -> tuple[int, dict[str, Any]]:
+    """
+    Normalize paths and centralize endpoint validation so the HTTP handler and tests
+    share identical response behavior.
+    """
     method = method.upper()
     path = path.rstrip("/") or "/"
 
@@ -326,6 +409,10 @@ class OpenAICompatibleHTTPHandler(BaseHTTPRequestHandler):
     generator: Callable[..., str] | None = None
 
     def do_GET(self) -> None:
+        """
+        BaseHTTPRequestHandler provides method and path state; this method delegates all
+        endpoint decisions to the shared router.
+        """
         status_code, response = route_openai_request(
             self.command,
             self.path,
@@ -335,6 +422,10 @@ class OpenAICompatibleHTTPHandler(BaseHTTPRequestHandler):
         self.send_json(status_code, response)
 
     def do_POST(self) -> None:
+        """
+        Reject invalid or non-object JSON before endpoint-specific validation so every
+        POST route receives a mapping.
+        """
         payload = self.read_json_payload()
         if not isinstance(payload, dict):
             self.send_json(
@@ -353,6 +444,10 @@ class OpenAICompatibleHTTPHandler(BaseHTTPRequestHandler):
         self.send_json(status_code, response)
 
     def read_json_payload(self) -> Any:
+        """
+        Treat an empty request body as `{}` so missing required fields produce the same
+        validation errors as empty JSON.
+        """
         content_length = int(self.headers.get("Content-Length", "0"))
         if content_length == 0:
             return {}
@@ -363,6 +458,10 @@ class OpenAICompatibleHTTPHandler(BaseHTTPRequestHandler):
             return None
 
     def send_json(self, status_code: int, payload: Mapping[str, Any]) -> None:
+        """
+        Set Content-Length explicitly before writing bytes for compatibility with simple
+        HTTP clients.
+        """
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
@@ -375,6 +474,10 @@ def make_openai_compatible_handler(
     model_name: str,
     generator: Callable[..., str] | None = None,
 ) -> type[OpenAICompatibleHTTPHandler]:
+    """
+    Bind model name and generator on a fresh subclass so separate servers do not mutate
+    shared handler state.
+    """
     class ConfiguredOpenAICompatibleHTTPHandler(OpenAICompatibleHTTPHandler):
         pass
 
@@ -388,6 +491,10 @@ def run_openai_compatible_server(
     port: int = 8000,
     model_name: str = DEFAULT_MODEL_NAME,
 ) -> None:
+    """
+    ThreadingHTTPServer allows concurrent local requests; KeyboardInterrupt is swallowed
+    so the CLI exits cleanly.
+    """
     handler_class = make_openai_compatible_handler(model_name)
     server = ThreadingHTTPServer((host, port), handler_class)
     print(f"Serving SML OpenAI-compatible API at http://{host}:{port}/v1")
@@ -400,6 +507,10 @@ def run_openai_compatible_server(
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """
+    Serving and one-shot generation share a parser, but prompts are required only
+    outside server mode.
+    """
     parser = argparse.ArgumentParser(
         description="Generate text from an SML checkpoint."
     )
@@ -443,6 +554,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """
+    Choose between server mode and one-shot generation after parsing, then return the
+    project success code.
+    """
     args = parse_args(argv)
     if args.serve:
         run_openai_compatible_server(

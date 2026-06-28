@@ -25,9 +25,9 @@ class FakeTokenizer:
 
 
 class FakeModel:
-    def __init__(self, max_position_embeddings=6):
+    def __init__(self, effective_max_position_embeddings=6):
         self.config = SimpleNamespace(
-            max_position_embeddings=max_position_embeddings,
+            effective_max_position_embeddings=effective_max_position_embeddings,
             bos_token_id=1,
             eos_token_id=2,
             pad_token_id=3,
@@ -50,7 +50,7 @@ class HumanEvalAdapterTest(unittest.TestCase):
     def test_generate_until_caps_completion_and_applies_earliest_stop(self):
         import eval_humaneval
 
-        model = FakeModel(max_position_embeddings=6)
+        model = FakeModel(effective_max_position_embeddings=6)
         lm = eval_humaneval.SMLHumanEvalLM(
             model=model,
             tokenizer=FakeTokenizer(),
@@ -77,7 +77,7 @@ class HumanEvalAdapterTest(unittest.TestCase):
         import eval_humaneval
 
         lm = eval_humaneval.SMLHumanEvalLM(
-            model=FakeModel(max_position_embeddings=3),
+            model=FakeModel(effective_max_position_embeddings=3),
             tokenizer=FakeTokenizer(),
             device=torch.device("cpu"),
         )

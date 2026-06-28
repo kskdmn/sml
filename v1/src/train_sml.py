@@ -37,6 +37,10 @@ ROW_INCREMENT = 1
 
 class TextTokenizer(Protocol):
     def encode(self, text: str, out_type: type = int) -> list[int]:
+        """
+        Training only needs SentencePiece-style integer encoding, which keeps the
+        protocol narrow enough for lightweight tests.
+        """
         ...
 
 
@@ -44,6 +48,10 @@ def discover_input_files(
     input_dir: Path,
     file_name_regex: str,
 ) -> tuple[Path, ...]:
+    """
+    Match the regex against file names rather than paths, and skip hidden files such as
+    local filesystem metadata.
+    """
     root = resolve_path(input_dir)
     if not root.exists():
         raise FileNotFoundError(f"Input directory does not exist: {root}")
@@ -63,6 +71,10 @@ def iter_texts(
     input_files: Iterable[Path],
     max_rows_per_file: int | None,
 ) -> Iterator[str]:
+    """
+    Reuse tokenizer-training text filters so tokenizer and model training agree on which
+    rows are usable.
+    """
     for input_file in input_files:
         for row in iter_jsonl_records(input_file, max_rows_per_file):
             text = filter_text(row.get(TEXT_COLUMN))
@@ -74,6 +86,10 @@ def iter_jsonl_records(
     path: Path,
     max_rows_per_file: int | None,
 ) -> Iterator[dict[str, object]]:
+    """
+    Ignore blank and non-object rows, but include file and line number when malformed
+    JSON is encountered.
+    """
     for line_number, line in iter_zstd_jsonl_lines(path, max_rows_per_file):
         line = line.strip()
         if not line:
@@ -92,6 +108,10 @@ def iter_zstd_jsonl_lines(
     path: Path,
     max_rows_per_file: int | None,
 ) -> Iterator[tuple[int, str]]:
+    """
+    Stream zstd shards instead of materializing them, applying the optional row cap as
+    lines are decoded.
+    """
     try:
         with path.open("rb") as compressed_stream:
             decompressor = zstd.ZstdDecompressor()
@@ -121,6 +141,10 @@ class TokenBlockDataset(IterableDataset[dict[str, torch.Tensor]]):
         bos_token_id: int | None = None,
         eos_token_id: int | None = None,
     ) -> None:
+        """
+        Stride defaults to non-overlapping blocks; special-token fallbacks are resolved
+        later because tokenizers may expose methods instead of IDs.
+        """
         super().__init__()
         if sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
@@ -132,6 +156,10 @@ class TokenBlockDataset(IterableDataset[dict[str, torch.Tensor]]):
         self.eos_token_id = eos_token_id
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        """
+        Maintain a rolling token buffer so streamed documents become fixed-size
+        next-token training pairs.
+        """
         buffer: list[int] = []
         tokens_per_block = self.sequence_length + 1
         bos_token_id = get_special_token_id(
@@ -175,6 +203,10 @@ def get_special_token_id(
     name: str,
     fallback: int | None,
 ) -> int | None:
+    """
+    SentencePiece reports negative IDs for disabled special tokens, so config fallbacks
+    are used in that case.
+    """
     value = getattr(tokenizer, name, None)
     if callable(value):
         value = value()
@@ -184,6 +216,9 @@ def get_special_token_id(
 
 
 def load_tokenizer(path: Path) -> spm.SentencePieceProcessor:
+    """
+    Fail before training starts if the configured SentencePiece model path is missing.
+    """
     model_path = resolve_path(path)
     if not model_path.exists():
         raise FileNotFoundError(f"Tokenizer model does not exist: {model_path}")
@@ -191,6 +226,10 @@ def load_tokenizer(path: Path) -> spm.SentencePieceProcessor:
 
 
 def resolve_device(device: str) -> torch.device:
+    """
+    Auto mode prefers MPS, then CUDA, then CPU so local accelerator support is used when
+    available.
+    """
     if device != "auto":
         return torch.device(device)
     if torch.backends.mps.is_available():
@@ -201,6 +240,10 @@ def resolve_device(device: str) -> torch.device:
 
 
 def resolve_autocast_dtype(name: str) -> torch.dtype | None:
+    """
+    Keep mixed precision opt-in by name because CPU runs should avoid autocast while
+    accelerators may benefit.
+    """
     if name == "none":
         return None
     if name == "bfloat16":
@@ -211,6 +254,10 @@ def resolve_autocast_dtype(name: str) -> torch.dtype | None:
 
 
 def set_seed(seed: int) -> None:
+    """
+    Seed CUDA separately when present so runs are closer to reproducible across
+    supported devices.
+    """
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -224,6 +271,10 @@ def build_dataloader(
     batch_size: int,
     max_rows_per_file: int | None,
 ) -> DataLoader[dict[str, torch.Tensor]]:
+    """
+    Wrap the streaming dataset directly; no extra workers are introduced because the
+    iterator owns shard state.
+    """
     dataset = TokenBlockDataset(
         texts=iter_texts(input_files, max_rows_per_file=max_rows_per_file),
         tokenizer=tokenizer,
@@ -241,6 +292,10 @@ def save_checkpoint(
     training_config: TrainingConfig,
     step: int,
 ) -> None:
+    """
+    Persist configs with state dicts so inference can reconstruct the exact model shape
+    later.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -256,10 +311,18 @@ def save_checkpoint(
 
 
 def is_step_limit_reached(global_step: int, max_steps: int | None) -> bool:
+    """
+    A None limit means data and epoch boundaries, not optimizer steps, decide when
+    training stops.
+    """
     return max_steps is not None and global_step >= max_steps
 
 
 def resolve_lr_total_steps(training_config: TrainingConfig) -> int | None:
+    """
+    Prefer an explicit schedule horizon, but fall back to max_steps so finite runs decay
+    as expected.
+    """
     if training_config.lr_total_steps is not None:
         return training_config.lr_total_steps
     if training_config.max_steps is not None:
@@ -275,6 +338,10 @@ def format_training_log(
     grad_norm: float,
     timestamp: datetime,
 ) -> str:
+    """
+    Log gradient norm before clipping so exploding gradients remain visible even when
+    clipping succeeds.
+    """
     return (
         f"time={timestamp:%Y-%m-%d %H:%M:%S} "
         f"epoch={epoch} step={global_step} "
@@ -287,6 +354,10 @@ def train_model(
     training_config: TrainingConfig | None = None,
     model_config: SMLConfig | None = None,
 ) -> Path:
+    """
+    The tokenizer vocab and requested sequence length are folded into model_config
+    before weights are allocated, keeping checkpoints aligned with the data pipeline.
+    """
     training_config = TrainingConfig() if training_config is None else training_config
     base_model_config = SMLConfig() if model_config is None else model_config
 
@@ -307,8 +378,8 @@ def train_model(
     model_config = replace(
         base_model_config,
         vocab_size=tokenizer.get_piece_size(),
-        max_position_embeddings=max(
-            base_model_config.max_position_embeddings,
+        original_max_position_embeddings=max(
+            base_model_config.original_max_position_embeddings,
             training_config.sequence_length,
         ),
     )
@@ -438,6 +509,10 @@ def train_model(
 
 
 def main() -> int:
+    """
+    Keep the entry point thin so tests and callers can exercise train_model without CLI
+    parsing.
+    """
     checkpoint_path = train_model()
     print(f"Checkpoint: {checkpoint_path}")
     return SUCCESS_RETURN_CODE
