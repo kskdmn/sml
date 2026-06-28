@@ -46,6 +46,14 @@ class RMSNorm(nn.Module):
         return (self.weight * x).to(dtype)  # [batch_size, seq_len, hidden_size]
 
 
+# YaRN (Yet another RoPE extension) stretches context beyond
+# original_max_position_embeddings without retraining RoPE from scratch.
+# Each attention head has head_dim values; RoPE uses head_dim // 2 frequency bands
+# (band k covers dimensions 2k and 2k+1). Band 0 rotates fastest; higher k rotates
+# slower. When rope_scaling_factor > 1, YaRN blends two inverse-frequency sets per band:
+# extrapolated (trained) and interpolated (divided by rope_scaling_factor).
+
+
 def yarn_find_correction_dim(
     num_rotations: float,
     dim: int,
@@ -53,8 +61,15 @@ def yarn_find_correction_dim(
     original_max_position_embeddings: int,
 ) -> float:
     """
-    Solve for the rotary pair index where a target number of rotations fits inside the
-    original context window.
+    Map a target rotation count to a rotary band index.
+
+    Over the original context length L, band k completes
+    R_k = L / (2 * pi * base^(2k/d)) full turns, where d is head_dim.
+    Given a target rotation count N, solve R_k = N for k:
+
+        k = d * ln(L / (2 * pi * N)) / (2 * ln(base))
+
+    ``yarn_beta_fast`` and ``yarn_beta_slow`` are typical values of N.
     """
     return (
         dim
@@ -73,8 +88,14 @@ def yarn_find_correction_range(
     original_max_position_embeddings: int,
 ) -> tuple[int, int]:
     """
-    Convert YaRN's fast and slow rotation thresholds into clamped indices used to blend
-    interpolation and extrapolation.
+    Convert YaRN rotation thresholds into band-index cutoffs for blending.
+
+    ``low_rot`` (``yarn_beta_fast``) marks fast-rotating bands that keep extrapolated
+    frequencies for local positional detail. ``high_rot`` (``yarn_beta_slow``) marks
+    slow-rotating bands that use interpolated frequencies for long-range reach.
+
+    Returns (low, high) band indices; bands below low extrapolate, above high
+    interpolate, and bands in between are partially stretched.
     """
     low = math.floor(
         yarn_find_correction_dim(low_rot, dim, base, original_max_position_embeddings)
@@ -91,7 +112,15 @@ def yarn_linear_ramp_mask(
     dim: int,
 ) -> torch.Tensor:
     """
-    Produce a 0-to-1 blend mask; equal endpoints are widened to avoid division by zero.
+    Linear interpolation weight alpha_k in [0, 1] for each rotary band.
+
+    alpha_k = 0 for k < low (extrapolated only), alpha_k = 1 for k > high
+    (interpolated only), and alpha_k = (k - low) / (high - low) in between.
+    Partial stretch per band is:
+
+        inv_freq_final = alpha_k * inv_freq_int + (1 - alpha_k) * inv_freq_ext
+
+    where inv_freq_int = inv_freq_ext / rope_scaling_factor.
     """
     if low == high:
         high += 1
@@ -101,8 +130,10 @@ def yarn_linear_ramp_mask(
 
 def yarn_attention_factor(rope_scaling_factor: float) -> float:
     """
-    Long-context YaRN slightly rescales attention; unextended context keeps the factor
-    at one.
+    Rescale cached cos/sin values when context is extended.
+
+    Returns 0.1 * ln(rope_scaling_factor) + 1 for scaling factors above 1, else 1.
+    This small correction keeps attention stable at longer sequence lengths.
     """
     if rope_scaling_factor <= 1.0:
         return 1.0
@@ -121,8 +152,13 @@ class RotaryEmbedding(nn.Module):
         yarn_beta_slow: float,
     ) -> None:
         """
-        Caches cover the scaled context length, while frequencies are derived from the
-        original window plus YaRN correction.
+        RoPE cos/sin cache with optional YaRN long-context correction.
+
+        Caches cover effective_max_position_embeddings positions. When
+        rope_scaling_factor is 1, this is standard RoPE. Otherwise YaRN blends
+        extrapolated frequencies (trained, good for nearby tokens) with
+        interpolated frequencies (divided by rope_scaling_factor, good for
+        distant tokens) across rotary bands; see ``_compute_inv_freq``.
         """
         super().__init__()
         inv_freq = self._compute_inv_freq(
@@ -150,8 +186,25 @@ class RotaryEmbedding(nn.Module):
         yarn_beta_slow: float,
     ) -> torch.Tensor:
         """
-        Blend interpolated and extrapolated RoPE frequencies so low dimensions stretch
-        for context while high dimensions keep local detail.
+        Per-band inverse RoPE frequencies with YaRN blending.
+
+        Extrapolated (trained) frequency for band k:
+
+            inv_freq_ext = 1 / base^(2k/d)
+
+        Interpolated (stretched) frequency:
+
+            inv_freq_int = inv_freq_ext / rope_scaling_factor
+
+        Rotation count over original length L:
+
+            R_k = L * inv_freq_ext / (2 * pi)
+
+        Band cutoffs come from ``yarn_find_correction_range`` using
+        ``yarn_beta_fast`` and ``yarn_beta_slow``. The final frequency is a
+        linear blend controlled by ``yarn_linear_ramp_mask``; fast bands (low k,
+        high R_k) keep extrapolated frequencies, slow bands (high k, low R_k)
+        use interpolated ones, and middle bands are partially stretched.
         """
         rotary_dims = torch.arange(0, dim, 2, dtype=torch.float32)
         inv_freq_extrapolation = 1.0 / (base ** (rotary_dims / dim))

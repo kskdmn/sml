@@ -12,19 +12,24 @@ INPUT_FILE_NAME_REGEX = r".*-0000\.jsonl\.zst\Z"
 
 @dataclass(slots=True)
 class SMLConfig:
+    """
+    Model hyperparameters.
+
+    RoPE context extension uses YaRN when ``rope_scaling_factor`` > 1: slow rotary
+    bands are stretched for long range while fast bands keep trained frequencies.
+    """
+
     vocab_size: int = 49_152
     hidden_size: int = 768
     num_layers: int = 24
     num_q_heads: int = 12
     num_kv_heads: int = 2
     intermediate_size: int = 2_304
-    original_max_position_embeddings: int = 1_024
-    rope_theta: float = 10_000.0
-    rope_scaling_factor: float = 2.0
-    # YaRN blends interpolated (long-context) and extrapolated (local) RoPE frequencies.
-    # Rotation-count thresholds mark where that blend starts and ends across head dims.
-    yarn_beta_fast: float = 32.0  # High-frequency dims at/above this keep extrapolated frequencies.
-    yarn_beta_slow: float = 1.0  # Low-frequency dims at/below this use interpolated frequencies.
+    original_max_position_embeddings: int = 1_024  # RoPE design window; YaRN stretches beyond this.
+    rope_theta: float = 10_000.0  # RoPE base (theta in inv_freq = 1 / theta^(2k/d)).
+    rope_scaling_factor: float = 2.0  # Context multiplier; 1 disables YaRN blending.
+    yarn_beta_fast: float = 32.0  # Rotation-count cutoff for fast bands (extrapolate).
+    yarn_beta_slow: float = 1.0  # Rotation-count cutoff for slow bands (interpolate).
     rms_norm_eps: float = 1e-6
     attention_dropout: float = 0.005  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
     hidden_dropout: float = 0.01  # If overfitting, try 0.1
@@ -74,16 +79,17 @@ class SMLConfig:
     @property
     def head_dim(self) -> int:
         """
-        Grouped-query attention uses this derived width for both query and key/value
-        projections.
+        Per-head width for Q/K/V projections; RoPE uses head_dim // 2 frequency bands.
         """
         return self.hidden_size // self.num_q_heads
 
     @property
     def effective_max_position_embeddings(self) -> int:
         """
-        Round scaled context upward so fractional RoPE scaling never shortens the usable
-        window.
+        Usable context length after YaRN scaling.
+
+        ceil(original_max_position_embeddings * rope_scaling_factor); e.g. 1024 * 2
+        yields 2048 positions in the RoPE cache.
         """
         return math.ceil(
             self.original_max_position_embeddings * self.rope_scaling_factor
