@@ -29,6 +29,8 @@ class SMLConfigTest(unittest.TestCase):
         self.assertEqual(0, config.head_dim % 2)
         self.assertEqual(1_024, config.original_max_position_embeddings)
         self.assertEqual(2.0, config.rope_scaling_factor)
+        self.assertEqual(32.0, config.yarn_beta_fast)
+        self.assertEqual(1.0, config.yarn_beta_slow)
         self.assertEqual(2_048, config.effective_max_position_embeddings)
         self.assertTrue(config.gradient_checkpointing)
 
@@ -49,6 +51,9 @@ class SMLConfigTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "rope_scaling_factor"):
             SMLConfig(rope_scaling_factor=0.0)
+
+        with self.assertRaisesRegex(ValueError, "yarn_beta_fast"):
+            SMLConfig(yarn_beta_fast=1.0, yarn_beta_slow=1.0)
 
 
 class SMLScheduleTest(unittest.TestCase):

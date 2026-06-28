@@ -46,10 +46,6 @@ class RMSNorm(nn.Module):
         return (self.weight * x).to(dtype)  # [batch_size, seq_len, hidden_size]
 
 
-YARN_BETA_FAST = 32.0
-YARN_BETA_SLOW = 1.0
-
-
 def yarn_find_correction_dim(
     num_rotations: float,
     dim: int,
@@ -121,6 +117,8 @@ class RotaryEmbedding(nn.Module):
         effective_max_position_embeddings: int,
         base: float,
         rope_scaling_factor: float,
+        yarn_beta_fast: float,
+        yarn_beta_slow: float,
     ) -> None:
         """
         Caches cover the scaled context length, while frequencies are derived from the
@@ -132,6 +130,8 @@ class RotaryEmbedding(nn.Module):
             original_max_position_embeddings=original_max_position_embeddings,
             base=base,
             rope_scaling_factor=rope_scaling_factor,
+            yarn_beta_fast=yarn_beta_fast,
+            yarn_beta_slow=yarn_beta_slow,
         )
         positions = torch.arange(effective_max_position_embeddings, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
@@ -146,6 +146,8 @@ class RotaryEmbedding(nn.Module):
         original_max_position_embeddings: int,
         base: float,
         rope_scaling_factor: float,
+        yarn_beta_fast: float,
+        yarn_beta_slow: float,
     ) -> torch.Tensor:
         """
         Blend interpolated and extrapolated RoPE frequencies so low dimensions stretch
@@ -158,8 +160,8 @@ class RotaryEmbedding(nn.Module):
 
         inv_freq_interpolation = inv_freq_extrapolation / rope_scaling_factor
         low, high = yarn_find_correction_range(
-            low_rot=YARN_BETA_FAST,
-            high_rot=YARN_BETA_SLOW,
+            low_rot=yarn_beta_fast,
+            high_rot=yarn_beta_slow,
             dim=dim,
             base=base,
             original_max_position_embeddings=original_max_position_embeddings,
@@ -299,6 +301,8 @@ class GroupedQueryAttention(nn.Module):
             effective_max_position_embeddings=config.effective_max_position_embeddings,
             base=config.rope_theta,
             rope_scaling_factor=config.rope_scaling_factor,
+            yarn_beta_fast=config.yarn_beta_fast,
+            yarn_beta_slow=config.yarn_beta_slow,
         )
 
     def repeat_kv(self, x: torch.Tensor) -> torch.Tensor:

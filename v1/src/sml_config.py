@@ -13,17 +13,21 @@ INPUT_FILE_NAME_REGEX = r".*-0000\.jsonl\.zst\Z"
 @dataclass(slots=True)
 class SMLConfig:
     vocab_size: int = 49_152
-    hidden_size: int = 512
-    num_layers: int = 8
-    num_q_heads: int = 8
+    hidden_size: int = 768
+    num_layers: int = 24
+    num_q_heads: int = 12
     num_kv_heads: int = 2
-    intermediate_size: int = 1_536
+    intermediate_size: int = 2_304
     original_max_position_embeddings: int = 1_024
     rope_theta: float = 10_000.0
     rope_scaling_factor: float = 2.0
+    # YaRN blends interpolated (long-context) and extrapolated (local) RoPE frequencies.
+    # Rotation-count thresholds mark where that blend starts and ends across head dims.
+    yarn_beta_fast: float = 32.0  # High-frequency dims at/above this keep extrapolated frequencies.
+    yarn_beta_slow: float = 1.0  # Low-frequency dims at/below this use interpolated frequencies.
     rms_norm_eps: float = 1e-6
-    attention_dropout: float = 0.0  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
-    hidden_dropout: float = 0.0  # If overfitting, try 0.1
+    attention_dropout: float = 0.005  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
+    hidden_dropout: float = 0.01  # If overfitting, try 0.1
     initializer_range: float = 0.02
     gradient_checkpointing: bool = True  # Trade extra compute for lower activation memory during training.
     pad_token_id: int = 3
@@ -57,6 +61,15 @@ class SMLConfig:
             or self.rope_scaling_factor < 1.0
         ):
             raise ValueError("rope_scaling_factor must be at least 1.0")
+        if (
+            not math.isfinite(self.yarn_beta_fast)
+            or not math.isfinite(self.yarn_beta_slow)
+            or self.yarn_beta_fast <= 0.0
+            or self.yarn_beta_slow <= 0.0
+        ):
+            raise ValueError("yarn_beta_fast and yarn_beta_slow must be positive")
+        if self.yarn_beta_fast <= self.yarn_beta_slow:
+            raise ValueError("yarn_beta_fast must be greater than yarn_beta_slow")
 
     @property
     def head_dim(self) -> int:
