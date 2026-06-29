@@ -31,8 +31,8 @@ class SMLConfig:
     yarn_beta_fast: float = 32.0  # Rotation-count cutoff for fast bands (extrapolate).
     yarn_beta_slow: float = 1.0  # Rotation-count cutoff for slow bands (interpolate).
     yarn_attention_factor: float | None = None  # Override cos/sin scaling; None infers from factor.
-    yarn_mscale: float | None = None  # Optional numerator for inferred attention scaling.
-    yarn_mscale_all_dim: float | None = None  # Optional denominator for inferred attention scaling.
+    yarn_mscale: float | None = None  # Optional numerator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale_all_dim is set.
+    yarn_mscale_all_dim: float | None = None  # Optional denominator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale is set.
     yarn_truncate: bool = True  # Floor/ceil band cutoffs in the YaRN correction range.
     rms_norm_eps: float = 1e-6
     attention_dropout: float = 0.005  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
