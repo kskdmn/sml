@@ -20,6 +20,7 @@ from sml import SMLLanguageModel, count_parameters, lr_lambda
 from sml_config import (
     SMLConfig,
     TrainingConfig,
+    model_config_for_training,
 )
 from train_tokenizer import (
     FIRST_LINE_NUMBER,
@@ -355,8 +356,9 @@ def train_model(
     model_config: SMLConfig | None = None,
 ) -> Path:
     """
-    The tokenizer vocab and requested sequence length are folded into model_config
-    before weights are allocated, keeping checkpoints aligned with the data pipeline.
+    The tokenizer vocab and requested sequence length are folded into the checkpoint
+    config before weights are allocated. Training runs with YaRN disabled; the saved
+    config keeps the inference rope_scaling_factor for load-time context extension.
     """
     training_config = TrainingConfig() if training_config is None else training_config
     base_model_config = SMLConfig() if model_config is None else model_config
@@ -375,7 +377,7 @@ def train_model(
         )
 
     tokenizer = load_tokenizer(training_config.tokenizer_model_path)
-    model_config = replace(
+    checkpoint_model_config = replace(
         base_model_config,
         vocab_size=tokenizer.get_piece_size(),
         original_max_position_embeddings=max(
@@ -383,9 +385,10 @@ def train_model(
             training_config.sequence_length,
         ),
     )
+    training_model_config = model_config_for_training(checkpoint_model_config)
     device = resolve_device(training_config.device)
     autocast_dtype = resolve_autocast_dtype(training_config.autocast_dtype)
-    model = SMLLanguageModel(model_config).to(device)
+    model = SMLLanguageModel(training_model_config).to(device)
     total_params, trainable_params = count_parameters(model)
 
     optimizer = torch.optim.AdamW(
@@ -411,7 +414,7 @@ def train_model(
     loss_sum = 0.0
 
     print(f"Input files: {len(input_files)}")
-    print(f"Tokenizer vocab: {model_config.vocab_size:,}")
+    print(f"Tokenizer vocab: {checkpoint_model_config.vocab_size:,}")
     print(f"Device: {device}")
     print(f"Parameters: total={total_params:,} trainable={trainable_params:,}")
 
@@ -479,7 +482,7 @@ def train_model(
                     model,
                     optimizer,
                     scheduler,
-                    model_config,
+                    checkpoint_model_config,
                     training_config,
                     global_step,
                 )
@@ -490,7 +493,7 @@ def train_model(
                     model,
                     optimizer,
                     scheduler,
-                    model_config,
+                    checkpoint_model_config,
                     training_config,
                     global_step,
                 )
@@ -501,7 +504,7 @@ def train_model(
         model,
         optimizer,
         scheduler,
-        model_config,
+        checkpoint_model_config,
         training_config,
         global_step,
     )

@@ -43,6 +43,17 @@ class SMLConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "num_q_heads"):
             SMLConfig(num_q_heads=6, num_kv_heads=4)
 
+    def test_model_config_for_training_disables_yarn(self):
+        from sml_config import SMLConfig, model_config_for_training
+
+        config = SMLConfig(rope_scaling_factor=2.0)
+        training_config = model_config_for_training(config)
+
+        self.assertEqual(2.0, config.rope_scaling_factor)
+        self.assertEqual(2_048, config.effective_max_position_embeddings)
+        self.assertEqual(1.0, training_config.rope_scaling_factor)
+        self.assertEqual(1_024, training_config.effective_max_position_embeddings)
+
     def test_invalid_context_scaling_is_rejected(self):
         from sml_config import SMLConfig
 
@@ -54,6 +65,22 @@ class SMLConfigTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "yarn_beta_fast"):
             SMLConfig(yarn_beta_fast=1.0, yarn_beta_slow=1.0)
+
+    def test_yarn_mscale_fields_must_be_set_together(self):
+        from sml_config import SMLConfig
+
+        with self.assertRaisesRegex(ValueError, "yarn_mscale and yarn_mscale_all_dim"):
+            SMLConfig(yarn_mscale=1.0)
+
+    def test_effective_max_position_embeddings_scales_with_large_rope_factor(self):
+        from sml_config import SMLConfig
+
+        config = SMLConfig(
+            original_max_position_embeddings=1_024,
+            rope_scaling_factor=8.0,
+        )
+
+        self.assertEqual(8_192, config.effective_max_position_embeddings)
 
 
 class SMLScheduleTest(unittest.TestCase):
@@ -207,6 +234,60 @@ class SMLModelTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "effective_max_position_embeddings"):
             model.generate(prompt, max_new_tokens=1)
+
+    def test_forward_accepts_large_rope_scaling_factor(self):
+        from dataclasses import replace
+
+        from sml import SMLLanguageModel
+
+        config = replace(
+            self.tiny_config(),
+            original_max_position_embeddings=16,
+            rope_scaling_factor=4.0,
+        )
+        model = SMLLanguageModel(config)
+        input_ids = torch.randint(
+            0,
+            config.vocab_size,
+            (1, config.effective_max_position_embeddings),
+        )
+
+        output = model(input_ids)
+
+        self.assertEqual(
+            (1, config.effective_max_position_embeddings, config.vocab_size),
+            tuple(output.logits.shape),
+        )
+        self.assertEqual(64, model.layers[0].self_attn.rope.cos_cached.shape[0])
+
+    def test_resolve_yarn_attention_factor_supports_mscale_ratio(self):
+        from sml import resolve_yarn_attention_factor, yarn_get_mscale
+
+        factor = 8.0
+        expected = yarn_get_mscale(factor, 1.0) / yarn_get_mscale(factor, 0.5)
+
+        self.assertAlmostEqual(
+            expected,
+            resolve_yarn_attention_factor(
+                factor,
+                mscale=1.0,
+                mscale_all_dim=0.5,
+            ),
+        )
+
+    def test_yarn_find_correction_range_clamps_to_rotary_band_count(self):
+        from sml import yarn_find_correction_range
+
+        low, high = yarn_find_correction_range(
+            low_rot=1.0,
+            high_rot=1.0,
+            rotary_dim=16,
+            base=10_000.0,
+            original_max_position_embeddings=1_024,
+        )
+
+        self.assertGreaterEqual(low, 0)
+        self.assertLessEqual(high, 7)
 
     def test_causal_lm_loss_uses_aligned_next_token_labels(self):
         from sml import compute_causal_lm_loss

@@ -48,6 +48,8 @@ class RMSNorm(nn.Module):
 
 # YaRN (Yet another RoPE extension) stretches context beyond
 # original_max_position_embeddings without retraining RoPE from scratch.
+# Training uses standard RoPE (rope_scaling_factor=1.0); checkpoints store the
+# inference rope_scaling_factor and apply YaRN when the model is loaded for generation.
 # Each attention head has head_dim values; RoPE uses head_dim // 2 frequency bands
 # (band k covers dimensions 2k and 2k+1). Band 0 rotates fastest; higher k rotates
 # slower. When rope_scaling_factor > 1, YaRN blends two inverse-frequency sets per band:
@@ -83,9 +85,11 @@ def yarn_find_correction_dim(
 def yarn_find_correction_range(
     low_rot: float,
     high_rot: float,
-    dim: int,
+    rotary_dim: int,
     base: float,
     original_max_position_embeddings: int,
+    *,
+    truncate: bool = True,
 ) -> tuple[int, int]:
     """
     Convert YaRN rotation thresholds into band-index cutoffs for blending.
@@ -94,22 +98,27 @@ def yarn_find_correction_range(
     frequencies for local positional detail. ``high_rot`` (``yarn_beta_slow``) marks
     slow-rotating bands that use interpolated frequencies for long-range reach.
 
-    Returns (low, high) band indices; bands below low extrapolate, above high
-    interpolate, and bands in between are partially stretched.
+    Returns (low, high) band indices over ``rotary_dim // 2`` bands; bands below low
+    extrapolate, above high interpolate, and bands in between are partially stretched.
     """
-    low = math.floor(
-        yarn_find_correction_dim(low_rot, dim, base, original_max_position_embeddings)
+    num_rotary_bands = rotary_dim // 2
+    max_band = max(num_rotary_bands - 1, 0)
+    low = yarn_find_correction_dim(
+        low_rot, rotary_dim, base, original_max_position_embeddings
     )
-    high = math.ceil(
-        yarn_find_correction_dim(high_rot, dim, base, original_max_position_embeddings)
+    high = yarn_find_correction_dim(
+        high_rot, rotary_dim, base, original_max_position_embeddings
     )
-    return max(low, 0), min(high, dim - 1)
+    if truncate:
+        low = math.floor(low)
+        high = math.ceil(high)
+    return max(0, min(int(low), max_band)), max(0, min(int(high), max_band))
 
 
 def yarn_linear_ramp_mask(
     low: int,
     high: int,
-    dim: int,
+    num_rotary_bands: int,
 ) -> torch.Tensor:
     """
     Linear interpolation weight alpha_k in [0, 1] for each rotary band.
@@ -122,22 +131,48 @@ def yarn_linear_ramp_mask(
 
     where inv_freq_int = inv_freq_ext / rope_scaling_factor.
     """
+    if num_rotary_bands == 0:
+        return torch.empty(0, dtype=torch.float32)
     if low == high:
-        high += 1
-    positions = torch.arange(dim, dtype=torch.float32)
+        high = min(high + 1, num_rotary_bands - 1)
+        if low == high:
+            high += 1
+    positions = torch.arange(num_rotary_bands, dtype=torch.float32)
     return torch.clamp((positions - low) / (high - low), min=0.0, max=1.0)
 
 
-def yarn_attention_factor(rope_scaling_factor: float) -> float:
+def yarn_get_mscale(rope_scaling_factor: float, multiplier: float = 1.0) -> float:
     """
-    Rescale cached cos/sin values when context is extended.
-
-    Returns 0.1 * ln(rope_scaling_factor) + 1 for scaling factors above 1, else 1.
-    This small correction keeps attention stable at longer sequence lengths.
+    Log-scaled magnitude correction used by YaRN attention scaling helpers.
     """
     if rope_scaling_factor <= 1.0:
         return 1.0
-    return 0.1 * math.log(rope_scaling_factor) + 1.0
+    return 0.1 * multiplier * math.log(rope_scaling_factor) + 1.0
+
+
+def resolve_yarn_attention_factor(
+    rope_scaling_factor: float,
+    *,
+    attention_factor: float | None = None,
+    mscale: float | None = None,
+    mscale_all_dim: float | None = None,
+) -> float:
+    """
+    Rescale cached cos/sin values when context is extended.
+
+    Uses an explicit ``attention_factor`` when provided. Otherwise infers the YaRN
+    paper default from ``rope_scaling_factor``, or the ratio of two m-scales when
+    both ``mscale`` and ``mscale_all_dim`` are set (useful for factors well above 2).
+    """
+    if attention_factor is not None:
+        return attention_factor
+    if rope_scaling_factor <= 1.0:
+        return 1.0
+    if mscale is not None and mscale_all_dim is not None:
+        return yarn_get_mscale(rope_scaling_factor, mscale) / yarn_get_mscale(
+            rope_scaling_factor, mscale_all_dim
+        )
+    return yarn_get_mscale(rope_scaling_factor)
 
 
 class RotaryEmbedding(nn.Module):
@@ -150,6 +185,10 @@ class RotaryEmbedding(nn.Module):
         rope_scaling_factor: float,
         yarn_beta_fast: float,
         yarn_beta_slow: float,
+        yarn_attention_factor: float | None = None,
+        yarn_mscale: float | None = None,
+        yarn_mscale_all_dim: float | None = None,
+        yarn_truncate: bool = True,
     ) -> None:
         """
         RoPE cos/sin cache with optional YaRN long-context correction.
@@ -168,11 +207,17 @@ class RotaryEmbedding(nn.Module):
             rope_scaling_factor=rope_scaling_factor,
             yarn_beta_fast=yarn_beta_fast,
             yarn_beta_slow=yarn_beta_slow,
+            yarn_truncate=yarn_truncate,
         )
         positions = torch.arange(effective_max_position_embeddings, dtype=torch.float32)
         freqs = torch.outer(positions, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        attention_factor = yarn_attention_factor(rope_scaling_factor)
+        attention_factor = resolve_yarn_attention_factor(
+            rope_scaling_factor,
+            attention_factor=yarn_attention_factor,
+            mscale=yarn_mscale,
+            mscale_all_dim=yarn_mscale_all_dim,
+        )
         self.register_buffer("cos_cached", emb.cos() * attention_factor, persistent=False)
         self.register_buffer("sin_cached", emb.sin() * attention_factor, persistent=False)
 
@@ -184,6 +229,7 @@ class RotaryEmbedding(nn.Module):
         rope_scaling_factor: float,
         yarn_beta_fast: float,
         yarn_beta_slow: float,
+        yarn_truncate: bool,
     ) -> torch.Tensor:
         """
         Per-band inverse RoPE frequencies with YaRN blending.
@@ -215,9 +261,10 @@ class RotaryEmbedding(nn.Module):
         low, high = yarn_find_correction_range(
             low_rot=yarn_beta_fast,
             high_rot=yarn_beta_slow,
-            dim=dim,
+            rotary_dim=dim,
             base=base,
             original_max_position_embeddings=original_max_position_embeddings,
+            truncate=yarn_truncate,
         )
         interpolation_mask = yarn_linear_ramp_mask(low, high, dim // 2)
         extrapolation_mask = 1.0 - interpolation_mask
@@ -356,6 +403,10 @@ class GroupedQueryAttention(nn.Module):
             rope_scaling_factor=config.rope_scaling_factor,
             yarn_beta_fast=config.yarn_beta_fast,
             yarn_beta_slow=config.yarn_beta_slow,
+            yarn_attention_factor=config.yarn_attention_factor,
+            yarn_mscale=config.yarn_mscale,
+            yarn_mscale_all_dim=config.yarn_mscale_all_dim,
+            yarn_truncate=config.yarn_truncate,
         )
 
     def repeat_kv(self, x: torch.Tensor) -> torch.Tensor:
