@@ -3,6 +3,7 @@ import inspect
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
@@ -66,6 +67,72 @@ class TrainDataTest(unittest.TestCase):
             ["pile-0000.jsonl.zst", "pile-0002.jsonl.zst"],
             [path.name for path in files],
         )
+
+    def test_shuffle_input_files_uses_seeded_deterministic_order(self):
+        import train_sml
+
+        files = tuple(
+            Path(name)
+            for name in (
+                "pile-0000.jsonl.zst",
+                "pile-0001.jsonl.zst",
+                "pile-0002.jsonl.zst",
+                "pile-0003.jsonl.zst",
+            )
+        )
+
+        first_shuffle = train_sml.shuffle_input_files(files, seed=42)
+        second_shuffle = train_sml.shuffle_input_files(files, seed=42)
+
+        self.assertEqual(
+            [
+                "pile-0002.jsonl.zst",
+                "pile-0001.jsonl.zst",
+                "pile-0003.jsonl.zst",
+                "pile-0000.jsonl.zst",
+            ],
+            [path.name for path in first_shuffle],
+        )
+        self.assertEqual(first_shuffle, second_shuffle)
+
+    def test_shuffle_input_files_uses_seed_to_change_order(self):
+        import train_sml
+
+        files = tuple(
+            Path(name)
+            for name in (
+                "pile-0000.jsonl.zst",
+                "pile-0001.jsonl.zst",
+                "pile-0002.jsonl.zst",
+                "pile-0003.jsonl.zst",
+            )
+        )
+
+        self.assertEqual(
+            [
+                "pile-0002.jsonl.zst",
+                "pile-0000.jsonl.zst",
+                "pile-0001.jsonl.zst",
+                "pile-0003.jsonl.zst",
+            ],
+            [path.name for path in train_sml.shuffle_input_files(files, seed=99)],
+        )
+
+    def test_shuffle_input_files_returns_tuple_without_mutating_input(self):
+        import train_sml
+
+        files = [
+            Path("pile-0000.jsonl.zst"),
+            Path("pile-0001.jsonl.zst"),
+            Path("pile-0002.jsonl.zst"),
+            Path("pile-0003.jsonl.zst"),
+        ]
+        original_names = [path.name for path in files]
+
+        shuffled = train_sml.shuffle_input_files(files, seed=42)
+
+        self.assertIsInstance(shuffled, tuple)
+        self.assertEqual(original_names, [path.name for path in files])
 
     def test_iter_texts_streams_zst_jsonl_rows_without_loading_all_files(self):
         import train_sml
