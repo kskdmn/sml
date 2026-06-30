@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import argparse
 import io
 import itertools
 import json
+import pathlib
 import random
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator, Protocol
+from typing import Iterable, Iterator, Protocol, Sequence, TypeVar
 
 import sentencepiece as spm
 import torch
 import zstandard as zstd
+from torch.serialization import safe_globals
 from torch.utils.data import DataLoader, IterableDataset
 
 from config import SUCCESS_RETURN_CODE
@@ -34,12 +37,33 @@ from train_tokenizer import (
 
 
 ROW_INCREMENT = 1
+BatchT = TypeVar("BatchT")
 
 
 @dataclass(slots=True)
 class ReadingProgress:
     input_file: str | None = None
     line_number: int | None = None
+
+
+@dataclass(slots=True)
+class ResumeProgress:
+    batches_to_skip: int = 0
+
+
+@dataclass(slots=True)
+class TrainingDataState:
+    epoch: int = 0
+    input_file_index: int = 0
+    line_number: int | None = None
+    token_buffer: list[int] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TrainingResumeState:
+    step: int = 0
+    input_files: tuple[Path, ...] = ()
+    data_state: TrainingDataState | None = None
 
 
 class TextTokenizer(Protocol):
@@ -84,16 +108,32 @@ def iter_texts(
     input_files: Iterable[Path],
     max_rows_per_file: int | None,
     progress: ReadingProgress | None = None,
+    data_state: TrainingDataState | None = None,
 ) -> Iterator[str]:
     """
     Reuse tokenizer-training text filters so tokenizer and model training agree on which
     rows are usable.
     """
-    for input_file in input_files:
-        for row, line_number in iter_jsonl_records(input_file, max_rows_per_file):
+    start_file_index = 0 if data_state is None else data_state.input_file_index
+    for input_file_index, input_file in enumerate(input_files):
+        if input_file_index < start_file_index:
+            continue
+        start_after_line = (
+            data_state.line_number
+            if data_state is not None and input_file_index == start_file_index
+            else None
+        )
+        for row, line_number in iter_jsonl_records(
+            input_file,
+            max_rows_per_file,
+            start_after_line=start_after_line,
+        ):
             if progress is not None:
                 progress.input_file = input_file.name
                 progress.line_number = line_number
+            if data_state is not None:
+                data_state.input_file_index = input_file_index
+                data_state.line_number = line_number
             text = filter_text(row.get(TEXT_COLUMN))
             if text is not None:
                 yield text
@@ -102,12 +142,17 @@ def iter_texts(
 def iter_jsonl_records(
     path: Path,
     max_rows_per_file: int | None,
+    start_after_line: int | None = None,
 ) -> Iterator[tuple[dict[str, object], int]]:
     """
     Ignore blank and non-object rows, but include file and line number when malformed
     JSON is encountered.
     """
-    for line_number, line in iter_zstd_jsonl_lines(path, max_rows_per_file):
+    for line_number, line in iter_zstd_jsonl_lines(
+        path,
+        max_rows_per_file,
+        start_after_line=start_after_line,
+    ):
         line = line.strip()
         if not line:
             continue
@@ -124,6 +169,7 @@ def iter_jsonl_records(
 def iter_zstd_jsonl_lines(
     path: Path,
     max_rows_per_file: int | None,
+    start_after_line: int | None = None,
 ) -> Iterator[tuple[int, str]]:
     """
     Stream zstd shards instead of materializing them, applying the optional row cap as
@@ -143,7 +189,16 @@ def iter_zstd_jsonl_lines(
                         if max_rows_per_file is None
                         else itertools.islice(text_stream, max_rows_per_file)
                     )
-                    yield from enumerate(limited_stream, start=FIRST_LINE_NUMBER)
+                    for line_number, line in enumerate(
+                        limited_stream,
+                        start=FIRST_LINE_NUMBER,
+                    ):
+                        if (
+                            start_after_line is not None
+                            and line_number <= start_after_line
+                        ):
+                            continue
+                        yield line_number, line
     except zstd.ZstdError as exc:
         raise RuntimeError(f"zstd failed for {path}: {exc}") from exc
 
@@ -157,6 +212,7 @@ class TokenBlockDataset(IterableDataset[dict[str, torch.Tensor]]):
         stride: int | None = None,
         bos_token_id: int | None = None,
         eos_token_id: int | None = None,
+        data_state: TrainingDataState | None = None,
     ) -> None:
         """
         Stride defaults to non-overlapping blocks; special-token fallbacks are resolved
@@ -171,13 +227,14 @@ class TokenBlockDataset(IterableDataset[dict[str, torch.Tensor]]):
         self.stride = sequence_length if stride is None else stride
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
+        self.data_state = data_state
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         """
         Maintain a rolling token buffer so streamed documents become fixed-size
         next-token training pairs.
         """
-        buffer: list[int] = []
+        buffer = [] if self.data_state is None else list(self.data_state.token_buffer)
         tokens_per_block = self.sequence_length + 1
         bos_token_id = get_special_token_id(
             self.tokenizer,
@@ -190,6 +247,18 @@ class TokenBlockDataset(IterableDataset[dict[str, torch.Tensor]]):
             self.eos_token_id,
         )
 
+        def iter_ready_blocks() -> Iterator[dict[str, torch.Tensor]]:
+            while len(buffer) >= tokens_per_block:
+                block = buffer[:tokens_per_block]
+                del buffer[: self.stride]
+                if self.data_state is not None:
+                    self.data_state.token_buffer = list(buffer)
+                yield {
+                    "input_ids": torch.tensor(block[:-1], dtype=torch.long),
+                    "labels": torch.tensor(block[1:], dtype=torch.long),
+                }
+
+        yield from iter_ready_blocks()
         for text in self.texts:
             """
             Current: Add BOS and EOS tokens to the buffer.
@@ -205,14 +274,10 @@ class TokenBlockDataset(IterableDataset[dict[str, torch.Tensor]]):
             buffer.extend(token_ids)
             if eos_token_id is not None:
                 buffer.append(eos_token_id)
+            if self.data_state is not None:
+                self.data_state.token_buffer = list(buffer)
 
-            while len(buffer) >= tokens_per_block:
-                block = buffer[:tokens_per_block]
-                yield {
-                    "input_ids": torch.tensor(block[:-1], dtype=torch.long),
-                    "labels": torch.tensor(block[1:], dtype=torch.long),
-                }
-                del buffer[: self.stride]
+            yield from iter_ready_blocks()
 
 
 def get_special_token_id(
@@ -288,6 +353,7 @@ def build_dataloader(
     batch_size: int,
     max_rows_per_file: int | None,
     progress: ReadingProgress | None = None,
+    data_state: TrainingDataState | None = None,
 ) -> DataLoader[dict[str, torch.Tensor]]:
     """
     Wrap the streaming dataset directly; no extra workers are introduced because the
@@ -298,9 +364,11 @@ def build_dataloader(
             input_files,
             max_rows_per_file=max_rows_per_file,
             progress=progress,
+            data_state=data_state,
         ),
         tokenizer=tokenizer,
         sequence_length=sequence_length,
+        data_state=data_state,
     )
     return DataLoader(dataset, batch_size=batch_size)
 
@@ -313,23 +381,133 @@ def save_checkpoint(
     model_config: SMLConfig,
     training_config: TrainingConfig,
     step: int,
+    input_files: Iterable[Path] = (),
+    data_state: TrainingDataState | None = None,
 ) -> None:
     """
     Persist configs with state dicts so inference can reconstruct the exact model shape
     later.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_input_files = [str(input_file) for input_file in input_files]
     torch.save(
         {
             "step": step,
             "model_config": asdict(model_config),
             "training_config": asdict(training_config),
+            "input_files": checkpoint_input_files,
+            "data_state": None if data_state is None else asdict(data_state),
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
         },
         path,
     )
+
+
+def load_training_checkpoint(
+    path: Path,
+    model: SMLLanguageModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    device: torch.device,
+) -> TrainingResumeState:
+    """
+    Restore model, optimizer, and scheduler state from a training checkpoint.
+
+    Missing checkpoints mean the caller is starting a new run, so step 0 is returned.
+    """
+    checkpoint_path = resolve_path(path)
+    if not checkpoint_path.exists():
+        return TrainingResumeState()
+
+    with safe_globals([pathlib.PosixPath]):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"Checkpoint must contain a dictionary: {checkpoint_path}")
+
+    step = checkpoint.get("step")
+    model_state_dict = checkpoint.get("model_state_dict")
+    optimizer_state_dict = checkpoint.get("optimizer_state_dict")
+    scheduler_state_dict = checkpoint.get("scheduler_state_dict")
+    if not isinstance(step, int):
+        raise ValueError("Checkpoint is missing step")
+    if not isinstance(model_state_dict, dict):
+        raise ValueError("Checkpoint is missing model_state_dict")
+    if not isinstance(optimizer_state_dict, dict):
+        raise ValueError("Checkpoint is missing optimizer_state_dict")
+    if not isinstance(scheduler_state_dict, dict):
+        raise ValueError("Checkpoint is missing scheduler_state_dict")
+
+    model.load_state_dict(model_state_dict)
+    optimizer.load_state_dict(optimizer_state_dict)
+    scheduler.load_state_dict(scheduler_state_dict)
+
+    input_files = parse_checkpoint_input_files(checkpoint.get("input_files", ()))
+    data_state = parse_checkpoint_data_state(checkpoint.get("data_state"))
+    return TrainingResumeState(
+        step=step,
+        input_files=input_files,
+        data_state=data_state,
+    )
+
+
+def parse_checkpoint_input_files(input_files: object) -> tuple[Path, ...]:
+    if input_files is None:
+        return ()
+    if not isinstance(input_files, (list, tuple)):
+        raise ValueError("Checkpoint input_files must be a list")
+    return tuple(resolve_path(Path(str(input_file))) for input_file in input_files)
+
+
+def parse_checkpoint_data_state(data_state: object) -> TrainingDataState | None:
+    if data_state is None:
+        return None
+    if not isinstance(data_state, dict):
+        raise ValueError("Checkpoint data_state must be a dictionary")
+
+    token_buffer = data_state.get("token_buffer", [])
+    if not isinstance(token_buffer, list):
+        raise ValueError("Checkpoint data_state token_buffer must be a list")
+    line_number = data_state.get("line_number")
+    if line_number is not None and not isinstance(line_number, int):
+        raise ValueError("Checkpoint data_state line_number must be an integer")
+    return TrainingDataState(
+        epoch=int(data_state.get("epoch", 0)),
+        input_file_index=int(data_state.get("input_file_index", 0)),
+        line_number=line_number,
+        token_buffer=[int(token_id) for token_id in token_buffer],
+    )
+
+
+def reset_training_data_state(data_state: TrainingDataState, epoch: int) -> None:
+    data_state.epoch = epoch
+    data_state.input_file_index = 0
+    data_state.line_number = None
+    data_state.token_buffer = []
+
+
+def count_resume_batches(global_step: int, training_config: TrainingConfig) -> int:
+    """
+    A checkpoint step represents completed optimizer steps; each completed step consumed
+    one gradient-accumulation window of dataloader batches.
+    """
+    return global_step * training_config.gradient_accumulation_steps
+
+
+def iter_unseen_batches(
+    dataloader: Iterable[BatchT],
+    progress: ResumeProgress,
+) -> Iterator[BatchT]:
+    """
+    Rebuild the deterministic input stream and discard batches already reflected in the
+    loaded optimizer step.
+    """
+    for batch in dataloader:
+        if progress.batches_to_skip > 0:
+            progress.batches_to_skip -= ROW_INCREMENT
+            continue
+        yield batch
 
 
 def is_step_limit_reached(global_step: int, max_steps: int | None) -> bool:
@@ -387,6 +565,7 @@ def format_training_log(
 def train_model(
     training_config: TrainingConfig | None = None,
     model_config: SMLConfig | None = None,
+    resume_from_checkpoint: bool = False,
 ) -> Path:
     """
     The tokenizer vocab and requested sequence length are folded into the checkpoint
@@ -442,9 +621,28 @@ def train_model(
     )
 
     checkpoint_path = output_dir / training_config.checkpoint_name
+    resume_state = TrainingResumeState()
+    if resume_from_checkpoint:
+        resume_state = load_training_checkpoint(
+            checkpoint_path,
+            model,
+            optimizer,
+            scheduler,
+            device,
+        )
+        if resume_state.input_files:
+            input_files = resume_state.input_files
+
+    global_step = resume_state.step
+    data_state = resume_state.data_state or TrainingDataState()
+    legacy_batches_to_skip = (
+        count_resume_batches(global_step, training_config)
+        if resume_from_checkpoint and resume_state.data_state is None
+        else 0
+    )
+    resume_progress = ResumeProgress(batches_to_skip=legacy_batches_to_skip)
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    global_step = 0
     micro_step = 0
     loss_sum = 0.0
     reading_progress = ReadingProgress()
@@ -454,7 +652,9 @@ def train_model(
     print(f"Device: {device}")
     print(f"Parameters: total={total_params:,} trainable={trainable_params:,}")
 
-    for epoch in range(training_config.epochs):
+    for epoch in range(data_state.epoch, training_config.epochs):
+        if epoch != data_state.epoch:
+            reset_training_data_state(data_state, epoch)
         dataloader = build_dataloader(
             input_files=input_files,
             tokenizer=tokenizer,
@@ -462,8 +662,9 @@ def train_model(
             batch_size=training_config.batch_size,
             max_rows_per_file=training_config.max_rows_per_file,
             progress=reading_progress,
+            data_state=data_state,
         )
-        for batch in dataloader:
+        for batch in iter_unseen_batches(dataloader, resume_progress):
             input_ids = batch["input_ids"].to(device)
             labels = batch["labels"].to(device)
 
@@ -523,6 +724,8 @@ def train_model(
                     checkpoint_model_config,
                     training_config,
                     global_step,
+                    input_files=input_files,
+                    data_state=data_state,
                 )
 
             if is_step_limit_reached(global_step, training_config.max_steps):
@@ -534,6 +737,8 @@ def train_model(
                     checkpoint_model_config,
                     training_config,
                     global_step,
+                    input_files=input_files,
+                    data_state=data_state,
                 )
                 return checkpoint_path
 
@@ -545,16 +750,34 @@ def train_model(
         checkpoint_model_config,
         training_config,
         global_step,
+        input_files=input_files,
+        data_state=data_state,
     )
     return checkpoint_path
 
 
-def main() -> int:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """
-    Keep the entry point thin so tests and callers can exercise train_model without CLI
-    parsing.
+    Keep CLI surface narrow; training configuration defaults live in TrainingConfig.
     """
-    checkpoint_path = train_model()
+    parser = argparse.ArgumentParser(description="Train the SML language model.")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from output_dir/checkpoint_name and skip consumed input batches.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """
+    Parse the small CLI surface, then delegate training to the config-based API.
+    """
+    args = parse_args(argv)
+    checkpoint_path = train_model(
+        training_config=TrainingConfig(),
+        resume_from_checkpoint=args.resume,
+    )
     print(f"Checkpoint: {checkpoint_path}")
     return SUCCESS_RETURN_CODE
 

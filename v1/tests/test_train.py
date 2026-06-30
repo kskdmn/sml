@@ -35,20 +35,67 @@ class FakeTokenizer:
         del out_type
         return [int(part) for part in text.split()]
 
+    def get_piece_size(self):
+        return 16
+
 
 class TrainDataTest(unittest.TestCase):
-    def test_train_module_does_not_export_cli_parsing_helpers(self):
+    def tiny_config(self):
+        from sml_config import SMLConfig
+
+        return SMLConfig(
+            vocab_size=16,
+            hidden_size=8,
+            num_layers=1,
+            num_q_heads=2,
+            num_kv_heads=1,
+            intermediate_size=16,
+            original_max_position_embeddings=16,
+            rope_scaling_factor=2.0,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            gradient_checkpointing=False,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=3,
+        )
+
+    def test_parse_args_defaults_to_fresh_training(self):
         import train_sml
 
-        self.assertFalse(hasattr(train_sml, "parse_args"))
-        self.assertFalse(hasattr(train_sml, "parse_optional_int"))
+        args = train_sml.parse_args([])
 
-    def test_train_model_accepts_config_objects(self):
+        self.assertFalse(args.resume)
+
+    def test_parse_args_enables_resume(self):
+        import train_sml
+
+        args = train_sml.parse_args(["--resume"])
+
+        self.assertTrue(args.resume)
+
+    def test_main_passes_resume_flag_to_training_config(self):
+        import train_sml
+
+        with mock.patch.object(
+            train_sml,
+            "train_model",
+            return_value=Path("/tmp/sml.pt"),
+        ) as train_model:
+            return_code = train_sml.main(["--resume"])
+
+        self.assertEqual(train_sml.SUCCESS_RETURN_CODE, return_code)
+        self.assertTrue(train_model.call_args.kwargs["resume_from_checkpoint"])
+
+    def test_train_model_accepts_config_objects_and_resume_flag(self):
         import train_sml
 
         parameters = inspect.signature(train_sml.train_model).parameters
 
-        self.assertEqual(["training_config", "model_config"], list(parameters))
+        self.assertEqual(
+            ["training_config", "model_config", "resume_from_checkpoint"],
+            list(parameters),
+        )
 
     def test_discover_input_files_uses_supplied_regex_and_sorts_matches(self):
         import train_sml
@@ -139,6 +186,11 @@ class TrainDataTest(unittest.TestCase):
 
         self.assertIs(True, TrainingConfig().shuffle_input_files)
 
+    def test_training_config_does_not_store_resume_cli_state(self):
+        from sml_config import TrainingConfig
+
+        self.assertFalse(hasattr(TrainingConfig(), "resume_from_checkpoint"))
+
     def test_train_model_shuffles_discovered_input_files_before_loading_tokenizer(self):
         import train_sml
         from sml_config import TrainingConfig
@@ -218,6 +270,215 @@ class TrainDataTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "stop after input order"):
                     train_sml.train_model(training_config)
 
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_train_model_starts_fresh_without_resume_even_when_checkpoint_exists(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        discovered = (Path("pile-0000.jsonl.zst"),)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            training_config = TrainingConfig(
+                input_dir=root,
+                output_dir=root / "output",
+                tokenizer_model_path=root / "tokenizer.model",
+                checkpoint_name="sml.pt",
+                device="cpu",
+            )
+
+            with (
+                mock.patch.object(
+                    train_sml,
+                    "discover_input_files",
+                    return_value=discovered,
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "load_tokenizer",
+                    return_value=FakeTokenizer(),
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "load_training_checkpoint",
+                    side_effect=AssertionError("checkpoint should not be loaded"),
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "build_dataloader",
+                    side_effect=RuntimeError("stop after dataloader"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after dataloader"):
+                    train_sml.train_model(
+                        training_config,
+                        model_config=self.tiny_config(),
+                    )
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_train_model_restarts_from_checkpoint_name_when_resume_is_enabled(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        discovered = (Path("pile-0000.jsonl.zst"),)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            training_config = TrainingConfig(
+                input_dir=root,
+                output_dir=root / "output",
+                tokenizer_model_path=root / "tokenizer.model",
+                checkpoint_name="sml.pt",
+                device="cpu",
+            )
+
+            with (
+                mock.patch.object(
+                    train_sml,
+                    "discover_input_files",
+                    return_value=discovered,
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "load_tokenizer",
+                    return_value=FakeTokenizer(),
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "load_training_checkpoint",
+                    return_value=train_sml.TrainingResumeState(),
+                ) as load_training_checkpoint,
+                mock.patch.object(
+                    train_sml,
+                    "build_dataloader",
+                    side_effect=RuntimeError("stop after dataloader"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after dataloader"):
+                    train_sml.train_model(
+                        training_config,
+                        model_config=self.tiny_config(),
+                        resume_from_checkpoint=True,
+                    )
+
+        load_training_checkpoint.assert_called_once()
+        args = load_training_checkpoint.call_args.args
+        self.assertEqual(training_config.output_dir / "sml.pt", args[0])
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_train_model_uses_checkpoint_input_file_order_when_resume_is_enabled(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        discovered = (
+            Path("pile-0000.jsonl.zst"),
+            Path("pile-0001.jsonl.zst"),
+        )
+        checkpoint_order = (
+            Path("pile-0001.jsonl.zst"),
+            Path("pile-0000.jsonl.zst"),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            training_config = TrainingConfig(
+                input_dir=root,
+                output_dir=root / "output",
+                tokenizer_model_path=root / "tokenizer.model",
+                checkpoint_name="sml.pt",
+                device="cpu",
+            )
+
+            with (
+                mock.patch.object(
+                    train_sml,
+                    "discover_input_files",
+                    return_value=discovered,
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "load_tokenizer",
+                    return_value=FakeTokenizer(),
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "load_training_checkpoint",
+                    return_value=train_sml.TrainingResumeState(
+                        step=0,
+                        input_files=checkpoint_order,
+                        data_state=train_sml.TrainingDataState(),
+                    ),
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "build_dataloader",
+                    side_effect=RuntimeError("stop after dataloader"),
+                ) as build_dataloader,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after dataloader"):
+                    train_sml.train_model(
+                        training_config,
+                        model_config=self.tiny_config(),
+                        resume_from_checkpoint=True,
+                    )
+
+        self.assertEqual(checkpoint_order, build_dataloader.call_args.kwargs["input_files"])
+
+    def test_count_resume_batches_uses_completed_optimizer_steps(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        training_config = TrainingConfig(gradient_accumulation_steps=8)
+
+        self.assertEqual(
+            56,
+            train_sml.count_resume_batches(
+                global_step=7,
+                training_config=training_config,
+            ),
+        )
+
+    def test_iter_unseen_batches_skips_consumed_batches_across_dataloaders(self):
+        import train_sml
+
+        progress = train_sml.ResumeProgress(batches_to_skip=3)
+
+        first_epoch = list(train_sml.iter_unseen_batches(["a", "b"], progress))
+        second_epoch = list(train_sml.iter_unseen_batches(["c", "d", "e"], progress))
+
+        self.assertEqual([], first_epoch)
+        self.assertEqual(["d", "e"], second_epoch)
+        self.assertEqual(0, progress.batches_to_skip)
+
+    def test_iter_texts_resumes_after_training_data_state_line_number(self):
+        import train_sml
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "pile-0000.jsonl.zst"
+            write_zst_rows(
+                path,
+                [
+                    {"text": "a" * 100},
+                    {"text": "b" * 100},
+                    {"text": "c" * 100},
+                ],
+            )
+            data_state = train_sml.TrainingDataState(
+                input_file_index=0,
+                line_number=2,
+            )
+
+            texts = list(
+                train_sml.iter_texts(
+                    [path],
+                    max_rows_per_file=None,
+                    data_state=data_state,
+                )
+            )
+
+        self.assertEqual(["c" * 100], texts)
+        self.assertEqual(3, data_state.line_number)
+
     def test_iter_texts_streams_zst_jsonl_rows_without_loading_all_files(self):
         import train_sml
 
@@ -286,6 +547,140 @@ class TrainDataTest(unittest.TestCase):
         training_config = TrainingConfig(lr_total_steps=None, max_steps=None)
 
         self.assertIsNone(train_sml.resolve_lr_total_steps(training_config))
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_load_training_checkpoint_returns_zero_when_checkpoint_is_absent(self):
+        import train_sml
+        from sml import SMLLanguageModel
+
+        model = SMLLanguageModel(self.tiny_config())
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            step = train_sml.load_training_checkpoint(
+                Path(tmp_dir) / "sml.pt",
+                model,
+                optimizer,
+                scheduler,
+                torch.device("cpu"),
+            )
+
+        self.assertEqual(0, step.step)
+        self.assertEqual((), step.input_files)
+        self.assertIsNone(step.data_state)
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_save_and_load_training_checkpoint_restores_training_and_data_state(self):
+        import train_sml
+        from sml import SMLLanguageModel
+
+        config = self.tiny_config()
+        source_model = SMLLanguageModel(config)
+        source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=0.1)
+        source_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            source_optimizer,
+            lambda step: 1.0,
+        )
+        input_ids = torch.tensor([[1, 4, 5]])
+        labels = torch.tensor([[4, 5, 6]])
+        loss = source_model(input_ids, labels=labels).loss
+        self.assertIsNotNone(loss)
+        loss.backward()
+        source_optimizer.step()
+        source_scheduler.step()
+
+        target_model = SMLLanguageModel(config)
+        target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=0.1)
+        target_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            target_optimizer,
+            lambda step: 1.0,
+        )
+        data_state = train_sml.TrainingDataState(
+            epoch=2,
+            input_file_index=1,
+            line_number=42,
+            token_buffer=[4, 5, 6],
+        )
+        input_files = (
+            Path("/data/pile-0001.jsonl.zst"),
+            Path("/data/pile-0000.jsonl.zst"),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = Path(tmp_dir) / "sml.pt"
+            train_sml.save_checkpoint(
+                checkpoint_path,
+                source_model,
+                source_optimizer,
+                source_scheduler,
+                config,
+                train_sml.TrainingConfig(checkpoint_name="sml.pt"),
+                step=7,
+                input_files=input_files,
+                data_state=data_state,
+            )
+
+            resume_state = train_sml.load_training_checkpoint(
+                checkpoint_path,
+                target_model,
+                target_optimizer,
+                target_scheduler,
+                torch.device("cpu"),
+            )
+
+        self.assertEqual(7, resume_state.step)
+        self.assertEqual(input_files, resume_state.input_files)
+        self.assertEqual(data_state, resume_state.data_state)
+        self.assertEqual(
+            source_scheduler.state_dict()["last_epoch"],
+            target_scheduler.state_dict()["last_epoch"],
+        )
+        self.assertEqual(
+            len(source_optimizer.state_dict()["state"]),
+            len(target_optimizer.state_dict()["state"]),
+        )
+        for source_param, target_param in zip(
+            source_model.parameters(),
+            target_model.parameters(),
+            strict=True,
+        ):
+            self.assertTrue(torch.equal(source_param, target_param))
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_token_block_dataset_updates_training_data_state_after_yield(self):
+        import train_sml
+
+        data_state = train_sml.TrainingDataState()
+        dataset = train_sml.TokenBlockDataset(
+            texts=iter(["4 5 6 7 8"]),
+            tokenizer=FakeTokenizer(),
+            sequence_length=3,
+            data_state=data_state,
+        )
+
+        first = next(iter(dataset))
+
+        self.assertTrue(torch.equal(torch.tensor([1, 4, 5]), first["input_ids"]))
+        self.assertEqual([6, 7, 8, 2], data_state.token_buffer)
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_token_block_dataset_resumes_from_training_data_state_token_buffer(self):
+        import train_sml
+
+        data_state = train_sml.TrainingDataState(token_buffer=[6, 7, 8, 2])
+        dataset = train_sml.TokenBlockDataset(
+            texts=iter([]),
+            tokenizer=FakeTokenizer(),
+            sequence_length=3,
+            data_state=data_state,
+        )
+
+        first = next(iter(dataset))
+
+        self.assertTrue(torch.equal(torch.tensor([6, 7, 8]), first["input_ids"]))
+        self.assertTrue(torch.equal(torch.tensor([7, 8, 2]), first["labels"]))
+        self.assertEqual([2], data_state.token_buffer)
 
     def test_format_training_log_includes_timestamp(self):
         import train_sml
