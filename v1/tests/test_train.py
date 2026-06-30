@@ -50,6 +50,11 @@ class TrainDataTest(unittest.TestCase):
 
         self.assertEqual(["training_config", "model_config"], list(parameters))
 
+    def test_training_config_disables_input_file_shuffle_by_default(self):
+        from sml_config import TrainingConfig
+
+        self.assertFalse(TrainingConfig().shuffle_input_file_order)
+
     def test_discover_input_files_uses_supplied_regex_and_sorts_matches(self):
         import train_sml
 
@@ -133,6 +138,226 @@ class TrainDataTest(unittest.TestCase):
 
         self.assertIsInstance(shuffled, tuple)
         self.assertEqual(original_names, [path.name for path in files])
+
+    def test_training_config_shuffles_input_files_by_default(self):
+        from sml_config import TrainingConfig
+
+        self.assertIs(True, TrainingConfig().shuffle_input_files)
+
+    def test_train_model_shuffles_discovered_input_files_before_loading_tokenizer(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        discovered = (
+            Path("pile-0000.jsonl.zst"),
+            Path("pile-0001.jsonl.zst"),
+        )
+        shuffled = tuple(reversed(discovered))
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            training_config = TrainingConfig(
+                input_dir=Path(tmp_dir),
+                output_dir=Path(tmp_dir) / "output",
+                tokenizer_model_path=Path(tmp_dir) / "tokenizer.model",
+                shuffle_input_files=True,
+                seed=123,
+            )
+
+            with (
+                mock.patch.object(
+                    train_sml,
+                    "discover_input_files",
+                    return_value=discovered,
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "shuffle_input_files",
+                    return_value=shuffled,
+                ) as shuffle,
+                mock.patch.object(
+                    train_sml,
+                    "load_tokenizer",
+                    side_effect=RuntimeError("stop after shuffle"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after shuffle"):
+                    train_sml.train_model(training_config)
+
+        shuffle.assert_called_once_with(discovered, seed=123)
+
+    def test_train_model_can_keep_discovered_input_file_order(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        discovered = (
+            Path("pile-0000.jsonl.zst"),
+            Path("pile-0001.jsonl.zst"),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            training_config = TrainingConfig(
+                input_dir=Path(tmp_dir),
+                output_dir=Path(tmp_dir) / "output",
+                tokenizer_model_path=Path(tmp_dir) / "tokenizer.model",
+                shuffle_input_files=False,
+                seed=123,
+            )
+
+            with (
+                mock.patch.object(
+                    train_sml,
+                    "discover_input_files",
+                    return_value=discovered,
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "shuffle_input_files",
+                    side_effect=AssertionError("shuffle should be skipped"),
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "load_tokenizer",
+                    side_effect=RuntimeError("stop after input order"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after input order"):
+                    train_sml.train_model(training_config)
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_train_model_keeps_discovered_input_file_order_by_default(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        discovered_files = tuple(
+            Path(name)
+            for name in (
+                "pile-0000.jsonl.zst",
+                "pile-0001.jsonl.zst",
+                "pile-0002.jsonl.zst",
+                "pile-0003.jsonl.zst",
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            training_config = TrainingConfig(
+                input_dir=Path(tmp_dir) / "input",
+                output_dir=Path(tmp_dir) / "output",
+                tokenizer_model_path=Path(tmp_dir) / "tokenizer.model",
+            )
+            tokenizer = mock.Mock()
+            tokenizer.get_piece_size.return_value = 8
+            model = mock.Mock()
+            model.to.return_value = model
+            optimizer = mock.Mock()
+            scheduler = mock.Mock()
+
+            with (
+                mock.patch.object(
+                    train_sml,
+                    "discover_input_files",
+                    return_value=discovered_files,
+                ),
+                mock.patch.object(train_sml, "shuffle_input_files") as shuffle_files,
+                mock.patch.object(train_sml, "load_tokenizer", return_value=tokenizer),
+                mock.patch.object(train_sml, "SMLLanguageModel", return_value=model),
+                mock.patch.object(
+                    train_sml,
+                    "resolve_device",
+                    return_value=torch.device("cpu"),
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "resolve_autocast_dtype",
+                    return_value=None,
+                ),
+                mock.patch.object(train_sml, "count_parameters", return_value=(0, 0)),
+                mock.patch.object(train_sml.torch.optim, "AdamW", return_value=optimizer),
+                mock.patch.object(
+                    train_sml.torch.optim.lr_scheduler,
+                    "LambdaLR",
+                    return_value=scheduler,
+                ),
+                mock.patch.object(train_sml, "save_checkpoint"),
+                mock.patch.object(train_sml, "build_dataloader", return_value=[]) as build,
+            ):
+                train_sml.train_model(training_config)
+
+        shuffle_files.assert_not_called()
+        self.assertEqual(discovered_files, build.call_args.kwargs["input_files"])
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_train_model_shuffles_discovered_input_file_order_when_enabled(self):
+        import train_sml
+        from sml_config import TrainingConfig
+
+        discovered_files = tuple(
+            Path(name)
+            for name in (
+                "pile-0000.jsonl.zst",
+                "pile-0001.jsonl.zst",
+                "pile-0002.jsonl.zst",
+                "pile-0003.jsonl.zst",
+            )
+        )
+        shuffled_files = (
+            discovered_files[2],
+            discovered_files[1],
+            discovered_files[3],
+            discovered_files[0],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            training_config = TrainingConfig(
+                input_dir=Path(tmp_dir) / "input",
+                output_dir=Path(tmp_dir) / "output",
+                tokenizer_model_path=Path(tmp_dir) / "tokenizer.model",
+                shuffle_input_file_order=True,
+                seed=42,
+            )
+            tokenizer = mock.Mock()
+            tokenizer.get_piece_size.return_value = 8
+            model = mock.Mock()
+            model.to.return_value = model
+            optimizer = mock.Mock()
+            scheduler = mock.Mock()
+
+            with (
+                mock.patch.object(
+                    train_sml,
+                    "discover_input_files",
+                    return_value=discovered_files,
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "shuffle_input_files",
+                    return_value=shuffled_files,
+                ) as shuffle_files,
+                mock.patch.object(train_sml, "load_tokenizer", return_value=tokenizer),
+                mock.patch.object(train_sml, "SMLLanguageModel", return_value=model),
+                mock.patch.object(
+                    train_sml,
+                    "resolve_device",
+                    return_value=torch.device("cpu"),
+                ),
+                mock.patch.object(
+                    train_sml,
+                    "resolve_autocast_dtype",
+                    return_value=None,
+                ),
+                mock.patch.object(train_sml, "count_parameters", return_value=(0, 0)),
+                mock.patch.object(train_sml.torch.optim, "AdamW", return_value=optimizer),
+                mock.patch.object(
+                    train_sml.torch.optim.lr_scheduler,
+                    "LambdaLR",
+                    return_value=scheduler,
+                ),
+                mock.patch.object(train_sml, "save_checkpoint"),
+                mock.patch.object(train_sml, "build_dataloader", return_value=[]) as build,
+            ):
+                train_sml.train_model(training_config)
+
+        shuffle_files.assert_called_once_with(discovered_files, seed=42)
+        self.assertEqual(shuffled_files, build.call_args.kwargs["input_files"])
 
     def test_iter_texts_streams_zst_jsonl_rows_without_loading_all_files(self):
         import train_sml

@@ -408,6 +408,8 @@ def train_model(
         raise FileNotFoundError(
             f"No supported input files found in {resolve_path(training_config.input_dir)}"
         )
+    if training_config.shuffle_input_files:
+        input_files = shuffle_input_files(input_files, seed=training_config.seed)
 
     tokenizer = load_tokenizer(training_config.tokenizer_model_path)
     checkpoint_model_config = replace(
