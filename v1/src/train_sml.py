@@ -373,6 +373,42 @@ def build_dataloader(
     return DataLoader(dataset, batch_size=batch_size)
 
 
+def is_mps_rng_available() -> bool:
+    return (
+        hasattr(torch, "mps")
+        and hasattr(torch.mps, "get_rng_state")
+        and hasattr(torch.mps, "set_rng_state")
+        and hasattr(torch.backends, "mps")
+        and torch.backends.mps.is_available()
+    )
+
+
+def capture_rng_state() -> dict[str, object]:
+    return {
+        "python_rng_state": random.getstate(),
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+        "mps_rng_state": torch.mps.get_rng_state() if is_mps_rng_available() else None,
+    }
+
+
+def restore_rng_state(checkpoint: dict[object, object]) -> None:
+    random.setstate(checkpoint["python_rng_state"])
+    torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
+
+    cuda_rng_state_all = checkpoint["cuda_rng_state_all"]
+    if cuda_rng_state_all is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(
+            [cuda_rng_state.cpu() for cuda_rng_state in cuda_rng_state_all]
+        )
+
+    mps_rng_state = checkpoint["mps_rng_state"]
+    if mps_rng_state is not None and is_mps_rng_available():
+        torch.mps.set_rng_state(mps_rng_state.cpu())
+
+
 def save_checkpoint(
     path: Path,
     model: SMLLanguageModel,
@@ -400,6 +436,7 @@ def save_checkpoint(
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
+            **capture_rng_state(),
         },
         path,
     )
@@ -442,6 +479,7 @@ def load_training_checkpoint(
     model.load_state_dict(model_state_dict)
     optimizer.load_state_dict(optimizer_state_dict)
     scheduler.load_state_dict(scheduler_state_dict)
+    restore_rng_state(checkpoint)
 
     input_files = parse_checkpoint_input_files(checkpoint.get("input_files", ()))
     data_state = parse_checkpoint_data_state(checkpoint.get("data_state"))

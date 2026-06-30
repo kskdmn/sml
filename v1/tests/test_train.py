@@ -646,6 +646,138 @@ class TrainDataTest(unittest.TestCase):
             self.assertTrue(torch.equal(source_param, target_param))
 
     @unittest.skipIf(torch is None, "torch is not installed")
+    def test_save_and_load_training_checkpoint_restores_rng_state(self):
+        import random
+        import train_sml
+        from sml import SMLLanguageModel
+
+        original_python_rng_state = random.getstate()
+        original_torch_rng_state = torch.get_rng_state()
+        try:
+            config = self.tiny_config()
+            source_model = SMLLanguageModel(config)
+            source_optimizer = torch.optim.AdamW(source_model.parameters(), lr=0.1)
+            source_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                source_optimizer,
+                lambda step: 1.0,
+            )
+            target_model = SMLLanguageModel(config)
+            target_optimizer = torch.optim.AdamW(target_model.parameters(), lr=0.1)
+            target_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                target_optimizer,
+                lambda step: 1.0,
+            )
+
+            random.seed(123)
+            torch.manual_seed(456)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                checkpoint_path = Path(tmp_dir) / "sml.pt"
+                train_sml.save_checkpoint(
+                    checkpoint_path,
+                    source_model,
+                    source_optimizer,
+                    source_scheduler,
+                    config,
+                    train_sml.TrainingConfig(checkpoint_name="sml.pt"),
+                    step=7,
+                )
+
+                expected_python_value = random.random()
+                expected_torch_values = torch.rand(3)
+                random.seed(999)
+                torch.manual_seed(999)
+
+                train_sml.load_training_checkpoint(
+                    checkpoint_path,
+                    target_model,
+                    target_optimizer,
+                    target_scheduler,
+                    torch.device("cpu"),
+                )
+
+            self.assertEqual(expected_python_value, random.random())
+            self.assertTrue(torch.equal(expected_torch_values, torch.rand(3)))
+        finally:
+            random.setstate(original_python_rng_state)
+            torch.set_rng_state(original_torch_rng_state)
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_restore_rng_state_moves_torch_cpu_rng_state_to_cpu(self):
+        import random
+        import train_sml
+
+        mapped_rng_state = mock.Mock()
+        cpu_rng_state = mock.Mock()
+        mapped_rng_state.cpu.return_value = cpu_rng_state
+        checkpoint = {
+            "python_rng_state": random.getstate(),
+            "torch_rng_state": mapped_rng_state,
+            "cuda_rng_state_all": None,
+            "mps_rng_state": None,
+        }
+
+        with (
+            mock.patch.object(train_sml.random, "setstate"),
+            mock.patch.object(train_sml.torch, "set_rng_state") as set_rng_state,
+        ):
+            train_sml.restore_rng_state(checkpoint)
+
+        mapped_rng_state.cpu.assert_called_once_with()
+        set_rng_state.assert_called_once_with(cpu_rng_state)
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_restore_rng_state_moves_cuda_rng_states_to_cpu(self):
+        import random
+        import train_sml
+
+        mapped_cuda_rng_state = mock.Mock()
+        cpu_cuda_rng_state = mock.Mock()
+        mapped_cuda_rng_state.cpu.return_value = cpu_cuda_rng_state
+        checkpoint = {
+            "python_rng_state": random.getstate(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": [mapped_cuda_rng_state],
+            "mps_rng_state": None,
+        }
+
+        with (
+            mock.patch.object(train_sml.random, "setstate"),
+            mock.patch.object(train_sml.torch, "set_rng_state"),
+            mock.patch.object(train_sml.torch.cuda, "is_available", return_value=True),
+            mock.patch.object(train_sml.torch.cuda, "set_rng_state_all") as set_rng_state_all,
+        ):
+            train_sml.restore_rng_state(checkpoint)
+
+        mapped_cuda_rng_state.cpu.assert_called_once_with()
+        set_rng_state_all.assert_called_once_with([cpu_cuda_rng_state])
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_restore_rng_state_moves_mps_rng_state_to_cpu(self):
+        import random
+        import train_sml
+
+        mapped_mps_rng_state = mock.Mock()
+        cpu_mps_rng_state = mock.Mock()
+        mapped_mps_rng_state.cpu.return_value = cpu_mps_rng_state
+        checkpoint = {
+            "python_rng_state": random.getstate(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": None,
+            "mps_rng_state": mapped_mps_rng_state,
+        }
+
+        with (
+            mock.patch.object(train_sml.random, "setstate"),
+            mock.patch.object(train_sml.torch, "set_rng_state"),
+            mock.patch.object(train_sml, "is_mps_rng_available", return_value=True),
+            mock.patch.object(train_sml.torch.mps, "set_rng_state") as set_rng_state,
+        ):
+            train_sml.restore_rng_state(checkpoint)
+
+        mapped_mps_rng_state.cpu.assert_called_once_with()
+        set_rng_state.assert_called_once_with(cpu_mps_rng_state)
+
+    @unittest.skipIf(torch is None, "torch is not installed")
     def test_token_block_dataset_updates_training_data_state_after_yield(self):
         import train_sml
 
