@@ -50,10 +50,10 @@ class TrainDataTest(unittest.TestCase):
 
         self.assertEqual(["training_config", "model_config"], list(parameters))
 
-    def test_training_config_disables_input_file_shuffle_by_default(self):
+    def test_training_config_uses_requested_input_file_shuffle_flag(self):
         from sml_config import TrainingConfig
 
-        self.assertFalse(TrainingConfig().shuffle_input_file_order)
+        self.assertTrue(TrainingConfig().shuffle_input_files)
 
     def test_discover_input_files_uses_supplied_regex_and_sorts_matches(self):
         import train_sml
@@ -224,7 +224,7 @@ class TrainDataTest(unittest.TestCase):
                     train_sml.train_model(training_config)
 
     @unittest.skipIf(torch is None, "torch is not installed")
-    def test_train_model_keeps_discovered_input_file_order_by_default(self):
+    def test_train_model_keeps_discovered_input_file_order_when_shuffle_disabled(self):
         import train_sml
         from sml_config import TrainingConfig
 
@@ -243,6 +243,7 @@ class TrainDataTest(unittest.TestCase):
                 input_dir=Path(tmp_dir) / "input",
                 output_dir=Path(tmp_dir) / "output",
                 tokenizer_model_path=Path(tmp_dir) / "tokenizer.model",
+                shuffle_input_files=False,
             )
             tokenizer = mock.Mock()
             tokenizer.get_piece_size.return_value = 8
@@ -286,7 +287,7 @@ class TrainDataTest(unittest.TestCase):
         self.assertEqual(discovered_files, build.call_args.kwargs["input_files"])
 
     @unittest.skipIf(torch is None, "torch is not installed")
-    def test_train_model_shuffles_discovered_input_file_order_when_enabled(self):
+    def test_train_model_shuffles_discovered_input_files_for_dataloader_when_enabled(self):
         import train_sml
         from sml_config import TrainingConfig
 
@@ -311,7 +312,7 @@ class TrainDataTest(unittest.TestCase):
                 input_dir=Path(tmp_dir) / "input",
                 output_dir=Path(tmp_dir) / "output",
                 tokenizer_model_path=Path(tmp_dir) / "tokenizer.model",
-                shuffle_input_file_order=True,
+                shuffle_input_files=True,
                 seed=42,
             )
             tokenizer = mock.Mock()
