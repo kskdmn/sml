@@ -415,11 +415,11 @@ def load_training_checkpoint(
     """
     Restore model, optimizer, and scheduler state from a training checkpoint.
 
-    Missing checkpoints mean the caller is starting a new run, so step 0 is returned.
+    Missing checkpoints are an invalid explicit resume request.
     """
     checkpoint_path = resolve_path(path)
     if not checkpoint_path.exists():
-        return TrainingResumeState()
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
 
     with safe_globals([pathlib.PosixPath]):
         checkpoint = torch.load(checkpoint_path, map_location=device)

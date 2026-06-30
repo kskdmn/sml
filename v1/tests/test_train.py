@@ -549,7 +549,7 @@ class TrainDataTest(unittest.TestCase):
         self.assertIsNone(train_sml.resolve_lr_total_steps(training_config))
 
     @unittest.skipIf(torch is None, "torch is not installed")
-    def test_load_training_checkpoint_returns_zero_when_checkpoint_is_absent(self):
+    def test_load_training_checkpoint_raises_when_checkpoint_is_absent(self):
         import train_sml
         from sml import SMLLanguageModel
 
@@ -558,17 +558,15 @@ class TrainDataTest(unittest.TestCase):
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            step = train_sml.load_training_checkpoint(
-                Path(tmp_dir) / "sml.pt",
-                model,
-                optimizer,
-                scheduler,
-                torch.device("cpu"),
-            )
-
-        self.assertEqual(0, step.step)
-        self.assertEqual((), step.input_files)
-        self.assertIsNone(step.data_state)
+            checkpoint_path = Path(tmp_dir) / "sml.pt"
+            with self.assertRaisesRegex(FileNotFoundError, "Checkpoint does not exist"):
+                train_sml.load_training_checkpoint(
+                    checkpoint_path,
+                    model,
+                    optimizer,
+                    scheduler,
+                    torch.device("cpu"),
+                )
 
     @unittest.skipIf(torch is None, "torch is not installed")
     def test_save_and_load_training_checkpoint_restores_training_and_data_state(self):
