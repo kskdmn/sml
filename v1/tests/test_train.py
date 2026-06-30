@@ -154,6 +154,47 @@ class TrainDataTest(unittest.TestCase):
             log_line,
         )
 
+    def test_format_training_log_includes_reading_progress(self):
+        import train_sml
+
+        log_line = train_sml.format_training_log(
+            epoch=1,
+            global_step=10,
+            lr=0.0003,
+            avg_loss=9.8457,
+            grad_norm=6.069,
+            timestamp=datetime(2026, 6, 30, 7, 50, 0),
+            progress=train_sml.ReadingProgress(
+                input_file="pile-0000.jsonl.zst",
+                line_number=42,
+            ),
+        )
+
+        self.assertEqual(
+            "time=2026-06-30 07:50:00 epoch=1 step=10 "
+            "input=pile-0000.jsonl.zst line=42 "
+            "lr=3.000e-04 loss=9.8457 grad_norm=6.069 (before clipping)",
+            log_line,
+        )
+
+    def test_iter_texts_updates_reading_progress(self):
+        import train_sml
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "pile-0000.jsonl.zst"
+            write_zst_rows(
+                path,
+                [{"text": "a" * 100}, {"text": "too short"}, {"other": "missing"}],
+            )
+            progress = train_sml.ReadingProgress()
+            texts = list(
+                train_sml.iter_texts([path], max_rows_per_file=None, progress=progress)
+            )
+
+        self.assertEqual(["a" * 100], texts)
+        self.assertEqual("pile-0000.jsonl.zst", progress.input_file)
+        self.assertEqual(3, progress.line_number)
+
     @unittest.skipIf(torch is None, "torch is not installed")
     def test_token_block_dataset_yields_fixed_length_input_label_pairs(self):
         import train_sml

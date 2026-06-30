@@ -86,7 +86,11 @@ class TrainTokenizerTest(unittest.TestCase):
             files = tokenizer.discover_input_files(root)
 
         self.assertEqual(
-            ["dataset-0000.jsonl.zst", "dataset-0009.jsonl.zst"],
+            [
+                "dataset-0000.jsonl.zst",
+                "dataset-0009.jsonl.zst",
+                "dataset-0010.jsonl.zst",
+            ],
             [path.name for path in files],
         )
 

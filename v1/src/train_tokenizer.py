@@ -15,7 +15,7 @@ from config import OUTPUT_DIR, PROJECT_DIR, SUCCESS_RETURN_CODE
 
 INPUT_DIR = Path("~/Documents/data-common_pile/")
 
-VOCAB_SIZE = 49_152
+VOCAB_SIZE = 24_576
 MAX_ROWS_PER_FILE = 10_000
 MIN_TEXT_LENGTH = 100
 MAX_TEXT_LENGTH = 2_000
@@ -39,7 +39,7 @@ TEXT_COLUMN = "text"
 TEXT_ENCODING = "utf-8"
 TEXT_DECODE_ERRORS = "replace"
 HIDDEN_FILE_PREFIX = "."
-INPUT_FILE_NAME_PATTERN = re.compile(r".*-00[01][0-9]\.jsonl\.zst\Z")
+INPUT_FILE_NAME_PATTERN = re.compile(r".*-00[0-2][0-9]\.jsonl\.zst\Z")
 NULL_CHARACTER = "\x00"
 
 SHUFFLE_INPUT_SENTENCE = False

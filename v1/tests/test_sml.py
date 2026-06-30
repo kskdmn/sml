@@ -16,12 +16,19 @@ except ImportError:  # pragma: no cover - exercised only before torch is install
 
 
 class SMLConfigTest(unittest.TestCase):
-    def test_default_config_matches_existing_tokenizer_vocab(self):
+    def test_default_config_targets_small_model_size(self):
+        from sml import estimate_model_size
         from sml_config import SMLConfig
 
         config = SMLConfig()
 
-        self.assertEqual(49_152, config.vocab_size)
+        self.assertEqual(24_576, config.vocab_size)
+        self.assertEqual(512, config.hidden_size)
+        self.assertEqual(12, config.num_layers)
+        self.assertEqual(8, config.num_q_heads)
+        self.assertEqual(2, config.num_kv_heads)
+        self.assertEqual(1_536, config.intermediate_size)
+        self.assertEqual(48_771_584, estimate_model_size(config))
         self.assertEqual(0, config.unk_token_id)
         self.assertEqual(1, config.bos_token_id)
         self.assertEqual(2, config.eos_token_id)
@@ -32,7 +39,7 @@ class SMLConfigTest(unittest.TestCase):
         self.assertEqual(32.0, config.yarn_beta_fast)
         self.assertEqual(1.0, config.yarn_beta_slow)
         self.assertEqual(2_048, config.effective_max_position_embeddings)
-        self.assertTrue(config.gradient_checkpointing)
+        self.assertFalse(config.gradient_checkpointing)
 
     def test_invalid_attention_shape_is_rejected(self):
         from sml_config import SMLConfig

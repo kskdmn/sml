@@ -5,7 +5,7 @@ import itertools
 import json
 import random
 import re
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol
@@ -34,6 +34,12 @@ from train_tokenizer import (
 
 
 ROW_INCREMENT = 1
+
+
+@dataclass(slots=True)
+class ReadingProgress:
+    input_file: str | None = None
+    line_number: int | None = None
 
 
 class TextTokenizer(Protocol):
@@ -71,13 +77,17 @@ def discover_input_files(
 def iter_texts(
     input_files: Iterable[Path],
     max_rows_per_file: int | None,
+    progress: ReadingProgress | None = None,
 ) -> Iterator[str]:
     """
     Reuse tokenizer-training text filters so tokenizer and model training agree on which
     rows are usable.
     """
     for input_file in input_files:
-        for row in iter_jsonl_records(input_file, max_rows_per_file):
+        for row, line_number in iter_jsonl_records(input_file, max_rows_per_file):
+            if progress is not None:
+                progress.input_file = input_file.name
+                progress.line_number = line_number
             text = filter_text(row.get(TEXT_COLUMN))
             if text is not None:
                 yield text
@@ -86,7 +96,7 @@ def iter_texts(
 def iter_jsonl_records(
     path: Path,
     max_rows_per_file: int | None,
-) -> Iterator[dict[str, object]]:
+) -> Iterator[tuple[dict[str, object], int]]:
     """
     Ignore blank and non-object rows, but include file and line number when malformed
     JSON is encountered.
@@ -102,7 +112,7 @@ def iter_jsonl_records(
             raise ValueError(f"Invalid JSON in {path} at line {line_number}") from exc
 
         if isinstance(row, dict):
-            yield row
+            yield row, line_number
 
 
 def iter_zstd_jsonl_lines(
@@ -271,13 +281,18 @@ def build_dataloader(
     sequence_length: int,
     batch_size: int,
     max_rows_per_file: int | None,
+    progress: ReadingProgress | None = None,
 ) -> DataLoader[dict[str, torch.Tensor]]:
     """
     Wrap the streaming dataset directly; no extra workers are introduced because the
     iterator owns shard state.
     """
     dataset = TokenBlockDataset(
-        texts=iter_texts(input_files, max_rows_per_file=max_rows_per_file),
+        texts=iter_texts(
+            input_files,
+            max_rows_per_file=max_rows_per_file,
+            progress=progress,
+        ),
         tokenizer=tokenizer,
         sequence_length=sequence_length,
     )
@@ -338,17 +353,29 @@ def format_training_log(
     avg_loss: float,
     grad_norm: float,
     timestamp: datetime,
+    progress: ReadingProgress | None = None,
 ) -> str:
     """
     Log gradient norm before clipping so exploding gradients remain visible even when
     clipping succeeds.
     """
-    return (
-        f"time={timestamp:%Y-%m-%d %H:%M:%S} "
-        f"epoch={epoch} step={global_step} "
-        f"lr={lr:.3e} loss={avg_loss:.4f} "
-        f"grad_norm={grad_norm:.3f} (before clipping)"
+    parts = [
+        f"time={timestamp:%Y-%m-%d %H:%M:%S}",
+        f"epoch={epoch}",
+        f"step={global_step}",
+    ]
+    if progress is not None and progress.input_file is not None:
+        parts.append(f"input={progress.input_file}")
+    if progress is not None and progress.line_number is not None:
+        parts.append(f"line={progress.line_number}")
+    parts.extend(
+        [
+            f"lr={lr:.3e}",
+            f"loss={avg_loss:.4f}",
+            f"grad_norm={grad_norm:.3f} (before clipping)",
+        ]
     )
+    return " ".join(parts)
 
 
 def train_model(
@@ -412,6 +439,7 @@ def train_model(
     global_step = 0
     micro_step = 0
     loss_sum = 0.0
+    reading_progress = ReadingProgress()
 
     print(f"Input files: {len(input_files)}")
     print(f"Tokenizer vocab: {checkpoint_model_config.vocab_size:,}")
@@ -425,6 +453,7 @@ def train_model(
             sequence_length=training_config.sequence_length,
             batch_size=training_config.batch_size,
             max_rows_per_file=training_config.max_rows_per_file,
+            progress=reading_progress,
         )
         for batch in dataloader:
             input_ids = batch["input_ids"].to(device)
@@ -469,6 +498,7 @@ def train_model(
                         avg_loss=avg_loss,
                         grad_norm=float(grad_norm),
                         timestamp=datetime.now(),
+                        progress=reading_progress,
                     )
                 )
             loss_sum = 0.0
