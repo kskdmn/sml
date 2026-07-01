@@ -299,6 +299,29 @@ class InferenceInterfaceTest(unittest.TestCase):
         generate_text.assert_called_once_with(
             prompt="hello",
             max_new_tokens=3,
+            device_name="auto",
+            include_prompt=False,
+        )
+        print_.assert_called_once_with("hello world")
+
+    def test_main_passes_device_from_cli_args(self):
+        import infer_sml
+
+        with (
+            mock.patch.object(
+                infer_sml,
+                "generate_text",
+                return_value="hello world",
+            ) as generate_text,
+            mock.patch("builtins.print") as print_,
+        ):
+            exit_code = infer_sml.main(["hello", "--device", "cuda:0"])
+
+        self.assertEqual(0, exit_code)
+        generate_text.assert_called_once_with(
+            prompt="hello",
+            max_new_tokens=infer_sml.DEFAULT_MAX_NEW_TOKENS,
+            device_name="cuda:0",
             include_prompt=False,
         )
         print_.assert_called_once_with("hello world")
@@ -320,6 +343,7 @@ class InferenceInterfaceTest(unittest.TestCase):
         generate_text.assert_called_once_with(
             prompt="hello",
             max_new_tokens=infer_sml.DEFAULT_MAX_NEW_TOKENS,
+            device_name="auto",
             include_prompt=True,
         )
         print_.assert_called_once_with("hello world")
@@ -345,6 +369,27 @@ class InferenceInterfaceTest(unittest.TestCase):
             host="0.0.0.0",
             port=9000,
             model_name="sml-test",
+            device_name="auto",
+        )
+
+    def test_main_passes_device_to_openai_compatible_server(self):
+        import infer_sml
+
+        with mock.patch.object(infer_sml, "run_openai_compatible_server") as run_server:
+            exit_code = infer_sml.main(
+                [
+                    "--serve",
+                    "--device",
+                    "cpu",
+                ]
+            )
+
+        self.assertEqual(0, exit_code)
+        run_server.assert_called_once_with(
+            host="127.0.0.1",
+            port=8000,
+            model_name=infer_sml.DEFAULT_MODEL_NAME,
+            device_name="cpu",
         )
 
     def test_parse_args_rejects_fixed_inference_defaults(self):
@@ -353,7 +398,6 @@ class InferenceInterfaceTest(unittest.TestCase):
         for option, value in (
             ("--checkpoint", "model.pt"),
             ("--tokenizer", "tokenizer.model"),
-            ("--device", "cpu"),
             ("--completion-only", None),
         ):
             with self.subTest(option=option):
@@ -363,6 +407,13 @@ class InferenceInterfaceTest(unittest.TestCase):
                     self.assertRaises(SystemExit),
                 ):
                     infer_sml.parse_args(argv)
+
+    def test_parse_args_defaults_device_to_auto(self):
+        import infer_sml
+
+        args = infer_sml.parse_args(["hello"])
+
+        self.assertEqual("auto", args.device)
 
 
 if __name__ == "__main__":

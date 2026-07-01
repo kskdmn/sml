@@ -490,12 +490,19 @@ def run_openai_compatible_server(
     host: str = "127.0.0.1",
     port: int = 8000,
     model_name: str = DEFAULT_MODEL_NAME,
+    device_name: str = "auto",
 ) -> None:
     """
     ThreadingHTTPServer allows concurrent local requests; KeyboardInterrupt is swallowed
     so the CLI exits cleanly.
     """
-    handler_class = make_openai_compatible_handler(model_name)
+    def generate_with_device(**kwargs: Any) -> str:
+        return generate_text(**kwargs, device_name=device_name)
+
+    handler_class = make_openai_compatible_handler(
+        model_name,
+        generator=generate_with_device,
+    )
     server = ThreadingHTTPServer((host, port), handler_class)
     print(f"Serving SML OpenAI-compatible API at http://{host}:{port}/v1")
     try:
@@ -543,6 +550,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=f"Maximum generated tokens. Defaults to {DEFAULT_MAX_NEW_TOKENS}.",
     )
     parser.add_argument(
+        "--device",
+        default="auto",
+        help="PyTorch device such as auto, cpu, cuda, cuda:0, or mps.",
+    )
+    parser.add_argument(
         "--include-prompt",
         action="store_true",
         help="Print the prompt with the generated completion.",
@@ -564,12 +576,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             host=args.host,
             port=args.port,
             model_name=args.model,
+            device_name=args.device,
         )
         return SUCCESS_RETURN_CODE
 
     text = generate_text(
         prompt=args.prompt,
         max_new_tokens=args.max_new_tokens,
+        device_name=args.device,
         include_prompt=args.include_prompt,
     )
     print(text)
