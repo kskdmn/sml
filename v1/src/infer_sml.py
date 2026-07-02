@@ -14,6 +14,7 @@ from torch.serialization import safe_globals
 
 from config import OUTPUT_DIR, SUCCESS_RETURN_CODE, TOKENIZER_MODEL_PATH
 from sml import SMLLanguageModel
+from sml_config import GenerationConfig
 from sml_config import SMLConfig
 from train_sml import load_tokenizer, resolve_device
 from train_tokenizer import resolve_path
@@ -135,6 +136,7 @@ def generate_text(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
     device_name: str = "auto",
     include_prompt: bool = False,
+    generation_config: GenerationConfig | None = None,
 ) -> str:
     """
     This one-shot path loads model and tokenizer per call, then decodes only the
@@ -158,6 +160,7 @@ def generate_text(
             input_ids,
             max_new_tokens=max_new_tokens,
             eos_token_id=model.config.eos_token_id,
+            generation_config=generation_config,
         )
 
     start_index = 0 if include_prompt else input_ids.shape[1]
@@ -513,6 +516,22 @@ def run_openai_compatible_server(
         server.server_close()
 
 
+def generation_config_from_args(args: argparse.Namespace) -> GenerationConfig:
+    """
+    Build decoding settings from CLI flags while keeping greedy decoding as default.
+
+    ``infer_sml.py`` exposes these knobs as ``--temperature``, ``--top-p``,
+    ``--repetition-penalty``, ``--no-repeat-ngram-size``, and ``--seed``.
+    """
+    return GenerationConfig(
+        temperature=args.temperature,
+        top_p=args.top_p,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+        seed=args.seed,
+    )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """
     Serving and one-shot generation share a parser, but prompts are required only
@@ -559,6 +578,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print the prompt with the generated completion.",
     )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature. 0 keeps greedy decoding. Defaults to 0.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Nucleus sampling cutoff in (0, 1]. Ignored when temperature is 0.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.0,
+        help="Penalty for tokens already in the context. 1 disables it.",
+    )
+    parser.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=0,
+        help="Block repeating n-grams of this size. 0 disables it.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for sampling. Ignored when temperature is 0.",
+    )
     args = parser.parse_args(argv)
     if not args.serve and args.prompt is None:
         parser.error("prompt is required unless --serve is set")
@@ -585,6 +634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_new_tokens=args.max_new_tokens,
         device_name=args.device,
         include_prompt=args.include_prompt,
+        generation_config=generation_config_from_args(args),
     )
     print(text)
     return SUCCESS_RETURN_CODE

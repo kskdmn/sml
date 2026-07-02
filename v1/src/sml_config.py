@@ -149,3 +149,57 @@ class TrainingConfig:
     seed: int = 42
     device: str = "auto"
     autocast_dtype: str = "bfloat16"
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationConfig:
+    """
+    Inference-time decoding controls for ``SMLLanguageModel.generate``.
+
+    These settings are applied when converting logits into the next token. They do
+    not change model weights and can be tuned per request without retraining.
+
+    Decoding order inside ``generate``:
+
+    1. ``repetition_penalty`` down-weights logits for tokens already in the prefix.
+    2. ``no_repeat_ngram_size`` hard-blocks tokens that would repeat an n-gram.
+    3. ``temperature`` and ``top_p`` choose the next token (greedy or sampled).
+
+    Defaults preserve legacy greedy decoding: ``temperature=0`` selects argmax and
+    leaves repetition controls disabled.
+    """
+
+    temperature: float = 0.0
+    # Sampling temperature; <= 0 keeps greedy argmax (default).
+    # With sampling enabled, try 0.7-1.0 for natural variation; 0.8 is a common start.
+    # Values above ~1.5 often look incoherent on small models.
+
+    top_p: float = 1.0
+    # Nucleus cutoff in (0, 1]; 1.0 disables top-p. Ignored when temperature <= 0.
+    # With sampling, try 0.9-0.95 to trim low-probability tails without much quality loss.
+
+    repetition_penalty: float = 1.0
+    # Down-weight tokens already in the prefix; 1.0 disables. Must stay > 0.
+    # For phrase loops on small models, try 1.05-1.25; start at 1.15. Above ~1.3 can sound odd.
+
+    no_repeat_ngram_size: int = 0
+    # Hard-block tokens that would repeat an n-gram of this length; 0 disables.
+    # Use 3 or 4 when the same phrase repeats verbatim; pair with repetition_penalty.
+    # 3 is a common starting point for small models and stricter than 4.
+
+    seed: int | None = None
+    # RNG seed for torch.multinomial; ignored when temperature <= 0.
+    # Set for reproducible sampling; omit to get different continuations each run.
+
+    def __post_init__(self) -> None:
+        """
+        Reject non-finite or out-of-range values before decoding starts.
+        """
+        if not math.isfinite(self.temperature):
+            raise ValueError("temperature must be finite")
+        if self.top_p <= 0.0 or self.top_p > 1.0 or not math.isfinite(self.top_p):
+            raise ValueError("top_p must be in (0, 1]")
+        if self.repetition_penalty <= 0.0 or not math.isfinite(self.repetition_penalty):
+            raise ValueError("repetition_penalty must be positive")
+        if self.no_repeat_ngram_size < 0:
+            raise ValueError("no_repeat_ngram_size must be non-negative")

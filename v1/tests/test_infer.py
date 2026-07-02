@@ -278,6 +278,7 @@ class InferenceInterfaceTest(unittest.TestCase):
 
     def test_main_omits_prompt_by_default(self):
         import infer_sml
+        from sml_config import GenerationConfig
 
         with (
             mock.patch.object(
@@ -301,11 +302,13 @@ class InferenceInterfaceTest(unittest.TestCase):
             max_new_tokens=3,
             device_name="auto",
             include_prompt=False,
+            generation_config=GenerationConfig(),
         )
         print_.assert_called_once_with("hello world")
 
     def test_main_passes_device_from_cli_args(self):
         import infer_sml
+        from sml_config import GenerationConfig
 
         with (
             mock.patch.object(
@@ -323,11 +326,13 @@ class InferenceInterfaceTest(unittest.TestCase):
             max_new_tokens=infer_sml.DEFAULT_MAX_NEW_TOKENS,
             device_name="cuda:0",
             include_prompt=False,
+            generation_config=GenerationConfig(),
         )
         print_.assert_called_once_with("hello world")
 
     def test_main_can_include_prompt_from_cli_args(self):
         import infer_sml
+        from sml_config import GenerationConfig
 
         with (
             mock.patch.object(
@@ -345,8 +350,40 @@ class InferenceInterfaceTest(unittest.TestCase):
             max_new_tokens=infer_sml.DEFAULT_MAX_NEW_TOKENS,
             device_name="auto",
             include_prompt=True,
+            generation_config=GenerationConfig(),
         )
         print_.assert_called_once_with("hello world")
+
+    def test_parse_args_accepts_decoding_flags(self):
+        import infer_sml
+        from sml_config import GenerationConfig
+
+        args = infer_sml.parse_args(
+            [
+                "hello",
+                "--temperature",
+                "0.8",
+                "--top-p",
+                "0.9",
+                "--repetition-penalty",
+                "1.2",
+                "--no-repeat-ngram-size",
+                "3",
+                "--seed",
+                "7",
+            ]
+        )
+
+        self.assertEqual(
+            GenerationConfig(
+                temperature=0.8,
+                top_p=0.9,
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3,
+                seed=7,
+            ),
+            infer_sml.generation_config_from_args(args),
+        )
 
     def test_main_can_start_openai_compatible_server(self):
         import infer_sml

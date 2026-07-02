@@ -17,13 +17,16 @@ uv run python v1/src/train_sml.py --resume
 Run the saved `v1/output/sml.pt` checkpoint with:
 
 ```bash
-uv run python v1/src/infer_sml.py "Hello." --max-new-tokens 50
+uv run python v1/src/infer_sml.py "Hello." --max-new-tokens 500
 ```
 
 Useful options:
 
 ```bash
 uv run python v1/src/infer_sml.py "Hello." --include-prompt
+
+uv run python v1/src/infer_sml.py "Hello." --max-new-tokens 500 \
+  --repetition-penalty 1.15 --no-repeat-ngram-size 4
 ```
 
 ## Other

@@ -242,6 +242,72 @@ class SMLModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "effective_max_position_embeddings"):
             model.generate(prompt, max_new_tokens=1)
 
+    def test_repetition_penalty_reduces_repeated_token_logit(self):
+        from sml import apply_repetition_penalty
+
+        logits = torch.tensor([[1.0, 2.0, 3.0]])
+        input_ids = torch.tensor([[1, 1, 2]])
+        adjusted = apply_repetition_penalty(logits, input_ids, penalty=2.0)
+
+        self.assertEqual(1.0, adjusted[0, 0].item())
+        self.assertEqual(1.0, adjusted[0, 1].item())
+        self.assertEqual(1.5, adjusted[0, 2].item())
+
+    def test_no_repeat_ngram_blocks_repeated_trigram(self):
+        from sml import apply_no_repeat_ngram
+
+        logits = torch.tensor([[0.0, 0.0, 0.0, 5.0]])
+        generated = torch.tensor([[0, 1, 2, 0, 1]])
+        adjusted = apply_no_repeat_ngram(logits, generated, ngram_size=3)
+
+        self.assertTrue(torch.isinf(adjusted[0, 2]))
+        self.assertEqual(5.0, adjusted[0, 3].item())
+
+    def test_generate_uses_repetition_penalty_without_sampling(self):
+        from sml_config import GenerationConfig
+        from sml import SMLLanguageModel
+
+        config = self.tiny_config()
+        model = SMLLanguageModel(config)
+        prompt = torch.tensor([[config.bos_token_id, 5, 6]], dtype=torch.long)
+
+        greedy = model.generate(
+            prompt,
+            max_new_tokens=3,
+            generation_config=GenerationConfig(repetition_penalty=1.0),
+        )
+        penalized = model.generate(
+            prompt,
+            max_new_tokens=3,
+            generation_config=GenerationConfig(repetition_penalty=10.0),
+        )
+
+        self.assertEqual((1, 6), tuple(greedy.shape))
+        self.assertEqual((1, 6), tuple(penalized.shape))
+        self.assertFalse(torch.equal(greedy, penalized))
+
+    def test_generate_sampling_is_reproducible_with_seed(self):
+        from sml_config import GenerationConfig
+        from sml import SMLLanguageModel
+
+        config = self.tiny_config()
+        model = SMLLanguageModel(config)
+        prompt = torch.tensor([[config.bos_token_id, 5, 6]], dtype=torch.long)
+        generation_config = GenerationConfig(temperature=0.8, top_p=0.9, seed=123)
+
+        first = model.generate(
+            prompt,
+            max_new_tokens=4,
+            generation_config=generation_config,
+        )
+        second = model.generate(
+            prompt,
+            max_new_tokens=4,
+            generation_config=generation_config,
+        )
+
+        self.assertTrue(torch.equal(first, second))
+
     def test_forward_accepts_large_rope_scaling_factor(self):
         from dataclasses import replace
 

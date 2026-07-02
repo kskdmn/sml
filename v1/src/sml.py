@@ -8,13 +8,103 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 
-from sml_config import SMLConfig
+from sml_config import GenerationConfig, SMLConfig
 
 
 @dataclass(slots=True)
 class SMLForwardOutput:
     logits: torch.Tensor
     loss: torch.Tensor | None = None
+
+
+def apply_repetition_penalty(
+    logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    penalty: float,
+) -> torch.Tensor:
+    """
+    Down-weight logits for tokens already present in ``input_ids``.
+
+    Follows the Hugging Face repetition-penalty rule: positive logits are divided by
+    ``penalty`` and negative logits are multiplied by it. A penalty of ``1.0`` is a
+    no-op and returns ``logits`` unchanged.
+    """
+    if penalty == 1.0:
+        return logits
+
+    adjusted = logits.clone()
+    for batch_idx in range(input_ids.shape[0]):
+        token_ids = input_ids[batch_idx].unique()
+        scores = adjusted[batch_idx, token_ids]
+        adjusted[batch_idx, token_ids] = torch.where(
+            scores > 0,
+            scores / penalty,
+            scores * penalty,
+        )
+    return adjusted
+
+
+def apply_no_repeat_ngram(
+    logits: torch.Tensor,
+    generated: torch.Tensor,
+    ngram_size: int,
+) -> torch.Tensor:
+    """
+    Hard-block tokens that would complete a repeated n-gram.
+
+    When the last ``ngram_size - 1`` tokens match an earlier prefix in
+    ``generated``, any token that previously completed that prefix is set to
+    ``-inf``. ``ngram_size <= 0`` disables blocking.
+    """
+    if ngram_size <= 0:
+        return logits
+
+    adjusted = logits.clone()
+    for batch_idx in range(generated.shape[0]):
+        token_ids = generated[batch_idx].tolist()
+        if len(token_ids) + 1 < ngram_size:
+            continue
+
+        prefix = tuple(token_ids[-(ngram_size - 1) :])
+        banned: set[int] = set()
+        for start in range(len(token_ids) - ngram_size + 1):
+            if tuple(token_ids[start : start + ngram_size - 1]) == prefix:
+                banned.add(token_ids[start + ngram_size - 1])
+        for token_id in banned:
+            adjusted[batch_idx, token_id] = float("-inf")
+    return adjusted
+
+
+def select_next_token(
+    logits: torch.Tensor,
+    generation_config: GenerationConfig,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """
+    Choose the next token from adjusted logits.
+
+    ``generation_config.temperature <= 0`` selects greedy argmax. Otherwise logits
+    are scaled by temperature, optionally filtered with nucleus (top-p) sampling,
+    and drawn from the resulting categorical distribution.
+    """
+    if generation_config.temperature <= 0.0:
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    scaled_logits = logits / generation_config.temperature
+    if generation_config.top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True, dim=-1)
+        sorted_probs = F.softmax(sorted_logits, dim=-1)
+        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+        sorted_mask = cumulative_probs - sorted_probs >= generation_config.top_p
+        sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
+        scaled_logits = torch.zeros_like(scaled_logits).scatter(
+            -1,
+            sorted_indices,
+            sorted_logits,
+        )
+
+    probs = F.softmax(scaled_logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1, generator=generator)
 
 
 class RMSNorm(nn.Module):
@@ -626,10 +716,14 @@ class SMLLanguageModel(nn.Module):
         input_ids: torch.Tensor,
         max_new_tokens: int = 50,
         eos_token_id: int | None = None,
+        generation_config: GenerationConfig | None = None,
     ) -> torch.Tensor:
         """
-        Greedy decoding reuses KV cache after the prompt pass and stops early only when
-        every batch item emits EOS.
+        Autoregressively extend ``input_ids`` by up to ``max_new_tokens``.
+
+        KV cache is reused after the prompt pass. Decoding knobs live in
+        ``GenerationConfig`` (see ``sml_config``); when omitted, greedy argmax is
+        used. Generation stops early only when every batch item emits ``eos_token_id``.
         """
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be non-negative")
@@ -640,9 +734,14 @@ class SMLLanguageModel(nn.Module):
                 f"{requested_seq_len} > {self.config.effective_max_position_embeddings}"
             )
         self.eval()
+        config = generation_config or GenerationConfig()
         eos_token_id = self.config.eos_token_id if eos_token_id is None else eos_token_id
         generated = input_ids
         kv_cache = KVCache() if self.config.use_cache else None
+        generator = None
+        if config.seed is not None:
+            generator = torch.Generator(device=input_ids.device)
+            generator.manual_seed(config.seed)
 
         for _ in range(max_new_tokens):
             if kv_cache is not None and len(kv_cache.key_cache) > 0:
@@ -651,7 +750,22 @@ class SMLLanguageModel(nn.Module):
                 model_input = generated
 
             output = self(model_input, kv_cache=kv_cache)
-            next_token = torch.argmax(output.logits[:, -1, :], dim=-1, keepdim=True)
+            next_token_logits = output.logits[:, -1, :]
+            next_token_logits = apply_repetition_penalty(
+                next_token_logits,
+                generated,
+                config.repetition_penalty,
+            )
+            next_token_logits = apply_no_repeat_ngram(
+                next_token_logits,
+                generated,
+                config.no_repeat_ngram_size,
+            )
+            next_token = select_next_token(
+                next_token_logits,
+                config,
+                generator=generator,
+            )
             generated = torch.cat((generated, next_token), dim=1)
             if eos_token_id is not None and bool((next_token == eos_token_id).all()):
                 break
