@@ -126,6 +126,14 @@ def model_config_for_training(config: SMLConfig) -> SMLConfig:
 
 @dataclass(slots=True)
 class TrainingConfig:
+    """
+    Training hyperparameters and I/O paths.
+
+    ``train_sml.py`` reads these defaults from code; the CLI only exposes
+    ``--resume``. Edit fields here (or pass a custom instance to
+    ``train_sml.train_model``) instead of adding CLI flags.
+    """
+
     input_dir: Path = INPUT_DIR
     input_file_name_regex: str = INPUT_FILE_NAME_REGEX  # Regex matched against each file name.
     output_dir: Path = OUTPUT_DIR

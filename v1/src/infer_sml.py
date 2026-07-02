@@ -1,3 +1,21 @@
+"""
+Inference entrypoint for SML checkpoints.
+
+Default files (under ``v1/output/``): checkpoint ``sml.pt``, tokenizer
+``bpe_tokenizer.model``. Both must exist before inference.
+
+One-shot CLI generation accepts decoding flags documented on
+``GenerationConfig`` in ``sml_config.py`` and exposed as ``--temperature``,
+``--top-p``, ``--repetition-penalty``, ``--no-repeat-ngram-size``, and
+``--seed``. Those flags do not apply to the OpenAI-compatible HTTP API yet.
+
+``--serve`` exposes a vLLM-style API at ``/v1/models``, ``/v1/completions``,
+and ``/v1/chat/completions``. Streaming is not implemented. Chat message
+``content`` must be a string. Role markers are plain text labels, not special
+tokens; see ``format_chat_messages``. ``max_tokens`` maps to ``max_new_tokens``.
+Token usage is a whitespace-split estimate, not tokenizer-exact accounting.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -40,8 +58,13 @@ class InferenceTokenizer(Protocol):
 
 def load_checkpoint(checkpoint_path: Path, device: torch.device) -> dict[str, Any]:
     """
-    Allow POSIX paths inside older checkpoint payloads while mapping tensor storage to
-    the selected torch device.
+    Load a checkpoint dict, allowlisting POSIX paths in older payloads.
+
+    Maps tensor storage to the selected torch device. PyTorch 2.6+ defaults
+    ``torch.load`` to ``weights_only=True``; this helper uses ``safe_globals``
+    for trusted local checkpoints. Typical keys include ``step``, ``model_config``,
+    ``training_config``, ``input_files``, ``data_state``, ``model_state_dict``,
+    ``optimizer_state_dict``, and ``scheduler_state_dict``.
     """
     path = resolve_path(checkpoint_path)
     if not path.exists():
@@ -227,6 +250,16 @@ def format_chat_messages(messages: Sequence[Mapping[str, Any]]) -> str:
     """
     Flatten role/content pairs into a deterministic transcript and append an assistant
     cue when the client has not already provided one.
+
+    Example output::
+
+        system: Be concise.
+        user: Explain SML in one sentence.
+        assistant:
+
+    ``system``, ``user``, and ``assistant`` are encoded as ordinary text. The only
+    special token added for inference is BOS at the start of the whole prompt
+    (see ``encode_prompt``).
     """
     if not messages:
         raise ValueError("messages must contain at least one message")
@@ -263,6 +296,8 @@ def create_completion_response(
     """
     Mirror the legacy completions schema while forcing generation to return completion
     text rather than prompt-plus-completion.
+
+    Generated text is returned at ``choices[0].text``.
     """
     prompt = request.get("prompt")
     if not isinstance(prompt, str):
@@ -298,6 +333,8 @@ def create_chat_completion_response(
     """
     Convert chat messages into the plain-text prompt format SML can consume, then wrap
     the result in OpenAI's chat response shape.
+
+    The assistant message is returned at ``choices[0].message.content``.
     """
     messages = request.get("messages")
     if not isinstance(messages, list):
@@ -582,31 +619,44 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--temperature",
         type=float,
         default=0.0,
-        help="Sampling temperature. 0 keeps greedy decoding. Defaults to 0.",
+        help=(
+            "Sampling temperature; 0 keeps greedy decoding (default). "
+            "With sampling, try 0.7-1.0; 0.8 is a common start. "
+            "See GenerationConfig in sml_config.py."
+        ),
     )
     parser.add_argument(
         "--top-p",
         type=float,
         default=1.0,
-        help="Nucleus sampling cutoff in (0, 1]. Ignored when temperature is 0.",
+        help=(
+            "Nucleus sampling cutoff in (0, 1]; 1.0 disables (default). "
+            "Ignored when --temperature is 0. With sampling, try 0.9-0.95."
+        ),
     )
     parser.add_argument(
         "--repetition-penalty",
         type=float,
         default=1.0,
-        help="Penalty for tokens already in the context. 1 disables it.",
+        help=(
+            "Down-weight tokens already in the prefix; 1.0 disables (default). "
+            "For phrase loops, try 1.05-1.25; start at 1.15."
+        ),
     )
     parser.add_argument(
         "--no-repeat-ngram-size",
         type=int,
         default=0,
-        help="Block repeating n-grams of this size. 0 disables it.",
+        help=(
+            "Hard-block tokens that would repeat an n-gram of this length; "
+            "0 disables (default). Try 3 or 4; 3 is stricter than 4."
+        ),
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=None,
-        help="Random seed for sampling. Ignored when temperature is 0.",
+        help="Random seed for sampling. Ignored when --temperature is 0.",
     )
     args = parser.parse_args(argv)
     if not args.serve and args.prompt is None:

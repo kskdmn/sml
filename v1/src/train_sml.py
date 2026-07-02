@@ -450,9 +450,17 @@ def load_training_checkpoint(
     device: torch.device,
 ) -> TrainingResumeState:
     """
-    Restore model, optimizer, and scheduler state from a training checkpoint.
+    Restore model, optimizer, scheduler, and RNG state from a training checkpoint.
 
-    Missing checkpoints are an invalid explicit resume request.
+    Missing checkpoints are an invalid explicit resume request. Checkpoints are
+    full training dictionaries written to ``output_dir / checkpoint_name``
+    (default ``v1/output/sml.pt``) with keys such as ``step``, ``model_config``,
+    ``training_config``, ``input_files``, ``data_state``, ``model_state_dict``,
+    ``optimizer_state_dict``, and ``scheduler_state_dict``.
+
+    PyTorch 2.6+ defaults ``torch.load`` to ``weights_only=True``. Use
+    ``weights_only=False`` for trusted local checkpoints, or load through this
+    helper or ``infer_sml.load_checkpoint``, which allowlist the needed types.
     """
     checkpoint_path = resolve_path(path)
     if not checkpoint_path.exists():
@@ -802,7 +810,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Resume from output_dir/checkpoint_name and skip consumed input batches.",
+        help=(
+            "Resume from output_dir/checkpoint_name (default v1/output/sml.pt). "
+            "Restores model, optimizer, scheduler, and RNG state, then continues "
+            "from the saved training step and data position. The checkpoint must "
+            "already exist; without --resume, training starts from scratch and "
+            "overwrites the checkpoint when it is saved."
+        ),
     )
     return parser.parse_args(argv)
 
