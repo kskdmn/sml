@@ -39,7 +39,6 @@ from train_tokenizer import resolve_path
 
 
 DEFAULT_CHECKPOINT_PATH = OUTPUT_DIR / "sml.pt"
-DEFAULT_MAX_NEW_TOKENS = 100
 DEFAULT_MODEL_NAME = "sml"
 
 
@@ -152,11 +151,26 @@ def decode_token_ids(
     return tokenizer.decode(decoded_ids)
 
 
+def resolve_max_new_tokens(
+    max_new_tokens: int | None,
+    max_length: int,
+    input_length: int,
+) -> int:
+    """
+    Fill the remaining context window when callers omit an explicit token budget.
+
+    When ``max_new_tokens`` is ``None``, return ``max_length - input_length``.
+    """
+    if max_new_tokens is None:
+        return max(0, max_length - input_length)
+    return max_new_tokens
+
+
 def generate_text(
     prompt: str,
     checkpoint_path: Path = DEFAULT_CHECKPOINT_PATH,
     tokenizer_model_path: Path = TOKENIZER_MODEL_PATH,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    max_new_tokens: int | None = None,
     device_name: str = "auto",
     include_prompt: bool = False,
     generation_config: GenerationConfig | None = None,
@@ -165,7 +179,7 @@ def generate_text(
     This one-shot path loads model and tokenizer per call, then decodes only the
     continuation unless the caller asks to include the prompt.
     """
-    if max_new_tokens < 0:
+    if max_new_tokens is not None and max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative")
 
     device = resolve_device(device_name)
@@ -177,11 +191,23 @@ def generate_text(
         bos_token_id=model.config.bos_token_id,
         device=device,
     )
+    max_length = model.config.effective_max_position_embeddings
+    input_length = input_ids.shape[1]
+    if input_length > max_length:
+        raise ValueError(
+            "prompt exceeds the checkpoint context window: "
+            f"{input_length} > {max_length}"
+        )
+    resolved_max_new_tokens = resolve_max_new_tokens(
+        max_new_tokens,
+        max_length,
+        input_length,
+    )
 
     with torch.no_grad():
         generated = model.generate(
             input_ids,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=resolved_max_new_tokens,
             eos_token_id=model.config.eos_token_id,
             generation_config=generation_config,
         )
@@ -207,14 +233,16 @@ def estimate_token_count(text: str) -> int:
     return len(text.split())
 
 
-def resolve_max_tokens(request: Mapping[str, Any]) -> int:
+def resolve_max_tokens(request: Mapping[str, Any]) -> int | None:
     """
-    Accept OpenAI's `max_tokens` and the local `max_new_tokens` alias, falling back to
-    the CLI default when neither is present.
+    Accept OpenAI's `max_tokens` and the local `max_new_tokens` alias.
+
+    When neither is present, return ``None`` so generation can use the remaining
+    context window.
     """
     max_tokens = request.get("max_tokens", request.get("max_new_tokens"))
     if max_tokens is None:
-        return DEFAULT_MAX_NEW_TOKENS
+        return None
     if not isinstance(max_tokens, int):
         raise ValueError("max_tokens must be an integer")
     if max_tokens < 0:
@@ -602,8 +630,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=DEFAULT_MAX_NEW_TOKENS,
-        help=f"Maximum generated tokens. Defaults to {DEFAULT_MAX_NEW_TOKENS}.",
+        default=None,
+        help=(
+            "Maximum generated tokens. Defaults to the remaining context window "
+            "(effective_max_position_embeddings minus prompt length)."
+        ),
     )
     parser.add_argument(
         "--device",

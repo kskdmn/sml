@@ -133,6 +133,7 @@ class InferenceInterfaceTest(unittest.TestCase):
         model.config.bos_token_id = 1
         model.config.eos_token_id = 2
         model.config.pad_token_id = 3
+        model.config.effective_max_position_embeddings = 16
         model.generate.return_value = torch.tensor([[1, 4, 5, 6, 2]])
 
         with (
@@ -143,6 +144,33 @@ class InferenceInterfaceTest(unittest.TestCase):
             text = infer_sml.generate_text("4 5", max_new_tokens=2)
 
         self.assertEqual("6", text)
+
+    def test_resolve_max_new_tokens_uses_remaining_context_window_by_default(self):
+        import infer_sml
+
+        self.assertEqual(13, infer_sml.resolve_max_new_tokens(None, 16, 3))
+        self.assertEqual(5, infer_sml.resolve_max_new_tokens(5, 16, 3))
+        self.assertEqual(0, infer_sml.resolve_max_new_tokens(None, 16, 20))
+
+    def test_generate_text_uses_remaining_context_window_by_default(self):
+        import infer_sml
+
+        model = mock.Mock()
+        model.config.bos_token_id = 1
+        model.config.eos_token_id = 2
+        model.config.pad_token_id = 3
+        model.config.effective_max_position_embeddings = 16
+        model.generate.return_value = torch.tensor([[1, 4, 5, 6, 2]])
+
+        with (
+            mock.patch.object(infer_sml, "resolve_device", return_value=torch.device("cpu")),
+            mock.patch.object(infer_sml, "load_tokenizer", return_value=FakeTokenizer()),
+            mock.patch.object(infer_sml, "load_model", return_value=model),
+        ):
+            text = infer_sml.generate_text("4 5")
+
+        self.assertEqual("6", text)
+        self.assertEqual(13, model.generate.call_args.kwargs["max_new_tokens"])
 
     def test_create_completion_response_uses_openai_compatible_shape(self):
         import infer_sml
@@ -323,7 +351,7 @@ class InferenceInterfaceTest(unittest.TestCase):
         self.assertEqual(0, exit_code)
         generate_text.assert_called_once_with(
             prompt="hello",
-            max_new_tokens=infer_sml.DEFAULT_MAX_NEW_TOKENS,
+            max_new_tokens=None,
             device_name="cuda:0",
             include_prompt=False,
             generation_config=GenerationConfig(),
@@ -347,7 +375,7 @@ class InferenceInterfaceTest(unittest.TestCase):
         self.assertEqual(0, exit_code)
         generate_text.assert_called_once_with(
             prompt="hello",
-            max_new_tokens=infer_sml.DEFAULT_MAX_NEW_TOKENS,
+            max_new_tokens=None,
             device_name="auto",
             include_prompt=True,
             generation_config=GenerationConfig(),
