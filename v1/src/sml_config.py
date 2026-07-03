@@ -150,7 +150,7 @@ class TrainingConfig:
     weight_decay: float = 0.1
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
-    warmup_steps: int = 100
+    warmup_steps: int = 100  # TODO for v2: set to int(lr_total_steps * 0.01)
     min_lr_ratio: float = 0.1
     log_every: int = 10
     save_every: int = 1_000  # 0 for never, positive for every N steps
