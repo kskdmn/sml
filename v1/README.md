@@ -87,3 +87,23 @@ uv run python v1/src/eval_humaneval.py --limit 1 --device cpu
 
 Results default to `v1/output/humaneval.json`. See `eval_humaneval.py` for
 flags and safety notes.
+
+## HellaSwag
+
+```bash
+uv run python v1/src/eval_hellaswag.py
+
+uv run python v1/src/eval_hellaswag.py --limit 1 --device cpu
+```
+
+Results default to `v1/output/hellaswag.json`.
+
+## Winogrande
+
+```bash
+uv run python v1/src/eval_winogrande.py
+
+uv run python v1/src/eval_winogrande.py --limit 1 --device cpu
+```
+
+Results default to `v1/output/winogrande.json`.

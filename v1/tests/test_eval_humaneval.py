@@ -1,8 +1,6 @@
 import sys
 import unittest
-import json
 import os
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -115,9 +113,9 @@ class HumanEvalAdapterTest(unittest.TestCase):
 
         with mock.patch.object(
             eval_humaneval,
-            "simple_evaluate",
+            "evaluate_lm",
             side_effect=evaluate,
-        ) as simple_evaluate:
+        ) as evaluate_lm:
             result = eval_humaneval.evaluate_humaneval(
                 lm=lm,
                 checkpoint_path=Path("v1/output/sml.pt"),
@@ -125,31 +123,13 @@ class HumanEvalAdapterTest(unittest.TestCase):
             )
 
         self.assertIs(expected, result)
-        simple_evaluate.assert_called_once_with(
-            model=lm,
-            model_args={"path": "v1/output/sml.pt"},
+        evaluate_lm.assert_called_once_with(
+            lm=lm,
+            checkpoint_path=Path("v1/output/sml.pt"),
             tasks=["humaneval"],
-            num_fewshot=0,
-            batch_size=1,
             limit=2,
-            log_samples=False,
             confirm_run_unsafe_code=True,
         )
-
-    def test_write_results_creates_parent_directory_and_serializes_paths(self):
-        import eval_humaneval
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            output_path = Path(tmp_dir) / "nested" / "results.json"
-
-            eval_humaneval.write_results(
-                output_path,
-                {"checkpoint": Path("v1/output/sml.pt")},
-            )
-
-            saved = json.loads(output_path.read_text(encoding="utf-8"))
-
-        self.assertEqual("v1/output/sml.pt", saved["checkpoint"])
 
     def test_main_loads_default_checkpoint_and_runs_limited_evaluation(self):
         import eval_humaneval
