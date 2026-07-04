@@ -20,8 +20,8 @@ LoRA fine-tune the pretrained checkpoint on the SWAG train split (`allenai/swag`
 (`sml_config.py`).
 
 ```bash
-uv run python v1/src/train_swag.py
-uv run python v1/src/train_swag.py --resume
+uv run python v1/src/ft_swag.py
+uv run python v1/src/ft_swag.py --resume
 ```
 
 Requires `v1/output/sml.pt` for a fresh run. Writes `v1/output/sml-swag.pt` with

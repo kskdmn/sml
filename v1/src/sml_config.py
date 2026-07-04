@@ -186,9 +186,9 @@ class SwagFineTuneConfig:
     """
     LoRA fine-tuning hyperparameters for SWAG continuation training.
 
-    ``train_swag.py`` reads these defaults from code; the CLI only exposes
+    ``ft_swag.py`` reads these defaults from code; the CLI only exposes
     ``--resume``. Edit fields here (or pass a custom instance to
-    ``train_swag.fine_tune_swag``) instead of adding CLI flags.
+    ``ft_swag.fine_tune_swag``) instead of adding CLI flags.
     """
 
     dataset_name: str = "allenai/swag"
