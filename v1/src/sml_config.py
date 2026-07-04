@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from config import OUTPUT_DIR, PROJECT_DIR, TOKENIZER_MODEL_PATH
@@ -154,6 +154,67 @@ class TrainingConfig:
     min_lr_ratio: float = 0.1
     log_every: int = 10
     save_every: int = 1_000  # 0 for never, positive for every N steps
+    seed: int = 42
+    device: str = "auto"
+    autocast_dtype: str = "bfloat16"
+
+
+@dataclass(slots=True)
+class LoRAConfig:
+    """
+    Low-rank adapter settings for SWAG fine-tuning.
+
+    Adapters attach to attention and MLP projections by module name.
+    """
+
+    rank: int = 16
+    alpha: float = 32.0
+    dropout: float = 0.05
+    target_modules: tuple[str, ...] = (
+        "q_proj",
+        #"k_proj",
+        "v_proj",
+        #"o_proj",
+        #"gate_proj",
+        #"up_proj",
+        #"down_proj",
+    )
+
+
+@dataclass(slots=True)
+class SwagFineTuneConfig:
+    """
+    LoRA fine-tuning hyperparameters for SWAG continuation training.
+
+    ``train_swag.py`` reads these defaults from code; the CLI only exposes
+    ``--resume``. Edit fields here (or pass a custom instance to
+    ``train_swag.fine_tune_swag``) instead of adding CLI flags.
+    """
+
+    dataset_name: str = "allenai/swag"
+    dataset_config: str = "regular"
+    dataset_split: str = "train"
+    hf_cache_dir: Path | None = PROJECT_DIR.parent / ".hf-cache"
+    pretrained_checkpoint_path: Path = OUTPUT_DIR / "sml.pt"
+    output_dir: Path = OUTPUT_DIR
+    tokenizer_model_path: Path = TOKENIZER_MODEL_PATH
+    checkpoint_name: str = "sml-swag.pt"
+    sequence_length: int = 256
+    batch_size: int = 1
+    max_steps: int | None = 5_000
+    lr_total_steps: int | None = 5_000
+    epochs: int = 1
+    max_examples: int | None = None
+    shuffle_examples: bool = True
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.0
+    gradient_accumulation_steps: int = 8
+    max_grad_norm: float = 1.0
+    warmup_steps: int = 100
+    min_lr_ratio: float = 0.1
+    log_every: int = 10
+    save_every: int = 500
     seed: int = 42
     device: str = "auto"
     autocast_dtype: str = "bfloat16"

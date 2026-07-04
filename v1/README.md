@@ -13,6 +13,20 @@ uv run python v1/src/train_sml.py --resume
 Configure training in `TrainingConfig` (`sml_config.py`). See `train_sml.py`
 for `--resume` behavior.
 
+## SWAG fine-tuning (LoRA)
+
+LoRA fine-tune the pretrained checkpoint on the SWAG train split (`allenai/swag`,
+`regular` config). Defaults live in `SwagFineTuneConfig` and `LoRAConfig`
+(`sml_config.py`).
+
+```bash
+uv run python v1/src/train_swag.py
+uv run python v1/src/train_swag.py --resume
+```
+
+Requires `v1/output/sml.pt` for a fresh run. Writes `v1/output/sml-swag.pt` with
+merged weights for inference plus adapter state for resume.
+
 ## Checkpoint
 
 Default path: `v1/output/sml.pt`.

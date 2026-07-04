@@ -1898,6 +1898,7 @@ name = "sml"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "datasets" },
     { name = "lm-eval", extra = ["api"] },
     { name = "numpy" },
     { name = "sentencepiece" },
@@ -1907,6 +1908,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "datasets", specifier = ">=5.0.0" },
     { name = "lm-eval", extras = ["api"], specifier = ">=0.4.12" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "sentencepiece", specifier = ">=0.2.1" },

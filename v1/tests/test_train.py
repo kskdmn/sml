@@ -830,6 +830,30 @@ class TrainDataTest(unittest.TestCase):
             log_line,
         )
 
+    def test_format_training_log_includes_example_index(self):
+        import train_sml
+
+        log_line = train_sml.format_training_log(
+            epoch=1,
+            global_step=10,
+            lr=0.0003,
+            avg_loss=9.8457,
+            grad_norm=6.069,
+            timestamp=datetime(2026, 6, 30, 7, 50, 0),
+            progress=train_sml.ReadingProgress(
+                input_file="swag-train",
+                line_number=42,
+                example_index=17_203,
+            ),
+        )
+
+        self.assertEqual(
+            "time=2026-06-30 07:50:00 epoch=1 step=10 "
+            "input=swag-train line=42 example=17203 "
+            "lr=3.000e-04 loss=9.8457 grad_norm=6.069 (before clipping)",
+            log_line,
+        )
+
     def test_format_training_log_includes_reading_progress(self):
         import train_sml
 
