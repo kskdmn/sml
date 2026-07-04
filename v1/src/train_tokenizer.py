@@ -17,11 +17,11 @@ INPUT_DIR = Path("~/Documents/data-common_pile/")
 
 VOCAB_SIZE = 24_576
 MAX_ROWS_PER_FILE = 10_000
-MIN_TEXT_LENGTH = 100
-MAX_TEXT_LENGTH = 2_000
+MIN_TEXT_LENGTH = 100  # TODO v2: min is len(text), while max is len(text.encode("utf-8")). 
+MAX_TEXT_LENGTH = 2_000  # TODO for v2: This should be larger or `None` (confirm if `None` is supported).
 RANDOM_SEED = 42
 NUM_THREADS = 8
-INPUT_SENTENCE_SIZE = 0
+INPUT_SENTENCE_SIZE = 0  # TODO for v2: Choose 500,000 and switch on `SHUFFLE_INPUT_SENTENCE`.
 SELF_TEST_SAMPLE_SIZE = 0
 CHARACTER_COVERAGE = 0.9995  # 1.0 for small character sets (e.g. English clean datasets), 0.9995 for Pile/web-like datasets
 BYTE_FALLBACK = True
@@ -44,7 +44,7 @@ NULL_CHARACTER = "\x00"
 
 SHUFFLE_INPUT_SENTENCE = False
 HARD_VOCAB_LIMIT = True
-TRAIN_EXTREMELY_LARGE_CORPUS = True
+TRAIN_EXTREMELY_LARGE_CORPUS = True  # TODO for v2: This is only for Unigram models.
 MAX_SENTENCE_LENGTH = MAX_TEXT_LENGTH
 
 WHITESPACE_PATTERN = re.compile(r"\s+")
