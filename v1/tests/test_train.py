@@ -830,7 +830,7 @@ class TrainDataTest(unittest.TestCase):
             log_line,
         )
 
-    def test_format_training_log_includes_example_index(self):
+    def test_format_training_log_omits_example_index(self):
         import train_sml
 
         log_line = train_sml.format_training_log(
@@ -849,7 +849,7 @@ class TrainDataTest(unittest.TestCase):
 
         self.assertEqual(
             "time=2026-06-30 07:50:00 epoch=1 step=10 "
-            "input=swag-train line=42 example=17203 "
+            "input=swag-train line=42 "
             "lr=3.000e-04 loss=9.8457 grad_norm=6.069 (before clipping)",
             log_line,
         )

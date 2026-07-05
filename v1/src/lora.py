@@ -44,8 +44,9 @@ class LoRALinear(nn.Module):
         self.rank = rank
         self.scaling = alpha / rank
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-        self.lora_A = nn.Parameter(torch.empty(rank, linear.in_features))
-        self.lora_B = nn.Parameter(torch.empty(linear.out_features, rank))
+        device = linear.weight.device
+        self.lora_A = nn.Parameter(torch.empty(rank, linear.in_features, device=device))
+        self.lora_B = nn.Parameter(torch.empty(linear.out_features, rank, device=device))
         self.reset_lora_parameters()
 
         for parameter in self.linear.parameters():
@@ -60,14 +61,18 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = self.linear(x)
-        lora_output = self.lora_dropout(x) @ self.lora_A.T @ self.lora_B.T
-        return output + lora_output * self.scaling
+        # Outer autocast can keep matmul operands in bf16 even after .float().
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            lora_x = self.lora_dropout(x).to(dtype=self.lora_A.dtype)
+            lora_output = lora_x @ self.lora_A.T @ self.lora_B.T
+        return output + lora_output.to(dtype=output.dtype) * self.scaling
 
     def merge(self) -> nn.Linear:
         """
         Fold the low-rank delta into the wrapped linear layer and return it.
         """
-        self.linear.weight.data.add_(self.scaling * (self.lora_B @ self.lora_A))
+        delta = self.lora_B @ self.lora_A
+        self.linear.weight.data.add_(self.scaling * delta.to(dtype=self.linear.weight.dtype))
         return self.linear
 
 

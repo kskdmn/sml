@@ -599,8 +599,6 @@ def format_training_log(
         parts.append(f"input={progress.input_file}")
     if progress is not None and progress.line_number is not None:
         parts.append(f"line={progress.line_number}")
-    if progress is not None and progress.example_index is not None:
-        parts.append(f"example={progress.example_index}")
     parts.extend(
         [
             f"lr={lr:.3e}",

@@ -75,6 +75,18 @@ class LoRATest(unittest.TestCase):
         }
         self.assertEqual(adapter_parameter_ids, trainable_parameter_ids)
 
+    def test_apply_lora_places_adapters_on_base_device(self):
+        from lora import apply_lora
+        from sml import SMLLanguageModel
+
+        config, lora_config = self.tiny_config()
+        model = SMLLanguageModel(config).to("cpu")
+        apply_lora(model, lora_config)
+
+        wrapped = model.layers[0].self_attn.q_proj
+        self.assertEqual(wrapped.lora_A.device, wrapped.linear.weight.device)
+        self.assertEqual(wrapped.lora_B.device, wrapped.linear.weight.device)
+
     def test_lora_forward_changes_output(self):
         from lora import LoRALinear
 
@@ -89,6 +101,21 @@ class LoRATest(unittest.TestCase):
         lora_output = lora(x)
 
         self.assertFalse(torch.allclose(base_output, lora_output))
+
+    def test_lora_forward_matches_activation_dtype(self):
+        from lora import LoRALinear
+
+        linear = nn.Linear(8, 4, bias=False)
+        lora = LoRALinear(linear, rank=4, alpha=8.0)
+        x = torch.randn(2, 8)
+
+        with torch.no_grad():
+            lora.lora_B.fill_(0.1)
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            output = lora(x)
+
+        self.assertEqual(output.dtype, torch.bfloat16)
 
     def test_merge_lora_updates_base_linear(self):
         from lora import LoRALinear, merge_lora

@@ -80,6 +80,39 @@ class FtSwagTest(unittest.TestCase):
         self.assertEqual(["second beta", "third z"], texts)
         self.assertEqual(2, data_state.line_number)
 
+    def test_iter_swag_texts_resumes_same_shuffled_order(self):
+        import ft_swag
+        from sml_config import SwagFineTuneConfig
+        from train_sml import TrainingDataState
+
+        rows = [
+            {
+                "startphrase": f"row-{index}",
+                "ending0": " end",
+                "ending1": " wrong",
+                "ending2": " wrong",
+                "ending3": " wrong",
+                "label": 0,
+            }
+            for index in range(8)
+        ]
+        dataset = mock.Mock()
+        dataset.__len__ = mock.Mock(return_value=len(rows))
+        dataset.__getitem__ = mock.Mock(side_effect=lambda index: rows[index])
+        config = SwagFineTuneConfig(shuffle_examples=True, seed=7)
+
+        with mock.patch.object(ft_swag, "load_swag_dataset", return_value=dataset):
+            full_epoch = list(ft_swag.iter_swag_texts(config, epoch=2))
+
+        data_state = TrainingDataState(line_number=2)
+        with mock.patch.object(ft_swag, "load_swag_dataset", return_value=dataset):
+            resumed_epoch = list(
+                ft_swag.iter_swag_texts(config, epoch=2, data_state=data_state)
+            )
+
+        self.assertEqual(full_epoch[3:], resumed_epoch)
+        self.assertEqual(7, data_state.line_number)
+
     def test_iter_swag_texts_updates_reading_progress_example_index(self):
         import ft_swag
         from sml_config import SwagFineTuneConfig

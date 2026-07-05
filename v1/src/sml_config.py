@@ -203,7 +203,7 @@ class SwagFineTuneConfig:
     batch_size: int = 1
     max_steps: int | None = 5_000
     lr_total_steps: int | None = 5_000
-    epochs: int = 1
+    epochs: int = 3  # TODO for v2: 3 is not enough for max_steps = 5_000.
     max_examples: int | None = None
     shuffle_examples: bool = True
     lora: LoRAConfig = field(default_factory=LoRAConfig)
