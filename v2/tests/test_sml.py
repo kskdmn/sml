@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - exercised only before torch is install
 class TestSMLConfig:
     def test_default_config_targets_small_model_size(self):
         from sml import estimate_model_size
-        from sml_config import SMLConfig
+        from sml import SMLConfig
 
         config = SMLConfig()
 
@@ -42,7 +42,7 @@ class TestSMLConfig:
         assert not config.gradient_checkpointing
 
     def test_invalid_attention_shape_is_rejected(self):
-        from sml_config import SMLConfig
+        from sml import SMLConfig
 
         with pytest.raises(ValueError, match='hidden_size'):
             SMLConfig(hidden_size=30, num_q_heads=8)
@@ -51,7 +51,8 @@ class TestSMLConfig:
             SMLConfig(num_q_heads=6, num_kv_heads=4)
 
     def test_model_config_for_training_disables_yarn(self):
-        from sml_config import SMLConfig, model_config_for_training
+        from sml import SMLConfig
+        from train_sml import model_config_for_training
 
         config = SMLConfig(rope_scaling_factor=2.0)
         training_config = model_config_for_training(config)
@@ -62,7 +63,7 @@ class TestSMLConfig:
         assert 1024 == training_config.effective_max_position_embeddings
 
     def test_invalid_context_scaling_is_rejected(self):
-        from sml_config import SMLConfig
+        from sml import SMLConfig
 
         with pytest.raises(ValueError, match='original_max_position_embeddings'):
             SMLConfig(original_max_position_embeddings=0)
@@ -74,13 +75,13 @@ class TestSMLConfig:
             SMLConfig(yarn_beta_fast=1.0, yarn_beta_slow=1.0)
 
     def test_yarn_mscale_fields_must_be_set_together(self):
-        from sml_config import SMLConfig
+        from sml import SMLConfig
 
         with pytest.raises(ValueError, match='yarn_mscale and yarn_mscale_all_dim'):
             SMLConfig(yarn_mscale=1.0)
 
     def test_effective_max_position_embeddings_scales_with_large_rope_factor(self):
-        from sml_config import SMLConfig
+        from sml import SMLConfig
 
         config = SMLConfig(
             original_max_position_embeddings=1_024,
@@ -100,7 +101,7 @@ class TestSMLSchedule:
 @pytest.mark.skipif(torch is None, reason="torch is not installed")
 class TestSMLModel:
     def tiny_config(self):
-        from sml_config import SMLConfig
+        from sml import SMLConfig
 
         return SMLConfig(
             vocab_size=32,
@@ -248,7 +249,7 @@ class TestSMLModel:
         assert 5.0 == adjusted[0, 3].item()
 
     def test_generate_uses_repetition_penalty_without_sampling(self):
-        from sml_config import GenerationConfig
+        from sml import GenerationConfig
         from sml import SMLLanguageModel
 
         config = self.tiny_config()
@@ -271,7 +272,7 @@ class TestSMLModel:
         assert not torch.equal(greedy, penalized)
 
     def test_generate_sampling_is_reproducible_with_seed(self):
-        from sml_config import GenerationConfig
+        from sml import GenerationConfig
         from sml import SMLLanguageModel
 
         config = self.tiny_config()

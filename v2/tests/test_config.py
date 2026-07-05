@@ -20,5 +20,9 @@ class TestConfig:
 
         assert 0 == config.SUCCESS_RETURN_CODE
         assert PROJECT_DIR == config.PROJECT_DIR
+        assert Path("~/Documents/data-common_pile/") == config.INPUT_DIR
+        assert r".*-00[0-9][0-9]\.jsonl\.zst\Z" == config.INPUT_FILE_NAME_REGEX
         assert PROJECT_DIR / 'output' == config.OUTPUT_DIR
         assert config.OUTPUT_DIR / 'bpe_tokenizer.model' == config.TOKENIZER_MODEL_PATH
+        assert Path("/tmp/example") == config.resolve_path(Path("/tmp/example"))
+        assert Path.home() / "example" == config.resolve_path(Path("~/example"))

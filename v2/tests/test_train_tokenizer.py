@@ -11,6 +11,7 @@ import zstandard as zstd
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"
 SCRIPT_PATH = PROJECT_DIR / "src" / "train_tokenizer.py"
+TOKENIZER_PATH = PROJECT_DIR / "src" / "tokenizer.py"
 MAX_ROWS_IN_TEST = 3
 EXPECTED_NORMALIZED_TEXT_COUNT = 1
 REPEATED_WORD_COUNT = 60
@@ -32,10 +33,10 @@ def collect_filtered_texts(tokenizer, input_files, max_rows_per_file=None):
     return list(tokenizer.FilteredTextIterable(input_files, max_rows_per_file))
 
 
-def load_script():
+def load_module(module_name: str, path: Path):
     if str(SRC_DIR) not in sys.path:
         sys.path.insert(0, str(SRC_DIR))
-    spec = importlib.util.spec_from_file_location("train_tokenizer", SCRIPT_PATH)
+    spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     with warnings.catch_warnings():
@@ -51,6 +52,14 @@ def load_script():
         )
         spec.loader.exec_module(module)
     return module
+
+
+def load_script():
+    return load_module("train_tokenizer", SCRIPT_PATH)
+
+
+def load_tokenizer_module():
+    return load_module("tokenizer", TOKENIZER_PATH)
 
 
 class TestTrainTokenizer:
@@ -70,7 +79,7 @@ class TestTrainTokenizer:
         assert not hasattr(tokenizer, 'iter_jsonl_lines')
 
     def test_discover_input_files_sorts_matching_zst_shards_and_skips_others(self):
-        tokenizer = load_script()
+        tokenizer = load_tokenizer_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -87,7 +96,7 @@ class TestTrainTokenizer:
         assert ['dataset-0000.jsonl.zst', 'dataset-0009.jsonl.zst', 'dataset-0010.jsonl.zst'] == [path.name for path in files]
 
     def test_filtered_text_iterable_reads_only_first_rows_and_filters_min_text_length(self):
-        tokenizer = load_script()
+        tokenizer = load_tokenizer_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "sample-0000.jsonl.zst"
@@ -111,7 +120,7 @@ class TestTrainTokenizer:
         assert ['a' * tokenizer.MIN_TEXT_LENGTH, byte_min_text] == texts
 
     def test_filtered_text_iterable_keeps_long_utf8_text_when_max_is_unset(self):
-        tokenizer = load_script()
+        tokenizer = load_tokenizer_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "sample-0000.jsonl.zst"
@@ -126,7 +135,7 @@ class TestTrainTokenizer:
         assert [byte_long_text, valid_text] == texts
 
     def test_filtered_text_iterable_normalizes_multiline_text_to_one_line(self):
-        tokenizer = load_script()
+        tokenizer = load_tokenizer_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "sample-0000.jsonl.zst"
@@ -140,7 +149,7 @@ class TestTrainTokenizer:
         assert len(texts[0]) >= tokenizer.MIN_TEXT_LENGTH
 
     def test_filtered_text_iterable_removes_null_characters(self):
-        tokenizer = load_script()
+        tokenizer = load_tokenizer_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "sample-0000.jsonl.zst"
@@ -153,7 +162,7 @@ class TestTrainTokenizer:
         assert '\x00' not in texts[0]
 
     def test_filtered_text_iterable_does_not_recheck_discovered_file_names(self, monkeypatch):
-        tokenizer = load_script()
+        tokenizer = load_tokenizer_module()
 
         class MatchCountingPattern:
             def __init__(self):
@@ -178,7 +187,7 @@ class TestTrainTokenizer:
         assert ['sample-0000.jsonl.zst'] == pattern.names
 
     def test_iter_zstd_jsonl_lines_reads_zst_files_without_subprocess(self, monkeypatch):
-        tokenizer = load_script()
+        tokenizer = load_tokenizer_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "sample-0000.jsonl.zst"
@@ -194,34 +203,40 @@ class TestTrainTokenizer:
         assert [(1, '{"text": "first"}\n')] == lines
 
     def test_train_tokenizer_enables_byte_fallback(self, monkeypatch):
-        tokenizer = load_script()
+        train_tokenizer = load_script()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             input_path = root / "sample-0000.jsonl.zst"
-            write_zst_rows(input_path, [{"text": "a" * tokenizer.MIN_TEXT_LENGTH}])
+            write_zst_rows(
+                input_path,
+                [{"text": "a" * train_tokenizer.tokenizer.MIN_TEXT_LENGTH}],
+            )
 
             train = Spy()
-            monkeypatch.setattr(tokenizer, "INPUT_DIR", root)
-            monkeypatch.setattr(tokenizer, "OUTPUT_DIR", root / "output")
-            monkeypatch.setattr(tokenizer.spm.SentencePieceTrainer, "train", train)
-            tokenizer.train_tokenizer()
+            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer, "OUTPUT_DIR", root / "output")
+            monkeypatch.setattr(train_tokenizer.spm.SentencePieceTrainer, "train", train)
+            train_tokenizer.train_tokenizer()
 
         assert True is train.call_args.kwargs.get('byte_fallback')
 
     def test_train_tokenizer_omits_max_sentence_length_when_unset(self, monkeypatch):
-        tokenizer = load_script()
+        train_tokenizer = load_script()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             input_path = root / "sample-0000.jsonl.zst"
-            write_zst_rows(input_path, [{"text": "a" * tokenizer.MIN_TEXT_LENGTH}])
+            write_zst_rows(
+                input_path,
+                [{"text": "a" * train_tokenizer.tokenizer.MIN_TEXT_LENGTH}],
+            )
 
             train = Spy()
-            monkeypatch.setattr(tokenizer, "INPUT_DIR", root)
-            monkeypatch.setattr(tokenizer, "OUTPUT_DIR", root / "output")
-            monkeypatch.setattr(tokenizer.spm.SentencePieceTrainer, "train", train)
-            tokenizer.train_tokenizer()
+            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer, "OUTPUT_DIR", root / "output")
+            monkeypatch.setattr(train_tokenizer.spm.SentencePieceTrainer, "train", train)
+            train_tokenizer.train_tokenizer()
 
-        assert tokenizer.MAX_SENTENCE_LENGTH is None
+        assert train_tokenizer.MAX_SENTENCE_LENGTH is None
         assert 'max_sentence_length' not in train.call_args.kwargs

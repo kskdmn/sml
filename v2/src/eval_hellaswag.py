@@ -1,7 +1,7 @@
 """
 HellaSwag evaluation for the local SML checkpoint and tokenizer.
 
-Results default to ``v1/output/hellaswag.json``. Override paths and runtime
+Results default to ``v2/output/hellaswag.json``. Override paths and runtime
 with ``--checkpoint``, ``--tokenizer``, ``--device``, ``--limit``, and
 ``--output``.
 """

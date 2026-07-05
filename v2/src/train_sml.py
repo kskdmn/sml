@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import io
-import itertools
-import json
 import pathlib
 import random
 import re
@@ -14,30 +11,77 @@ from typing import Iterable, Iterator, Protocol, Sequence, TypeVar
 
 import sentencepiece as spm
 import torch
-import zstandard as zstd
 from torch.serialization import safe_globals
 from torch.utils.data import DataLoader, IterableDataset
 
-from config import SUCCESS_RETURN_CODE
-from sml import SMLLanguageModel, count_parameters, lr_lambda
-from sml_config import (
-    SMLConfig,
-    TrainingConfig,
-    model_config_for_training,
+from config import (
+    INPUT_DIR,
+    INPUT_FILE_NAME_REGEX,
+    OUTPUT_DIR,
+    SUCCESS_RETURN_CODE,
+    TOKENIZER_MODEL_PATH,
+    resolve_path,
 )
-from train_tokenizer import (
-    FIRST_LINE_NUMBER,
+from sml import (
+    SMLConfig,
+    SMLLanguageModel,
+    count_parameters,
+    lr_lambda,
+)
+from tokenizer import (
     HIDDEN_FILE_PREFIX,
     TEXT_COLUMN,
-    TEXT_DECODE_ERRORS,
-    TEXT_ENCODING,
     filter_text,
-    resolve_path,
+    iter_jsonl_records,
 )
 
 
 ROW_INCREMENT = 1
 BatchT = TypeVar("BatchT")
+
+
+@dataclass(slots=True)
+class TrainingConfig:
+    """
+    Training hyperparameters and I/O paths.
+
+    ``train_sml.py`` reads these defaults from code; the CLI only exposes
+    ``--resume``. Edit fields here (or pass a custom instance to
+    ``train_sml.train_model``) instead of adding CLI flags.
+    """
+
+    input_dir: Path = INPUT_DIR
+    input_file_name_regex: str = INPUT_FILE_NAME_REGEX  # Regex matched against each file name.
+    output_dir: Path = OUTPUT_DIR
+    tokenizer_model_path: Path = TOKENIZER_MODEL_PATH
+    checkpoint_name: str = "sml.pt"
+    sequence_length: int = 1_024
+    batch_size: int = 1
+    max_steps: int | None = None  # Maximum optimizer steps. Set to None to train until epochs/data end.
+    lr_total_steps: int | None = 100_000  # LR schedule horizon. Falls back to max_steps when None.
+    epochs: int = 1
+    max_rows_per_file: int | None = 32_768  # Maximum rows read from each input file per epoch. Set to None for all rows.
+    shuffle_input_files: bool = True  # Shuffle model-training shards deterministically with seed.
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.1
+    gradient_accumulation_steps: int = 8
+    max_grad_norm: float = 1.0
+    warmup_steps: int = int(lr_total_steps if lr_total_steps is not None else 100 * 0.01)
+    min_lr_ratio: float = 0.1
+    log_every: int = 10
+    save_every: int = 1_000  # 0 for never, positive for every N steps
+    seed: int = 42
+    device: str = "auto"
+    autocast_dtype: str = "bfloat16"
+
+
+def model_config_for_training(config: SMLConfig) -> SMLConfig:
+    """
+    Return a copy that trains with standard RoPE inside ``sequence_length``.
+
+    YaRN is applied only when checkpoints are loaded for inference.
+    """
+    return replace(config, rope_scaling_factor=1.0)
 
 
 @dataclass(slots=True)
@@ -138,70 +182,6 @@ def iter_texts(
             text = filter_text(row.get(TEXT_COLUMN))
             if text is not None:
                 yield text
-
-
-def iter_jsonl_records(
-    path: Path,
-    max_rows_per_file: int | None,
-    start_after_line: int | None = None,
-) -> Iterator[tuple[dict[str, object], int]]:
-    """
-    Ignore blank and non-object rows, but include file and line number when malformed
-    JSON is encountered.
-    """
-    for line_number, line in iter_zstd_jsonl_lines(
-        path,
-        max_rows_per_file,
-        start_after_line=start_after_line,
-    ):
-        line = line.strip()
-        if not line:
-            continue
-
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON in {path} at line {line_number}") from exc
-
-        if isinstance(row, dict):
-            yield row, line_number
-
-
-def iter_zstd_jsonl_lines(
-    path: Path,
-    max_rows_per_file: int | None,
-    start_after_line: int | None = None,
-) -> Iterator[tuple[int, str]]:
-    """
-    Stream zstd shards instead of materializing them, applying the optional row cap as
-    lines are decoded.
-    """
-    try:
-        with path.open("rb") as compressed_stream:
-            decompressor = zstd.ZstdDecompressor()
-            with decompressor.stream_reader(compressed_stream) as zstd_stream:
-                with io.TextIOWrapper(
-                    zstd_stream,
-                    encoding=TEXT_ENCODING,
-                    errors=TEXT_DECODE_ERRORS,
-                ) as text_stream:
-                    limited_stream = (
-                        text_stream
-                        if max_rows_per_file is None
-                        else itertools.islice(text_stream, max_rows_per_file)
-                    )
-                    for line_number, line in enumerate(
-                        limited_stream,
-                        start=FIRST_LINE_NUMBER,
-                    ):
-                        if (
-                            start_after_line is not None
-                            and line_number <= start_after_line
-                        ):
-                            continue
-                        yield line_number, line
-    except zstd.ZstdError as exc:
-        raise RuntimeError(f"zstd failed for {path}: {exc}") from exc
 
 
 class TokenBlockDataset(IterableDataset[dict[str, torch.Tensor]]):
@@ -455,7 +435,7 @@ def load_training_checkpoint(
 
     Missing checkpoints are an invalid explicit resume request. Checkpoints are
     full training dictionaries written to ``output_dir / checkpoint_name``
-    (default ``v1/output/sml.pt``) with keys such as ``step``, ``model_config``,
+    (default ``v2/output/sml.pt``) with keys such as ``step``, ``model_config``,
     ``training_config``, ``input_files``, ``data_state``, ``model_state_dict``,
     ``optimizer_state_dict``, and ``scheduler_state_dict``.
 
@@ -812,7 +792,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--resume",
         action="store_true",
         help=(
-            "Resume from output_dir/checkpoint_name (default v1/output/sml.pt). "
+            "Resume from output_dir/checkpoint_name (default v2/output/sml.pt). "
             "Restores model, optimizer, scheduler, and RNG state, then continues "
             "from the saved training step and data position. The checkpoint must "
             "already exist; without --resume, training starts from scratch and "

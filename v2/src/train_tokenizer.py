@@ -1,24 +1,16 @@
 from __future__ import annotations
 
-import io
 import itertools
-import json
 import random
-import re
 from pathlib import Path
-from typing import Iterable, Iterator, NamedTuple, Sequence
+from typing import Iterator, NamedTuple
 
 import sentencepiece as spm
-import zstandard as zstd
 
-from config import OUTPUT_DIR, PROJECT_DIR, SUCCESS_RETURN_CODE
-
-INPUT_DIR = Path("~/Documents/data-common_pile/")
+from config import INPUT_DIR, OUTPUT_DIR, SUCCESS_RETURN_CODE, resolve_path
+import tokenizer
 
 VOCAB_SIZE = 24_576
-MAX_ROWS_PER_FILE = 10_000
-MIN_TEXT_LENGTH = 100
-MAX_TEXT_LENGTH: int | None = None
 RANDOM_SEED = 42
 NUM_THREADS = 8
 INPUT_SENTENCE_SIZE = 500_000
@@ -29,25 +21,13 @@ UNK_ID = 0
 BOS_ID = 1
 EOS_ID = 2
 PAD_ID = 3
-FIRST_LINE_NUMBER = 1
-NO_ROWS = 0
-ROW_INCREMENT = 1
-
-MODEL_PREFIX_NAME = "bpe_tokenizer"
-MODEL_TYPE = "bpe"
-TEXT_COLUMN = "text"
-TEXT_ENCODING = "utf-8"
-TEXT_DECODE_ERRORS = "replace"
-HIDDEN_FILE_PREFIX = "."
-INPUT_FILE_NAME_PATTERN = re.compile(r".*-00[0-2][0-9]\.jsonl\.zst\Z")
-NULL_CHARACTER = "\x00"
-
 SHUFFLE_INPUT_SENTENCE = True
 HARD_VOCAB_LIMIT = True
 TRAIN_EXTREMELY_LARGE_CORPUS = False  # This is only for Unigram models.
-MAX_SENTENCE_LENGTH: int | None = MAX_TEXT_LENGTH
 
-WHITESPACE_PATTERN = re.compile(r"\s+")
+MODEL_PREFIX_NAME = "bpe_tokenizer"
+MODEL_TYPE = "bpe"
+MAX_SENTENCE_LENGTH: int | None = tokenizer.MAX_TEXT_LENGTH
 
 
 class TrainingResult(NamedTuple):
@@ -56,140 +36,6 @@ class TrainingResult(NamedTuple):
     input_file_count: int
     rows_read: int
     texts_used: int
-
-
-class FilteredTextIterable:
-    def __init__(
-        self,
-        input_files: Sequence[Path],
-        max_rows_per_file: int = MAX_ROWS_PER_FILE,
-    ) -> None:
-        """
-        Counters live on the iterable so training can report rows read versus texts kept
-        after filtering.
-        """
-        self.input_files = input_files
-        self.max_rows_per_file = max_rows_per_file
-        self.rows_read = NO_ROWS
-        self.texts_used = NO_ROWS
-
-    def __iter__(self) -> Iterator[str]:
-        """
-        Each shard is streamed once; rows_read counts JSON objects while texts_used
-        counts only rows that survive text filters.
-        """
-        for input_file in self.input_files:
-            for row in iter_jsonl_records(input_file, self.max_rows_per_file):
-                self.rows_read += ROW_INCREMENT
-                text = filter_text(row.get(TEXT_COLUMN))
-                if text is None:
-                    continue
-
-                self.texts_used += ROW_INCREMENT
-                yield text
-
-
-def resolve_path(path: Path) -> Path:
-    """
-    Only expand `~`; callers decide separately whether the resulting path must exist.
-    """
-    return path.expanduser()
-
-
-def discover_input_files(input_dir: Path = INPUT_DIR) -> tuple[Path, ...]:
-    """
-    Use the fixed shard naming pattern and skip hidden files that may appear on local
-    filesystems.
-    """
-    root = resolve_path(input_dir)
-    if not root.exists():
-        raise FileNotFoundError(f"Input directory does not exist: {root}")
-
-    files = [
-        path
-        for path in root.iterdir()
-        if path.is_file()
-        and not path.name.startswith(HIDDEN_FILE_PREFIX)
-        and INPUT_FILE_NAME_PATTERN.fullmatch(path.name) is not None
-    ]
-    return tuple(sorted(files, key=lambda path: path.name))
-
-
-def iter_jsonl_records(path: Path, max_rows_per_file: int) -> Iterator[dict[str, object]]:
-    """
-    Blank lines and non-object JSON are ignored; malformed JSON includes the compressed
-    file line number.
-    """
-    for line_number, line in iter_zstd_jsonl_lines(path, max_rows_per_file):
-        line = line.strip()
-        if not line:
-            continue
-
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON in {path} at line {line_number}") from exc
-
-        if isinstance(row, dict):
-            yield row
-
-
-def iter_zstd_jsonl_lines(path: Path, max_rows_per_file: int) -> Iterator[tuple[int, str]]:
-    """
-    Decode zstd streams as replacement-tolerant UTF-8 so rare bad bytes do not abort
-    tokenizer training.
-    """
-    try:
-        with path.open("rb") as compressed_stream:
-            decompressor = zstd.ZstdDecompressor()
-            with decompressor.stream_reader(compressed_stream) as zstd_stream:
-                with io.TextIOWrapper(
-                    zstd_stream,
-                    encoding=TEXT_ENCODING,
-                    errors=TEXT_DECODE_ERRORS,
-                ) as text_stream:
-                    yield from enumerate_limited_lines(text_stream, max_rows_per_file)
-    except zstd.ZstdError as exc:
-        raise RuntimeError(f"zstd failed for {path}: {exc}") from exc
-
-
-def enumerate_limited_lines(
-    stream: Iterable[str],
-    max_rows_per_file: int,
-) -> Iterator[tuple[int, str]]:
-    """
-    Line numbers stay one-based after applying the row cap for readable JSON error
-    messages.
-    """
-    limited_stream = itertools.islice(stream, max_rows_per_file)
-    yield from enumerate(limited_stream, start=FIRST_LINE_NUMBER)
-
-
-def filter_text(value: object) -> str | None:
-    """
-    Reject non-strings, too-short UTF-8 byte rows, and optionally too-long rows before
-    SentencePiece sees them.
-    """
-    if not isinstance(value, str):
-        return None
-
-    text = normalize_text(value)
-    text_byte_length = len(text.encode(TEXT_ENCODING))
-    if text_byte_length < MIN_TEXT_LENGTH:
-        return None
-    if MAX_TEXT_LENGTH is not None and text_byte_length > MAX_TEXT_LENGTH:
-        return None
-
-    return text
-
-
-def normalize_text(text: str) -> str:
-    """
-    Convert null bytes to spaces before whitespace collapse to avoid embedded
-    terminators in tokenizer input.
-    """
-    text = text.replace(NULL_CHARACTER, " ")
-    return WHITESPACE_PATTERN.sub(" ", text).strip()
 
 
 def require_non_empty_iterator(iterator: Iterator[str]) -> Iterator[str]:
@@ -217,11 +63,13 @@ def train_tokenizer() -> TrainingResult:
     output_dir = resolve_path(OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    input_files = discover_input_files(INPUT_DIR)
+    input_files = tokenizer.discover_input_files(INPUT_DIR)
     if not input_files:
-        raise FileNotFoundError(f"No supported input files found in {resolve_path(INPUT_DIR)}")
+        raise FileNotFoundError(
+            f"No supported input files found in {resolve_path(INPUT_DIR)}"
+        )
 
-    text_iterable = FilteredTextIterable(input_files)
+    text_iterable = tokenizer.FilteredTextIterable(input_files)
     sentence_iterator = require_non_empty_iterator(iter(text_iterable))
 
     model_prefix = output_dir / MODEL_PREFIX_NAME

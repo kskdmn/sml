@@ -1,11 +1,11 @@
 """
 Inference entrypoint for SML checkpoints.
 
-Default files (under ``v1/output/``): checkpoint ``sml.pt``, tokenizer
+Default files (under ``v2/output/``): checkpoint ``sml.pt``, tokenizer
 ``bpe_tokenizer.model``. Both must exist before inference.
 
 One-shot CLI generation accepts decoding flags documented on
-``GenerationConfig`` in ``sml_config.py`` and exposed as ``--temperature``,
+``sml.GenerationConfig`` and exposed as ``--temperature``,
 ``--top-p``, ``--repetition-penalty``, ``--no-repeat-ngram-size``, and
 ``--seed``. Those flags do not apply to the OpenAI-compatible HTTP API yet.
 
@@ -30,12 +30,9 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 import torch
 from torch.serialization import safe_globals
 
-from config import OUTPUT_DIR, SUCCESS_RETURN_CODE, TOKENIZER_MODEL_PATH
-from sml import SMLLanguageModel
-from sml_config import GenerationConfig
-from sml_config import SMLConfig
+from config import OUTPUT_DIR, SUCCESS_RETURN_CODE, TOKENIZER_MODEL_PATH, resolve_path
+from sml import GenerationConfig, SMLConfig, SMLLanguageModel
 from train_sml import load_tokenizer, resolve_device
-from train_tokenizer import resolve_path
 
 
 DEFAULT_CHECKPOINT_PATH = OUTPUT_DIR / "sml.pt"
@@ -653,7 +650,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Sampling temperature; 0 keeps greedy decoding (default). "
             "With sampling, try 0.7-1.0; 0.8 is a common start. "
-            "See GenerationConfig in sml_config.py."
+            "See GenerationConfig in sml.py."
         ),
     )
     parser.add_argument(

@@ -42,7 +42,7 @@ class FakeGenerationModel:
 @pytest.mark.skipif(torch is None, reason="torch is not installed")
 class TestInferenceInterface:
     def tiny_config(self):
-        from sml_config import SMLConfig
+        from sml import SMLConfig
 
         return SMLConfig(
             vocab_size=16,
@@ -281,7 +281,7 @@ class TestInferenceInterface:
 
     def test_main_omits_prompt_by_default(self, monkeypatch):
         import infer_sml
-        from sml_config import GenerationConfig
+        from sml import GenerationConfig
 
         generate_text = Spy(return_value="hello world")
         print_ = Spy()
@@ -308,7 +308,7 @@ class TestInferenceInterface:
 
     def test_main_passes_device_from_cli_args(self, monkeypatch):
         import infer_sml
-        from sml_config import GenerationConfig
+        from sml import GenerationConfig
 
         generate_text = Spy(return_value="hello world")
         print_ = Spy()
@@ -329,7 +329,7 @@ class TestInferenceInterface:
 
     def test_main_can_include_prompt_from_cli_args(self, monkeypatch):
         import infer_sml
-        from sml_config import GenerationConfig
+        from sml import GenerationConfig
 
         generate_text = Spy(return_value="hello world")
         print_ = Spy()
@@ -350,7 +350,7 @@ class TestInferenceInterface:
 
     def test_parse_args_accepts_decoding_flags(self):
         import infer_sml
-        from sml_config import GenerationConfig
+        from sml import GenerationConfig
 
         args = infer_sml.parse_args(
             [

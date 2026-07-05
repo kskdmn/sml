@@ -19,7 +19,8 @@ except ImportError:  # pragma: no cover - exercised only before torch is install
 @pytest.mark.skipif(torch is None, reason="torch is not installed")
 class TestLoRA:
     def tiny_config(self):
-        from sml_config import LoRAConfig, SMLConfig
+        from lora import LoRAConfig
+        from sml import SMLConfig
 
         return (
             SMLConfig(

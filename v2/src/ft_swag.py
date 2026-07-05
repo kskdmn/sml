@@ -3,7 +3,7 @@ Fine-tune an SML checkpoint on the SWAG train split with LoRA adapters.
 
 Loads ``allenai/swag`` (``regular`` config) and trains low-rank adapters on the
 gold continuation for each ``startphrase``. Defaults read from
-``SwagFineTuneConfig`` in ``sml_config.py``; the CLI exposes ``--resume`` only.
+``SwagFineTuneConfig`` in this module; the CLI exposes ``--resume`` only.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import copy
 import pathlib
 import random
 from collections.abc import Mapping
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -22,9 +22,16 @@ import torch
 from torch.serialization import safe_globals
 from torch.utils.data import DataLoader
 
-from config import SUCCESS_RETURN_CODE
+from config import (
+    OUTPUT_DIR,
+    PROJECT_DIR,
+    SUCCESS_RETURN_CODE,
+    TOKENIZER_MODEL_PATH,
+    resolve_path,
+)
 from infer_sml import load_checkpoint, normalize_model_config
 from lora import (
+    LoRAConfig,
     apply_lora,
     load_lora_state_dict,
     lora_parameters,
@@ -32,8 +39,7 @@ from lora import (
     merge_lora,
     require_lora_modules,
 )
-from sml import SMLLanguageModel, count_parameters, lr_lambda
-from sml_config import SMLConfig, SwagFineTuneConfig
+from sml import SMLConfig, SMLLanguageModel, count_parameters, lr_lambda
 from train_sml import (
     ROW_INCREMENT,
     ReadingProgress,
@@ -54,10 +60,48 @@ from train_sml import (
     restore_rng_state,
     set_seed,
 )
-from train_tokenizer import resolve_path
 
 ENDING_KEY_PREFIX = "ending"
 SWAG_PROGRESS_NAME = "swag-train"
+
+
+@dataclass(slots=True)
+class SwagFineTuneConfig:
+    """
+    LoRA fine-tuning hyperparameters for SWAG continuation training.
+
+    ``ft_swag.py`` reads these defaults from code; the CLI only exposes
+    ``--resume``. Edit fields here (or pass a custom instance to
+    ``ft_swag.fine_tune_swag``) instead of adding CLI flags.
+    """
+
+    dataset_name: str = "allenai/swag"
+    dataset_config: str = "regular"
+    dataset_split: str = "train"
+    hf_cache_dir: Path | None = PROJECT_DIR.parent / ".hf-cache"
+    pretrained_checkpoint_path: Path = OUTPUT_DIR / "sml.pt"
+    output_dir: Path = OUTPUT_DIR
+    tokenizer_model_path: Path = TOKENIZER_MODEL_PATH
+    checkpoint_name: str = "sml-swag.pt"
+    sequence_length: int = 256
+    batch_size: int = 1
+    max_steps: int | None = 5_000
+    lr_total_steps: int | None = 5_000
+    epochs: int = 5
+    max_examples: int | None = None
+    shuffle_examples: bool = True
+    lora: LoRAConfig = field(default_factory=LoRAConfig)
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.0
+    gradient_accumulation_steps: int = 8
+    max_grad_norm: float = 1.0
+    warmup_steps: int = 100
+    min_lr_ratio: float = 0.1
+    log_every: int = 10
+    save_every: int = 500
+    seed: int = 42
+    device: str = "auto"
+    autocast_dtype: str = "bfloat16"
 
 
 def resolve_swag_label(value: object) -> int:
@@ -500,7 +544,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--resume",
         action="store_true",
         help=(
-            "Resume from output_dir/checkpoint_name (default v1/output/sml-swag.pt). "
+            "Resume from output_dir/checkpoint_name (default v2/output/sml-swag.pt). "
             "Restores model, optimizer, scheduler, and RNG state, then continues "
             "from the saved training step and data position."
         ),

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -17,10 +18,31 @@ import torch.nn as nn
 
 if TYPE_CHECKING:
     from sml import SMLLanguageModel
-    from sml_config import LoRAConfig
 
 LORA_A_SUFFIX = "lora_A"
 LORA_B_SUFFIX = "lora_B"
+
+
+@dataclass(slots=True)
+class LoRAConfig:
+    """
+    Low-rank adapter settings for SWAG fine-tuning.
+
+    Adapters attach to attention and MLP projections by module name.
+    """
+
+    rank: int = 16
+    alpha: float = 32.0
+    dropout: float = 0.05
+    target_modules: tuple[str, ...] = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        # "gate_proj",
+        # "up_proj",
+        # "down_proj",
+    )
 
 
 class LoRALinear(nn.Module):

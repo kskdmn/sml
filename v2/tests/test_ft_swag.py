@@ -43,7 +43,7 @@ class TestFtSwag:
 
     def test_iter_swag_texts_resumes_after_saved_position(self, monkeypatch):
         import ft_swag
-        from sml_config import SwagFineTuneConfig
+        from ft_swag import SwagFineTuneConfig
         from train_sml import TrainingDataState
 
         rows = [
@@ -89,7 +89,7 @@ class TestFtSwag:
 
     def test_iter_swag_texts_resumes_same_shuffled_order(self, monkeypatch):
         import ft_swag
-        from sml_config import SwagFineTuneConfig
+        from ft_swag import SwagFineTuneConfig
         from train_sml import TrainingDataState
 
         rows = [
@@ -119,7 +119,7 @@ class TestFtSwag:
 
     def test_iter_swag_texts_updates_reading_progress_example_index(self, monkeypatch):
         import ft_swag
-        from sml_config import SwagFineTuneConfig
+        from ft_swag import SwagFineTuneConfig
         from train_sml import ReadingProgress
 
         rows = [
@@ -190,7 +190,8 @@ class TestFtSwag:
 
     def test_fine_tune_swag_forces_yarn_rope_scaling_for_lora_model(self, monkeypatch):
         import ft_swag
-        from sml_config import SMLConfig, SwagFineTuneConfig
+        from ft_swag import SwagFineTuneConfig
+        from sml import SMLConfig
 
         class StopAfterModelConstruction(Exception):
             pass

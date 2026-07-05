@@ -46,7 +46,7 @@ class CpuMovingValue:
 
 class TestTrainData:
     def tiny_config(self):
-        from sml_config import SMLConfig
+        from sml import SMLConfig
 
         return SMLConfig(
             vocab_size=16,
@@ -163,12 +163,12 @@ class TestTrainData:
         assert original_names == [path.name for path in files]
 
     def test_training_config_shuffles_input_files_by_default(self):
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         assert True is TrainingConfig().shuffle_input_files
 
     def test_training_config_does_not_store_resume_cli_state(self):
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         assert not hasattr(TrainingConfig(), 'resume_from_checkpoint')
 
@@ -177,7 +177,7 @@ class TestTrainData:
         monkeypatch,
     ):
         import train_sml
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         discovered = (
             Path("pile-0000.jsonl.zst"),
@@ -213,7 +213,7 @@ class TestTrainData:
 
     def test_train_model_can_keep_discovered_input_file_order(self, monkeypatch):
         import train_sml
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         discovered = (
             Path("pile-0000.jsonl.zst"),
@@ -253,7 +253,7 @@ class TestTrainData:
         monkeypatch,
     ):
         import train_sml
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         discovered = (Path("pile-0000.jsonl.zst"),)
 
@@ -299,7 +299,7 @@ class TestTrainData:
         monkeypatch,
     ):
         import train_sml
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         discovered = (Path("pile-0000.jsonl.zst"),)
 
@@ -353,7 +353,7 @@ class TestTrainData:
         monkeypatch,
     ):
         import train_sml
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         discovered = (
             Path("pile-0000.jsonl.zst"),
@@ -410,7 +410,7 @@ class TestTrainData:
 
     def test_count_resume_batches_uses_completed_optimizer_steps(self):
         import train_sml
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         training_config = TrainingConfig(gradient_accumulation_steps=8)
 
@@ -501,7 +501,7 @@ class TestTrainData:
 
     def test_resolve_lr_total_steps_prefers_lr_total_steps(self):
         import train_sml
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         training_config = TrainingConfig(
             lr_total_steps=5_000,
@@ -512,7 +512,7 @@ class TestTrainData:
 
     def test_resolve_lr_total_steps_falls_back_to_max_steps(self):
         import train_sml
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         training_config = TrainingConfig(lr_total_steps=None, max_steps=1_000)
 
@@ -520,7 +520,7 @@ class TestTrainData:
 
     def test_resolve_lr_total_steps_is_none_without_lr_or_max_steps(self):
         import train_sml
-        from sml_config import TrainingConfig
+        from train_sml import TrainingConfig
 
         training_config = TrainingConfig(lr_total_steps=None, max_steps=None)
 
