@@ -6,6 +6,11 @@
 
 ## Models
 
-### v1 (Under Development)
+### v1
 
+- MPS
 - 50M model
+
+### v2 (under development)
+
+- 100M model?
