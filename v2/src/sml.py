@@ -27,7 +27,7 @@ class SMLConfig:
     intermediate_size: int = 1_536
     original_max_position_embeddings: int = 1_024  # RoPE design window; YaRN stretches beyond this.
     rope_theta: float = 10_000.0  # RoPE base (theta in inv_freq = 1 / theta^(2k/d)).
-    rope_scaling_factor: float = 2.0  # Inference context multiplier; 1 disables YaRN.
+    rope_scaling_factor: float = 4.0  # Inference context multiplier; 1 disables YaRN.
     yarn_beta_fast: float = 32.0  # Rotation-count cutoff for fast bands (extrapolate).
     yarn_beta_slow: float = 1.0  # Rotation-count cutoff for slow bands (interpolate).
     yarn_attention_factor: float | None = None  # Override cos/sin scaling; None infers from factor.
