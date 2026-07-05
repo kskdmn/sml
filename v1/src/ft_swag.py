@@ -33,7 +33,7 @@ from lora import (
     require_lora_modules,
 )
 from sml import SMLLanguageModel, count_parameters, lr_lambda
-from sml_config import SMLConfig, SwagFineTuneConfig, model_config_for_training
+from sml_config import SMLConfig, SwagFineTuneConfig
 from train_sml import (
     ROW_INCREMENT,
     ReadingProgress,
@@ -332,13 +332,13 @@ def fine_tune_swag(
     checkpoint_model_config = replace(
         base_model_config,
         vocab_size=tokenizer.get_piece_size(),
+        rope_scaling_factor=SMLConfig().rope_scaling_factor,
         original_max_position_embeddings=max(
             base_model_config.original_max_position_embeddings,
             fine_tune_config.sequence_length,
         ),
     )
-    training_model_config = model_config_for_training(checkpoint_model_config)
-    model = SMLLanguageModel(training_model_config).to(device)
+    model = SMLLanguageModel(checkpoint_model_config).to(device)
     load_pretrained_weights(model, pretrained_path, device)
     prepare_lora_model(model, fine_tune_config)
     total_params, trainable_params = count_parameters(model)

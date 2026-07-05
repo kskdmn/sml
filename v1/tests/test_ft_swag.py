@@ -158,6 +158,61 @@ class FtSwagTest(unittest.TestCase):
             list(parameters),
         )
 
+    def test_fine_tune_swag_forces_yarn_rope_scaling_for_lora_model(self):
+        import ft_swag
+        from sml_config import SMLConfig, SwagFineTuneConfig
+
+        class StopAfterModelConstruction(Exception):
+            pass
+
+        class FakeTokenizer:
+            def get_piece_size(self):
+                return 32
+
+        captured_rope_scaling_factor = None
+
+        def capture_model_config(config):
+            nonlocal captured_rope_scaling_factor
+            captured_rope_scaling_factor = config.rope_scaling_factor
+            raise StopAfterModelConstruction
+
+        base_model_config = SMLConfig(
+            vocab_size=32,
+            hidden_size=16,
+            num_layers=1,
+            num_q_heads=4,
+            num_kv_heads=2,
+            intermediate_size=32,
+            original_max_position_embeddings=16,
+            rope_scaling_factor=1.0,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+
+        with (
+            mock.patch.object(ft_swag, "load_tokenizer", return_value=FakeTokenizer()),
+            mock.patch.object(ft_swag, "resolve_device", return_value="cpu"),
+            mock.patch.object(
+                ft_swag,
+                "load_pretrained_model_config",
+                return_value=base_model_config,
+            ),
+            mock.patch.object(
+                ft_swag,
+                "SMLLanguageModel",
+                side_effect=capture_model_config,
+            ),
+        ):
+            with self.assertRaises(StopAfterModelConstruction):
+                ft_swag.fine_tune_swag(
+                    SwagFineTuneConfig(
+                        pretrained_checkpoint_path=Path(__file__),
+                        tokenizer_model_path=Path(__file__),
+                    )
+                )
+
+        self.assertEqual(SMLConfig().rope_scaling_factor, captured_rope_scaling_factor)
+
 
 if __name__ == "__main__":
     unittest.main()
