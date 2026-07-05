@@ -14,3 +14,6 @@ dependencies = [
     "torch>=2.12.0,<3.0.0",
     "zstandard>=0.25.0,<1.0.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["v2/tests"]

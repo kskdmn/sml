@@ -35,10 +35,10 @@ class TestSMLConfig:
         assert 3 == config.pad_token_id
         assert 0 == config.head_dim % 2
         assert 1024 == config.original_max_position_embeddings
-        assert 2.0 == config.rope_scaling_factor
+        assert 4.0 == config.rope_scaling_factor
         assert 32.0 == config.yarn_beta_fast
         assert 1.0 == config.yarn_beta_slow
-        assert 2048 == config.effective_max_position_embeddings
+        assert 4096 == config.effective_max_position_embeddings
         assert not config.gradient_checkpointing
 
     def test_invalid_attention_shape_is_rejected(self):

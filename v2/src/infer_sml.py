@@ -11,9 +11,10 @@ One-shot CLI generation accepts decoding flags documented on
 
 ``--serve`` exposes a vLLM-style API at ``/v1/models``, ``/v1/completions``,
 and ``/v1/chat/completions``. Streaming is not implemented. Chat message
-``content`` must be a string. Role markers are plain text labels, not special
-tokens; see ``format_chat_messages``. ``max_tokens`` maps to ``max_new_tokens``.
-Token usage is a whitespace-split estimate, not tokenizer-exact accounting.
+``content`` must be a string. System/user/assistant role markers use the
+conversation tokens reserved by tokenizer training; see ``format_chat_messages``.
+``max_tokens`` maps to ``max_new_tokens``. Token usage is a whitespace-split
+estimate, not tokenizer-exact accounting.
 """
 
 from __future__ import annotations
@@ -32,11 +33,16 @@ from torch.serialization import safe_globals
 
 from config import OUTPUT_DIR, SUCCESS_RETURN_CODE, TOKENIZER_MODEL_PATH, resolve_path
 from sml import GenerationConfig, SMLConfig, SMLLanguageModel
+from tokenizer import CONVERSATION_SPECIAL_TOKENS
 from train_sml import load_tokenizer, resolve_device
 
 
 DEFAULT_CHECKPOINT_PATH = OUTPUT_DIR / "sml.pt"
 DEFAULT_MODEL_NAME = "sml"
+CONVERSATION_ROLE_NAMES = ("system", "user", "assistant")
+CONVERSATION_ROLE_TOKENS = dict(
+    zip(CONVERSATION_ROLE_NAMES, CONVERSATION_SPECIAL_TOKENS, strict=True)
+)
 
 
 class InferenceTokenizer(Protocol):
@@ -273,18 +279,19 @@ def create_usage(prompt: str, completion: str) -> dict[str, int]:
 
 def format_chat_messages(messages: Sequence[Mapping[str, Any]]) -> str:
     """
-    Flatten role/content pairs into a deterministic transcript and append an assistant
-    cue when the client has not already provided one.
+    Flatten role/content pairs into a deterministic transcript and append an
+    assistant cue when the client has not already provided one.
 
     Example output::
 
-        system: Be concise.
-        user: Explain SML in one sentence.
-        assistant:
+        <|system|> Be concise.
+        <|user|> Explain SML in one sentence.
+        <|assistant|>
 
-    ``system``, ``user``, and ``assistant`` are encoded as ordinary text. The only
-    special token added for inference is BOS at the start of the whole prompt
-    (see ``encode_prompt``).
+    ``system``, ``user``, and ``assistant`` use the reserved conversation
+    special tokens. Nonstandard roles keep the previous plain-label fallback.
+    BOS is still added separately at the start of the whole prompt (see
+    ``encode_prompt``).
     """
     if not messages:
         raise ValueError("messages must contain at least one message")
@@ -297,10 +304,16 @@ def format_chat_messages(messages: Sequence[Mapping[str, Any]]) -> str:
             raise ValueError("each message must include a non-empty role")
         if not isinstance(content, str):
             raise ValueError("SML chat completions currently support string content only")
-        lines.append(f"{role}: {content}")
+        role_token = CONVERSATION_ROLE_TOKENS.get(role)
+        if role_token is None:
+            lines.append(f"{role}: {content}")
+        elif content:
+            lines.append(f"{role_token} {content}")
+        else:
+            lines.append(role_token)
 
     if messages[-1].get("role") != "assistant":
-        lines.append("assistant:")
+        lines.append(CONVERSATION_ROLE_TOKENS["assistant"])
     return "\n".join(lines)
 
 

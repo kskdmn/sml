@@ -221,6 +221,27 @@ class TestTrainTokenizer:
 
         assert True is train.call_args.kwargs.get('byte_fallback')
 
+    def test_train_tokenizer_reserves_conversation_special_tokens(self, monkeypatch):
+        train_tokenizer = load_script()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            input_path = root / "sample-0000.jsonl.zst"
+            write_zst_rows(
+                input_path,
+                [{"text": "a" * train_tokenizer.tokenizer.MIN_TEXT_LENGTH}],
+            )
+
+            train = Spy()
+            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer, "OUTPUT_DIR", root / "output")
+            monkeypatch.setattr(train_tokenizer.spm.SentencePieceTrainer, "train", train)
+            train_tokenizer.train_tokenizer()
+
+        assert list(train_tokenizer.tokenizer.CONVERSATION_SPECIAL_TOKENS) == (
+            train.call_args.kwargs.get('user_defined_symbols')
+        )
+
     def test_train_tokenizer_omits_max_sentence_length_when_unset(self, monkeypatch):
         train_tokenizer = load_script()
 

@@ -90,6 +90,7 @@ def train_tokenizer() -> TrainingResult:
         bos_id=BOS_ID,
         eos_id=EOS_ID,
         pad_id=PAD_ID,
+        user_defined_symbols=list(tokenizer.CONVERSATION_SPECIAL_TOKENS),
     )
     if MAX_SENTENCE_LENGTH is not None:
         trainer_kwargs["max_sentence_length"] = MAX_SENTENCE_LENGTH

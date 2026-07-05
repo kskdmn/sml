@@ -23,6 +23,11 @@ NULL_CHARACTER = "\x00"
 FIRST_LINE_NUMBER = 1
 NO_ROWS = 0
 ROW_INCREMENT = 1
+CONVERSATION_SPECIAL_TOKENS = (
+    "<|system|>",
+    "<|user|>",
+    "<|assistant|>",
+)
 
 WHITESPACE_PATTERN = re.compile(r"\s+")
 

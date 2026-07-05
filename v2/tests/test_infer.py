@@ -111,6 +111,7 @@ class TestInferenceInterface:
 
     def test_load_model_maps_legacy_max_position_embeddings_config(self):
         import infer_sml
+        from sml import SMLConfig
         from sml import SMLLanguageModel
 
         config = self.tiny_config()
@@ -134,7 +135,7 @@ class TestInferenceInterface:
             loaded = infer_sml.load_model(checkpoint_path, torch.device("cpu"))
 
         assert config.original_max_position_embeddings == loaded.config.original_max_position_embeddings
-        assert 2.0 == loaded.config.rope_scaling_factor
+        assert SMLConfig().rope_scaling_factor == loaded.config.rope_scaling_factor
 
     def test_generate_text_omits_prompt_by_default(self, monkeypatch):
         import infer_sml
@@ -210,9 +211,11 @@ class TestInferenceInterface:
 
     def test_create_chat_completion_response_formats_messages(self, monkeypatch):
         import infer_sml
+        import tokenizer
 
         generate_text = Spy(return_value="6")
         monkeypatch.setattr(infer_sml, "generate_text", generate_text)
+        system_token, user_token, assistant_token = tokenizer.CONVERSATION_SPECIAL_TOKENS
 
         response = infer_sml.create_chat_completion_response(
             {
@@ -226,7 +229,7 @@ class TestInferenceInterface:
         )
 
         generate_text.assert_called_once_with(
-            prompt="system: be terse\nuser: 4 5\nassistant:",
+            prompt=f"{system_token} be terse\n{user_token} 4 5\n{assistant_token}",
             max_new_tokens=3,
             include_prompt=False,
         )
@@ -246,9 +249,11 @@ class TestInferenceInterface:
 
     def test_route_openai_request_dispatches_chat_completions(self, monkeypatch):
         import infer_sml
+        import tokenizer
 
         generate_text = Spy(return_value="6")
         monkeypatch.setattr(infer_sml, "generate_text", generate_text)
+        _system_token, user_token, assistant_token = tokenizer.CONVERSATION_SPECIAL_TOKENS
 
         status_code, response = infer_sml.route_openai_request(
             "POST",
@@ -262,7 +267,7 @@ class TestInferenceInterface:
 
         assert 200 == status_code
         generate_text.assert_called_once_with(
-            prompt="user: 4 5\nassistant:",
+            prompt=f"{user_token} 4 5\n{assistant_token}",
             max_new_tokens=2,
             include_prompt=False,
         )
