@@ -75,6 +75,7 @@ def apply_lora(model: SMLLanguageModel, config: LoRAConfig) -> SMLLanguageModel:
     """
     Replace matching linear projections with ``LoRALinear`` wrappers in place.
     """
+    target_modules: list[tuple[str, nn.Linear]] = []
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
@@ -83,6 +84,15 @@ def apply_lora(model: SMLLanguageModel, config: LoRAConfig) -> SMLLanguageModel:
         if short_name not in config.target_modules:
             continue
 
+        target_modules.append((name, module))
+
+    if not target_modules:
+        return model
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    for name, module in target_modules:
         parent_name, child_name = name.rsplit(".", 1)
         parent = model.get_submodule(parent_name)
         setattr(

@@ -60,6 +60,21 @@ class LoRATest(unittest.TestCase):
             )
         )
 
+    def test_apply_lora_leaves_only_adapter_parameters_trainable(self):
+        from lora import apply_lora, lora_parameters
+        from sml import SMLLanguageModel
+
+        config, lora_config = self.tiny_config()
+        model = SMLLanguageModel(config)
+
+        apply_lora(model, lora_config)
+
+        adapter_parameter_ids = {id(parameter) for parameter in lora_parameters(model)}
+        trainable_parameter_ids = {
+            id(parameter) for parameter in model.parameters() if parameter.requires_grad
+        }
+        self.assertEqual(adapter_parameter_ids, trainable_parameter_ids)
+
     def test_lora_forward_changes_output(self):
         from lora import LoRALinear
 
