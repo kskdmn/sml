@@ -156,10 +156,6 @@ def tree_scale(tree: dict, scale: float | mx.array) -> dict:
     return tree_map(lambda value: value * scale, tree)
 
 
-def zero_like_tree(tree: dict) -> dict:
-    return tree_map(mx.zeros_like, tree)
-
-
 def global_grad_norm(grads: dict) -> mx.array:
     total = mx.array(0.0)
     for _, grad in tree_flatten(grads):

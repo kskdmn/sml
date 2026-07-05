@@ -2,8 +2,8 @@
 Convert JSONL stored as .json.gz to .jsonl.zst.
 
 Usage:
-    uv run python scripts/convert_jsonl_gz_to_zst.py path/to/file.json.gz
-    uv run python scripts/convert_jsonl_gz_to_zst.py path/to/directory
+    uv run python common/scripts/convert_jsonl_gz_to_zst.py path/to/file.json.gz
+    uv run python common/scripts/convert_jsonl_gz_to_zst.py path/to/directory
 """
 
 import argparse

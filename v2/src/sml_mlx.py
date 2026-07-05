@@ -9,10 +9,8 @@ from mlx.utils import tree_flatten
 
 from sml import GenerationConfig
 from sml import SMLConfig
-from sml import estimate_model_size
 from sml import resolve_yarn_attention_factor
 from sml import yarn_find_correction_range
-from sml import yarn_get_mscale
 
 
 @dataclass(slots=True)
@@ -323,8 +321,6 @@ class GroupedQueryAttention(nn.Module):
         self.num_q_heads = config.num_q_heads
         self.num_kv_heads = config.num_kv_heads
         self.head_dim = config.head_dim
-        self.num_groups = self.num_q_heads // self.num_kv_heads
-        self.attention_dropout = config.attention_dropout
         self.q_proj = nn.Linear(
             config.hidden_size,
             config.num_q_heads * self.head_dim,
@@ -347,7 +343,6 @@ class GroupedQueryAttention(nn.Module):
         )
         for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
             _init_linear(linear, config.initializer_range)
-        self.attn_dropout = nn.Dropout(config.attention_dropout)
         self.rope = RotaryEmbedding(
             dim=self.head_dim,
             original_max_position_embeddings=config.original_max_position_embeddings,
@@ -361,15 +356,6 @@ class GroupedQueryAttention(nn.Module):
             yarn_mscale_all_dim=config.yarn_mscale_all_dim,
             yarn_truncate=config.yarn_truncate,
         )
-
-    def repeat_kv(self, x: mx.array) -> mx.array:
-        batch_size, kv_heads, seq_len, head_dim = x.shape
-        x = mx.expand_dims(x, axis=2)
-        x = mx.broadcast_to(
-            x,
-            (batch_size, kv_heads, self.num_groups, seq_len, head_dim),
-        )
-        return x.reshape((batch_size, self.num_q_heads, seq_len, head_dim))
 
     def __call__(
         self,
@@ -395,38 +381,18 @@ class GroupedQueryAttention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update(self.layer_idx, k, v)
 
-        if self.training and self.attention_dropout > 0.0:
-            output = self._attention_with_dropout(q, k, v, is_causal=past_seq_len == 0)
-        else:
-            output = mx.fast.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                scale=1.0 / math.sqrt(self.head_dim),
-                mask="causal" if past_seq_len == 0 else None,
-            )
+        # MLX fast attention does not expose attention-dropout, so the MLX
+        # model ignores config.attention_dropout to keep the fused GQA path.
+        output = mx.fast.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=1.0 / math.sqrt(self.head_dim),
+            mask="causal" if past_seq_len == 0 else None,
+        )
         output = mx.swapaxes(output, 1, 2)
         output = output.reshape((batch_size, seq_len, self.hidden_size))
         return self.o_proj(output)
-
-    def _attention_with_dropout(
-        self,
-        q: mx.array,
-        k: mx.array,
-        v: mx.array,
-        *,
-        is_causal: bool,
-    ) -> mx.array:
-        k = self.repeat_kv(k)
-        v = self.repeat_kv(v)
-        scores = (q @ mx.swapaxes(k, -1, -2)) / math.sqrt(self.head_dim)
-        if is_causal:
-            seq_len = q.shape[2]
-            mask = mx.triu(mx.ones((seq_len, seq_len), dtype=mx.bool_), k=1)
-            scores = mx.where(mask, -math.inf, scores)
-        weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(q.dtype)
-        weights = self.attn_dropout(weights)
-        return weights @ v
 
 
 class SwiGLUFeedForward(nn.Module):
