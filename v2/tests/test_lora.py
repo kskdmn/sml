@@ -1,6 +1,7 @@
 import sys
-import unittest
 from pathlib import Path
+
+import pytest
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"
@@ -15,8 +16,8 @@ except ImportError:  # pragma: no cover - exercised only before torch is install
     nn = None
 
 
-@unittest.skipIf(torch is None, "torch is not installed")
-class LoRATest(unittest.TestCase):
+@pytest.mark.skipif(torch is None, reason="torch is not installed")
+class TestLoRA:
     def tiny_config(self):
         from sml_config import LoRAConfig, SMLConfig
 
@@ -51,14 +52,9 @@ class LoRATest(unittest.TestCase):
         apply_lora(model, lora_config)
         trainable = lora_parameters(model)
 
-        self.assertEqual(2, len(trainable))
-        self.assertFalse(model.layers[0].self_attn.q_proj.linear.weight.requires_grad)
-        self.assertTrue(
-            torch.equal(
-                original_q_weight,
-                model.layers[0].self_attn.q_proj.linear.weight.detach(),
-            )
-        )
+        assert 2 == len(trainable)
+        assert not model.layers[0].self_attn.q_proj.linear.weight.requires_grad
+        assert torch.equal(original_q_weight, model.layers[0].self_attn.q_proj.linear.weight.detach())
 
     def test_apply_lora_leaves_only_adapter_parameters_trainable(self):
         from lora import apply_lora, lora_parameters
@@ -73,7 +69,7 @@ class LoRATest(unittest.TestCase):
         trainable_parameter_ids = {
             id(parameter) for parameter in model.parameters() if parameter.requires_grad
         }
-        self.assertEqual(adapter_parameter_ids, trainable_parameter_ids)
+        assert adapter_parameter_ids == trainable_parameter_ids
 
     def test_apply_lora_places_adapters_on_base_device(self):
         from lora import apply_lora
@@ -84,8 +80,8 @@ class LoRATest(unittest.TestCase):
         apply_lora(model, lora_config)
 
         wrapped = model.layers[0].self_attn.q_proj
-        self.assertEqual(wrapped.lora_A.device, wrapped.linear.weight.device)
-        self.assertEqual(wrapped.lora_B.device, wrapped.linear.weight.device)
+        assert wrapped.lora_A.device == wrapped.linear.weight.device
+        assert wrapped.lora_B.device == wrapped.linear.weight.device
 
     def test_lora_forward_changes_output(self):
         from lora import LoRALinear
@@ -100,7 +96,7 @@ class LoRATest(unittest.TestCase):
         base_output = linear(x)
         lora_output = lora(x)
 
-        self.assertFalse(torch.allclose(base_output, lora_output))
+        assert not torch.allclose(base_output, lora_output)
 
     def test_lora_forward_matches_activation_dtype(self):
         from lora import LoRALinear
@@ -115,7 +111,7 @@ class LoRATest(unittest.TestCase):
         with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
             output = lora(x)
 
-        self.assertEqual(output.dtype, torch.bfloat16)
+        assert output.dtype == torch.bfloat16
 
     def test_merge_lora_updates_base_linear(self):
         from lora import LoRALinear, merge_lora
@@ -140,9 +136,9 @@ class LoRATest(unittest.TestCase):
         merge_lora(model)
         after = model.layers[0].self_attn(x, kv_cache=None).detach()
 
-        self.assertIsInstance(model.layers[0].self_attn.q_proj, nn.Linear)
-        self.assertTrue(torch.allclose(before, after, atol=1e-5, rtol=1e-5))
-        self.assertGreater(expected_delta.abs().sum().item(), 0.0)
+        assert isinstance(model.layers[0].self_attn.q_proj, nn.Linear)
+        assert torch.allclose(before, after, atol=1e-05, rtol=1e-05)
+        assert expected_delta.abs().sum().item() > 0.0
 
     def test_lora_state_dict_round_trip(self):
         from lora import apply_lora, load_lora_state_dict, lora_state_dict
@@ -160,19 +156,5 @@ class LoRATest(unittest.TestCase):
 
         load_lora_state_dict(target, lora_state_dict(source))
 
-        self.assertTrue(
-            torch.equal(
-                source.layers[0].self_attn.q_proj.lora_A,
-                target.layers[0].self_attn.q_proj.lora_A,
-            )
-        )
-        self.assertTrue(
-            torch.equal(
-                source.layers[0].self_attn.q_proj.lora_B,
-                target.layers[0].self_attn.q_proj.lora_B,
-            )
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert torch.equal(source.layers[0].self_attn.q_proj.lora_A, target.layers[0].self_attn.q_proj.lora_A)
+        assert torch.equal(source.layers[0].self_attn.q_proj.lora_B, target.layers[0].self_attn.q_proj.lora_B)

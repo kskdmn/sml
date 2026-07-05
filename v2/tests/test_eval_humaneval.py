@@ -1,10 +1,10 @@
 import sys
-import unittest
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
+from helpers import Spy
+import pytest
 import torch
 
 
@@ -44,7 +44,7 @@ class FakeModel:
         return torch.cat((input_ids, continuation), dim=1)
 
 
-class HumanEvalAdapterTest(unittest.TestCase):
+class TestHumanEvalAdapter:
     def test_generate_until_caps_completion_and_applies_earliest_stop(self):
         import eval_humaneval
 
@@ -67,9 +67,9 @@ class HumanEvalAdapterTest(unittest.TestCase):
 
         result = lm.generate_until([request])
 
-        self.assertEqual(["6"], result)
-        self.assertEqual(3, model.max_new_tokens)
-        self.assertEqual(2, model.eos_token_id)
+        assert ['6'] == result
+        assert 3 == model.max_new_tokens
+        assert 2 == model.eos_token_id
 
     def test_generate_until_rejects_prompt_beyond_checkpoint_context(self):
         import eval_humaneval
@@ -83,7 +83,7 @@ class HumanEvalAdapterTest(unittest.TestCase):
             args=("4 5 6", {"max_gen_toks": 1, "until": [], "do_sample": False})
         )
 
-        with self.assertRaisesRegex(ValueError, "HumanEval prompt"):
+        with pytest.raises(ValueError, match='HumanEval prompt'):
             lm.generate_until([request])
 
     def test_generate_until_rejects_sampling(self):
@@ -98,31 +98,29 @@ class HumanEvalAdapterTest(unittest.TestCase):
             args=("4", {"max_gen_toks": 1, "until": [], "do_sample": True})
         )
 
-        with self.assertRaisesRegex(ValueError, "greedy generation"):
+        with pytest.raises(ValueError, match='greedy generation'):
             lm.generate_until([request])
 
-    def test_evaluate_humaneval_confirms_unsafe_code_execution(self):
+    def test_evaluate_humaneval_confirms_unsafe_code_execution(self, monkeypatch):
         import eval_humaneval
 
-        lm = mock.Mock()
+        lm = object()
         expected = {"results": {"humaneval": {"pass@1,none": 0.0}}}
 
         def evaluate(**kwargs):
-            self.assertEqual("1", os.environ.get("HF_ALLOW_CODE_EVAL"))
+            assert '1' == os.environ.get('HF_ALLOW_CODE_EVAL')
             return expected
 
-        with mock.patch.object(
-            eval_humaneval,
-            "evaluate_lm",
-            side_effect=evaluate,
-        ) as evaluate_lm:
-            result = eval_humaneval.evaluate_humaneval(
-                lm=lm,
-                checkpoint_path=Path("v1/output/sml.pt"),
-                limit=2,
-            )
+        evaluate_lm = Spy(side_effect=evaluate)
+        monkeypatch.setattr(eval_humaneval, "evaluate_lm", evaluate_lm)
 
-        self.assertIs(expected, result)
+        result = eval_humaneval.evaluate_humaneval(
+            lm=lm,
+            checkpoint_path=Path("v1/output/sml.pt"),
+            limit=2,
+        )
+
+        assert expected is result
         evaluate_lm.assert_called_once_with(
             lm=lm,
             checkpoint_path=Path("v1/output/sml.pt"),
@@ -131,36 +129,28 @@ class HumanEvalAdapterTest(unittest.TestCase):
             confirm_run_unsafe_code=True,
         )
 
-    def test_main_loads_default_checkpoint_and_runs_limited_evaluation(self):
+    def test_main_loads_default_checkpoint_and_runs_limited_evaluation(self, monkeypatch):
         import eval_humaneval
 
-        lm = mock.Mock()
+        lm = object()
         results = {"results": {"humaneval": {"pass@1,none": 0.0}}}
-        with (
-            mock.patch.object(
-                eval_humaneval.SMLHumanEvalLM,
-                "from_checkpoint",
-                return_value=lm,
-            ) as from_checkpoint,
-            mock.patch.object(
-                eval_humaneval,
-                "evaluate_humaneval",
-                return_value=results,
-            ) as evaluate_humaneval,
-            mock.patch.object(
-                eval_humaneval,
-                "write_results",
-            ) as write_results,
-            mock.patch.object(
-                eval_humaneval,
-                "make_table",
-                return_value="table",
-            ),
-            mock.patch("builtins.print") as print_output,
-        ):
-            return_code = eval_humaneval.main(["--device", "cpu", "--limit", "2"])
+        from_checkpoint = Spy(return_value=lm)
+        evaluate_humaneval = Spy(return_value=results)
+        write_results = Spy()
+        print_output = Spy()
+        monkeypatch.setattr(
+            eval_humaneval.SMLHumanEvalLM,
+            "from_checkpoint",
+            from_checkpoint,
+        )
+        monkeypatch.setattr(eval_humaneval, "evaluate_humaneval", evaluate_humaneval)
+        monkeypatch.setattr(eval_humaneval, "write_results", write_results)
+        monkeypatch.setattr(eval_humaneval, "make_table", Spy(return_value="table"))
+        monkeypatch.setattr("builtins.print", print_output)
 
-        self.assertEqual(0, return_code)
+        return_code = eval_humaneval.main(["--device", "cpu", "--limit", "2"])
+
+        assert 0 == return_code
         from_checkpoint.assert_called_once_with(
             checkpoint_path=eval_humaneval.DEFAULT_CHECKPOINT_PATH,
             tokenizer_model_path=eval_humaneval.TOKENIZER_MODEL_PATH,
@@ -176,7 +166,3 @@ class HumanEvalAdapterTest(unittest.TestCase):
             results,
         )
         print_output.assert_called_once_with("table")
-
-
-if __name__ == "__main__":
-    unittest.main()

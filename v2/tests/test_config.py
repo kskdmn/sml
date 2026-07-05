@@ -1,5 +1,4 @@
 import importlib.util
-import unittest
 from pathlib import Path
 
 
@@ -15,18 +14,11 @@ def load_config():
     return module
 
 
-class ConfigTest(unittest.TestCase):
+class TestConfig:
     def test_common_constants_are_defined_from_current_version(self):
         config = load_config()
 
-        self.assertEqual(0, config.SUCCESS_RETURN_CODE)
-        self.assertEqual(PROJECT_DIR, config.PROJECT_DIR)
-        self.assertEqual(PROJECT_DIR / "output", config.OUTPUT_DIR)
-        self.assertEqual(
-            config.OUTPUT_DIR / "bpe_tokenizer.model",
-            config.TOKENIZER_MODEL_PATH,
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert 0 == config.SUCCESS_RETURN_CODE
+        assert PROJECT_DIR == config.PROJECT_DIR
+        assert PROJECT_DIR / 'output' == config.OUTPUT_DIR
+        assert config.OUTPUT_DIR / 'bpe_tokenizer.model' == config.TOKENIZER_MODEL_PATH

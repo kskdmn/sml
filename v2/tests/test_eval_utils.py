@@ -1,11 +1,11 @@
 import json
 import sys
 import tempfile
-import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 
+from helpers import Spy
+import pytest
 import torch
 
 
@@ -74,7 +74,7 @@ class FakeModel:
         return torch.cat((input_ids, continuation), dim=1)
 
 
-class EvalUtilsTest(unittest.TestCase):
+class TestEvalUtils:
     def test_loglikelihood_scores_only_continuation_tokens(self):
         import eval_utils
 
@@ -88,11 +88,11 @@ class EvalUtilsTest(unittest.TestCase):
 
         result = lm.loglikelihood([request])
 
-        self.assertEqual(1, len(result))
+        assert 1 == len(result)
         logprob, is_greedy = result[0]
-        self.assertGreater(logprob, -0.001)
-        self.assertTrue(is_greedy)
-        self.assertEqual([[[1, 4, 5, 6, 7]]], model.calls)
+        assert logprob > -0.001
+        assert is_greedy
+        assert [[[1, 4, 5, 6, 7]]] == model.calls
 
     def test_loglikelihood_tokenizes_context_and_continuation_together(self):
         import eval_utils
@@ -107,9 +107,9 @@ class EvalUtilsTest(unittest.TestCase):
 
         result = lm.loglikelihood([request])
 
-        self.assertGreater(result[0][0], -0.001)
-        self.assertTrue(result[0][1])
-        self.assertEqual([[[1, 10, 20]]], model.calls)
+        assert result[0][0] > -0.001
+        assert result[0][1]
+        assert [[[1, 10, 20]]] == model.calls
 
     def test_loglikelihood_rejects_sequences_beyond_checkpoint_context(self):
         import eval_utils
@@ -121,7 +121,7 @@ class EvalUtilsTest(unittest.TestCase):
         )
         request = SimpleNamespace(args=("4 5", " 6"))
 
-        with self.assertRaisesRegex(ValueError, "prompt plus continuation"):
+        with pytest.raises(ValueError, match='prompt plus continuation'):
             lm.loglikelihood([request])
 
     def test_generate_until_caps_completion_and_applies_earliest_stop(self):
@@ -146,28 +146,26 @@ class EvalUtilsTest(unittest.TestCase):
 
         result = lm.generate_until([request])
 
-        self.assertEqual(["6"], result)
-        self.assertEqual(3, model.max_new_tokens)
-        self.assertEqual(2, model.eos_token_id)
+        assert ['6'] == result
+        assert 3 == model.max_new_tokens
+        assert 2 == model.eos_token_id
 
-    def test_evaluate_lm_passes_common_lm_eval_options(self):
+    def test_evaluate_lm_passes_common_lm_eval_options(self, monkeypatch):
         import eval_utils
 
-        lm = mock.Mock()
+        lm = object()
         expected = {"results": {"hellaswag": {"acc,none": 0.0}}}
-        with mock.patch.object(
-            eval_utils,
-            "simple_evaluate",
-            return_value=expected,
-        ) as simple_evaluate:
-            result = eval_utils.evaluate_lm(
-                lm=lm,
-                checkpoint_path=Path("v1/output/sml.pt"),
-                tasks=["hellaswag"],
-                limit=2,
-            )
+        simple_evaluate = Spy(return_value=expected)
+        monkeypatch.setattr(eval_utils, "simple_evaluate", simple_evaluate)
 
-        self.assertIs(expected, result)
+        result = eval_utils.evaluate_lm(
+            lm=lm,
+            checkpoint_path=Path("v1/output/sml.pt"),
+            tasks=["hellaswag"],
+            limit=2,
+        )
+
+        assert expected is result
         simple_evaluate.assert_called_once_with(
             model=lm,
             model_args={"path": "v1/output/sml.pt"},
@@ -191,8 +189,4 @@ class EvalUtilsTest(unittest.TestCase):
 
             saved = json.loads(output_path.read_text(encoding="utf-8"))
 
-        self.assertEqual("v1/output/sml.pt", saved["checkpoint"])
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert 'v1/output/sml.pt' == saved['checkpoint']

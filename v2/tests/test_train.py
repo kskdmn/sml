@@ -2,11 +2,11 @@ import json
 import inspect
 import sys
 import tempfile
-import unittest
-from unittest import mock
 from datetime import datetime
 from pathlib import Path
 
+from helpers import Spy
+import pytest
 import zstandard as zstd
 
 
@@ -39,7 +39,12 @@ class FakeTokenizer:
         return 16
 
 
-class TrainDataTest(unittest.TestCase):
+class CpuMovingValue:
+    def __init__(self, cpu_value):
+        self.cpu = Spy(return_value=cpu_value)
+
+
+class TestTrainData:
     def tiny_config(self):
         from sml_config import SMLConfig
 
@@ -65,37 +70,32 @@ class TrainDataTest(unittest.TestCase):
 
         args = train_sml.parse_args([])
 
-        self.assertFalse(args.resume)
+        assert not args.resume
 
     def test_parse_args_enables_resume(self):
         import train_sml
 
         args = train_sml.parse_args(["--resume"])
 
-        self.assertTrue(args.resume)
+        assert args.resume
 
-    def test_main_passes_resume_flag_to_training_config(self):
+    def test_main_passes_resume_flag_to_training_config(self, monkeypatch):
         import train_sml
 
-        with mock.patch.object(
-            train_sml,
-            "train_model",
-            return_value=Path("/tmp/sml.pt"),
-        ) as train_model:
-            return_code = train_sml.main(["--resume"])
+        train_model = Spy(return_value=Path("/tmp/sml.pt"))
+        monkeypatch.setattr(train_sml, "train_model", train_model)
 
-        self.assertEqual(train_sml.SUCCESS_RETURN_CODE, return_code)
-        self.assertTrue(train_model.call_args.kwargs["resume_from_checkpoint"])
+        return_code = train_sml.main(["--resume"])
+
+        assert train_sml.SUCCESS_RETURN_CODE == return_code
+        assert train_model.call_args.kwargs['resume_from_checkpoint']
 
     def test_train_model_accepts_config_objects_and_resume_flag(self):
         import train_sml
 
         parameters = inspect.signature(train_sml.train_model).parameters
 
-        self.assertEqual(
-            ["training_config", "model_config", "resume_from_checkpoint"],
-            list(parameters),
-        )
+        assert ['training_config', 'model_config', 'resume_from_checkpoint'] == list(parameters)
 
     def test_discover_input_files_uses_supplied_regex_and_sorts_matches(self):
         import train_sml
@@ -110,10 +110,7 @@ class TrainDataTest(unittest.TestCase):
 
             files = train_sml.discover_input_files(root, r".*-000[0-9]\.jsonl\.zst\Z")
 
-        self.assertEqual(
-            ["pile-0000.jsonl.zst", "pile-0002.jsonl.zst"],
-            [path.name for path in files],
-        )
+        assert ['pile-0000.jsonl.zst', 'pile-0002.jsonl.zst'] == [path.name for path in files]
 
     def test_shuffle_input_files_uses_seeded_deterministic_order(self):
         import train_sml
@@ -131,16 +128,8 @@ class TrainDataTest(unittest.TestCase):
         first_shuffle = train_sml.shuffle_input_files(files, seed=42)
         second_shuffle = train_sml.shuffle_input_files(files, seed=42)
 
-        self.assertEqual(
-            [
-                "pile-0002.jsonl.zst",
-                "pile-0001.jsonl.zst",
-                "pile-0003.jsonl.zst",
-                "pile-0000.jsonl.zst",
-            ],
-            [path.name for path in first_shuffle],
-        )
-        self.assertEqual(first_shuffle, second_shuffle)
+        assert ['pile-0002.jsonl.zst', 'pile-0001.jsonl.zst', 'pile-0003.jsonl.zst', 'pile-0000.jsonl.zst'] == [path.name for path in first_shuffle]
+        assert first_shuffle == second_shuffle
 
     def test_shuffle_input_files_uses_seed_to_change_order(self):
         import train_sml
@@ -155,15 +144,7 @@ class TrainDataTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(
-            [
-                "pile-0002.jsonl.zst",
-                "pile-0000.jsonl.zst",
-                "pile-0001.jsonl.zst",
-                "pile-0003.jsonl.zst",
-            ],
-            [path.name for path in train_sml.shuffle_input_files(files, seed=99)],
-        )
+        assert ['pile-0002.jsonl.zst', 'pile-0000.jsonl.zst', 'pile-0001.jsonl.zst', 'pile-0003.jsonl.zst'] == [path.name for path in train_sml.shuffle_input_files(files, seed=99)]
 
     def test_shuffle_input_files_returns_tuple_without_mutating_input(self):
         import train_sml
@@ -178,20 +159,23 @@ class TrainDataTest(unittest.TestCase):
 
         shuffled = train_sml.shuffle_input_files(files, seed=42)
 
-        self.assertIsInstance(shuffled, tuple)
-        self.assertEqual(original_names, [path.name for path in files])
+        assert isinstance(shuffled, tuple)
+        assert original_names == [path.name for path in files]
 
     def test_training_config_shuffles_input_files_by_default(self):
         from sml_config import TrainingConfig
 
-        self.assertIs(True, TrainingConfig().shuffle_input_files)
+        assert True is TrainingConfig().shuffle_input_files
 
     def test_training_config_does_not_store_resume_cli_state(self):
         from sml_config import TrainingConfig
 
-        self.assertFalse(hasattr(TrainingConfig(), "resume_from_checkpoint"))
+        assert not hasattr(TrainingConfig(), 'resume_from_checkpoint')
 
-    def test_train_model_shuffles_discovered_input_files_before_loading_tokenizer(self):
+    def test_train_model_shuffles_discovered_input_files_before_loading_tokenizer(
+        self,
+        monkeypatch,
+    ):
         import train_sml
         from sml_config import TrainingConfig
 
@@ -210,29 +194,24 @@ class TrainDataTest(unittest.TestCase):
                 seed=123,
             )
 
-            with (
-                mock.patch.object(
-                    train_sml,
-                    "discover_input_files",
-                    return_value=discovered,
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "shuffle_input_files",
-                    return_value=shuffled,
-                ) as shuffle,
-                mock.patch.object(
-                    train_sml,
-                    "load_tokenizer",
-                    side_effect=RuntimeError("stop after shuffle"),
-                ),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "stop after shuffle"):
-                    train_sml.train_model(training_config)
+            shuffle = Spy(return_value=shuffled)
+            monkeypatch.setattr(
+                train_sml,
+                "discover_input_files",
+                Spy(return_value=discovered),
+            )
+            monkeypatch.setattr(train_sml, "shuffle_input_files", shuffle)
+            monkeypatch.setattr(
+                train_sml,
+                "load_tokenizer",
+                Spy(side_effect=RuntimeError("stop after shuffle")),
+            )
+            with pytest.raises(RuntimeError, match='stop after shuffle'):
+                train_sml.train_model(training_config)
 
         shuffle.assert_called_once_with(discovered, seed=123)
 
-    def test_train_model_can_keep_discovered_input_file_order(self):
+    def test_train_model_can_keep_discovered_input_file_order(self, monkeypatch):
         import train_sml
         from sml_config import TrainingConfig
 
@@ -250,28 +229,29 @@ class TrainDataTest(unittest.TestCase):
                 seed=123,
             )
 
-            with (
-                mock.patch.object(
-                    train_sml,
-                    "discover_input_files",
-                    return_value=discovered,
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "shuffle_input_files",
-                    side_effect=AssertionError("shuffle should be skipped"),
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "load_tokenizer",
-                    side_effect=RuntimeError("stop after input order"),
-                ),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "stop after input order"):
-                    train_sml.train_model(training_config)
+            monkeypatch.setattr(
+                train_sml,
+                "discover_input_files",
+                Spy(return_value=discovered),
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "shuffle_input_files",
+                Spy(side_effect=AssertionError("shuffle should be skipped")),
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "load_tokenizer",
+                Spy(side_effect=RuntimeError("stop after input order")),
+            )
+            with pytest.raises(RuntimeError, match='stop after input order'):
+                train_sml.train_model(training_config)
 
-    @unittest.skipIf(torch is None, "torch is not installed")
-    def test_train_model_starts_fresh_without_resume_even_when_checkpoint_exists(self):
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
+    def test_train_model_starts_fresh_without_resume_even_when_checkpoint_exists(
+        self,
+        monkeypatch,
+    ):
         import train_sml
         from sml_config import TrainingConfig
 
@@ -287,36 +267,37 @@ class TrainDataTest(unittest.TestCase):
                 device="cpu",
             )
 
-            with (
-                mock.patch.object(
-                    train_sml,
-                    "discover_input_files",
-                    return_value=discovered,
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "load_tokenizer",
-                    return_value=FakeTokenizer(),
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "load_training_checkpoint",
-                    side_effect=AssertionError("checkpoint should not be loaded"),
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "build_dataloader",
-                    side_effect=RuntimeError("stop after dataloader"),
-                ),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "stop after dataloader"):
-                    train_sml.train_model(
-                        training_config,
-                        model_config=self.tiny_config(),
-                    )
+            monkeypatch.setattr(
+                train_sml,
+                "discover_input_files",
+                Spy(return_value=discovered),
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "load_tokenizer",
+                Spy(return_value=FakeTokenizer()),
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "load_training_checkpoint",
+                Spy(side_effect=AssertionError("checkpoint should not be loaded")),
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "build_dataloader",
+                Spy(side_effect=RuntimeError("stop after dataloader")),
+            )
+            with pytest.raises(RuntimeError, match='stop after dataloader'):
+                train_sml.train_model(
+                    training_config,
+                    model_config=self.tiny_config(),
+                )
 
-    @unittest.skipIf(torch is None, "torch is not installed")
-    def test_train_model_restarts_from_checkpoint_name_when_resume_is_enabled(self):
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
+    def test_train_model_restarts_from_checkpoint_name_when_resume_is_enabled(
+        self,
+        monkeypatch,
+    ):
         import train_sml
         from sml_config import TrainingConfig
 
@@ -332,41 +313,45 @@ class TrainDataTest(unittest.TestCase):
                 device="cpu",
             )
 
-            with (
-                mock.patch.object(
-                    train_sml,
-                    "discover_input_files",
-                    return_value=discovered,
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "load_tokenizer",
-                    return_value=FakeTokenizer(),
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "load_training_checkpoint",
-                    return_value=train_sml.TrainingResumeState(),
-                ) as load_training_checkpoint,
-                mock.patch.object(
-                    train_sml,
-                    "build_dataloader",
-                    side_effect=RuntimeError("stop after dataloader"),
-                ),
-            ):
-                with self.assertRaisesRegex(RuntimeError, "stop after dataloader"):
-                    train_sml.train_model(
-                        training_config,
-                        model_config=self.tiny_config(),
-                        resume_from_checkpoint=True,
-                    )
+            load_training_checkpoint = Spy(
+                return_value=train_sml.TrainingResumeState()
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "discover_input_files",
+                Spy(return_value=discovered),
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "load_tokenizer",
+                Spy(return_value=FakeTokenizer()),
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "load_training_checkpoint",
+                load_training_checkpoint,
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "build_dataloader",
+                Spy(side_effect=RuntimeError("stop after dataloader")),
+            )
+            with pytest.raises(RuntimeError, match='stop after dataloader'):
+                train_sml.train_model(
+                    training_config,
+                    model_config=self.tiny_config(),
+                    resume_from_checkpoint=True,
+                )
 
         load_training_checkpoint.assert_called_once()
         args = load_training_checkpoint.call_args.args
-        self.assertEqual(training_config.output_dir / "sml.pt", args[0])
+        assert training_config.output_dir / 'sml.pt' == args[0]
 
-    @unittest.skipIf(torch is None, "torch is not installed")
-    def test_train_model_uses_checkpoint_input_file_order_when_resume_is_enabled(self):
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
+    def test_train_model_uses_checkpoint_input_file_order_when_resume_is_enabled(
+        self,
+        monkeypatch,
+    ):
         import train_sml
         from sml_config import TrainingConfig
 
@@ -389,40 +374,39 @@ class TrainDataTest(unittest.TestCase):
                 device="cpu",
             )
 
-            with (
-                mock.patch.object(
-                    train_sml,
-                    "discover_input_files",
-                    return_value=discovered,
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "load_tokenizer",
-                    return_value=FakeTokenizer(),
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "load_training_checkpoint",
+            build_dataloader = Spy(
+                side_effect=RuntimeError("stop after dataloader")
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "discover_input_files",
+                Spy(return_value=discovered),
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "load_tokenizer",
+                Spy(return_value=FakeTokenizer()),
+            )
+            monkeypatch.setattr(
+                train_sml,
+                "load_training_checkpoint",
+                Spy(
                     return_value=train_sml.TrainingResumeState(
                         step=0,
                         input_files=checkpoint_order,
                         data_state=train_sml.TrainingDataState(),
-                    ),
-                ),
-                mock.patch.object(
-                    train_sml,
-                    "build_dataloader",
-                    side_effect=RuntimeError("stop after dataloader"),
-                ) as build_dataloader,
-            ):
-                with self.assertRaisesRegex(RuntimeError, "stop after dataloader"):
-                    train_sml.train_model(
-                        training_config,
-                        model_config=self.tiny_config(),
-                        resume_from_checkpoint=True,
                     )
+                ),
+            )
+            monkeypatch.setattr(train_sml, "build_dataloader", build_dataloader)
+            with pytest.raises(RuntimeError, match='stop after dataloader'):
+                train_sml.train_model(
+                    training_config,
+                    model_config=self.tiny_config(),
+                    resume_from_checkpoint=True,
+                )
 
-        self.assertEqual(checkpoint_order, build_dataloader.call_args.kwargs["input_files"])
+        assert checkpoint_order == build_dataloader.call_args.kwargs['input_files']
 
     def test_count_resume_batches_uses_completed_optimizer_steps(self):
         import train_sml
@@ -430,13 +414,7 @@ class TrainDataTest(unittest.TestCase):
 
         training_config = TrainingConfig(gradient_accumulation_steps=8)
 
-        self.assertEqual(
-            56,
-            train_sml.count_resume_batches(
-                global_step=7,
-                training_config=training_config,
-            ),
-        )
+        assert 56 == train_sml.count_resume_batches(global_step=7, training_config=training_config)
 
     def test_iter_unseen_batches_skips_consumed_batches_across_dataloaders(self):
         import train_sml
@@ -446,9 +424,9 @@ class TrainDataTest(unittest.TestCase):
         first_epoch = list(train_sml.iter_unseen_batches(["a", "b"], progress))
         second_epoch = list(train_sml.iter_unseen_batches(["c", "d", "e"], progress))
 
-        self.assertEqual([], first_epoch)
-        self.assertEqual(["d", "e"], second_epoch)
-        self.assertEqual(0, progress.batches_to_skip)
+        assert [] == first_epoch
+        assert ['d', 'e'] == second_epoch
+        assert 0 == progress.batches_to_skip
 
     def test_iter_texts_resumes_after_training_data_state_line_number(self):
         import train_sml
@@ -476,8 +454,8 @@ class TrainDataTest(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(["c" * 100], texts)
-        self.assertEqual(3, data_state.line_number)
+        assert ['c' * 100] == texts
+        assert 3 == data_state.line_number
 
     def test_iter_texts_streams_zst_jsonl_rows_without_loading_all_files(self):
         import train_sml
@@ -493,9 +471,9 @@ class TrainDataTest(unittest.TestCase):
 
             iterator = train_sml.iter_texts([first, second], max_rows_per_file=2)
 
-            self.assertEqual("a" * 100, next(iterator))
-            self.assertEqual("b" * 100, next(iterator))
-            with self.assertRaises(StopIteration):
+            assert 'a' * 100 == next(iterator)
+            assert 'b' * 100 == next(iterator)
+            with pytest.raises(StopIteration):
                 next(iterator)
 
     def test_iter_texts_reads_all_rows_when_max_rows_per_file_is_none(self):
@@ -514,12 +492,12 @@ class TrainDataTest(unittest.TestCase):
 
             texts = list(train_sml.iter_texts([path], max_rows_per_file=None))
 
-        self.assertEqual(["a" * 100, "b" * 100, "c" * 100], texts)
+        assert ['a' * 100, 'b' * 100, 'c' * 100] == texts
 
     def test_step_limit_is_never_reached_when_max_steps_is_none(self):
         import train_sml
 
-        self.assertFalse(train_sml.is_step_limit_reached(global_step=10_000, max_steps=None))
+        assert not train_sml.is_step_limit_reached(global_step=10000, max_steps=None)
 
     def test_resolve_lr_total_steps_prefers_lr_total_steps(self):
         import train_sml
@@ -530,7 +508,7 @@ class TrainDataTest(unittest.TestCase):
             max_steps=1_000,
         )
 
-        self.assertEqual(5_000, train_sml.resolve_lr_total_steps(training_config))
+        assert 5000 == train_sml.resolve_lr_total_steps(training_config)
 
     def test_resolve_lr_total_steps_falls_back_to_max_steps(self):
         import train_sml
@@ -538,7 +516,7 @@ class TrainDataTest(unittest.TestCase):
 
         training_config = TrainingConfig(lr_total_steps=None, max_steps=1_000)
 
-        self.assertEqual(1_000, train_sml.resolve_lr_total_steps(training_config))
+        assert 1000 == train_sml.resolve_lr_total_steps(training_config)
 
     def test_resolve_lr_total_steps_is_none_without_lr_or_max_steps(self):
         import train_sml
@@ -546,9 +524,9 @@ class TrainDataTest(unittest.TestCase):
 
         training_config = TrainingConfig(lr_total_steps=None, max_steps=None)
 
-        self.assertIsNone(train_sml.resolve_lr_total_steps(training_config))
+        assert train_sml.resolve_lr_total_steps(training_config) is None
 
-    @unittest.skipIf(torch is None, "torch is not installed")
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
     def test_load_training_checkpoint_raises_when_checkpoint_is_absent(self):
         import train_sml
         from sml import SMLLanguageModel
@@ -559,7 +537,7 @@ class TrainDataTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             checkpoint_path = Path(tmp_dir) / "sml.pt"
-            with self.assertRaisesRegex(FileNotFoundError, "Checkpoint does not exist"):
+            with pytest.raises(FileNotFoundError, match='Checkpoint does not exist'):
                 train_sml.load_training_checkpoint(
                     checkpoint_path,
                     model,
@@ -568,7 +546,7 @@ class TrainDataTest(unittest.TestCase):
                     torch.device("cpu"),
                 )
 
-    @unittest.skipIf(torch is None, "torch is not installed")
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
     def test_save_and_load_training_checkpoint_restores_training_and_data_state(self):
         import train_sml
         from sml import SMLLanguageModel
@@ -583,7 +561,7 @@ class TrainDataTest(unittest.TestCase):
         input_ids = torch.tensor([[1, 4, 5]])
         labels = torch.tensor([[4, 5, 6]])
         loss = source_model(input_ids, labels=labels).loss
-        self.assertIsNotNone(loss)
+        assert loss is not None
         loss.backward()
         source_optimizer.step()
         source_scheduler.step()
@@ -627,25 +605,19 @@ class TrainDataTest(unittest.TestCase):
                 torch.device("cpu"),
             )
 
-        self.assertEqual(7, resume_state.step)
-        self.assertEqual(input_files, resume_state.input_files)
-        self.assertEqual(data_state, resume_state.data_state)
-        self.assertEqual(
-            source_scheduler.state_dict()["last_epoch"],
-            target_scheduler.state_dict()["last_epoch"],
-        )
-        self.assertEqual(
-            len(source_optimizer.state_dict()["state"]),
-            len(target_optimizer.state_dict()["state"]),
-        )
+        assert 7 == resume_state.step
+        assert input_files == resume_state.input_files
+        assert data_state == resume_state.data_state
+        assert source_scheduler.state_dict()['last_epoch'] == target_scheduler.state_dict()['last_epoch']
+        assert len(source_optimizer.state_dict()['state']) == len(target_optimizer.state_dict()['state'])
         for source_param, target_param in zip(
             source_model.parameters(),
             target_model.parameters(),
             strict=True,
         ):
-            self.assertTrue(torch.equal(source_param, target_param))
+            assert torch.equal(source_param, target_param)
 
-    @unittest.skipIf(torch is None, "torch is not installed")
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
     def test_save_and_load_training_checkpoint_restores_rng_state(self):
         import random
         import train_sml
@@ -695,20 +667,19 @@ class TrainDataTest(unittest.TestCase):
                     torch.device("cpu"),
                 )
 
-            self.assertEqual(expected_python_value, random.random())
-            self.assertTrue(torch.equal(expected_torch_values, torch.rand(3)))
+            assert expected_python_value == random.random()
+            assert torch.equal(expected_torch_values, torch.rand(3))
         finally:
             random.setstate(original_python_rng_state)
             torch.set_rng_state(original_torch_rng_state)
 
-    @unittest.skipIf(torch is None, "torch is not installed")
-    def test_restore_rng_state_moves_torch_cpu_rng_state_to_cpu(self):
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
+    def test_restore_rng_state_moves_torch_cpu_rng_state_to_cpu(self, monkeypatch):
         import random
         import train_sml
 
-        mapped_rng_state = mock.Mock()
-        cpu_rng_state = mock.Mock()
-        mapped_rng_state.cpu.return_value = cpu_rng_state
+        cpu_rng_state = object()
+        mapped_rng_state = CpuMovingValue(cpu_rng_state)
         checkpoint = {
             "python_rng_state": random.getstate(),
             "torch_rng_state": mapped_rng_state,
@@ -716,23 +687,22 @@ class TrainDataTest(unittest.TestCase):
             "mps_rng_state": None,
         }
 
-        with (
-            mock.patch.object(train_sml.random, "setstate"),
-            mock.patch.object(train_sml.torch, "set_rng_state") as set_rng_state,
-        ):
-            train_sml.restore_rng_state(checkpoint)
+        set_rng_state = Spy()
+        monkeypatch.setattr(train_sml.random, "setstate", Spy())
+        monkeypatch.setattr(train_sml.torch, "set_rng_state", set_rng_state)
+
+        train_sml.restore_rng_state(checkpoint)
 
         mapped_rng_state.cpu.assert_called_once_with()
         set_rng_state.assert_called_once_with(cpu_rng_state)
 
-    @unittest.skipIf(torch is None, "torch is not installed")
-    def test_restore_rng_state_moves_cuda_rng_states_to_cpu(self):
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
+    def test_restore_rng_state_moves_cuda_rng_states_to_cpu(self, monkeypatch):
         import random
         import train_sml
 
-        mapped_cuda_rng_state = mock.Mock()
-        cpu_cuda_rng_state = mock.Mock()
-        mapped_cuda_rng_state.cpu.return_value = cpu_cuda_rng_state
+        cpu_cuda_rng_state = object()
+        mapped_cuda_rng_state = CpuMovingValue(cpu_cuda_rng_state)
         checkpoint = {
             "python_rng_state": random.getstate(),
             "torch_rng_state": torch.get_rng_state(),
@@ -740,25 +710,28 @@ class TrainDataTest(unittest.TestCase):
             "mps_rng_state": None,
         }
 
-        with (
-            mock.patch.object(train_sml.random, "setstate"),
-            mock.patch.object(train_sml.torch, "set_rng_state"),
-            mock.patch.object(train_sml.torch.cuda, "is_available", return_value=True),
-            mock.patch.object(train_sml.torch.cuda, "set_rng_state_all") as set_rng_state_all,
-        ):
-            train_sml.restore_rng_state(checkpoint)
+        set_rng_state_all = Spy()
+        monkeypatch.setattr(train_sml.random, "setstate", Spy())
+        monkeypatch.setattr(train_sml.torch, "set_rng_state", Spy())
+        monkeypatch.setattr(train_sml.torch.cuda, "is_available", Spy(return_value=True))
+        monkeypatch.setattr(
+            train_sml.torch.cuda,
+            "set_rng_state_all",
+            set_rng_state_all,
+        )
+
+        train_sml.restore_rng_state(checkpoint)
 
         mapped_cuda_rng_state.cpu.assert_called_once_with()
         set_rng_state_all.assert_called_once_with([cpu_cuda_rng_state])
 
-    @unittest.skipIf(torch is None, "torch is not installed")
-    def test_restore_rng_state_moves_mps_rng_state_to_cpu(self):
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
+    def test_restore_rng_state_moves_mps_rng_state_to_cpu(self, monkeypatch):
         import random
         import train_sml
 
-        mapped_mps_rng_state = mock.Mock()
-        cpu_mps_rng_state = mock.Mock()
-        mapped_mps_rng_state.cpu.return_value = cpu_mps_rng_state
+        cpu_mps_rng_state = object()
+        mapped_mps_rng_state = CpuMovingValue(cpu_mps_rng_state)
         checkpoint = {
             "python_rng_state": random.getstate(),
             "torch_rng_state": torch.get_rng_state(),
@@ -766,18 +739,18 @@ class TrainDataTest(unittest.TestCase):
             "mps_rng_state": mapped_mps_rng_state,
         }
 
-        with (
-            mock.patch.object(train_sml.random, "setstate"),
-            mock.patch.object(train_sml.torch, "set_rng_state"),
-            mock.patch.object(train_sml, "is_mps_rng_available", return_value=True),
-            mock.patch.object(train_sml.torch.mps, "set_rng_state") as set_rng_state,
-        ):
-            train_sml.restore_rng_state(checkpoint)
+        set_rng_state = Spy()
+        monkeypatch.setattr(train_sml.random, "setstate", Spy())
+        monkeypatch.setattr(train_sml.torch, "set_rng_state", Spy())
+        monkeypatch.setattr(train_sml, "is_mps_rng_available", Spy(return_value=True))
+        monkeypatch.setattr(train_sml.torch.mps, "set_rng_state", set_rng_state)
+
+        train_sml.restore_rng_state(checkpoint)
 
         mapped_mps_rng_state.cpu.assert_called_once_with()
         set_rng_state.assert_called_once_with(cpu_mps_rng_state)
 
-    @unittest.skipIf(torch is None, "torch is not installed")
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
     def test_token_block_dataset_updates_training_data_state_after_yield(self):
         import train_sml
 
@@ -791,10 +764,10 @@ class TrainDataTest(unittest.TestCase):
 
         first = next(iter(dataset))
 
-        self.assertTrue(torch.equal(torch.tensor([1, 4, 5]), first["input_ids"]))
-        self.assertEqual([6, 7, 8, 2], data_state.token_buffer)
+        assert torch.equal(torch.tensor([1, 4, 5]), first['input_ids'])
+        assert [6, 7, 8, 2] == data_state.token_buffer
 
-    @unittest.skipIf(torch is None, "torch is not installed")
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
     def test_token_block_dataset_resumes_from_training_data_state_token_buffer(self):
         import train_sml
 
@@ -808,9 +781,9 @@ class TrainDataTest(unittest.TestCase):
 
         first = next(iter(dataset))
 
-        self.assertTrue(torch.equal(torch.tensor([6, 7, 8]), first["input_ids"]))
-        self.assertTrue(torch.equal(torch.tensor([7, 8, 2]), first["labels"]))
-        self.assertEqual([2], data_state.token_buffer)
+        assert torch.equal(torch.tensor([6, 7, 8]), first['input_ids'])
+        assert torch.equal(torch.tensor([7, 8, 2]), first['labels'])
+        assert [2] == data_state.token_buffer
 
     def test_format_training_log_includes_timestamp(self):
         import train_sml
@@ -824,11 +797,7 @@ class TrainDataTest(unittest.TestCase):
             timestamp=datetime(2026, 6, 5, 12, 34, 56),
         )
 
-        self.assertEqual(
-            "time=2026-06-05 12:34:56 epoch=2 step=3 "
-            "lr=3.000e-04 loss=1.2346 grad_norm=5.859 (before clipping)",
-            log_line,
-        )
+        assert 'time=2026-06-05 12:34:56 epoch=2 step=3 lr=3.000e-04 loss=1.2346 grad_norm=5.859 (before clipping)' == log_line
 
     def test_format_training_log_omits_example_index(self):
         import train_sml
@@ -847,12 +816,7 @@ class TrainDataTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(
-            "time=2026-06-30 07:50:00 epoch=1 step=10 "
-            "input=swag-train line=42 "
-            "lr=3.000e-04 loss=9.8457 grad_norm=6.069 (before clipping)",
-            log_line,
-        )
+        assert 'time=2026-06-30 07:50:00 epoch=1 step=10 input=swag-train line=42 lr=3.000e-04 loss=9.8457 grad_norm=6.069 (before clipping)' == log_line
 
     def test_format_training_log_includes_reading_progress(self):
         import train_sml
@@ -870,12 +834,7 @@ class TrainDataTest(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(
-            "time=2026-06-30 07:50:00 epoch=1 step=10 "
-            "input=pile-0000.jsonl.zst line=42 "
-            "lr=3.000e-04 loss=9.8457 grad_norm=6.069 (before clipping)",
-            log_line,
-        )
+        assert 'time=2026-06-30 07:50:00 epoch=1 step=10 input=pile-0000.jsonl.zst line=42 lr=3.000e-04 loss=9.8457 grad_norm=6.069 (before clipping)' == log_line
 
     def test_iter_texts_updates_reading_progress(self):
         import train_sml
@@ -891,11 +850,11 @@ class TrainDataTest(unittest.TestCase):
                 train_sml.iter_texts([path], max_rows_per_file=None, progress=progress)
             )
 
-        self.assertEqual(["a" * 100], texts)
-        self.assertEqual("pile-0000.jsonl.zst", progress.input_file)
-        self.assertEqual(3, progress.line_number)
+        assert ['a' * 100] == texts
+        assert 'pile-0000.jsonl.zst' == progress.input_file
+        assert 3 == progress.line_number
 
-    @unittest.skipIf(torch is None, "torch is not installed")
+    @pytest.mark.skipif(torch is None, reason="torch is not installed")
     def test_token_block_dataset_yields_fixed_length_input_label_pairs(self):
         import train_sml
 
@@ -907,9 +866,5 @@ class TrainDataTest(unittest.TestCase):
 
         first = next(iter(dataset))
 
-        self.assertTrue(torch.equal(torch.tensor([1, 4, 5]), first["input_ids"]))
-        self.assertTrue(torch.equal(torch.tensor([4, 5, 6]), first["labels"]))
-
-
-if __name__ == "__main__":
-    unittest.main()
+        assert torch.equal(torch.tensor([1, 4, 5]), first['input_ids'])
+        assert torch.equal(torch.tensor([4, 5, 6]), first['labels'])
