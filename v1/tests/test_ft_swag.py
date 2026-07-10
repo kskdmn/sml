@@ -36,6 +36,23 @@ class FtSwagTest(unittest.TestCase):
             ft_swag.format_swag_example(row),
         )
 
+    def test_format_swag_example_inserts_space_before_gold_ending(self):
+        import ft_swag
+
+        row = {
+            "startphrase": "The girl",
+            "ending0": "stops clutching her diary.",
+            "ending1": "runs away.",
+            "ending2": "looks around.",
+            "ending3": "opens the door.",
+            "label": 0,
+        }
+
+        self.assertEqual(
+            "The girl stops clutching her diary.",
+            ft_swag.format_swag_example(row),
+        )
+
     def test_resolve_swag_label_accepts_string_labels(self):
         import ft_swag
 

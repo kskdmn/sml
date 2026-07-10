@@ -84,7 +84,7 @@ def format_swag_example(row: Mapping[str, object]) -> str:
         raise ValueError("SWAG startphrase must be a string")
     if not isinstance(ending, str):
         raise ValueError(f"SWAG ending{label} must be a string")
-    return f"{startphrase}{ending}"
+    return f"{startphrase.rstrip()} {ending.lstrip()}"
 
 
 def load_swag_dataset(fine_tune_config: SwagFineTuneConfig):
