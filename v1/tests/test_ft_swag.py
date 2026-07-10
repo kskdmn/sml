@@ -9,6 +9,15 @@ SRC_DIR = PROJECT_DIR / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 
+class FakeTokenizer:
+    bos_id = 1
+    eos_id = 2
+
+    def encode(self, text, out_type=int):
+        del out_type
+        return [int(part) for part in text.split()]
+
+
 class FtSwagTest(unittest.TestCase):
     def test_format_swag_example_concatenates_gold_ending(self):
         import ft_swag
@@ -153,6 +162,83 @@ class FtSwagTest(unittest.TestCase):
         self.assertEqual(["first one", "second beta"], texts)
         self.assertEqual(1, progress.line_number)
         self.assertEqual(1, progress.example_index)
+
+    def test_build_swag_dataloader_pads_short_examples_without_packing(self):
+        import torch
+        import ft_swag
+        from sml_config import SwagFineTuneConfig
+
+        config = SwagFineTuneConfig(sequence_length=3, batch_size=2)
+
+        with mock.patch.object(
+            ft_swag,
+            "iter_swag_texts",
+            return_value=iter(["4", "5"]),
+        ):
+            batches = list(
+                ft_swag.build_swag_dataloader(
+                    fine_tune_config=config,
+                    tokenizer=FakeTokenizer(),
+                    epoch=0,
+                )
+            )
+
+        self.assertEqual(2, len(batches))
+        self.assertTrue(
+            torch.equal(torch.tensor([[1, 4, 2]]), batches[0]["input_ids"])
+        )
+        self.assertTrue(torch.equal(torch.tensor([[4, 2, 2]]), batches[0]["labels"]))
+        self.assertTrue(
+            torch.equal(torch.tensor([[1, 5, 2]]), batches[1]["input_ids"])
+        )
+        self.assertTrue(torch.equal(torch.tensor([[5, 2, 2]]), batches[1]["labels"]))
+
+    def test_build_swag_dataloader_skips_examples_longer_than_sequence(self):
+        import ft_swag
+        from sml_config import SwagFineTuneConfig
+
+        config = SwagFineTuneConfig(sequence_length=3, batch_size=1)
+
+        with mock.patch.object(
+            ft_swag,
+            "iter_swag_texts",
+            return_value=iter(["4 5 6 7"]),
+        ):
+            batches = list(
+                ft_swag.build_swag_dataloader(
+                    fine_tune_config=config,
+                    tokenizer=FakeTokenizer(),
+                    epoch=0,
+                )
+            )
+
+        self.assertEqual([], batches)
+
+    def test_build_swag_dataloader_keeps_examples_equal_to_sequence_length(self):
+        import torch
+        import ft_swag
+        from sml_config import SwagFineTuneConfig
+
+        config = SwagFineTuneConfig(sequence_length=3, batch_size=1)
+
+        with mock.patch.object(
+            ft_swag,
+            "iter_swag_texts",
+            return_value=iter(["4 5 6"]),
+        ):
+            batches = list(
+                ft_swag.build_swag_dataloader(
+                    fine_tune_config=config,
+                    tokenizer=FakeTokenizer(),
+                    epoch=0,
+                )
+            )
+
+        self.assertEqual(1, len(batches))
+        self.assertTrue(
+            torch.equal(torch.tensor([[1, 4, 5]]), batches[0]["input_ids"])
+        )
+        self.assertTrue(torch.equal(torch.tensor([[4, 5, 6]]), batches[0]["labels"]))
 
     def test_parse_args_defaults_to_fresh_fine_tuning(self):
         import ft_swag

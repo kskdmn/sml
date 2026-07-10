@@ -11,7 +11,7 @@ import zstandard as zstd
 
 from config import INPUT_DIR, resolve_path
 
-MAX_ROWS_PER_FILE = 10_000
+MAX_ROWS_PER_FILE = 32_768
 MIN_TEXT_LENGTH = 100
 MAX_TEXT_LENGTH: int | None = None
 TEXT_COLUMN = "text"

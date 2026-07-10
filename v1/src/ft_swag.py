@@ -12,7 +12,7 @@ import argparse
 import copy
 import pathlib
 import random
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +20,7 @@ from typing import Iterator, Sequence
 
 import torch
 from torch.serialization import safe_globals
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from config import SUCCESS_RETURN_CODE
 from infer_sml import load_checkpoint, normalize_model_config
@@ -38,12 +38,12 @@ from train_sml import (
     ROW_INCREMENT,
     ReadingProgress,
     ResumeProgress,
-    TokenBlockDataset,
     TrainingDataState,
     TrainingResumeState,
     capture_rng_state,
     count_resume_batches,
     format_training_log,
+    get_special_token_id,
     is_step_limit_reached,
     iter_unseen_batches,
     load_tokenizer,
@@ -144,6 +144,72 @@ def iter_swag_texts(
         yield format_swag_example(row)
 
 
+class SwagExampleDataset(IterableDataset[dict[str, torch.Tensor]]):
+    def __init__(
+        self,
+        texts: Iterable[str],
+        tokenizer: object,
+        sequence_length: int,
+        bos_token_id: int | None = None,
+        eos_token_id: int | None = None,
+        data_state: TrainingDataState | None = None,
+    ) -> None:
+        super().__init__()
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+        self.texts = texts
+        self.tokenizer = tokenizer
+        self.sequence_length = sequence_length
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.data_state = data_state
+
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        """
+        Yield one fixed-length causal-LM pair per SWAG example.
+
+        SWAG examples are never packed together. Short examples are padded with
+        EOS tokens; examples longer than the configured sequence length are skipped.
+        """
+        bos_token_id = get_special_token_id(
+            self.tokenizer,
+            "bos_id",
+            self.bos_token_id,
+        )
+        eos_token_id = get_special_token_id(
+            self.tokenizer,
+            "eos_id",
+            self.eos_token_id,
+        )
+        if eos_token_id is None:
+            raise ValueError("SWAG fine-tuning requires an EOS token for padding")
+        if self.data_state is not None:
+            self.data_state.token_buffer = []
+
+        tokens_per_example = self.sequence_length + 1
+        for text in self.texts:
+            token_ids = list(self.tokenizer.encode(text, out_type=int))
+            if len(token_ids) > self.sequence_length:
+                if self.data_state is not None:
+                    self.data_state.token_buffer = []
+                continue
+
+            example_tokens = []
+            if bos_token_id is not None:
+                example_tokens.append(bos_token_id)
+            example_tokens.extend(token_ids)
+            example_tokens.extend(
+                [eos_token_id] * (tokens_per_example - len(example_tokens))
+            )
+            if self.data_state is not None:
+                self.data_state.token_buffer = []
+
+            yield {
+                "input_ids": torch.tensor(example_tokens[:-1], dtype=torch.long),
+                "labels": torch.tensor(example_tokens[1:], dtype=torch.long),
+            }
+
+
 def build_swag_dataloader(
     fine_tune_config: SwagFineTuneConfig,
     tokenizer: object,
@@ -152,9 +218,9 @@ def build_swag_dataloader(
     data_state: TrainingDataState | None = None,
 ) -> DataLoader[dict[str, torch.Tensor]]:
     """
-    Stream SWAG examples through the same token-block dataset used for pretraining.
+    Stream one fixed-length, EOS-padded SWAG example per dataloader batch.
     """
-    dataset = TokenBlockDataset(
+    dataset = SwagExampleDataset(
         texts=iter_swag_texts(
             fine_tune_config,
             epoch=epoch,
@@ -165,7 +231,7 @@ def build_swag_dataloader(
         sequence_length=fine_tune_config.sequence_length,
         data_state=data_state,
     )
-    return DataLoader(dataset, batch_size=fine_tune_config.batch_size)
+    return DataLoader(dataset, batch_size=1)
 
 
 def load_pretrained_model_config(
