@@ -2,6 +2,7 @@
 
 - Python 3.12.13
 - Always use `uv run` to run a Python script.
+- Always run `uv run pytest` outside the sandbox so MLX/Metal can access the Apple GPU.
 
 # Rules
 
