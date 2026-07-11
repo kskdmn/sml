@@ -55,12 +55,12 @@ class TestWinograndeEval:
 
         assert 0 == return_code
         from_checkpoint.assert_called_once_with(
-            checkpoint_path=eval_winogrande.DEFAULT_CHECKPOINT_PATH,
-            tokenizer_model_path=eval_winogrande.TOKENIZER_MODEL_PATH,
+            checkpoint_path=eval_winogrande.DEFAULT_MODEL_PATH,
+            tokenizer_model_path=eval_winogrande.DEFAULT_TOKENIZER_MODEL_PATH,
         )
         evaluate_winogrande.assert_called_once_with(
             lm=lm,
-            checkpoint_path=eval_winogrande.DEFAULT_CHECKPOINT_PATH,
+            checkpoint_path=eval_winogrande.DEFAULT_MODEL_PATH,
             limit=2,
         )
         write_results.assert_called_once_with(
@@ -68,3 +68,53 @@ class TestWinograndeEval:
             results,
         )
         print_output.assert_called_once_with("table")
+
+    def test_main_accepts_model_path_alias(self, monkeypatch):
+        import eval_winogrande
+
+        lm = object()
+        results = {"results": {"winogrande": {"acc,none": 0.0}}}
+        from_checkpoint = Spy(return_value=lm)
+        monkeypatch.setattr(
+            eval_winogrande.SMLEvalLM,
+            "from_checkpoint",
+            from_checkpoint,
+        )
+        monkeypatch.setattr(eval_winogrande, "evaluate_winogrande", Spy(return_value=results))
+        monkeypatch.setattr(eval_winogrande, "write_results", Spy())
+        monkeypatch.setattr(eval_winogrande, "make_table", Spy(return_value="table"))
+        monkeypatch.setattr("builtins.print", Spy())
+
+        return_code = eval_winogrande.main(["--model", "/tmp/custom-sml"])
+
+        assert 0 == return_code
+        from_checkpoint.assert_called_once_with(
+            checkpoint_path=Path("/tmp/custom-sml"),
+            tokenizer_model_path=eval_winogrande.DEFAULT_TOKENIZER_MODEL_PATH,
+        )
+
+    def test_main_accepts_tokenizer_model_path(self, monkeypatch):
+        import eval_winogrande
+
+        lm = object()
+        results = {"results": {"winogrande": {"acc,none": 0.0}}}
+        from_checkpoint = Spy(return_value=lm)
+        monkeypatch.setattr(
+            eval_winogrande.SMLEvalLM,
+            "from_checkpoint",
+            from_checkpoint,
+        )
+        monkeypatch.setattr(eval_winogrande, "evaluate_winogrande", Spy(return_value=results))
+        monkeypatch.setattr(eval_winogrande, "write_results", Spy())
+        monkeypatch.setattr(eval_winogrande, "make_table", Spy(return_value="table"))
+        monkeypatch.setattr("builtins.print", Spy())
+
+        return_code = eval_winogrande.main(
+            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
+        )
+
+        assert 0 == return_code
+        from_checkpoint.assert_called_once_with(
+            checkpoint_path=eval_winogrande.DEFAULT_MODEL_PATH,
+            tokenizer_model_path=Path("/tmp/custom-tokenizer.model"),
+        )

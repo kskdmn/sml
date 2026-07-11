@@ -1,11 +1,12 @@
 # Environment
 
 - Python 3.12.13
-- Always use `uv run` to run a Python script.
+- Use `uv run` to run Python scripts.
 - Always run `uv run pytest` outside the sandbox so MLX/Metal can access the Apple GPU.
 
 # Rules
 
-- Directories in the project root indicates model version. For example, `v1` is the first version. Unless the user specifies a version, update the latest version. 
-- Don't edit files in the top-level (e.g. `pyproject.toml` and `uv.lock`) or clearly ask for the user's approval unless the user asks you to do it.
-- Always ensure all unit tests pass.
+- Directories in the project root indicate model versions. For example, `v1` is the first version. Unless the user specifies a version, update the latest version.
+- Do not edit top-level project files, such as `pyproject.toml` or `uv.lock`, unless the user explicitly asks for that change. If the task truly requires a top-level edit, ask for approval first.
+- Ensure all unit tests pass before finishing.
+- When removing code, you may add temporary tests to prove the removed path is no longer used. Delete those tests before finishing unless they verify lasting behavior that should remain part of the suite.

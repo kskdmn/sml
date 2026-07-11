@@ -29,13 +29,17 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import mlx.core as mx
 
-from config import OUTPUT_DIR, SUCCESS_RETURN_CODE, TOKENIZER_MODEL_PATH, resolve_path
+from config import (
+    DEFAULT_MODEL_PATH,
+    DEFAULT_TOKENIZER_MODEL_PATH,
+    SUCCESS_RETURN_CODE,
+    resolve_path,
+)
 from sml import GenerationConfig
 from tokenizer import CONVERSATION_SPECIAL_TOKENS
 from train_sml import load_tokenizer
 
 
-DEFAULT_CHECKPOINT_PATH = OUTPUT_DIR / "sml"
 DEFAULT_MODEL_NAME = "sml"
 CONVERSATION_ROLE_NAMES = ("system", "user", "assistant")
 CONVERSATION_ROLE_TOKENS = dict(
@@ -160,8 +164,8 @@ def resolve_max_new_tokens(
 
 def generate_text(
     prompt: str,
-    checkpoint_path: Path = DEFAULT_CHECKPOINT_PATH,
-    tokenizer_model_path: Path = TOKENIZER_MODEL_PATH,
+    checkpoint_path: Path = DEFAULT_MODEL_PATH,
+    tokenizer_model_path: Path = DEFAULT_TOKENIZER_MODEL_PATH,
     max_new_tokens: int | None = None,
     include_prompt: bool = False,
     generation_config: GenerationConfig | None = None,
@@ -553,15 +557,24 @@ def make_openai_compatible_handler(
 def run_openai_compatible_server(
     host: str = "127.0.0.1",
     port: int = 8000,
+    checkpoint_path: Path = DEFAULT_MODEL_PATH,
+    tokenizer_model_path: Path = DEFAULT_TOKENIZER_MODEL_PATH,
     model_name: str = DEFAULT_MODEL_NAME,
 ) -> None:
     """
     ThreadingHTTPServer allows concurrent local requests; KeyboardInterrupt is swallowed
     so the CLI exits cleanly.
     """
+    def server_generate_text(**kwargs: Any) -> str:
+        return generate_text(
+            checkpoint_path=checkpoint_path,
+            tokenizer_model_path=tokenizer_model_path,
+            **kwargs,
+        )
+
     handler_class = make_openai_compatible_handler(
         model_name,
-        generator=generate_text,
+        generator=server_generate_text,
     )
     server = ThreadingHTTPServer((host, port), handler_class)
     print(f"Serving SML OpenAI-compatible API at http://{host}:{port}/v1")
@@ -616,8 +629,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
+        type=Path,
+        default=DEFAULT_MODEL_PATH,
+        help=f"model checkpoint directory (default: {DEFAULT_MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--model-name",
         default=DEFAULT_MODEL_NAME,
         help=f"OpenAI-compatible model name. Defaults to {DEFAULT_MODEL_NAME}.",
+    )
+    parser.add_argument(
+        "--tokenizer-model",
+        type=Path,
+        default=DEFAULT_TOKENIZER_MODEL_PATH,
+        help=f"SentencePiece model path (default: {DEFAULT_TOKENIZER_MODEL_PATH})",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -692,12 +717,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_openai_compatible_server(
             host=args.host,
             port=args.port,
-            model_name=args.model,
+            checkpoint_path=args.model,
+            tokenizer_model_path=args.tokenizer_model,
+            model_name=args.model_name,
         )
         return SUCCESS_RETURN_CODE
 
     text = generate_text(
         prompt=args.prompt,
+        checkpoint_path=args.model,
+        tokenizer_model_path=args.tokenizer_model,
         max_new_tokens=args.max_new_tokens,
         include_prompt=args.include_prompt,
         generation_config=generation_config_from_args(args),

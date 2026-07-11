@@ -19,14 +19,8 @@ from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.utils import handle_non_serializable
 
-from config import TOKENIZER_MODEL_PATH
-from infer_sml import (
-    DEFAULT_CHECKPOINT_PATH,
-    InferenceTokenizer,
-    decode_token_ids,
-    encode_prompt,
-    load_model,
-)
+from config import DEFAULT_MODEL_PATH, DEFAULT_TOKENIZER_MODEL_PATH
+from infer_sml import InferenceTokenizer, decode_token_ids, encode_prompt, load_model
 from train_sml import load_tokenizer
 
 
@@ -249,16 +243,18 @@ def build_eval_parser(
     """
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
-        "--checkpoint",
+        "--model",
+        dest="checkpoint",
         type=Path,
-        default=DEFAULT_CHECKPOINT_PATH,
-        help=f"checkpoint path (default: {DEFAULT_CHECKPOINT_PATH})",
+        default=DEFAULT_MODEL_PATH,
+        help=f"model checkpoint directory (default: {DEFAULT_MODEL_PATH})",
     )
     parser.add_argument(
-        "--tokenizer",
+        "--tokenizer-model",
+        dest="tokenizer_model",
         type=Path,
-        default=TOKENIZER_MODEL_PATH,
-        help=f"SentencePiece model path (default: {TOKENIZER_MODEL_PATH})",
+        default=DEFAULT_TOKENIZER_MODEL_PATH,
+        help=f"SentencePiece model path (default: {DEFAULT_TOKENIZER_MODEL_PATH})",
     )
     parser.add_argument(
         "--limit",

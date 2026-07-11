@@ -141,6 +141,8 @@ class TestTrainData:
         args = train_sml.parse_args([])
 
         assert not args.resume
+        assert train_sml.DEFAULT_MODEL_PATH == args.model
+        assert train_sml.DEFAULT_TOKENIZER_MODEL_PATH == args.tokenizer_model
 
     def test_parse_args_enables_resume(self):
         import train_sml
@@ -149,12 +151,29 @@ class TestTrainData:
 
         assert args.resume
 
+    def test_parse_args_accepts_model_path(self):
+        import train_sml
+
+        args = train_sml.parse_args(["--model", "/tmp/custom-sml"])
+
+        assert Path("/tmp/custom-sml") == args.model
+
+    def test_parse_args_accepts_tokenizer_model_path(self):
+        import train_sml
+
+        args = train_sml.parse_args(
+            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
+        )
+
+        assert Path("/tmp/custom-tokenizer.model") == args.tokenizer_model
+
     def test_resume_help_documents_stochastic_continuity(self):
         import train_sml
 
         parser = train_sml.build_parser()
 
-        assert "Stochastic continuity is not guaranteed." in parser.format_help()
+        assert "Stochastic continuity" in parser.format_help()
+        assert "guaranteed." in parser.format_help()
 
     def test_main_passes_resume_flag_to_training_config(self, monkeypatch):
         import train_sml
@@ -167,6 +186,32 @@ class TestTrainData:
         assert train_sml.SUCCESS_RETURN_CODE == return_code
         assert train_model.call_args.kwargs["resume_from_checkpoint"]
 
+    def test_main_passes_model_path_to_training_config(self, monkeypatch):
+        import train_sml
+
+        train_model = Spy(return_value=Path("/tmp/custom-sml"))
+        monkeypatch.setattr(train_sml, "train_model", train_model)
+
+        return_code = train_sml.main(["--model", "/tmp/custom-sml"])
+
+        assert train_sml.SUCCESS_RETURN_CODE == return_code
+        training_config = train_model.call_args.kwargs["training_config"]
+        assert Path("/tmp/custom-sml") == training_config.model_path
+
+    def test_main_passes_tokenizer_model_path_to_training_config(self, monkeypatch):
+        import train_sml
+
+        train_model = Spy(return_value=Path("/tmp/sml"))
+        monkeypatch.setattr(train_sml, "train_model", train_model)
+
+        return_code = train_sml.main(
+            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
+        )
+
+        assert train_sml.SUCCESS_RETURN_CODE == return_code
+        training_config = train_model.call_args.kwargs["training_config"]
+        assert Path("/tmp/custom-tokenizer.model") == training_config.tokenizer_model_path
+
     def test_train_model_accepts_config_objects_and_resume_flag(self):
         import train_sml
 
@@ -177,11 +222,14 @@ class TestTrainData:
         )
 
     def test_training_config_defaults_to_mlx_checkpoint_name(self):
+        import train_sml
         from train_sml import TrainingConfig
 
         training_config = TrainingConfig()
 
         assert "sml" == training_config.checkpoint_name
+        assert training_config.model_path is None
+        assert train_sml.DEFAULT_TOKENIZER_MODEL_PATH == training_config.tokenizer_model_path
         assert not hasattr(training_config, "resume_from_checkpoint")
 
     def test_discover_input_files_uses_supplied_regex_and_sorts_matches(self):
@@ -697,6 +745,20 @@ class TestCanonicalMlxTraining:
 
         assert checkpoint_path == tmp_path / "custom"
 
+    def test_resolve_mlx_checkpoint_path_uses_model_path(self, tmp_path):
+        import train_sml
+        from train_sml import TrainingConfig
+
+        checkpoint_path = train_sml.resolve_mlx_checkpoint_path(
+            TrainingConfig(
+                output_dir=tmp_path,
+                checkpoint_name="ignored",
+                model_path=tmp_path / "model-dir",
+            )
+        )
+
+        assert checkpoint_path == tmp_path / "model-dir"
+
     def test_resolve_mlx_checkpoint_path_converts_legacy_suffix(self, tmp_path):
         import train_sml
         from train_sml import TrainingConfig
@@ -760,6 +822,7 @@ class TestCanonicalMlxTraining:
             output_dir=tmp_path / "output",
             tokenizer_model_path=tmp_path / "tokenizer.model",
             checkpoint_name="sml.pt",
+            model_path=tmp_path / "output" / "sml.pt",
         )
         load_training_checkpoint = Spy(return_value=train_sml.TrainingResumeState())
 

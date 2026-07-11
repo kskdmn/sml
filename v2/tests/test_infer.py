@@ -330,6 +330,8 @@ class TestInferenceInterface:
         assert 0 == exit_code
         generate_text.assert_called_once_with(
             prompt="hello",
+            checkpoint_path=infer_sml.DEFAULT_MODEL_PATH,
+            tokenizer_model_path=infer_sml.DEFAULT_TOKENIZER_MODEL_PATH,
             max_new_tokens=3,
             include_prompt=False,
             generation_config=generation_config,
@@ -355,11 +357,65 @@ class TestInferenceInterface:
         assert 0 == exit_code
         generate_text.assert_called_once_with(
             prompt="hello",
+            checkpoint_path=infer_sml.DEFAULT_MODEL_PATH,
+            tokenizer_model_path=infer_sml.DEFAULT_TOKENIZER_MODEL_PATH,
             max_new_tokens=None,
             include_prompt=True,
             generation_config=generation_config,
         )
         print_.assert_called_once_with("hello world")
+
+    def test_main_passes_model_path_from_cli_args(self, monkeypatch):
+        import infer_sml
+
+        generation_config = object()
+        generate_text = Spy(return_value="hello world")
+        monkeypatch.setattr(infer_sml, "generate_text", generate_text)
+        monkeypatch.setattr(
+            infer_sml,
+            "generation_config_from_args",
+            Spy(return_value=generation_config),
+        )
+        monkeypatch.setattr("builtins.print", Spy())
+
+        exit_code = infer_sml.main(["hello", "--model", "/tmp/custom-sml"])
+
+        assert 0 == exit_code
+        generate_text.assert_called_once_with(
+            prompt="hello",
+            checkpoint_path=Path("/tmp/custom-sml"),
+            tokenizer_model_path=infer_sml.DEFAULT_TOKENIZER_MODEL_PATH,
+            max_new_tokens=None,
+            include_prompt=False,
+            generation_config=generation_config,
+        )
+
+    def test_main_passes_tokenizer_model_path_from_cli_args(self, monkeypatch):
+        import infer_sml
+
+        generation_config = object()
+        generate_text = Spy(return_value="hello world")
+        monkeypatch.setattr(infer_sml, "generate_text", generate_text)
+        monkeypatch.setattr(
+            infer_sml,
+            "generation_config_from_args",
+            Spy(return_value=generation_config),
+        )
+        monkeypatch.setattr("builtins.print", Spy())
+
+        exit_code = infer_sml.main(
+            ["hello", "--tokenizer-model", "/tmp/custom-tokenizer.model"]
+        )
+
+        assert 0 == exit_code
+        generate_text.assert_called_once_with(
+            prompt="hello",
+            checkpoint_path=infer_sml.DEFAULT_MODEL_PATH,
+            tokenizer_model_path=Path("/tmp/custom-tokenizer.model"),
+            max_new_tokens=None,
+            include_prompt=False,
+            generation_config=generation_config,
+        )
 
     def test_parse_args_accepts_decoding_flags(self):
         import infer_sml
@@ -400,6 +456,10 @@ class TestInferenceInterface:
                 "--port",
                 "9000",
                 "--model",
+                "/tmp/custom-sml",
+                "--tokenizer-model",
+                "/tmp/custom-tokenizer.model",
+                "--model-name",
                 "sml-test",
             ]
         )
@@ -408,14 +468,14 @@ class TestInferenceInterface:
         run_server.assert_called_once_with(
             host="0.0.0.0",
             port=9000,
+            checkpoint_path=Path("/tmp/custom-sml"),
+            tokenizer_model_path=Path("/tmp/custom-tokenizer.model"),
             model_name="sml-test",
         )
 
     @pytest.mark.parametrize(
         ("option", "value"),
         [
-            ("--checkpoint", "model.pt"),
-            ("--tokenizer", "tokenizer.model"),
             ("--completion-only", None),
         ],
     )

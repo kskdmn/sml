@@ -209,6 +209,34 @@ class TestEvalUtils:
             log_samples=False,
         )
 
+    def test_build_eval_parser_accepts_model_option_for_checkpoint_path(self):
+        import eval_utils
+
+        parser = eval_utils.build_eval_parser(
+            description="Evaluate.",
+            default_results_path=Path("results.json"),
+            limit_help="limit examples",
+        )
+
+        args = parser.parse_args(["--model", "/tmp/custom-sml"])
+
+        assert Path("/tmp/custom-sml") == args.checkpoint
+
+    def test_build_eval_parser_accepts_tokenizer_model_option(self):
+        import eval_utils
+
+        parser = eval_utils.build_eval_parser(
+            description="Evaluate.",
+            default_results_path=Path("results.json"),
+            limit_help="limit examples",
+        )
+
+        args = parser.parse_args(
+            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
+        )
+
+        assert Path("/tmp/custom-tokenizer.model") == args.tokenizer_model
+
     def test_write_results_creates_parent_directory_and_serializes_paths(self):
         import eval_utils
 

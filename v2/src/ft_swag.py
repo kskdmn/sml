@@ -19,10 +19,11 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 from config import (
+    DEFAULT_MODEL_PATH,
+    DEFAULT_TOKENIZER_MODEL_PATH,
     OUTPUT_DIR,
     PROJECT_DIR,
     SUCCESS_RETURN_CODE,
-    TOKENIZER_MODEL_PATH,
     resolve_path,
 )
 from infer_sml import load_checkpoint_metadata, normalize_model_config
@@ -87,9 +88,9 @@ class SwagFineTuneConfig:
     dataset_config: str = "regular"
     dataset_split: str = "train"
     hf_cache_dir: Path | None = PROJECT_DIR.parent / ".hf-cache"
-    pretrained_checkpoint_path: Path = OUTPUT_DIR / "sml"
+    pretrained_checkpoint_path: Path = DEFAULT_MODEL_PATH
     output_dir: Path = OUTPUT_DIR
-    tokenizer_model_path: Path = TOKENIZER_MODEL_PATH
+    tokenizer_model_path: Path = DEFAULT_TOKENIZER_MODEL_PATH
     checkpoint_name: str = "sml-swag"
     sequence_length: int = 256
     batch_size: int = 1
@@ -682,6 +683,18 @@ def build_parser() -> argparse.ArgumentParser:
         description="LoRA fine-tune the SML language model on SWAG train examples.",
     )
     parser.add_argument(
+        "--model",
+        type=Path,
+        default=DEFAULT_MODEL_PATH,
+        help=f"pretrained model checkpoint directory (default: {DEFAULT_MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--tokenizer-model",
+        type=Path,
+        default=DEFAULT_TOKENIZER_MODEL_PATH,
+        help=f"SentencePiece model path (default: {DEFAULT_TOKENIZER_MODEL_PATH})",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -703,7 +716,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     args = parse_args(argv)
     checkpoint_path = fine_tune_swag(
-        fine_tune_config=SwagFineTuneConfig(),
+        fine_tune_config=SwagFineTuneConfig(
+            pretrained_checkpoint_path=args.model,
+            tokenizer_model_path=args.tokenizer_model,
+        ),
         resume_from_checkpoint=args.resume,
     )
     print(f"Checkpoint: {checkpoint_path}")

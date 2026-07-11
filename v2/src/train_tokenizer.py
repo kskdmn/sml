@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import argparse
 import itertools
 import random
 from pathlib import Path
-from typing import Iterator, NamedTuple
+from typing import Iterator, NamedTuple, Sequence
 
 import sentencepiece as spm
 
-from config import INPUT_DIR, OUTPUT_DIR, SUCCESS_RETURN_CODE, resolve_path
+from config import (
+    DEFAULT_TOKENIZER_MODEL_PATH,
+    INPUT_DIR,
+    OUTPUT_DIR,
+    SUCCESS_RETURN_CODE,
+    resolve_path,
+)
 import tokenizer
 
 VOCAB_SIZE = 28_672
@@ -25,7 +32,6 @@ SHUFFLE_INPUT_SENTENCE = True
 HARD_VOCAB_LIMIT = True
 TRAIN_EXTREMELY_LARGE_CORPUS = False  # This is only for Unigram models.
 
-MODEL_PREFIX_NAME = "bpe_tokenizer"
 MODEL_TYPE = "bpe"
 MAX_SENTENCE_LENGTH: int | None = tokenizer.MAX_TEXT_LENGTH
 
@@ -53,14 +59,17 @@ def require_non_empty_iterator(iterator: Iterator[str]) -> Iterator[str]:
     return itertools.chain((first_text,), iterator)
 
 
-def train_tokenizer() -> TrainingResult:
+def train_tokenizer(
+    tokenizer_model_path: Path = DEFAULT_TOKENIZER_MODEL_PATH,
+) -> TrainingResult:
     """
     Feed SentencePiece from a lazy filtered iterator so compressed shards do not need to
     be materialized.
     """
     random.seed(RANDOM_SEED)
 
-    output_dir = resolve_path(OUTPUT_DIR)
+    tokenizer_model_path = resolve_path(tokenizer_model_path)
+    output_dir = tokenizer_model_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
     input_files = tokenizer.discover_input_files(INPUT_DIR)
@@ -72,7 +81,7 @@ def train_tokenizer() -> TrainingResult:
     text_iterable = tokenizer.FilteredTextIterable(input_files)
     sentence_iterator = require_non_empty_iterator(iter(text_iterable))
 
-    model_prefix = output_dir / MODEL_PREFIX_NAME
+    model_prefix = tokenizer_model_path.with_suffix("")
     trainer_kwargs = dict(
         sentence_iterator=sentence_iterator,
         model_prefix=str(model_prefix),
@@ -106,9 +115,25 @@ def train_tokenizer() -> TrainingResult:
     )
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train the SML SentencePiece tokenizer.")
+    parser.add_argument(
+        "--tokenizer-model",
+        type=Path,
+        default=DEFAULT_TOKENIZER_MODEL_PATH,
+        help=f"SentencePiece model path (default: {DEFAULT_TOKENIZER_MODEL_PATH})",
+    )
+    return parser
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
     """Print generated artifacts and corpus counters for the tokenizer training CLI."""
-    result = train_tokenizer()
+    args = parse_args(argv)
+    result = train_tokenizer(tokenizer_model_path=args.tokenizer_model)
     print(f"Model: {result.model_path}")
     print(f"Vocab: {result.vocab_path}")
     print(f"Input files: {result.input_file_count}")

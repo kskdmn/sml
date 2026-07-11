@@ -2,7 +2,7 @@
 Winogrande evaluation for the local SML checkpoint and tokenizer.
 
 Results default to ``v2/output/winogrande.json``. Override paths with
-``--checkpoint``, ``--tokenizer``, ``--limit``, and ``--output``.
+``--model``, ``--tokenizer-model``, ``--limit``, and ``--output``.
 """
 
 from __future__ import annotations
@@ -14,7 +14,12 @@ from typing import Any
 from lm_eval.api.model import LM
 from lm_eval.utils import make_table
 
-from config import OUTPUT_DIR, SUCCESS_RETURN_CODE, TOKENIZER_MODEL_PATH
+from config import (
+    DEFAULT_MODEL_PATH,
+    DEFAULT_TOKENIZER_MODEL_PATH,
+    OUTPUT_DIR,
+    SUCCESS_RETURN_CODE,
+)
 from eval_utils import (
     SMLEvalLM,
     build_eval_parser,
@@ -22,7 +27,6 @@ from eval_utils import (
     require_results,
     write_results,
 )
-from infer_sml import DEFAULT_CHECKPOINT_PATH
 
 
 TASK_NAME = "winogrande"
@@ -31,7 +35,7 @@ DEFAULT_RESULTS_PATH = OUTPUT_DIR / "winogrande.json"
 
 def evaluate_winogrande(
     lm: LM,
-    checkpoint_path: Path = DEFAULT_CHECKPOINT_PATH,
+    checkpoint_path: Path = DEFAULT_MODEL_PATH,
     limit: int | None = None,
 ) -> dict[str, Any] | None:
     """
@@ -64,7 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     lm = SMLEvalLM.from_checkpoint(
         checkpoint_path=args.checkpoint,
-        tokenizer_model_path=args.tokenizer,
+        tokenizer_model_path=args.tokenizer_model,
     )
     results = require_results(
         evaluate_winogrande(

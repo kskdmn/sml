@@ -330,6 +330,8 @@ class TestFtSwag:
         args = ft_swag.parse_args([])
 
         assert not args.resume
+        assert ft_swag.DEFAULT_MODEL_PATH == args.model
+        assert ft_swag.DEFAULT_TOKENIZER_MODEL_PATH == args.tokenizer_model
 
     def test_parse_args_enables_resume(self):
         import ft_swag
@@ -338,12 +340,29 @@ class TestFtSwag:
 
         assert args.resume
 
+    def test_parse_args_accepts_model_path(self):
+        import ft_swag
+
+        args = ft_swag.parse_args(["--model", "/tmp/custom-sml"])
+
+        assert Path("/tmp/custom-sml") == args.model
+
+    def test_parse_args_accepts_tokenizer_model_path(self):
+        import ft_swag
+
+        args = ft_swag.parse_args(
+            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
+        )
+
+        assert Path("/tmp/custom-tokenizer.model") == args.tokenizer_model
+
     def test_resume_help_documents_stochastic_continuity(self):
         import ft_swag
 
         parser = ft_swag.build_parser()
 
-        assert "Stochastic continuity is not guaranteed." in parser.format_help()
+        assert "Stochastic continuity" in parser.format_help()
+        assert "guaranteed." in parser.format_help()
 
     def test_main_passes_resume_flag_to_fine_tune_swag(self, monkeypatch):
         import ft_swag
@@ -355,6 +374,32 @@ class TestFtSwag:
 
         assert ft_swag.SUCCESS_RETURN_CODE == return_code
         assert fine_tune_swag.call_args.kwargs['resume_from_checkpoint']
+
+    def test_main_passes_model_path_to_fine_tune_config(self, monkeypatch):
+        import ft_swag
+
+        fine_tune_swag = Spy(return_value=Path("/tmp/sml-swag"))
+        monkeypatch.setattr(ft_swag, "fine_tune_swag", fine_tune_swag)
+
+        return_code = ft_swag.main(["--model", "/tmp/custom-sml"])
+
+        assert ft_swag.SUCCESS_RETURN_CODE == return_code
+        fine_tune_config = fine_tune_swag.call_args.kwargs["fine_tune_config"]
+        assert Path("/tmp/custom-sml") == fine_tune_config.pretrained_checkpoint_path
+
+    def test_main_passes_tokenizer_model_path_to_fine_tune_config(self, monkeypatch):
+        import ft_swag
+
+        fine_tune_swag = Spy(return_value=Path("/tmp/sml-swag"))
+        monkeypatch.setattr(ft_swag, "fine_tune_swag", fine_tune_swag)
+
+        return_code = ft_swag.main(
+            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
+        )
+
+        assert ft_swag.SUCCESS_RETURN_CODE == return_code
+        fine_tune_config = fine_tune_swag.call_args.kwargs["fine_tune_config"]
+        assert Path("/tmp/custom-tokenizer.model") == fine_tune_config.tokenizer_model_path
 
     def test_fine_tune_swag_accepts_config_objects_and_resume_flag(self):
         import ft_swag

@@ -14,10 +14,11 @@ from typing import Protocol, Sequence, TypeVar
 import sentencepiece as spm
 
 from config import (
+    DEFAULT_MODEL_PATH,
+    DEFAULT_TOKENIZER_MODEL_PATH,
     INPUT_DIR,
     INPUT_FILE_NAME_REGEX,
     OUTPUT_DIR,
-    TOKENIZER_MODEL_PATH,
     resolve_path,
 )
 from tokenizer import (
@@ -96,7 +97,8 @@ class TrainingConfig:
     input_dir: Path = INPUT_DIR
     input_file_name_regex: str = INPUT_FILE_NAME_REGEX
     output_dir: Path = OUTPUT_DIR
-    tokenizer_model_path: Path = TOKENIZER_MODEL_PATH
+    model_path: Path | None = None
+    tokenizer_model_path: Path = DEFAULT_TOKENIZER_MODEL_PATH
     checkpoint_name: str = "sml"
     sequence_length: int = 1_024
     batch_size: int = 1
@@ -552,12 +554,15 @@ def clip_gradients_by_global_norm(
 
 
 def resolve_mlx_checkpoint_path(training_config: TrainingConfig) -> Path:
-    output_dir = resolve_path(training_config.output_dir)
-    checkpoint_name = Path(training_config.checkpoint_name)
-    if checkpoint_name.suffix == ".pt":
-        checkpoint_name = checkpoint_name.with_suffix("")
-        checkpoint_name = Path(f"{checkpoint_name.name}_mlx")
-    return output_dir / checkpoint_name
+    checkpoint_path = (
+        Path(training_config.model_path)
+        if training_config.model_path is not None
+        else resolve_path(training_config.output_dir) / training_config.checkpoint_name
+    )
+    if checkpoint_path.suffix == ".pt":
+        checkpoint_path = checkpoint_path.with_suffix("")
+        checkpoint_path = checkpoint_path.with_name(f"{checkpoint_path.name}_mlx")
+    return resolve_path(checkpoint_path)
 
 
 def _json_ready(value: object) -> object:
@@ -842,6 +847,18 @@ def _retie_embeddings_if_needed(model) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train the MLX SML language model.")
     parser.add_argument(
+        "--model",
+        type=Path,
+        default=DEFAULT_MODEL_PATH,
+        help=f"model checkpoint directory (default: {DEFAULT_MODEL_PATH})",
+    )
+    parser.add_argument(
+        "--tokenizer-model",
+        type=Path,
+        default=DEFAULT_TOKENIZER_MODEL_PATH,
+        help=f"SentencePiece model path (default: {DEFAULT_TOKENIZER_MODEL_PATH})",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -860,7 +877,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     checkpoint_path = train_model(
-        training_config=TrainingConfig(),
+        training_config=TrainingConfig(
+            model_path=args.model,
+            tokenizer_model_path=args.tokenizer_model,
+        ),
         resume_from_checkpoint=args.resume,
     )
     print(f"Checkpoint: {checkpoint_path}")

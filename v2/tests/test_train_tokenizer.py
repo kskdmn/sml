@@ -68,6 +68,22 @@ class TestTrainTokenizer:
 
         assert PROJECT_DIR / 'output' == tokenizer.OUTPUT_DIR
 
+    def test_parse_args_defaults_to_default_tokenizer_model_path(self):
+        train_tokenizer = load_script()
+
+        args = train_tokenizer.parse_args([])
+
+        assert train_tokenizer.DEFAULT_TOKENIZER_MODEL_PATH == args.tokenizer_model
+
+    def test_parse_args_accepts_tokenizer_model_path(self):
+        train_tokenizer = load_script()
+
+        args = train_tokenizer.parse_args(
+            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
+        )
+
+        assert Path("/tmp/custom-tokenizer.model") == args.tokenizer_model
+
     def test_module_does_not_export_test_only_filtered_text_wrapper(self):
         tokenizer = load_script()
 
@@ -220,6 +236,55 @@ class TestTrainTokenizer:
             train_tokenizer.train_tokenizer()
 
         assert True is train.call_args.kwargs.get('byte_fallback')
+
+    def test_train_tokenizer_uses_tokenizer_model_path(self, monkeypatch):
+        train_tokenizer = load_script()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            input_path = root / "sample-0000.jsonl.zst"
+            tokenizer_model_path = root / "nested" / "custom-tokenizer.model"
+            write_zst_rows(
+                input_path,
+                [{"text": "a" * train_tokenizer.tokenizer.MIN_TEXT_LENGTH}],
+            )
+
+            train = Spy()
+            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer.spm.SentencePieceTrainer, "train", train)
+            result = train_tokenizer.train_tokenizer(
+                tokenizer_model_path=tokenizer_model_path
+            )
+
+        assert str(tokenizer_model_path.with_suffix("")) == train.call_args.kwargs[
+            "model_prefix"
+        ]
+        assert tokenizer_model_path == result.model_path
+        assert tokenizer_model_path.with_suffix(".vocab") == result.vocab_path
+
+    def test_main_passes_tokenizer_model_path_to_train_tokenizer(self, monkeypatch):
+        train_tokenizer = load_script()
+        tokenizer_model_path = Path("/tmp/custom-tokenizer.model")
+        train_tokenizer_spy = Spy(
+            return_value=train_tokenizer.TrainingResult(
+                model_path=tokenizer_model_path,
+                vocab_path=tokenizer_model_path.with_suffix(".vocab"),
+                input_file_count=1,
+                rows_read=2,
+                texts_used=1,
+            )
+        )
+        monkeypatch.setattr(train_tokenizer, "train_tokenizer", train_tokenizer_spy)
+        monkeypatch.setattr("builtins.print", Spy())
+
+        return_code = train_tokenizer.main(
+            ["--tokenizer-model", str(tokenizer_model_path)]
+        )
+
+        assert train_tokenizer.SUCCESS_RETURN_CODE == return_code
+        train_tokenizer_spy.assert_called_once_with(
+            tokenizer_model_path=tokenizer_model_path
+        )
 
     def test_train_tokenizer_reserves_conversation_special_tokens(self, monkeypatch):
         train_tokenizer = load_script()
