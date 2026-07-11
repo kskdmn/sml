@@ -30,6 +30,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 import mlx.core as mx
 
 from config import OUTPUT_DIR, SUCCESS_RETURN_CODE, TOKENIZER_MODEL_PATH, resolve_path
+from sml import GenerationConfig
 from tokenizer import CONVERSATION_SPECIAL_TOKENS
 from train_sml import load_tokenizer
 
@@ -579,8 +580,6 @@ def generation_config_from_args(args: argparse.Namespace) -> GenerationConfig:
     ``infer_sml.py`` exposes these knobs as ``--temperature``, ``--top-p``,
     ``--repetition-penalty``, ``--no-repeat-ngram-size``, and ``--seed``.
     """
-    from sml import GenerationConfig
-
     return GenerationConfig(
         temperature=args.temperature,
         top_p=args.top_p,

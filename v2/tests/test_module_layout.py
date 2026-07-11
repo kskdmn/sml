@@ -40,5 +40,7 @@ class TestModuleLayout:
 
     def test_removed_modules_are_absent(self):
         assert not (SRC_DIR / "sml_config.py").exists()
+        assert not (SRC_DIR / "sml_mlx.py").exists()
+        assert not (SRC_DIR / "train_sml_mlx.py").exists()
         assert not (SRC_DIR / "eval_humaneval.py").exists()
         assert not (PROJECT_DIR / "tests" / "test_eval_humaneval.py").exists()

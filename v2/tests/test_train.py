@@ -88,6 +88,53 @@ def tiny_config():
 
 
 class TestTrainData:
+    def test_train_sml_owns_merged_public_api(self):
+        import train_sml
+
+        assert sorted(train_sml.__all__) == [
+            "METADATA_NAME",
+            "MODEL_WEIGHTS_NAME",
+            "OPTIMIZER_STATE_NAME",
+            "ROW_INCREMENT",
+            "ReadingProgress",
+            "ResumeProgress",
+            "SUCCESS_RETURN_CODE",
+            "TextTokenizer",
+            "TrainingConfig",
+            "TrainingDataState",
+            "TrainingResumeState",
+            "build_lr_schedule",
+            "build_parser",
+            "clip_gradients_by_global_norm",
+            "count_resume_batches",
+            "discover_input_files",
+            "format_training_log",
+            "get_special_token_id",
+            "global_grad_norm",
+            "is_step_limit_reached",
+            "iter_mlx_batches",
+            "iter_mlx_token_blocks",
+            "iter_texts",
+            "iter_unseen_batches",
+            "load_tokenizer",
+            "load_training_checkpoint",
+            "lr_lambda",
+            "main",
+            "model_config_for_training",
+            "parse_args",
+            "parse_checkpoint_data_state",
+            "parse_checkpoint_input_files",
+            "reset_training_data_state",
+            "resolve_lr_total_steps",
+            "resolve_mlx_checkpoint_path",
+            "save_checkpoint",
+            "set_seed",
+            "shuffle_input_files",
+            "train_model",
+            "tree_add",
+            "tree_scale",
+        ]
+
     def test_parse_args_defaults_to_fresh_training(self):
         import train_sml
 
