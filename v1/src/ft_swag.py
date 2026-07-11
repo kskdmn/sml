@@ -178,6 +178,7 @@ class SwagExampleDataset(IterableDataset[dict[str, torch.Tensor]]):
         sequence_length: int,
         pad_token_id: int,
         bos_token_id: int | None = None,
+        eos_token_id: int | None = None,
         data_state: TrainingDataState | None = None,
     ) -> None:
         super().__init__()
@@ -188,19 +189,25 @@ class SwagExampleDataset(IterableDataset[dict[str, torch.Tensor]]):
         self.sequence_length = sequence_length
         self.pad_token_id = pad_token_id
         self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
         self.data_state = data_state
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         """
         Yield one fixed-length causal-LM pair per SWAG example.
 
-        Labels outside the gold ending are set to ``pad_token_id`` so the model
-        loss ignores the conditioning context and padding positions.
+        Labels outside the gold ending and EOS are set to ``pad_token_id`` so
+        the model loss ignores the conditioning context and padding positions.
         """
         bos_token_id = get_special_token_id(
             self.tokenizer,
             "bos_id",
             self.bos_token_id,
+        )
+        eos_token_id = get_special_token_id(
+            self.tokenizer,
+            "eos_id",
+            self.eos_token_id,
         )
         if self.data_state is not None:
             self.data_state.token_buffer = []
@@ -209,13 +216,15 @@ class SwagExampleDataset(IterableDataset[dict[str, torch.Tensor]]):
         for startphrase, ending in self.examples:
             context_ids = list(self.tokenizer.encode(startphrase, out_type=int))
             ending_ids = list(self.tokenizer.encode(ending, out_type=int))
+            if eos_token_id is not None:
+                ending_ids.append(eos_token_id)
             example_tokens = []
             if bos_token_id is not None:
                 example_tokens.append(bos_token_id)
             example_tokens.extend(context_ids)
             ending_start = len(example_tokens)
             example_tokens.extend(ending_ids)
-            if len(example_tokens) > tokens_per_example:
+            if len(example_tokens) > self.sequence_length:
                 if self.data_state is not None:
                     self.data_state.token_buffer = []
                 continue
@@ -244,6 +253,8 @@ def build_swag_dataloader(
     tokenizer: object,
     epoch: int,
     pad_token_id: int = SMLConfig().pad_token_id,
+    bos_token_id: int | None = SMLConfig().bos_token_id,
+    eos_token_id: int | None = SMLConfig().eos_token_id,
     progress: ReadingProgress | None = None,
     data_state: TrainingDataState | None = None,
 ) -> DataLoader[dict[str, torch.Tensor]]:
@@ -260,6 +271,8 @@ def build_swag_dataloader(
         tokenizer=tokenizer,
         sequence_length=fine_tune_config.sequence_length,
         pad_token_id=pad_token_id,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
         data_state=data_state,
     )
     return DataLoader(dataset, batch_size=1)
