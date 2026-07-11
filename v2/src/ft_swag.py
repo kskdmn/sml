@@ -95,8 +95,8 @@ class SwagFineTuneConfig:
     checkpoint_name: str = "sml-swag"
     sequence_length: int = 256
     batch_size: int = 1
-    max_steps: int | None = 5_000
-    lr_total_steps: int | None = 5_000
+    max_steps: int | None = 8_192
+    lr_total_steps: int | None = 8_192
     epochs: int = 5
     max_examples: int | None = None
     shuffle_examples: bool = True
@@ -105,7 +105,9 @@ class SwagFineTuneConfig:
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
-    warmup_steps: int = 100
+    warmup_steps: int = int(
+        (lr_total_steps if lr_total_steps is not None else 10_000) * 0.01
+    )
     min_lr_ratio: float = 0.1
     log_every: int = 10
     save_every: int = 500

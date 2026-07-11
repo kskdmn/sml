@@ -112,7 +112,7 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
     warmup_steps: int = int(
-        lr_total_steps if lr_total_steps is not None else 100 * 0.01
+        (lr_total_steps if lr_total_steps is not None else 10_000) * 0.01
     )
     min_lr_ratio: float = 0.1
     log_every: int = 10
