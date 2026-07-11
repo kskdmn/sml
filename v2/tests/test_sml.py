@@ -201,6 +201,32 @@ class TestSMLModel:
         assert (1, 7) == generated.shape
         assert bool(mx.all(prompt == generated[:, : prompt.shape[1]]).item())
 
+    def test_cached_multi_token_chunk_matches_sequential_decode(self):
+        from sml import KVCache, SMLLanguageModel
+
+        mx.random.seed(0)
+        config = self.tiny_config()
+        model = SMLLanguageModel(config)
+        prompt = mx.array([[10, 20, 30]], dtype=mx.int32)
+        chunk = mx.array([[40, 50]], dtype=mx.int32)
+
+        kv_sequential = KVCache()
+        model(prompt, kv_cache=kv_sequential)
+        logits_first = model(mx.array([[40]]), kv_cache=kv_sequential).logits[0, 0]
+        logits_second = model(mx.array([[50]]), kv_cache=kv_sequential).logits[0, 0]
+
+        kv_chunk = KVCache()
+        model(prompt, kv_cache=kv_chunk)
+        chunk_logits = model(chunk, kv_cache=kv_chunk).logits
+        mx.eval(logits_first, logits_second, chunk_logits)
+
+        assert bool(
+            mx.allclose(logits_first, chunk_logits[0, 0], rtol=1e-5, atol=1e-3).item()
+        )
+        assert bool(
+            mx.allclose(logits_second, chunk_logits[0, 1], rtol=1e-5, atol=1e-3).item()
+        )
+
     def test_generate_rejects_requested_tokens_beyond_scaled_context_length(self):
         from sml import SMLLanguageModel
 

@@ -666,18 +666,19 @@ class GroupedQueryAttention(nn.Module):
         cos, sin = self.rope(seq_len, position_offset)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        past_seq_len = position_offset
         if kv_cache is not None:
             k, v = kv_cache.update(self.layer_idx, k, v)
 
         # MLX fast attention does not expose attention-dropout, so the MLX
         # model ignores config.attention_dropout to keep the fused GQA path.
+        # Always use the lower-right causal mask so cached multi-token chunks
+        # cannot attend to future keys within the chunk.
         output = mx.fast.scaled_dot_product_attention(
             q,
             k,
             v,
             scale=1.0 / math.sqrt(self.head_dim),
-            mask="causal" if past_seq_len == 0 else None,
+            mask="causal",
         )
         output = mx.swapaxes(output, 1, 2)
         output = output.reshape((batch_size, seq_len, self.hidden_size))
