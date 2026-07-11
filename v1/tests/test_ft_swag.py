@@ -180,6 +180,53 @@ class FtSwagTest(unittest.TestCase):
         self.assertEqual(1, progress.line_number)
         self.assertEqual(1, progress.example_index)
 
+    def test_build_swag_dataloader_masks_context_and_scores_gold_ending(self):
+        import ft_swag
+        from sml_config import SwagFineTuneConfig
+
+        class TextTokenizer:
+            bos_id = 1
+            eos_id = 2
+
+            def encode(self, text, out_type=int):
+                del out_type
+                return {
+                    "ctx": [10, 11],
+                    " end": [20, 21],
+                    "ctx end": [10, 11, 20, 21],
+                }[text]
+
+        rows = [
+            {
+                "startphrase": "ctx",
+                "ending0": " end",
+                "ending1": " wrong",
+                "ending2": " wrong",
+                "ending3": " wrong",
+                "label": 0,
+            },
+        ]
+        dataset = mock.Mock()
+        dataset.__len__ = mock.Mock(return_value=len(rows))
+        dataset.__getitem__ = mock.Mock(side_effect=lambda index: rows[index])
+        config = SwagFineTuneConfig(
+            sequence_length=5,
+            batch_size=1,
+            shuffle_examples=False,
+        )
+
+        with mock.patch.object(ft_swag, "load_swag_dataset", return_value=dataset):
+            batches = list(
+                ft_swag.build_swag_dataloader(
+                    fine_tune_config=config,
+                    tokenizer=TextTokenizer(),
+                    epoch=0,
+                )
+            )
+
+        self.assertEqual([[1, 10, 11, 20, 21]], batches[0]["input_ids"].tolist())
+        self.assertEqual([[3, 3, 20, 21, 3]], batches[0]["labels"].tolist())
+
     def test_build_swag_dataloader_pads_short_examples_without_packing(self):
         import torch
         import ft_swag
@@ -189,8 +236,8 @@ class FtSwagTest(unittest.TestCase):
 
         with mock.patch.object(
             ft_swag,
-            "iter_swag_texts",
-            return_value=iter(["4", "5"]),
+            "iter_swag_parts",
+            return_value=iter([("", "4"), ("", "5")]),
         ):
             batches = list(
                 ft_swag.build_swag_dataloader(
@@ -202,13 +249,13 @@ class FtSwagTest(unittest.TestCase):
 
         self.assertEqual(2, len(batches))
         self.assertTrue(
-            torch.equal(torch.tensor([[1, 4, 2]]), batches[0]["input_ids"])
+            torch.equal(torch.tensor([[1, 4, 3]]), batches[0]["input_ids"])
         )
-        self.assertTrue(torch.equal(torch.tensor([[4, 2, 2]]), batches[0]["labels"]))
+        self.assertTrue(torch.equal(torch.tensor([[4, 3, 3]]), batches[0]["labels"]))
         self.assertTrue(
-            torch.equal(torch.tensor([[1, 5, 2]]), batches[1]["input_ids"])
+            torch.equal(torch.tensor([[1, 5, 3]]), batches[1]["input_ids"])
         )
-        self.assertTrue(torch.equal(torch.tensor([[5, 2, 2]]), batches[1]["labels"]))
+        self.assertTrue(torch.equal(torch.tensor([[5, 3, 3]]), batches[1]["labels"]))
 
     def test_build_swag_dataloader_skips_examples_longer_than_sequence(self):
         import ft_swag
@@ -218,8 +265,8 @@ class FtSwagTest(unittest.TestCase):
 
         with mock.patch.object(
             ft_swag,
-            "iter_swag_texts",
-            return_value=iter(["4 5 6 7"]),
+            "iter_swag_parts",
+            return_value=iter([("", "4 5 6 7")]),
         ):
             batches = list(
                 ft_swag.build_swag_dataloader(
@@ -240,8 +287,8 @@ class FtSwagTest(unittest.TestCase):
 
         with mock.patch.object(
             ft_swag,
-            "iter_swag_texts",
-            return_value=iter(["4 5 6"]),
+            "iter_swag_parts",
+            return_value=iter([("", "4 5 6")]),
         ):
             batches = list(
                 ft_swag.build_swag_dataloader(
