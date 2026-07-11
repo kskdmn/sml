@@ -201,8 +201,8 @@ class SwagFineTuneConfig:
     checkpoint_name: str = "sml-swag.pt"
     sequence_length: int = 256
     batch_size: int = 1
-    max_steps: int | None = 8_000
-    lr_total_steps: int | None = 8_000
+    max_steps: int | None = 8_192
+    lr_total_steps: int | None = 8_192
     epochs: int = 1
     max_examples: int | None = None
     shuffle_examples: bool = True
