@@ -95,7 +95,8 @@ class TestTrainTokenizer:
         assert not hasattr(tokenizer, 'iter_jsonl_lines')
 
     def test_discover_input_files_sorts_matching_zst_shards_and_skips_others(self):
-        tokenizer = load_tokenizer_module()
+        train_tokenizer = load_script()
+        tokenizer = train_tokenizer.tokenizer
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -107,7 +108,10 @@ class TestTrainTokenizer:
             (root / ".dataset-0001.jsonl.zst").write_text("", encoding="utf-8")
             (root / "notes.txt").write_text("", encoding="utf-8")
 
-            files = tokenizer.discover_input_files(root)
+            files = tokenizer.discover_input_files(
+                root,
+                train_tokenizer.TOKENIZER_SHARD_NAME_REGEX,
+            )
 
         assert ['dataset-0000.jsonl.zst', 'dataset-0009.jsonl.zst', 'dataset-0010.jsonl.zst'] == [path.name for path in files]
 
@@ -177,30 +181,33 @@ class TestTrainTokenizer:
         assert EXPECTED_NORMALIZED_TEXT_COUNT == len(texts)
         assert '\x00' not in texts[0]
 
-    def test_filtered_text_iterable_does_not_recheck_discovered_file_names(self, monkeypatch):
-        tokenizer = load_tokenizer_module()
-
-        class MatchCountingPattern:
-            def __init__(self):
-                self.names = []
-
-            def fullmatch(self, name):
-                self.names.append(name)
-                return object()
+    def test_train_tokenizer_supplies_its_shard_regex_to_tokenizer_module(self, monkeypatch):
+        train_tokenizer = load_script()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
             input_path = root / "sample-0000.jsonl.zst"
-            expected_text = "a" * tokenizer.MIN_TEXT_LENGTH
+            expected_text = "a" * train_tokenizer.tokenizer.MIN_TEXT_LENGTH
             write_zst_rows(input_path, [{"text": expected_text}])
-            pattern = MatchCountingPattern()
+            discover_input_files = Spy(return_value=(input_path,))
 
-            monkeypatch.setattr(tokenizer, "INPUT_FILE_NAME_PATTERN", pattern)
-            input_files = tokenizer.discover_input_files(root)
-            texts = collect_filtered_texts(tokenizer, input_files)
+            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(
+                train_tokenizer.tokenizer,
+                "discover_input_files",
+                discover_input_files,
+            )
+            monkeypatch.setattr(
+                train_tokenizer.spm.SentencePieceTrainer,
+                "train",
+                Spy(),
+            )
+            train_tokenizer.train_tokenizer()
 
-        assert [expected_text] == texts
-        assert ['sample-0000.jsonl.zst'] == pattern.names
+        discover_input_files.assert_called_once_with(
+            root,
+            train_tokenizer.TOKENIZER_SHARD_NAME_REGEX,
+        )
 
     def test_iter_zstd_jsonl_lines_reads_zst_files_without_subprocess(self, monkeypatch):
         tokenizer = load_tokenizer_module()
@@ -324,5 +331,5 @@ class TestTrainTokenizer:
             monkeypatch.setattr(train_tokenizer.spm.SentencePieceTrainer, "train", train)
             train_tokenizer.train_tokenizer()
 
-        assert train_tokenizer.MAX_SENTENCE_LENGTH is None
+        assert train_tokenizer.tokenizer.MAX_SENTENCE_LENGTH is None
         assert 'max_sentence_length' not in train.call_args.kwargs

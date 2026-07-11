@@ -47,12 +47,12 @@ class SMLConfig:
     ``train_sml.model_config_for_training``.
     """
 
-    vocab_size: int = 24_576
-    hidden_size: int = 512
+    vocab_size: int = 28_672
+    hidden_size: int = 768
     num_layers: int = 12
-    num_q_heads: int = 8
-    num_kv_heads: int = 2
-    intermediate_size: int = 1_536
+    num_q_heads: int = 12
+    num_kv_heads: int = 3
+    intermediate_size: int = 2_176
     original_max_position_embeddings: int = 1_024  # RoPE design window; YaRN stretches beyond this.
     rope_theta: float = 10_000.0  # RoPE base (theta in inv_freq = 1 / theta^(2k/d)).
     rope_scaling_factor: float = 4.0  # Inference context multiplier; 1 disables YaRN.

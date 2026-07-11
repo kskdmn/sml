@@ -38,6 +38,28 @@ class TestModuleLayout:
         assert hasattr(lora, "LoRAConfig")
         assert hasattr(ft_swag, "SwagFineTuneConfig")
 
+    def test_training_entrypoints_own_training_constants(self):
+        config = importlib.import_module("config")
+        tokenizer = importlib.import_module("tokenizer")
+        train_sml = importlib.import_module("train_sml")
+        train_tokenizer = importlib.import_module("train_tokenizer")
+
+        assert r".*-00[0-9][0-9]\.jsonl\.zst\Z" == train_sml.INPUT_FILE_NAME_REGEX
+        assert not hasattr(config, "INPUT_FILE_NAME_REGEX")
+        assert not hasattr(tokenizer, "INPUT_FILE_NAME_REGEX")
+        assert not hasattr(tokenizer, "INPUT_FILE_NAME_PATTERN")
+
+        assert (
+            r".*-00[0-9][0-9]\.jsonl\.zst\Z"
+            == train_tokenizer.TOKENIZER_SHARD_NAME_REGEX
+        )
+        assert 32_768 == train_tokenizer.MAX_ROWS_PER_FILE
+        assert not hasattr(tokenizer, "MAX_ROWS_PER_FILE")
+        assert 28_672 == tokenizer.VOCAB_SIZE
+        assert "bpe" == tokenizer.MODEL_TYPE
+        assert not hasattr(train_tokenizer, "VOCAB_SIZE")
+        assert not hasattr(train_tokenizer, "MODEL_TYPE")
+
     def test_removed_modules_are_absent(self):
         assert not (SRC_DIR / "sml_config.py").exists()
         assert not (SRC_DIR / "sml_mlx.py").exists()

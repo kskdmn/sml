@@ -8,32 +8,21 @@ from typing import Iterator, NamedTuple, Sequence
 
 import sentencepiece as spm
 
-from config import (
-    DEFAULT_TOKENIZER_MODEL_PATH,
-    INPUT_DIR,
-    OUTPUT_DIR,
-    SUCCESS_RETURN_CODE,
-    resolve_path,
-)
+from config import PROJECT_DIR, resolve_path
 import tokenizer
 
-VOCAB_SIZE = 28_672
+SUCCESS_RETURN_CODE = 0
+INPUT_DIR = Path("~/Documents/data-common_pile/")
+TOKENIZER_SHARD_NAME_REGEX = r".*-00[0-9][0-9]\.jsonl\.zst\Z"
+OUTPUT_DIR = PROJECT_DIR / "output"
+DEFAULT_TOKENIZER_MODEL_PATH = OUTPUT_DIR / "bpe_tokenizer.model"
+MAX_ROWS_PER_FILE = 32_768
 RANDOM_SEED = 42
 NUM_THREADS = 8
 INPUT_SENTENCE_SIZE = 524_288
 SELF_TEST_SAMPLE_SIZE = 0
-CHARACTER_COVERAGE = 0.9995  # 1.0 for small character sets (e.g. English clean datasets), 0.9995 for Pile/web-like datasets
-BYTE_FALLBACK = True
-UNK_ID = 0
-BOS_ID = 1
-EOS_ID = 2
-PAD_ID = 3
 SHUFFLE_INPUT_SENTENCE = True
-HARD_VOCAB_LIMIT = True
 TRAIN_EXTREMELY_LARGE_CORPUS = False  # This is only for Unigram models.
-
-MODEL_TYPE = "bpe"
-MAX_SENTENCE_LENGTH: int | None = tokenizer.MAX_TEXT_LENGTH
 
 
 class TrainingResult(NamedTuple):
@@ -72,37 +61,43 @@ def train_tokenizer(
     output_dir = tokenizer_model_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    input_files = tokenizer.discover_input_files(INPUT_DIR)
+    input_files = tokenizer.discover_input_files(
+        INPUT_DIR,
+        TOKENIZER_SHARD_NAME_REGEX,
+    )
     if not input_files:
         raise FileNotFoundError(
             f"No supported input files found in {resolve_path(INPUT_DIR)}"
         )
 
-    text_iterable = tokenizer.FilteredTextIterable(input_files)
+    text_iterable = tokenizer.FilteredTextIterable(
+        input_files,
+        max_rows_per_file=MAX_ROWS_PER_FILE,
+    )
     sentence_iterator = require_non_empty_iterator(iter(text_iterable))
 
     model_prefix = tokenizer_model_path.with_suffix("")
     trainer_kwargs = dict(
         sentence_iterator=sentence_iterator,
         model_prefix=str(model_prefix),
-        vocab_size=VOCAB_SIZE,
-        model_type=MODEL_TYPE,
-        character_coverage=CHARACTER_COVERAGE,
-        byte_fallback=BYTE_FALLBACK,
+        vocab_size=tokenizer.VOCAB_SIZE,
+        model_type=tokenizer.MODEL_TYPE,
+        character_coverage=tokenizer.CHARACTER_COVERAGE,
+        byte_fallback=tokenizer.BYTE_FALLBACK,
         num_threads=NUM_THREADS,
         input_sentence_size=INPUT_SENTENCE_SIZE,
         shuffle_input_sentence=SHUFFLE_INPUT_SENTENCE,
         self_test_sample_size=SELF_TEST_SAMPLE_SIZE,
-        hard_vocab_limit=HARD_VOCAB_LIMIT,
+        hard_vocab_limit=tokenizer.HARD_VOCAB_LIMIT,
         train_extremely_large_corpus=TRAIN_EXTREMELY_LARGE_CORPUS,
-        unk_id=UNK_ID,
-        bos_id=BOS_ID,
-        eos_id=EOS_ID,
-        pad_id=PAD_ID,
+        unk_id=tokenizer.UNK_ID,
+        bos_id=tokenizer.BOS_ID,
+        eos_id=tokenizer.EOS_ID,
+        pad_id=tokenizer.PAD_ID,
         user_defined_symbols=list(tokenizer.CONVERSATION_SPECIAL_TOKENS),
     )
-    if MAX_SENTENCE_LENGTH is not None:
-        trainer_kwargs["max_sentence_length"] = MAX_SENTENCE_LENGTH
+    if tokenizer.MAX_SENTENCE_LENGTH is not None:
+        trainer_kwargs["max_sentence_length"] = tokenizer.MAX_SENTENCE_LENGTH
 
     spm.SentencePieceTrainer.train(**trainer_kwargs)
 

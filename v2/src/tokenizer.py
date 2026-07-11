@@ -9,20 +9,28 @@ from typing import Iterable, Iterator, Sequence
 
 import zstandard as zstd
 
-from config import INPUT_DIR, resolve_path
+from config import resolve_path
 
-MAX_ROWS_PER_FILE = 32_768
 MIN_TEXT_LENGTH = 100
 MAX_TEXT_LENGTH: int | None = None
 TEXT_COLUMN = "text"
 TEXT_ENCODING = "utf-8"
 TEXT_DECODE_ERRORS = "replace"
 HIDDEN_FILE_PREFIX = "."
-INPUT_FILE_NAME_PATTERN = re.compile(r".*-00[0-9][0-9]\.jsonl\.zst\Z")
 NULL_CHARACTER = "\x00"
 FIRST_LINE_NUMBER = 1
 NO_ROWS = 0
 ROW_INCREMENT = 1
+VOCAB_SIZE = 28_672
+MODEL_TYPE = "bpe"
+CHARACTER_COVERAGE = 0.9995  # 1.0 for small character sets; 0.9995 for Pile/web-like datasets.
+BYTE_FALLBACK = True
+UNK_ID = 0
+BOS_ID = 1
+EOS_ID = 2
+PAD_ID = 3
+HARD_VOCAB_LIMIT = True
+MAX_SENTENCE_LENGTH: int | None = MAX_TEXT_LENGTH
 CONVERSATION_SPECIAL_TOKENS = (
     "<|system|>",
     "<|user|>",
@@ -36,7 +44,7 @@ class FilteredTextIterable:
     def __init__(
         self,
         input_files: Sequence[Path],
-        max_rows_per_file: int | None = MAX_ROWS_PER_FILE,
+        max_rows_per_file: int | None = None,
     ) -> None:
         """
         Counters live on the iterable so callers can report rows read versus texts kept
@@ -66,20 +74,21 @@ class FilteredTextIterable:
                 yield text
 
 
-def discover_input_files(input_dir: Path = INPUT_DIR) -> tuple[Path, ...]:
+def discover_input_files(input_dir: Path, file_name_regex: str) -> tuple[Path, ...]:
     """
-    Use the fixed tokenizer shard naming pattern and skip hidden local metadata files.
+    Use the supplied shard naming pattern and skip hidden local metadata files.
     """
     root = resolve_path(input_dir)
     if not root.exists():
         raise FileNotFoundError(f"Input directory does not exist: {root}")
 
+    input_file_name_pattern = re.compile(file_name_regex)
     files = [
         path
         for path in root.iterdir()
         if path.is_file()
         and not path.name.startswith(HIDDEN_FILE_PREFIX)
-        and INPUT_FILE_NAME_PATTERN.fullmatch(path.name) is not None
+        and input_file_name_pattern.fullmatch(path.name) is not None
     ]
     return tuple(sorted(files, key=lambda path: path.name))
 

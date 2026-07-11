@@ -759,16 +759,6 @@ class TestCanonicalMlxTraining:
 
         assert checkpoint_path == tmp_path / "model-dir"
 
-    def test_resolve_mlx_checkpoint_path_converts_legacy_suffix(self, tmp_path):
-        import train_sml
-        from train_sml import TrainingConfig
-
-        checkpoint_path = train_sml.resolve_mlx_checkpoint_path(
-            TrainingConfig(output_dir=tmp_path, checkpoint_name="sml.pt")
-        )
-
-        assert checkpoint_path == tmp_path / "sml_mlx"
-
     def test_missing_explicit_resume_checkpoint_is_rejected(self, tmp_path):
         import train_sml
 
@@ -821,8 +811,8 @@ class TestCanonicalMlxTraining:
             input_dir=tmp_path,
             output_dir=tmp_path / "output",
             tokenizer_model_path=tmp_path / "tokenizer.model",
-            checkpoint_name="sml.pt",
-            model_path=tmp_path / "output" / "sml.pt",
+            checkpoint_name="sml",
+            model_path=tmp_path / "output" / "sml",
         )
         load_training_checkpoint = Spy(return_value=train_sml.TrainingResumeState())
 
@@ -847,7 +837,7 @@ class TestCanonicalMlxTraining:
             )
 
         load_training_checkpoint.assert_called_once()
-        assert training_config.output_dir / "sml_mlx" == load_training_checkpoint.call_args.args[0]
+        assert training_config.output_dir / "sml" == load_training_checkpoint.call_args.args[0]
 
     def test_train_model_uses_checkpoint_input_file_order_when_resume_is_enabled(
         self,

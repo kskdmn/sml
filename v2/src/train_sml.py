@@ -13,14 +13,7 @@ from typing import Protocol, Sequence, TypeVar
 
 import sentencepiece as spm
 
-from config import (
-    DEFAULT_MODEL_PATH,
-    DEFAULT_TOKENIZER_MODEL_PATH,
-    INPUT_DIR,
-    INPUT_FILE_NAME_REGEX,
-    OUTPUT_DIR,
-    resolve_path,
-)
+from config import PROJECT_DIR, resolve_path
 from tokenizer import (
     HIDDEN_FILE_PREFIX,
     TEXT_COLUMN,
@@ -31,6 +24,11 @@ from tokenizer import (
 
 ROW_INCREMENT = 1
 SUCCESS_RETURN_CODE = 0
+INPUT_DIR = Path("~/Documents/data-common_pile/")
+INPUT_FILE_NAME_REGEX = r".*-00[0-9][0-9]\.jsonl\.zst\Z"
+OUTPUT_DIR = PROJECT_DIR / "output"
+DEFAULT_MODEL_PATH = OUTPUT_DIR / "sml"
+DEFAULT_TOKENIZER_MODEL_PATH = OUTPUT_DIR / "bpe_tokenizer.model"
 MODEL_WEIGHTS_NAME = "model.safetensors"
 OPTIMIZER_STATE_NAME = "optimizer.npz"
 METADATA_NAME = "metadata.json"
@@ -559,9 +557,6 @@ def resolve_mlx_checkpoint_path(training_config: TrainingConfig) -> Path:
         if training_config.model_path is not None
         else resolve_path(training_config.output_dir) / training_config.checkpoint_name
     )
-    if checkpoint_path.suffix == ".pt":
-        checkpoint_path = checkpoint_path.with_suffix("")
-        checkpoint_path = checkpoint_path.with_name(f"{checkpoint_path.name}_mlx")
     return resolve_path(checkpoint_path)
 
 
