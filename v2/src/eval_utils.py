@@ -86,7 +86,9 @@ class SMLEvalLM(LM):
             for target_position in continuation_positions:
                 predictor_position = target_position - 1
                 target_token_id = token_ids[target_position]
-                logprob += float(log_probs[0, predictor_position, target_token_id].item())
+                logprob += float(
+                    log_probs[0, predictor_position, target_token_id].item()
+                )
                 greedy_token_id = int(mx.argmax(logits[0, predictor_position]).item())
                 is_greedy = is_greedy and greedy_token_id == target_token_id
 

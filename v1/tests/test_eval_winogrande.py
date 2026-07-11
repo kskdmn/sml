@@ -36,6 +36,7 @@ class WinograndeEvalTest(unittest.TestCase):
 
     def test_main_loads_default_checkpoint_and_writes_results(self):
         import eval_winogrande
+        from config import TOKENIZER_MODEL_PATH
 
         lm = mock.Mock()
         results = {"results": {"winogrande": {"acc,none": 0.0}}}
@@ -59,7 +60,7 @@ class WinograndeEvalTest(unittest.TestCase):
         self.assertEqual(0, return_code)
         from_checkpoint.assert_called_once_with(
             checkpoint_path=eval_winogrande.DEFAULT_CHECKPOINT_PATH,
-            tokenizer_model_path=eval_winogrande.TOKENIZER_MODEL_PATH,
+            tokenizer_model_path=TOKENIZER_MODEL_PATH,
             device_name="cpu",
         )
         evaluate_winogrande.assert_called_once_with(

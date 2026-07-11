@@ -25,20 +25,32 @@ class SMLConfig:
     num_q_heads: int = 8
     num_kv_heads: int = 2
     intermediate_size: int = 1_536
-    original_max_position_embeddings: int = 1_024  # RoPE design window; YaRN stretches beyond this.
+    original_max_position_embeddings: int = (
+        1_024  # RoPE design window; YaRN stretches beyond this.
+    )
     rope_theta: float = 10_000.0  # RoPE base (theta in inv_freq = 1 / theta^(2k/d)).
     rope_scaling_factor: float = 2.0  # Inference context multiplier; 1 disables YaRN.
     yarn_beta_fast: float = 32.0  # Rotation-count cutoff for fast bands (extrapolate).
     yarn_beta_slow: float = 1.0  # Rotation-count cutoff for slow bands (interpolate).
-    yarn_attention_factor: float | None = None  # Override cos/sin scaling; None infers from factor.
-    yarn_mscale: float | None = None  # Optional numerator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale_all_dim is set.
-    yarn_mscale_all_dim: float | None = None  # Optional denominator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale is set.
+    yarn_attention_factor: float | None = (
+        None  # Override cos/sin scaling; None infers from factor.
+    )
+    yarn_mscale: float | None = (
+        None  # Optional numerator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale_all_dim is set.
+    )
+    yarn_mscale_all_dim: float | None = (
+        None  # Optional denominator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale is set.
+    )
     yarn_truncate: bool = True  # Floor/ceil band cutoffs in the YaRN correction range.
     rms_norm_eps: float = 1e-6
-    attention_dropout: float = 0.005  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
+    attention_dropout: float = (
+        0.005  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
+    )
     hidden_dropout: float = 0.01  # If overfitting, try 0.1
     initializer_range: float = 0.02
-    gradient_checkpointing: bool = False  # Trade extra compute for lower activation memory during training.
+    gradient_checkpointing: bool = (
+        False  # Trade extra compute for lower activation memory during training.
+    )
     pad_token_id: int = 3
     bos_token_id: int = 1
     eos_token_id: int = 2
@@ -135,17 +147,27 @@ class TrainingConfig:
     """
 
     input_dir: Path = INPUT_DIR
-    input_file_name_regex: str = INPUT_FILE_NAME_REGEX  # Regex matched against each file name.
+    input_file_name_regex: str = (
+        INPUT_FILE_NAME_REGEX  # Regex matched against each file name.
+    )
     output_dir: Path = OUTPUT_DIR
     tokenizer_model_path: Path = TOKENIZER_MODEL_PATH
     checkpoint_name: str = "sml.pt"
     sequence_length: int = 1_024
     batch_size: int = 1
-    max_steps: int | None = None # Maximum optimizer steps. Set to None to train until epochs/data end.
-    lr_total_steps: int | None = 100_000  # LR schedule horizon. Falls back to max_steps when None.
+    max_steps: int | None = (
+        None  # Maximum optimizer steps. Set to None to train until epochs/data end.
+    )
+    lr_total_steps: int | None = (
+        100_000  # LR schedule horizon. Falls back to max_steps when None.
+    )
     epochs: int = 1
-    max_rows_per_file: int | None = 32_768  # Maximum rows read from each input file per epoch. Set to None for all rows.
-    shuffle_input_files: bool = True  # Shuffle model-training shards deterministically with seed.
+    max_rows_per_file: int | None = (
+        32_768  # Maximum rows read from each input file per epoch. Set to None for all rows.
+    )
+    shuffle_input_files: bool = (
+        True  # Shuffle model-training shards deterministically with seed.
+    )
     learning_rate: float = 3e-4
     weight_decay: float = 0.1
     gradient_accumulation_steps: int = 8
@@ -175,9 +197,9 @@ class LoRAConfig:
         "k_proj",
         "v_proj",
         "o_proj",
-        #"gate_proj",
-        #"up_proj",
-        #"down_proj",
+        # "gate_proj",
+        # "up_proj",
+        # "down_proj",
     )
 
 

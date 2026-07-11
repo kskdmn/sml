@@ -46,7 +46,9 @@ class LoRALinear(nn.Module):
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         device = linear.weight.device
         self.lora_A = nn.Parameter(torch.empty(rank, linear.in_features, device=device))
-        self.lora_B = nn.Parameter(torch.empty(linear.out_features, rank, device=device))
+        self.lora_B = nn.Parameter(
+            torch.empty(linear.out_features, rank, device=device)
+        )
         self.reset_lora_parameters()
 
         for parameter in self.linear.parameters():
@@ -72,7 +74,9 @@ class LoRALinear(nn.Module):
         Fold the low-rank delta into the wrapped linear layer and return it.
         """
         delta = self.lora_B @ self.lora_A
-        self.linear.weight.data.add_(self.scaling * delta.to(dtype=self.linear.weight.dtype))
+        self.linear.weight.data.add_(
+            self.scaling * delta.to(dtype=self.linear.weight.dtype)
+        )
         return self.linear
 
 
@@ -184,4 +188,6 @@ def require_lora_modules(model: nn.Module, target_modules: Iterable[str]) -> Non
     """
     if count_lora_modules(model) == 0:
         targets = ", ".join(sorted(set(target_modules)))
-        raise RuntimeError(f"No LoRA adapters were applied to target modules: {targets}")
+        raise RuntimeError(
+            f"No LoRA adapters were applied to target modules: {targets}"
+        )

@@ -154,7 +154,7 @@ class TestEvalUtils:
         )
         request = SimpleNamespace(args=("4 5", " 6"))
 
-        with pytest.raises(ValueError, match='prompt plus continuation'):
+        with pytest.raises(ValueError, match="prompt plus continuation"):
             lm.loglikelihood([request])
 
     def test_generate_until_caps_completion_and_applies_earliest_stop(self):
@@ -179,7 +179,7 @@ class TestEvalUtils:
 
         result = lm.generate_until([request])
 
-        assert ['6'] == result
+        assert ["6"] == result
         assert 3 == model.max_new_tokens
         assert 2 == model.eos_token_id
 
@@ -231,9 +231,7 @@ class TestEvalUtils:
             limit_help="limit examples",
         )
 
-        args = parser.parse_args(
-            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
-        )
+        args = parser.parse_args(["--tokenizer-model", "/tmp/custom-tokenizer.model"])
 
         assert Path("/tmp/custom-tokenizer.model") == args.tokenizer_model
 
@@ -250,4 +248,4 @@ class TestEvalUtils:
 
             saved = json.loads(output_path.read_text(encoding="utf-8"))
 
-        assert 'v2/output/sml' == saved['checkpoint']
+        assert "v2/output/sml" == saved["checkpoint"]

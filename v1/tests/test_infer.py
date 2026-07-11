@@ -137,8 +137,12 @@ class InferenceInterfaceTest(unittest.TestCase):
         model.generate.return_value = torch.tensor([[1, 4, 5, 6, 2]])
 
         with (
-            mock.patch.object(infer_sml, "resolve_device", return_value=torch.device("cpu")),
-            mock.patch.object(infer_sml, "load_tokenizer", return_value=FakeTokenizer()),
+            mock.patch.object(
+                infer_sml, "resolve_device", return_value=torch.device("cpu")
+            ),
+            mock.patch.object(
+                infer_sml, "load_tokenizer", return_value=FakeTokenizer()
+            ),
             mock.patch.object(infer_sml, "load_model", return_value=model),
         ):
             text = infer_sml.generate_text("4 5", max_new_tokens=2)
@@ -163,8 +167,12 @@ class InferenceInterfaceTest(unittest.TestCase):
         model.generate.return_value = torch.tensor([[1, 4, 5, 6, 2]])
 
         with (
-            mock.patch.object(infer_sml, "resolve_device", return_value=torch.device("cpu")),
-            mock.patch.object(infer_sml, "load_tokenizer", return_value=FakeTokenizer()),
+            mock.patch.object(
+                infer_sml, "resolve_device", return_value=torch.device("cpu")
+            ),
+            mock.patch.object(
+                infer_sml, "load_tokenizer", return_value=FakeTokenizer()
+            ),
             mock.patch.object(infer_sml, "load_model", return_value=model),
         ):
             text = infer_sml.generate_text("4 5")

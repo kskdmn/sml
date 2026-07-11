@@ -22,7 +22,7 @@ from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
 from lm_eval.utils import make_table
 
-from config import OUTPUT_DIR, SUCCESS_RETURN_CODE, TOKENIZER_MODEL_PATH
+from config import OUTPUT_DIR, SUCCESS_RETURN_CODE
 from eval_utils import (
     SMLEvalLM,
     build_eval_parser,

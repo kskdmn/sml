@@ -188,7 +188,9 @@ class TrainTokenizerTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "sample-0000.jsonl.zst"
-            text = "\n".join(json.dumps({"text": value}) for value in ("first", "second"))
+            text = "\n".join(
+                json.dumps({"text": value}) for value in ("first", "second")
+            )
             write_zst_text(path, text)
 
             with mock.patch(

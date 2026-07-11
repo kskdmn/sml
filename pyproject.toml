@@ -15,5 +15,7 @@ dependencies = [
     "zstandard>=0.25.0,<1.0.0",
 ]
 
-[tool.pytest.ini_options]
-testpaths = ["v2/tests"]
+[dependency-groups]
+dev = [
+    "ruff>=0.15.21,<16.0.0",
+]

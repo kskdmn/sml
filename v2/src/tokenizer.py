@@ -23,7 +23,9 @@ NO_ROWS = 0
 ROW_INCREMENT = 1
 VOCAB_SIZE = 28_672
 MODEL_TYPE = "bpe"
-CHARACTER_COVERAGE = 0.9995  # 1.0 for small character sets; 0.9995 for Pile/web-like datasets.
+CHARACTER_COVERAGE = (
+    0.9995  # 1.0 for small character sets; 0.9995 for Pile/web-like datasets.
+)
 BYTE_FALLBACK = True
 UNK_ID = 0
 BOS_ID = 1

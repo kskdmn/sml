@@ -210,7 +210,9 @@ class TestTrainData:
 
         assert train_sml.SUCCESS_RETURN_CODE == return_code
         training_config = train_model.call_args.kwargs["training_config"]
-        assert Path("/tmp/custom-tokenizer.model") == training_config.tokenizer_model_path
+        assert (
+            Path("/tmp/custom-tokenizer.model") == training_config.tokenizer_model_path
+        )
 
     def test_train_model_accepts_config_objects_and_resume_flag(self):
         import train_sml
@@ -229,7 +231,10 @@ class TestTrainData:
 
         assert "sml" == training_config.checkpoint_name
         assert training_config.model_path is None
-        assert train_sml.DEFAULT_TOKENIZER_MODEL_PATH == training_config.tokenizer_model_path
+        assert (
+            train_sml.DEFAULT_TOKENIZER_MODEL_PATH
+            == training_config.tokenizer_model_path
+        )
         assert not hasattr(training_config, "resume_from_checkpoint")
 
     def test_discover_input_files_uses_supplied_regex_and_sorts_matches(self):
@@ -418,9 +423,10 @@ class TestTrainData:
         import train_sml
 
         assert () == train_sml.parse_checkpoint_input_files(None)
-        assert (tmp_path / "a", tmp_path / "b") == train_sml.parse_checkpoint_input_files(
-            [tmp_path / "a", tmp_path / "b"]
-        )
+        assert (
+            tmp_path / "a",
+            tmp_path / "b",
+        ) == train_sml.parse_checkpoint_input_files([tmp_path / "a", tmp_path / "b"])
 
     def test_parse_checkpoint_input_files_rejects_non_lists(self):
         import train_sml
@@ -583,7 +589,9 @@ class TestTrainData:
             "line=42 lr=3.000e-04 loss=9.8457 grad_norm=6.069 (before clipping)"
         ) == log_line
 
-    def test_model_config_for_training_disables_rope_scaling_without_mutating_input(self):
+    def test_model_config_for_training_disables_rope_scaling_without_mutating_input(
+        self,
+    ):
         import train_sml
 
         config = PureModelConfig(rope_scaling_factor=2.0)
@@ -781,8 +789,12 @@ class TestCanonicalMlxTraining:
             tokenizer_model_path=tmp_path / "tokenizer.model",
         )
 
-        monkeypatch.setattr(train_sml, "discover_input_files", Spy(return_value=discovered))
-        monkeypatch.setattr(train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer()))
+        monkeypatch.setattr(
+            train_sml, "discover_input_files", Spy(return_value=discovered)
+        )
+        monkeypatch.setattr(
+            train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
+        )
         monkeypatch.setattr(
             train_sml,
             "load_training_checkpoint",
@@ -816,8 +828,12 @@ class TestCanonicalMlxTraining:
         )
         load_training_checkpoint = Spy(return_value=train_sml.TrainingResumeState())
 
-        monkeypatch.setattr(train_sml, "discover_input_files", Spy(return_value=discovered))
-        monkeypatch.setattr(train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer()))
+        monkeypatch.setattr(
+            train_sml, "discover_input_files", Spy(return_value=discovered)
+        )
+        monkeypatch.setattr(
+            train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
+        )
         monkeypatch.setattr(
             train_sml,
             "load_training_checkpoint",
@@ -837,7 +853,10 @@ class TestCanonicalMlxTraining:
             )
 
         load_training_checkpoint.assert_called_once()
-        assert training_config.output_dir / "sml" == load_training_checkpoint.call_args.args[0]
+        assert (
+            training_config.output_dir / "sml"
+            == load_training_checkpoint.call_args.args[0]
+        )
 
     def test_train_model_uses_checkpoint_input_file_order_when_resume_is_enabled(
         self,
@@ -863,8 +882,12 @@ class TestCanonicalMlxTraining:
         )
         iter_texts = Spy(side_effect=RuntimeError("stop after input order"))
 
-        monkeypatch.setattr(train_sml, "discover_input_files", Spy(return_value=discovered))
-        monkeypatch.setattr(train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer()))
+        monkeypatch.setattr(
+            train_sml, "discover_input_files", Spy(return_value=discovered)
+        )
+        monkeypatch.setattr(
+            train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
+        )
         monkeypatch.setattr(
             train_sml,
             "load_training_checkpoint",
@@ -910,8 +933,12 @@ class TestCanonicalMlxTraining:
             save_every=1,
         )
 
-        monkeypatch.setattr(train_sml, "discover_input_files", Spy(return_value=(data_file,)))
-        monkeypatch.setattr(train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer()))
+        monkeypatch.setattr(
+            train_sml, "discover_input_files", Spy(return_value=(data_file,))
+        )
+        monkeypatch.setattr(
+            train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
+        )
         monkeypatch.setattr(
             train_sml,
             "iter_texts",
@@ -958,8 +985,12 @@ class TestCanonicalMlxTraining:
                 save_every=1,
             )
 
-        monkeypatch.setattr(train_sml, "discover_input_files", Spy(return_value=(data_file,)))
-        monkeypatch.setattr(train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer()))
+        monkeypatch.setattr(
+            train_sml, "discover_input_files", Spy(return_value=(data_file,))
+        )
+        monkeypatch.setattr(
+            train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
+        )
         monkeypatch.setattr(
             train_sml,
             "iter_texts",
@@ -975,7 +1006,9 @@ class TestCanonicalMlxTraining:
             model_config=tiny_config(),
             resume_from_checkpoint=True,
         )
-        metadata = json.loads((resumed_path / train_sml.METADATA_NAME).read_text(encoding="utf-8"))
+        metadata = json.loads(
+            (resumed_path / train_sml.METADATA_NAME).read_text(encoding="utf-8")
+        )
 
         assert resumed_path == checkpoint_path
         assert metadata["step"] == 2

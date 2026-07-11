@@ -33,7 +33,9 @@ def positive_int(value: str) -> int:
 def jsonl_output_path(json_gz_path: Path) -> Path:
     if not json_gz_path.name.endswith(JSON_GZ_SUFFIX):
         raise ValueError(f"Expected a {JSON_GZ_SUFFIX} file: {json_gz_path}")
-    return json_gz_path.with_name(json_gz_path.name[: -len(JSON_GZ_SUFFIX)] + JSONL_ZST_SUFFIX)
+    return json_gz_path.with_name(
+        json_gz_path.name[: -len(JSON_GZ_SUFFIX)] + JSONL_ZST_SUFFIX
+    )
 
 
 def candidate_files(path: Path) -> list[Path]:
@@ -42,7 +44,9 @@ def candidate_files(path: Path) -> list[Path]:
             raise ValueError(f"Expected a {JSON_GZ_SUFFIX} file: {path}")
         return [path]
     if path.is_dir():
-        return sorted(child for child in path.glob(f"*{JSON_GZ_SUFFIX}") if child.is_file())
+        return sorted(
+            child for child in path.glob(f"*{JSON_GZ_SUFFIX}") if child.is_file()
+        )
     raise FileNotFoundError(f"No such file or directory: {path}")
 
 
@@ -67,7 +71,9 @@ def is_jsonl_gzip(path: Path, sample_lines: int) -> bool:
     return sample_lines == valid_lines + empty_lines and valid_lines > 0
 
 
-def convert_gzip_to_zstd(source: Path, destination: Path, compression_level: int) -> None:
+def convert_gzip_to_zstd(
+    source: Path, destination: Path, compression_level: int
+) -> None:
     if destination.exists():
         raise FileExistsError(f"Destination already exists: {destination}")
 
@@ -109,7 +115,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Convert .json.gz files that contain JSONL records to .jsonl.zst and delete the original .json.gz files.",
     )
-    parser.add_argument("path", type=Path, help="A .json.gz file or a directory containing .json.gz files.")
+    parser.add_argument(
+        "path",
+        type=Path,
+        help="A .json.gz file or a directory containing .json.gz files.",
+    )
     parser.add_argument(
         "--sample-lines",
         type=positive_int,
@@ -138,7 +148,9 @@ def main() -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    print(f"processed: {len(files)}, converted: {converted}, skipped: {len(files) - converted}")
+    print(
+        f"processed: {len(files)}, converted: {converted}, skipped: {len(files) - converted}"
+    )
     return 0
 
 

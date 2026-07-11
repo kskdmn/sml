@@ -248,13 +248,9 @@ class FtSwagTest(unittest.TestCase):
             )
 
         self.assertEqual(2, len(batches))
-        self.assertTrue(
-            torch.equal(torch.tensor([[1, 4, 2]]), batches[0]["input_ids"])
-        )
+        self.assertTrue(torch.equal(torch.tensor([[1, 4, 2]]), batches[0]["input_ids"]))
         self.assertTrue(torch.equal(torch.tensor([[4, 2, 3]]), batches[0]["labels"]))
-        self.assertTrue(
-            torch.equal(torch.tensor([[1, 5, 2]]), batches[1]["input_ids"])
-        )
+        self.assertTrue(torch.equal(torch.tensor([[1, 5, 2]]), batches[1]["input_ids"]))
         self.assertTrue(torch.equal(torch.tensor([[5, 2, 3]]), batches[1]["labels"]))
 
     def test_build_swag_dataloader_skips_examples_longer_than_sequence(self):
@@ -278,7 +274,9 @@ class FtSwagTest(unittest.TestCase):
 
         self.assertEqual([], batches)
 
-    def test_build_swag_dataloader_keeps_examples_equal_to_sequence_length_with_eos(self):
+    def test_build_swag_dataloader_keeps_examples_equal_to_sequence_length_with_eos(
+        self,
+    ):
         import torch
         import ft_swag
         from sml_config import SwagFineTuneConfig

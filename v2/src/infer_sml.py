@@ -14,7 +14,10 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from sml import SMLLanguageModel
 
 import mlx.core as mx
 
@@ -51,7 +54,9 @@ def load_checkpoint_metadata(checkpoint_path: Path) -> dict[str, Any]:
 
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if not isinstance(metadata, dict):
-        raise ValueError(f"Checkpoint metadata must contain a dictionary: {metadata_path}")
+        raise ValueError(
+            f"Checkpoint metadata must contain a dictionary: {metadata_path}"
+        )
     return metadata
 
 

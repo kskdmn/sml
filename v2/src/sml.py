@@ -53,20 +53,32 @@ class SMLConfig:
     num_q_heads: int = 12
     num_kv_heads: int = 3
     intermediate_size: int = 2_176
-    original_max_position_embeddings: int = 1_024  # RoPE design window; YaRN stretches beyond this.
+    original_max_position_embeddings: int = (
+        1_024  # RoPE design window; YaRN stretches beyond this.
+    )
     rope_theta: float = 10_000.0  # RoPE base (theta in inv_freq = 1 / theta^(2k/d)).
     rope_scaling_factor: float = 4.0  # Inference context multiplier; 1 disables YaRN.
     yarn_beta_fast: float = 32.0  # Rotation-count cutoff for fast bands (extrapolate).
     yarn_beta_slow: float = 1.0  # Rotation-count cutoff for slow bands (interpolate).
-    yarn_attention_factor: float | None = None  # Override cos/sin scaling; None infers from factor.
-    yarn_mscale: float | None = None  # Optional numerator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale_all_dim is set.
-    yarn_mscale_all_dim: float | None = None  # Optional denominator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale is set.
+    yarn_attention_factor: float | None = (
+        None  # Override cos/sin scaling; None infers from factor.
+    )
+    yarn_mscale: float | None = (
+        None  # Optional numerator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale_all_dim is set.
+    )
+    yarn_mscale_all_dim: float | None = (
+        None  # Optional denominator for inferred attention scaling. Valid if yarn_attention_factor is not set and yarn_mscale is set.
+    )
     yarn_truncate: bool = True  # Floor/ceil band cutoffs in the YaRN correction range.
     rms_norm_eps: float = 1e-6
-    attention_dropout: float = 0.005  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
+    attention_dropout: float = (
+        0.005  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
+    )
     hidden_dropout: float = 0.01  # If overfitting, try 0.1
     initializer_range: float = 0.02
-    gradient_checkpointing: bool = False  # Trade extra compute for lower activation memory during training.
+    gradient_checkpointing: bool = (
+        False  # Trade extra compute for lower activation memory during training.
+    )
     pad_token_id: int = 3
     bos_token_id: int = 1
     eos_token_id: int = 2
@@ -216,9 +228,7 @@ def yarn_find_correction_dim(
     """
     return (
         dim
-        * math.log(
-            original_max_position_embeddings / (num_rotations * 2.0 * math.pi)
-        )
+        * math.log(original_max_position_embeddings / (num_rotations * 2.0 * math.pi))
         / (2.0 * math.log(base))
     )
 
@@ -650,7 +660,9 @@ class GroupedQueryAttention(nn.Module):
         k = mx.swapaxes(k, 1, 2)
         v = mx.swapaxes(v, 1, 2)
 
-        position_offset = 0 if kv_cache is None else kv_cache.get_seq_len(self.layer_idx)
+        position_offset = (
+            0 if kv_cache is None else kv_cache.get_seq_len(self.layer_idx)
+        )
         cos, sin = self.rope(seq_len, position_offset)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -782,7 +794,9 @@ class SMLLanguageModel(nn.Module):
             )
         self.eval()
         config = generation_config or GenerationConfig()
-        eos_token_id = self.config.eos_token_id if eos_token_id is None else eos_token_id
+        eos_token_id = (
+            self.config.eos_token_id if eos_token_id is None else eos_token_id
+        )
         generated = input_ids
         kv_cache = KVCache() if self.config.use_cache else None
         key = mx.random.key(config.seed) if config.seed is not None else None
@@ -816,7 +830,9 @@ class SMLLanguageModel(nn.Module):
                 key=sample_key,
             ).astype(input_ids.dtype)
             generated = mx.concatenate([generated, next_token], axis=1)
-            if eos_token_id is not None and bool(mx.all(next_token == eos_token_id).item()):
+            if eos_token_id is not None and bool(
+                mx.all(next_token == eos_token_id).item()
+            ):
                 break
 
         return generated

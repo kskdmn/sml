@@ -422,7 +422,9 @@ class TrainDataTest(unittest.TestCase):
                         resume_from_checkpoint=True,
                     )
 
-        self.assertEqual(checkpoint_order, build_dataloader.call_args.kwargs["input_files"])
+        self.assertEqual(
+            checkpoint_order, build_dataloader.call_args.kwargs["input_files"]
+        )
 
     def test_count_resume_batches_uses_completed_optimizer_steps(self):
         import train_sml
@@ -519,7 +521,9 @@ class TrainDataTest(unittest.TestCase):
     def test_step_limit_is_never_reached_when_max_steps_is_none(self):
         import train_sml
 
-        self.assertFalse(train_sml.is_step_limit_reached(global_step=10_000, max_steps=None))
+        self.assertFalse(
+            train_sml.is_step_limit_reached(global_step=10_000, max_steps=None)
+        )
 
     def test_resolve_lr_total_steps_prefers_lr_total_steps(self):
         import train_sml
@@ -744,7 +748,9 @@ class TrainDataTest(unittest.TestCase):
             mock.patch.object(train_sml.random, "setstate"),
             mock.patch.object(train_sml.torch, "set_rng_state"),
             mock.patch.object(train_sml.torch.cuda, "is_available", return_value=True),
-            mock.patch.object(train_sml.torch.cuda, "set_rng_state_all") as set_rng_state_all,
+            mock.patch.object(
+                train_sml.torch.cuda, "set_rng_state_all"
+            ) as set_rng_state_all,
         ):
             train_sml.restore_rng_state(checkpoint)
 

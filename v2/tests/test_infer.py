@@ -101,7 +101,7 @@ class TestInferenceInterface:
             pad_token_id=3,
         )
 
-        assert '4 5' == text
+        assert "4 5" == text
 
     def test_load_model_restores_checkpoint_config_and_weights(self):
         mx = require_mlx_runtime()
@@ -152,7 +152,10 @@ class TestInferenceInterface:
 
             loaded = infer_sml.load_model(checkpoint_path)
 
-        assert config.original_max_position_embeddings == loaded.config.original_max_position_embeddings
+        assert (
+            config.original_max_position_embeddings
+            == loaded.config.original_max_position_embeddings
+        )
         assert SMLConfig().rope_scaling_factor == loaded.config.rope_scaling_factor
 
     def test_load_checkpoint_metadata_requires_dictionary(self):
@@ -180,7 +183,7 @@ class TestInferenceInterface:
 
         text = infer_sml.generate_text("4 5", max_new_tokens=2)
 
-        assert '6' == text
+        assert "6" == text
 
     def test_resolve_max_new_tokens_uses_remaining_context_window_by_default(self):
         import infer_sml
@@ -203,8 +206,8 @@ class TestInferenceInterface:
 
         text = infer_sml.generate_text("4 5")
 
-        assert '6' == text
-        assert 13 == model.generate.call_args.kwargs['max_new_tokens']
+        assert "6" == text
+        assert 13 == model.generate.call_args.kwargs["max_new_tokens"]
 
     def test_main_omits_prompt_by_default(self, monkeypatch):
         import infer_sml

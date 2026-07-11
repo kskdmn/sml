@@ -78,7 +78,10 @@ class TestLoRA:
         trainable = lora_parameters(model)
 
         assert 2 == len(trainable)
-        assert "weight" not in model.layers[0].self_attn.q_proj.linear.trainable_parameters()
+        assert (
+            "weight"
+            not in model.layers[0].self_attn.q_proj.linear.trainable_parameters()
+        )
         assert bool(
             mx.array_equal(
                 original_q_weight,

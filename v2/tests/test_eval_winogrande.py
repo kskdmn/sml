@@ -34,6 +34,7 @@ class TestWinograndeEval:
 
     def test_main_loads_default_checkpoint_and_writes_results(self, monkeypatch):
         import eval_winogrande
+        from config import DEFAULT_TOKENIZER_MODEL_PATH
 
         lm = object()
         results = {"results": {"winogrande": {"acc,none": 0.0}}}
@@ -56,7 +57,7 @@ class TestWinograndeEval:
         assert 0 == return_code
         from_checkpoint.assert_called_once_with(
             checkpoint_path=eval_winogrande.DEFAULT_MODEL_PATH,
-            tokenizer_model_path=eval_winogrande.DEFAULT_TOKENIZER_MODEL_PATH,
+            tokenizer_model_path=DEFAULT_TOKENIZER_MODEL_PATH,
         )
         evaluate_winogrande.assert_called_once_with(
             lm=lm,
@@ -71,6 +72,7 @@ class TestWinograndeEval:
 
     def test_main_accepts_model_path_alias(self, monkeypatch):
         import eval_winogrande
+        from config import DEFAULT_TOKENIZER_MODEL_PATH
 
         lm = object()
         results = {"results": {"winogrande": {"acc,none": 0.0}}}
@@ -80,7 +82,9 @@ class TestWinograndeEval:
             "from_checkpoint",
             from_checkpoint,
         )
-        monkeypatch.setattr(eval_winogrande, "evaluate_winogrande", Spy(return_value=results))
+        monkeypatch.setattr(
+            eval_winogrande, "evaluate_winogrande", Spy(return_value=results)
+        )
         monkeypatch.setattr(eval_winogrande, "write_results", Spy())
         monkeypatch.setattr(eval_winogrande, "make_table", Spy(return_value="table"))
         monkeypatch.setattr("builtins.print", Spy())
@@ -90,7 +94,7 @@ class TestWinograndeEval:
         assert 0 == return_code
         from_checkpoint.assert_called_once_with(
             checkpoint_path=Path("/tmp/custom-sml"),
-            tokenizer_model_path=eval_winogrande.DEFAULT_TOKENIZER_MODEL_PATH,
+            tokenizer_model_path=DEFAULT_TOKENIZER_MODEL_PATH,
         )
 
     def test_main_accepts_tokenizer_model_path(self, monkeypatch):
@@ -104,7 +108,9 @@ class TestWinograndeEval:
             "from_checkpoint",
             from_checkpoint,
         )
-        monkeypatch.setattr(eval_winogrande, "evaluate_winogrande", Spy(return_value=results))
+        monkeypatch.setattr(
+            eval_winogrande, "evaluate_winogrande", Spy(return_value=results)
+        )
         monkeypatch.setattr(eval_winogrande, "write_results", Spy())
         monkeypatch.setattr(eval_winogrande, "make_table", Spy(return_value="table"))
         monkeypatch.setattr("builtins.print", Spy())

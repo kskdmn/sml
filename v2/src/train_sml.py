@@ -109,7 +109,9 @@ class TrainingConfig:
     weight_decay: float = 0.1
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
-    warmup_steps: int = int(lr_total_steps if lr_total_steps is not None else 100 * 0.01)
+    warmup_steps: int = int(
+        lr_total_steps if lr_total_steps is not None else 100 * 0.01
+    )
     min_lr_ratio: float = 0.1
     log_every: int = 10
     save_every: int = 1_000
@@ -637,7 +639,9 @@ def load_training_checkpoint(
     data_state = parse_checkpoint_data_state(metadata.get("data_state"))
     return TrainingResumeState(
         step=step,
-        input_files=tuple(resolve_path(Path(str(input_file))) for input_file in input_files),
+        input_files=tuple(
+            resolve_path(Path(str(input_file))) for input_file in input_files
+        ),
         data_state=data_state,
     )
 

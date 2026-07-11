@@ -35,7 +35,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Decompress a .jsonl.zst file and print its first few lines.",
     )
-    parser.add_argument("jsonl_zst_path", type=Path, help="Path to the .jsonl.zst file.")
+    parser.add_argument(
+        "jsonl_zst_path", type=Path, help="Path to the .jsonl.zst file."
+    )
     parser.add_argument(
         "-n",
         "--lines",

@@ -92,7 +92,9 @@ def select_next_token(
 
     scaled_logits = logits / generation_config.temperature
     if generation_config.top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(scaled_logits, descending=True, dim=-1)
+        sorted_logits, sorted_indices = torch.sort(
+            scaled_logits, descending=True, dim=-1
+        )
         sorted_probs = F.softmax(sorted_logits, dim=-1)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
         sorted_mask = cumulative_probs - sorted_probs >= generation_config.top_p
@@ -131,8 +133,14 @@ class RMSNorm(nn.Module):
         """
         dtype = x.dtype
         x = x.float()  # Convert to float32 for numerical stability. [batch_size, seq_len, hidden_size]
-        mean_square = x.pow(2).mean(dim=-1, keepdim=True)  # [batch_size, seq_len, 1]; `x` will be `average(x^2)` along the last dimension.
-        x = x * torch.rsqrt(mean_square + self.eps)  # [batch_size, seq_len, hidden_size]; `x` will be `x / sqrt(mean_square + eps)` along the last dimension.
+        mean_square = x.pow(
+            2
+        ).mean(
+            dim=-1, keepdim=True
+        )  # [batch_size, seq_len, 1]; `x` will be `average(x^2)` along the last dimension.
+        x = (
+            x * torch.rsqrt(mean_square + self.eps)
+        )  # [batch_size, seq_len, hidden_size]; `x` will be `x / sqrt(mean_square + eps)` along the last dimension.
         return (self.weight * x).to(dtype)  # [batch_size, seq_len, hidden_size]
 
 
@@ -165,9 +173,7 @@ def yarn_find_correction_dim(
     """
     return (
         dim
-        * math.log(
-            original_max_position_embeddings / (num_rotations * 2.0 * math.pi)
-        )
+        * math.log(original_max_position_embeddings / (num_rotations * 2.0 * math.pi))
         / (2.0 * math.log(base))
     )
 
@@ -308,8 +314,12 @@ class RotaryEmbedding(nn.Module):
             mscale=yarn_mscale,
             mscale_all_dim=yarn_mscale_all_dim,
         )
-        self.register_buffer("cos_cached", emb.cos() * attention_factor, persistent=False)
-        self.register_buffer("sin_cached", emb.sin() * attention_factor, persistent=False)
+        self.register_buffer(
+            "cos_cached", emb.cos() * attention_factor, persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin() * attention_factor, persistent=False
+        )
 
     def _compute_inv_freq(
         self,
@@ -442,7 +452,9 @@ class KVCache:
             self.key_cache.append(key)
             self.value_cache.append(value)
         else:
-            self.key_cache[layer_idx] = torch.cat((self.key_cache[layer_idx], key), dim=2)
+            self.key_cache[layer_idx] = torch.cat(
+                (self.key_cache[layer_idx], key), dim=2
+            )
             self.value_cache[layer_idx] = torch.cat(
                 (self.value_cache[layer_idx], value),
                 dim=2,
@@ -523,10 +535,16 @@ class GroupedQueryAttention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
         q = q.view(batch_size, seq_len, self.num_q_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(
+            1, 2
+        )
 
-        position_offset = 0 if kv_cache is None else kv_cache.get_seq_len(self.layer_idx)
+        position_offset = (
+            0 if kv_cache is None else kv_cache.get_seq_len(self.layer_idx)
+        )
         cos, sin = self.rope(seq_len, position_offset)
         q, k = apply_rotary_pos_emb(
             q,
@@ -735,7 +753,9 @@ class SMLLanguageModel(nn.Module):
             )
         self.eval()
         config = generation_config or GenerationConfig()
-        eos_token_id = self.config.eos_token_id if eos_token_id is None else eos_token_id
+        eos_token_id = (
+            self.config.eos_token_id if eos_token_id is None else eos_token_id
+        )
         generated = input_ids
         kv_cache = KVCache() if self.config.use_cache else None
         generator = None
@@ -783,9 +803,7 @@ def compute_causal_lm_loss(
     tensors for cross-entropy.
     """
     if logits.shape[:-1] != labels.shape:
-        raise ValueError(
-            "labels must have the same batch and sequence shape as logits"
-        )
+        raise ValueError("labels must have the same batch and sequence shape as logits")
     return F.cross_entropy(
         logits.reshape(-1, logits.size(-1)),  # [batch_size * seq_len, vocab_size]
         labels.reshape(-1),  # [batch_size * seq_len]

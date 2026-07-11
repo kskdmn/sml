@@ -10,7 +10,7 @@ sys.path.insert(0, str(SRC_DIR))
 
 try:
     import mlx.core as mx
-    import mlx.nn
+    import mlx.nn  # noqa: F401
 except (ImportError, RuntimeError) as exc:
     pytestmark = pytest.mark.skip(reason=f"mlx is not available: {exc}")
 
@@ -46,10 +46,10 @@ class TestSMLConfig:
     def test_invalid_attention_shape_is_rejected(self):
         from sml import SMLConfig
 
-        with pytest.raises(ValueError, match='hidden_size'):
+        with pytest.raises(ValueError, match="hidden_size"):
             SMLConfig(hidden_size=30, num_q_heads=8)
 
-        with pytest.raises(ValueError, match='num_q_heads'):
+        with pytest.raises(ValueError, match="num_q_heads"):
             SMLConfig(num_q_heads=6, num_kv_heads=4)
 
     def test_model_config_for_training_disables_yarn(self):
@@ -67,19 +67,19 @@ class TestSMLConfig:
     def test_invalid_context_scaling_is_rejected(self):
         from sml import SMLConfig
 
-        with pytest.raises(ValueError, match='original_max_position_embeddings'):
+        with pytest.raises(ValueError, match="original_max_position_embeddings"):
             SMLConfig(original_max_position_embeddings=0)
 
-        with pytest.raises(ValueError, match='rope_scaling_factor'):
+        with pytest.raises(ValueError, match="rope_scaling_factor"):
             SMLConfig(rope_scaling_factor=0.0)
 
-        with pytest.raises(ValueError, match='yarn_beta_fast'):
+        with pytest.raises(ValueError, match="yarn_beta_fast"):
             SMLConfig(yarn_beta_fast=1.0, yarn_beta_slow=1.0)
 
     def test_yarn_mscale_fields_must_be_set_together(self):
         from sml import SMLConfig
 
-        with pytest.raises(ValueError, match='yarn_mscale and yarn_mscale_all_dim'):
+        with pytest.raises(ValueError, match="yarn_mscale and yarn_mscale_all_dim"):
             SMLConfig(yarn_mscale=1.0)
 
     def test_effective_max_position_embeddings_scales_with_large_rope_factor(self):
@@ -97,7 +97,9 @@ class TestSMLSchedule:
     def test_lr_schedule_stays_constant_after_warmup_without_total_steps(self):
         from sml import lr_lambda
 
-        assert 1.0 == lr_lambda(step=1000, total_steps=None, warmup_steps=100, min_lr_ratio=0.1)
+        assert 1.0 == lr_lambda(
+            step=1000, total_steps=None, warmup_steps=100, min_lr_ratio=0.1
+        )
 
 
 class TestSMLModel:
@@ -159,7 +161,11 @@ class TestSMLModel:
         output = model(input_ids)
         mx.eval(output.logits)
 
-        assert (1, config.effective_max_position_embeddings, config.vocab_size) == output.logits.shape
+        assert (
+            1,
+            config.effective_max_position_embeddings,
+            config.vocab_size,
+        ) == output.logits.shape
 
     def test_forward_rejects_tokens_beyond_scaled_context_length(self):
         from sml import SMLLanguageModel
@@ -172,7 +178,7 @@ class TestSMLModel:
             shape=(1, config.effective_max_position_embeddings + 1),
         )
 
-        with pytest.raises(ValueError, match='effective_max_position_embeddings'):
+        with pytest.raises(ValueError, match="effective_max_position_embeddings"):
             model(input_ids)
 
     def test_embedding_and_lm_head_weights_are_tied(self):
@@ -206,7 +212,7 @@ class TestSMLModel:
             dtype=mx.int32,
         )
 
-        with pytest.raises(ValueError, match='effective_max_position_embeddings'):
+        with pytest.raises(ValueError, match="effective_max_position_embeddings"):
             model.generate(prompt, max_new_tokens=1)
 
     def test_repetition_penalty_reduces_repeated_token_logit(self):
@@ -299,7 +305,11 @@ class TestSMLModel:
         output = model(input_ids)
         mx.eval(output.logits)
 
-        assert (1, config.effective_max_position_embeddings, config.vocab_size) == output.logits.shape
+        assert (
+            1,
+            config.effective_max_position_embeddings,
+            config.vocab_size,
+        ) == output.logits.shape
         assert 64 == model.layers[0].self_attn.rope.cos_cached.shape[0]
 
     def test_resolve_yarn_attention_factor_supports_mscale_ratio(self):
@@ -308,7 +318,9 @@ class TestSMLModel:
         factor = 8.0
         expected = yarn_get_mscale(factor, 1.0) / yarn_get_mscale(factor, 0.5)
 
-        assert resolve_yarn_attention_factor(factor, mscale=1.0, mscale_all_dim=0.5) == pytest.approx(expected)
+        assert resolve_yarn_attention_factor(
+            factor, mscale=1.0, mscale_all_dim=0.5
+        ) == pytest.approx(expected)
 
     def test_yarn_find_correction_range_clamps_to_rotary_band_count(self):
         from sml import yarn_find_correction_range

@@ -133,6 +133,7 @@ class HumanEvalAdapterTest(unittest.TestCase):
 
     def test_main_loads_default_checkpoint_and_runs_limited_evaluation(self):
         import eval_humaneval
+        from config import TOKENIZER_MODEL_PATH
 
         lm = mock.Mock()
         results = {"results": {"humaneval": {"pass@1,none": 0.0}}}
@@ -163,7 +164,7 @@ class HumanEvalAdapterTest(unittest.TestCase):
         self.assertEqual(0, return_code)
         from_checkpoint.assert_called_once_with(
             checkpoint_path=eval_humaneval.DEFAULT_CHECKPOINT_PATH,
-            tokenizer_model_path=eval_humaneval.TOKENIZER_MODEL_PATH,
+            tokenizer_model_path=TOKENIZER_MODEL_PATH,
             device_name="cpu",
         )
         evaluate_humaneval.assert_called_once_with(

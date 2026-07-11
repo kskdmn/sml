@@ -36,6 +36,7 @@ class HellaSwagEvalTest(unittest.TestCase):
 
     def test_main_loads_default_checkpoint_and_writes_results(self):
         import eval_hellaswag
+        from config import TOKENIZER_MODEL_PATH
 
         lm = mock.Mock()
         results = {"results": {"hellaswag": {"acc,none": 0.0}}}
@@ -59,7 +60,7 @@ class HellaSwagEvalTest(unittest.TestCase):
         self.assertEqual(0, return_code)
         from_checkpoint.assert_called_once_with(
             checkpoint_path=eval_hellaswag.DEFAULT_CHECKPOINT_PATH,
-            tokenizer_model_path=eval_hellaswag.TOKENIZER_MODEL_PATH,
+            tokenizer_model_path=TOKENIZER_MODEL_PATH,
             device_name="cpu",
         )
         evaluate_hellaswag.assert_called_once_with(

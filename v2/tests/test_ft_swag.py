@@ -70,7 +70,10 @@ class TestFtSwag:
             "label": 0,
         }
 
-        assert 'A man is sitting on a roof. he starts typing on a laptop.' == ft_swag.format_swag_example(row)
+        assert (
+            "A man is sitting on a roof. he starts typing on a laptop."
+            == ft_swag.format_swag_example(row)
+        )
 
     def test_format_swag_example_inserts_space_before_gold_ending(self):
         import ft_swag
@@ -89,7 +92,7 @@ class TestFtSwag:
     def test_resolve_swag_label_accepts_string_labels(self):
         import ft_swag
 
-        assert 2 == ft_swag.resolve_swag_label('2')
+        assert 2 == ft_swag.resolve_swag_label("2")
 
     def test_iter_swag_texts_resumes_after_saved_position(self, monkeypatch):
         import ft_swag
@@ -134,7 +137,7 @@ class TestFtSwag:
             )
         )
 
-        assert ['second beta', 'third z'] == texts
+        assert ["second beta", "third z"] == texts
         assert 2 == data_state.line_number
 
     def test_iter_swag_texts_resumes_same_shuffled_order(self, monkeypatch):
@@ -202,11 +205,13 @@ class TestFtSwag:
             )
         )
 
-        assert ['first one', 'second beta'] == texts
+        assert ["first one", "second beta"] == texts
         assert 1 == progress.line_number
         assert 1 == progress.example_index
 
-    def test_build_swag_batches_masks_context_and_scores_gold_ending_and_eos(self, monkeypatch):
+    def test_build_swag_batches_masks_context_and_scores_gold_ending_and_eos(
+        self, monkeypatch
+    ):
         mx = require_mlx_runtime()
         import ft_swag
         from ft_swag import SwagFineTuneConfig
@@ -300,7 +305,9 @@ class TestFtSwag:
 
         assert [] == batches
 
-    def test_build_swag_batches_keeps_examples_equal_to_sequence_length_with_eos(self, monkeypatch):
+    def test_build_swag_batches_keeps_examples_equal_to_sequence_length_with_eos(
+        self, monkeypatch
+    ):
         require_mlx_runtime()
         import ft_swag
         from ft_swag import SwagFineTuneConfig
@@ -350,9 +357,7 @@ class TestFtSwag:
     def test_parse_args_accepts_tokenizer_model_path(self):
         import ft_swag
 
-        args = ft_swag.parse_args(
-            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
-        )
+        args = ft_swag.parse_args(["--tokenizer-model", "/tmp/custom-tokenizer.model"])
 
         assert Path("/tmp/custom-tokenizer.model") == args.tokenizer_model
 
@@ -373,7 +378,7 @@ class TestFtSwag:
         return_code = ft_swag.main(["--resume"])
 
         assert ft_swag.SUCCESS_RETURN_CODE == return_code
-        assert fine_tune_swag.call_args.kwargs['resume_from_checkpoint']
+        assert fine_tune_swag.call_args.kwargs["resume_from_checkpoint"]
 
     def test_main_passes_model_path_to_fine_tune_config(self, monkeypatch):
         import ft_swag
@@ -393,20 +398,20 @@ class TestFtSwag:
         fine_tune_swag = Spy(return_value=Path("/tmp/sml-swag"))
         monkeypatch.setattr(ft_swag, "fine_tune_swag", fine_tune_swag)
 
-        return_code = ft_swag.main(
-            ["--tokenizer-model", "/tmp/custom-tokenizer.model"]
-        )
+        return_code = ft_swag.main(["--tokenizer-model", "/tmp/custom-tokenizer.model"])
 
         assert ft_swag.SUCCESS_RETURN_CODE == return_code
         fine_tune_config = fine_tune_swag.call_args.kwargs["fine_tune_config"]
-        assert Path("/tmp/custom-tokenizer.model") == fine_tune_config.tokenizer_model_path
+        assert (
+            Path("/tmp/custom-tokenizer.model") == fine_tune_config.tokenizer_model_path
+        )
 
     def test_fine_tune_swag_accepts_config_objects_and_resume_flag(self):
         import ft_swag
 
         parameters = inspect.signature(ft_swag.fine_tune_swag).parameters
 
-        assert ['fine_tune_config', 'resume_from_checkpoint'] == list(parameters)
+        assert ["fine_tune_config", "resume_from_checkpoint"] == list(parameters)
 
     def test_fine_tune_swag_forces_yarn_rope_scaling_for_lora_model(self, monkeypatch):
         require_mlx_runtime()
@@ -442,7 +447,9 @@ class TestFtSwag:
             hidden_dropout=0.0,
         )
 
-        monkeypatch.setattr(ft_swag, "load_tokenizer", Spy(return_value=FakeTokenizer()))
+        monkeypatch.setattr(
+            ft_swag, "load_tokenizer", Spy(return_value=FakeTokenizer())
+        )
         monkeypatch.setattr(
             ft_swag,
             "load_pretrained_model_config",
@@ -580,7 +587,9 @@ class TestFtSwag:
 
         assert 16 == model_config.original_max_position_embeddings
 
-    def test_fine_tune_swag_validates_pretrained_checkpoint_path(self, tmp_path, monkeypatch):
+    def test_fine_tune_swag_validates_pretrained_checkpoint_path(
+        self, tmp_path, monkeypatch
+    ):
         import ft_swag
         from ft_swag import SwagFineTuneConfig
 
@@ -589,9 +598,13 @@ class TestFtSwag:
                 return 32
 
         missing_checkpoint = tmp_path / "missing"
-        monkeypatch.setattr(ft_swag, "load_tokenizer", Spy(return_value=FakeTokenizer()))
+        monkeypatch.setattr(
+            ft_swag, "load_tokenizer", Spy(return_value=FakeTokenizer())
+        )
 
-        with pytest.raises(FileNotFoundError, match="Pretrained checkpoint does not exist"):
+        with pytest.raises(
+            FileNotFoundError, match="Pretrained checkpoint does not exist"
+        ):
             ft_swag.fine_tune_swag(
                 SwagFineTuneConfig(
                     pretrained_checkpoint_path=missing_checkpoint,

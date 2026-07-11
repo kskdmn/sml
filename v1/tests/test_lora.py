@@ -118,7 +118,7 @@ class LoRATest(unittest.TestCase):
         self.assertEqual(output.dtype, torch.bfloat16)
 
     def test_merge_lora_updates_base_linear(self):
-        from lora import LoRALinear, merge_lora
+        from lora import merge_lora
         from sml import SMLLanguageModel
 
         config, lora_config = self.tiny_config()
@@ -132,8 +132,7 @@ class LoRATest(unittest.TestCase):
         x = torch.randn(1, 1, config.hidden_size)
         wrapped = model.layers[0].self_attn.q_proj
         expected_delta = (
-            wrapped.scaling
-            * (x @ wrapped.lora_A.T @ wrapped.lora_B.T)
+            wrapped.scaling * (x @ wrapped.lora_A.T @ wrapped.lora_B.T)
         ).detach()
         before = model.layers[0].self_attn(x, kv_cache=None).detach()
 

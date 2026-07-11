@@ -66,7 +66,7 @@ class TestTrainTokenizer:
     def test_output_dir_defaults_to_current_numbered_project(self):
         tokenizer = load_script()
 
-        assert PROJECT_DIR / 'output' == tokenizer.OUTPUT_DIR
+        assert PROJECT_DIR / "output" == tokenizer.OUTPUT_DIR
 
     def test_parse_args_defaults_to_default_tokenizer_model_path(self):
         train_tokenizer = load_script()
@@ -87,12 +87,12 @@ class TestTrainTokenizer:
     def test_module_does_not_export_test_only_filtered_text_wrapper(self):
         tokenizer = load_script()
 
-        assert not hasattr(tokenizer, 'iter_filtered_texts')
+        assert not hasattr(tokenizer, "iter_filtered_texts")
 
     def test_module_does_not_export_jsonl_lines_wrapper(self):
         tokenizer = load_script()
 
-        assert not hasattr(tokenizer, 'iter_jsonl_lines')
+        assert not hasattr(tokenizer, "iter_jsonl_lines")
 
     def test_discover_input_files_sorts_matching_zst_shards_and_skips_others(self):
         train_tokenizer = load_script()
@@ -113,9 +113,15 @@ class TestTrainTokenizer:
                 train_tokenizer.TOKENIZER_SHARD_NAME_REGEX,
             )
 
-        assert ['dataset-0000.jsonl.zst', 'dataset-0009.jsonl.zst', 'dataset-0010.jsonl.zst'] == [path.name for path in files]
+        assert [
+            "dataset-0000.jsonl.zst",
+            "dataset-0009.jsonl.zst",
+            "dataset-0010.jsonl.zst",
+        ] == [path.name for path in files]
 
-    def test_filtered_text_iterable_reads_only_first_rows_and_filters_min_text_length(self):
+    def test_filtered_text_iterable_reads_only_first_rows_and_filters_min_text_length(
+        self,
+    ):
         tokenizer = load_tokenizer_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -136,8 +142,11 @@ class TestTrainTokenizer:
             )
 
         assert len(byte_min_text) < tokenizer.MIN_TEXT_LENGTH
-        assert len(byte_min_text.encode(tokenizer.TEXT_ENCODING)) >= tokenizer.MIN_TEXT_LENGTH
-        assert ['a' * tokenizer.MIN_TEXT_LENGTH, byte_min_text] == texts
+        assert (
+            len(byte_min_text.encode(tokenizer.TEXT_ENCODING))
+            >= tokenizer.MIN_TEXT_LENGTH
+        )
+        assert ["a" * tokenizer.MIN_TEXT_LENGTH, byte_min_text] == texts
 
     def test_filtered_text_iterable_keeps_long_utf8_text_when_max_is_unset(self):
         tokenizer = load_tokenizer_module()
@@ -165,7 +174,7 @@ class TestTrainTokenizer:
             texts = collect_filtered_texts(tokenizer, [path])
 
         assert EXPECTED_NORMALIZED_TEXT_COUNT == len(texts)
-        assert '\n' not in texts[0]
+        assert "\n" not in texts[0]
         assert len(texts[0]) >= tokenizer.MIN_TEXT_LENGTH
 
     def test_filtered_text_iterable_removes_null_characters(self):
@@ -179,9 +188,11 @@ class TestTrainTokenizer:
             texts = collect_filtered_texts(tokenizer, [path])
 
         assert EXPECTED_NORMALIZED_TEXT_COUNT == len(texts)
-        assert '\x00' not in texts[0]
+        assert "\x00" not in texts[0]
 
-    def test_train_tokenizer_supplies_its_shard_regex_to_tokenizer_module(self, monkeypatch):
+    def test_train_tokenizer_supplies_its_shard_regex_to_tokenizer_module(
+        self, monkeypatch
+    ):
         train_tokenizer = load_script()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -209,12 +220,16 @@ class TestTrainTokenizer:
             train_tokenizer.TOKENIZER_SHARD_NAME_REGEX,
         )
 
-    def test_iter_zstd_jsonl_lines_reads_zst_files_without_subprocess(self, monkeypatch):
+    def test_iter_zstd_jsonl_lines_reads_zst_files_without_subprocess(
+        self, monkeypatch
+    ):
         tokenizer = load_tokenizer_module()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "sample-0000.jsonl.zst"
-            text = "\n".join(json.dumps({"text": value}) for value in ("first", "second"))
+            text = "\n".join(
+                json.dumps({"text": value}) for value in ("first", "second")
+            )
             write_zst_text(path, text)
 
             monkeypatch.setattr(
@@ -239,10 +254,12 @@ class TestTrainTokenizer:
             train = Spy()
             monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
             monkeypatch.setattr(train_tokenizer, "OUTPUT_DIR", root / "output")
-            monkeypatch.setattr(train_tokenizer.spm.SentencePieceTrainer, "train", train)
+            monkeypatch.setattr(
+                train_tokenizer.spm.SentencePieceTrainer, "train", train
+            )
             train_tokenizer.train_tokenizer()
 
-        assert True is train.call_args.kwargs.get('byte_fallback')
+        assert True is train.call_args.kwargs.get("byte_fallback")
 
     def test_train_tokenizer_uses_tokenizer_model_path(self, monkeypatch):
         train_tokenizer = load_script()
@@ -258,14 +275,17 @@ class TestTrainTokenizer:
 
             train = Spy()
             monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
-            monkeypatch.setattr(train_tokenizer.spm.SentencePieceTrainer, "train", train)
+            monkeypatch.setattr(
+                train_tokenizer.spm.SentencePieceTrainer, "train", train
+            )
             result = train_tokenizer.train_tokenizer(
                 tokenizer_model_path=tokenizer_model_path
             )
 
-        assert str(tokenizer_model_path.with_suffix("")) == train.call_args.kwargs[
-            "model_prefix"
-        ]
+        assert (
+            str(tokenizer_model_path.with_suffix(""))
+            == train.call_args.kwargs["model_prefix"]
+        )
         assert tokenizer_model_path == result.model_path
         assert tokenizer_model_path.with_suffix(".vocab") == result.vocab_path
 
@@ -307,11 +327,13 @@ class TestTrainTokenizer:
             train = Spy()
             monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
             monkeypatch.setattr(train_tokenizer, "OUTPUT_DIR", root / "output")
-            monkeypatch.setattr(train_tokenizer.spm.SentencePieceTrainer, "train", train)
+            monkeypatch.setattr(
+                train_tokenizer.spm.SentencePieceTrainer, "train", train
+            )
             train_tokenizer.train_tokenizer()
 
         assert list(train_tokenizer.tokenizer.CONVERSATION_SPECIAL_TOKENS) == (
-            train.call_args.kwargs.get('user_defined_symbols')
+            train.call_args.kwargs.get("user_defined_symbols")
         )
 
     def test_train_tokenizer_omits_max_sentence_length_when_unset(self, monkeypatch):
@@ -328,8 +350,10 @@ class TestTrainTokenizer:
             train = Spy()
             monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
             monkeypatch.setattr(train_tokenizer, "OUTPUT_DIR", root / "output")
-            monkeypatch.setattr(train_tokenizer.spm.SentencePieceTrainer, "train", train)
+            monkeypatch.setattr(
+                train_tokenizer.spm.SentencePieceTrainer, "train", train
+            )
             train_tokenizer.train_tokenizer()
 
         assert train_tokenizer.tokenizer.MAX_SENTENCE_LENGTH is None
-        assert 'max_sentence_length' not in train.call_args.kwargs
+        assert "max_sentence_length" not in train.call_args.kwargs

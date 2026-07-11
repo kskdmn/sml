@@ -299,7 +299,9 @@ def format_chat_messages(messages: Sequence[Mapping[str, Any]]) -> str:
         if not isinstance(role, str) or not role:
             raise ValueError("each message must include a non-empty role")
         if not isinstance(content, str):
-            raise ValueError("SML chat completions currently support string content only")
+            raise ValueError(
+                "SML chat completions currently support string content only"
+            )
         lines.append(f"{role}: {content}")
 
     if messages[-1].get("role") != "assistant":
@@ -546,6 +548,7 @@ def make_openai_compatible_handler(
     Bind model name and generator on a fresh subclass so separate servers do not mutate
     shared handler state.
     """
+
     class ConfiguredOpenAICompatibleHTTPHandler(OpenAICompatibleHTTPHandler):
         pass
 
@@ -564,6 +567,7 @@ def run_openai_compatible_server(
     ThreadingHTTPServer allows concurrent local requests; KeyboardInterrupt is swallowed
     so the CLI exits cleanly.
     """
+
     def generate_with_device(**kwargs: Any) -> str:
         return generate_text(**kwargs, device_name=device_name)
 

@@ -486,7 +486,9 @@ def fine_tune_swag(
     ``output_dir / checkpoint_name``. ``--resume`` continues from the LoRA
     checkpoint, restoring adapters, optimizer state, and data position.
     """
-    fine_tune_config = SwagFineTuneConfig() if fine_tune_config is None else fine_tune_config
+    fine_tune_config = (
+        SwagFineTuneConfig() if fine_tune_config is None else fine_tune_config
+    )
 
     output_dir = resolve_path(fine_tune_config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

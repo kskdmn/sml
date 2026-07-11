@@ -16,7 +16,6 @@ from lm_eval.utils import make_table
 
 from config import (
     DEFAULT_MODEL_PATH,
-    DEFAULT_TOKENIZER_MODEL_PATH,
     OUTPUT_DIR,
     SUCCESS_RETURN_CODE,
 )

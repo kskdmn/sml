@@ -20,9 +20,12 @@ class TestConfig:
 
         assert 0 == config.SUCCESS_RETURN_CODE
         assert PROJECT_DIR == config.PROJECT_DIR
-        assert PROJECT_DIR / 'output' == config.OUTPUT_DIR
-        assert config.OUTPUT_DIR / 'sml' == config.DEFAULT_MODEL_PATH
-        assert config.OUTPUT_DIR / 'bpe_tokenizer.model' == config.DEFAULT_TOKENIZER_MODEL_PATH
+        assert PROJECT_DIR / "output" == config.OUTPUT_DIR
+        assert config.OUTPUT_DIR / "sml" == config.DEFAULT_MODEL_PATH
+        assert (
+            config.OUTPUT_DIR / "bpe_tokenizer.model"
+            == config.DEFAULT_TOKENIZER_MODEL_PATH
+        )
         assert not hasattr(config, "INPUT_DIR")
         assert not hasattr(config, "INPUT_FILE_NAME_REGEX")
         assert Path("/tmp/example") == config.resolve_path(Path("/tmp/example"))

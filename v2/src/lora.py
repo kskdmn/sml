@@ -80,7 +80,9 @@ class LoRALinear(_ModuleBase):
         self.linear = linear
         self.rank = rank
         self.scaling = alpha / rank
-        self.lora_dropout = mlx_nn.Dropout(dropout) if dropout > 0.0 else mlx_nn.Identity()
+        self.lora_dropout = (
+            mlx_nn.Dropout(dropout) if dropout > 0.0 else mlx_nn.Identity()
+        )
         input_dims = linear.weight.shape[1]
         output_dims = linear.weight.shape[0]
         self.lora_A = mx.random.normal(shape=(rank, input_dims)) * 0.01
@@ -232,4 +234,6 @@ def require_lora_modules(model, target_modules: Iterable[str]) -> None:
     """
     if count_lora_modules(model) == 0:
         targets = ", ".join(sorted(set(target_modules)))
-        raise RuntimeError(f"No LoRA adapters were applied to target modules: {targets}")
+        raise RuntimeError(
+            f"No LoRA adapters were applied to target modules: {targets}"
+        )

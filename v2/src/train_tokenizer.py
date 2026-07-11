@@ -111,7 +111,9 @@ def train_tokenizer(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train the SML SentencePiece tokenizer.")
+    parser = argparse.ArgumentParser(
+        description="Train the SML SentencePiece tokenizer."
+    )
     parser.add_argument(
         "--tokenizer-model",
         type=Path,

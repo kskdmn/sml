@@ -11,17 +11,21 @@ from typing import Iterable, Iterator, NamedTuple, Sequence
 import sentencepiece as spm
 import zstandard as zstd
 
-from config import OUTPUT_DIR, PROJECT_DIR, SUCCESS_RETURN_CODE
+from config import OUTPUT_DIR, SUCCESS_RETURN_CODE
 
 INPUT_DIR = Path("~/Documents/data-common_pile/")
 
 VOCAB_SIZE = 24_576
 MAX_ROWS_PER_FILE = 10_000
-MIN_TEXT_LENGTH = 100  # TODO v2: min is len(text), while max is len(text.encode("utf-8")). 
+MIN_TEXT_LENGTH = (
+    100  # TODO v2: min is len(text), while max is len(text.encode("utf-8")).
+)
 MAX_TEXT_LENGTH = 2_000  # TODO for v2: This should be larger or `None` (confirm if `None` is supported).
 RANDOM_SEED = 42
 NUM_THREADS = 8
-INPUT_SENTENCE_SIZE = 0  # TODO for v2: Choose 500,000 and switch on `SHUFFLE_INPUT_SENTENCE`.
+INPUT_SENTENCE_SIZE = (
+    0  # TODO for v2: Choose 500,000 and switch on `SHUFFLE_INPUT_SENTENCE`.
+)
 SELF_TEST_SAMPLE_SIZE = 0
 CHARACTER_COVERAGE = 0.9995  # 1.0 for small character sets (e.g. English clean datasets), 0.9995 for Pile/web-like datasets
 BYTE_FALLBACK = True
@@ -115,7 +119,9 @@ def discover_input_files(input_dir: Path = INPUT_DIR) -> tuple[Path, ...]:
     return tuple(sorted(files, key=lambda path: path.name))
 
 
-def iter_jsonl_records(path: Path, max_rows_per_file: int) -> Iterator[dict[str, object]]:
+def iter_jsonl_records(
+    path: Path, max_rows_per_file: int
+) -> Iterator[dict[str, object]]:
     """
     Blank lines and non-object JSON are ignored; malformed JSON includes the compressed
     file line number.
@@ -134,7 +140,9 @@ def iter_jsonl_records(path: Path, max_rows_per_file: int) -> Iterator[dict[str,
             yield row
 
 
-def iter_zstd_jsonl_lines(path: Path, max_rows_per_file: int) -> Iterator[tuple[int, str]]:
+def iter_zstd_jsonl_lines(
+    path: Path, max_rows_per_file: int
+) -> Iterator[tuple[int, str]]:
     """
     Decode zstd streams as replacement-tolerant UTF-8 so rare bad bytes do not abort
     tokenizer training.
@@ -174,10 +182,7 @@ def filter_text(value: object) -> str | None:
         return None
 
     text = normalize_text(value)
-    if (
-        len(text) < MIN_TEXT_LENGTH
-        or len(text.encode(TEXT_ENCODING)) > MAX_TEXT_LENGTH
-    ):
+    if len(text) < MIN_TEXT_LENGTH or len(text.encode(TEXT_ENCODING)) > MAX_TEXT_LENGTH:
         return None
 
     return text
@@ -219,7 +224,9 @@ def train_tokenizer() -> TrainingResult:
 
     input_files = discover_input_files(INPUT_DIR)
     if not input_files:
-        raise FileNotFoundError(f"No supported input files found in {resolve_path(INPUT_DIR)}")
+        raise FileNotFoundError(
+            f"No supported input files found in {resolve_path(INPUT_DIR)}"
+        )
 
     text_iterable = FilteredTextIterable(input_files)
     sentence_iterator = require_non_empty_iterator(iter(text_iterable))
