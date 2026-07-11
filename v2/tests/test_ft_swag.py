@@ -21,7 +21,32 @@ class FakeSwagDataset:
         return self.rows[index]
 
 
+class FakeTokenizer:
+    bos_id = 1
+    eos_id = 2
+
+    def encode(self, text, out_type=int):
+        del out_type
+        return [int(part) for part in text.split()]
+
+
 class TestFtSwag:
+    def test_format_swag_parts_returns_parts_without_separator(self):
+        import ft_swag
+
+        row = {
+            "startphrase": "The girl ",
+            "ending0": " stops clutching her diary.",
+            "ending1": "runs away.",
+            "ending2": "looks around.",
+            "ending3": "opens the door.",
+            "label": 0,
+        }
+
+        assert ("The girl", "stops clutching her diary.") == ft_swag.format_swag_parts(
+            row
+        )
+
     def test_format_swag_example_concatenates_gold_ending(self):
         import ft_swag
 
@@ -35,6 +60,20 @@ class TestFtSwag:
         }
 
         assert 'A man is sitting on a roof. he starts typing on a laptop.' == ft_swag.format_swag_example(row)
+
+    def test_format_swag_example_inserts_space_before_gold_ending(self):
+        import ft_swag
+
+        row = {
+            "startphrase": "The girl",
+            "ending0": "stops clutching her diary.",
+            "ending1": "runs away.",
+            "ending2": "looks around.",
+            "ending3": "opens the door.",
+            "label": 0,
+        }
+
+        assert "The girl stops clutching her diary." == ft_swag.format_swag_example(row)
 
     def test_resolve_swag_label_accepts_string_labels(self):
         import ft_swag
@@ -155,6 +194,122 @@ class TestFtSwag:
         assert ['first one', 'second beta'] == texts
         assert 1 == progress.line_number
         assert 1 == progress.example_index
+
+    def test_build_swag_dataloader_masks_context_and_scores_gold_ending_and_eos(self, monkeypatch):
+        import ft_swag
+        from ft_swag import SwagFineTuneConfig
+
+        class TextTokenizer:
+            bos_id = 1
+            eos_id = 2
+
+            def encode(self, text, out_type=int):
+                del out_type
+                return {
+                    "ctx": [10, 11],
+                    " end": [20, 21],
+                    "ctx end": [10, 11, 20, 21],
+                }[text]
+
+        rows = [
+            {
+                "startphrase": "ctx",
+                "ending0": " end",
+                "ending1": " wrong",
+                "ending2": " wrong",
+                "ending3": " wrong",
+                "label": 0,
+            },
+        ]
+        dataset = FakeSwagDataset(rows)
+        config = SwagFineTuneConfig(
+            sequence_length=6,
+            batch_size=1,
+            shuffle_examples=False,
+        )
+
+        monkeypatch.setattr(ft_swag, "load_swag_dataset", Spy(return_value=dataset))
+        batches = list(
+            ft_swag.build_swag_dataloader(
+                fine_tune_config=config,
+                tokenizer=TextTokenizer(),
+                epoch=0,
+            )
+        )
+
+        assert [[1, 10, 11, 20, 21, 2]] == batches[0]["input_ids"].tolist()
+        assert [[3, 3, 20, 21, 2, 3]] == batches[0]["labels"].tolist()
+
+    def test_build_swag_dataloader_pads_short_examples_without_packing(self, monkeypatch):
+        import torch
+        import ft_swag
+        from ft_swag import SwagFineTuneConfig
+
+        config = SwagFineTuneConfig(sequence_length=3, batch_size=2)
+
+        monkeypatch.setattr(
+            ft_swag,
+            "iter_swag_parts",
+            Spy(return_value=iter([("", "4"), ("", "5")])),
+        )
+        batches = list(
+            ft_swag.build_swag_dataloader(
+                fine_tune_config=config,
+                tokenizer=FakeTokenizer(),
+                epoch=0,
+            )
+        )
+
+        assert 2 == len(batches)
+        assert torch.equal(torch.tensor([[1, 4, 2]]), batches[0]["input_ids"])
+        assert torch.equal(torch.tensor([[4, 2, 3]]), batches[0]["labels"])
+        assert torch.equal(torch.tensor([[1, 5, 2]]), batches[1]["input_ids"])
+        assert torch.equal(torch.tensor([[5, 2, 3]]), batches[1]["labels"])
+
+    def test_build_swag_dataloader_skips_examples_longer_than_sequence(self, monkeypatch):
+        import ft_swag
+        from ft_swag import SwagFineTuneConfig
+
+        config = SwagFineTuneConfig(sequence_length=3, batch_size=1)
+
+        monkeypatch.setattr(
+            ft_swag,
+            "iter_swag_parts",
+            Spy(return_value=iter([("", "4 5 6 7")])),
+        )
+        batches = list(
+            ft_swag.build_swag_dataloader(
+                fine_tune_config=config,
+                tokenizer=FakeTokenizer(),
+                epoch=0,
+            )
+        )
+
+        assert [] == batches
+
+    def test_build_swag_dataloader_keeps_examples_equal_to_sequence_length_with_eos(self, monkeypatch):
+        import torch
+        import ft_swag
+        from ft_swag import SwagFineTuneConfig
+
+        config = SwagFineTuneConfig(sequence_length=5, batch_size=1)
+
+        monkeypatch.setattr(
+            ft_swag,
+            "iter_swag_parts",
+            Spy(return_value=iter([("", "4 5 6")])),
+        )
+        batches = list(
+            ft_swag.build_swag_dataloader(
+                fine_tune_config=config,
+                tokenizer=FakeTokenizer(),
+                epoch=0,
+            )
+        )
+
+        assert 1 == len(batches)
+        assert torch.equal(torch.tensor([[1, 4, 5, 6, 2]]), batches[0]["input_ids"])
+        assert torch.equal(torch.tensor([[4, 5, 6, 2, 3]]), batches[0]["labels"])
 
     def test_parse_args_defaults_to_fresh_fine_tuning(self):
         import ft_swag

@@ -12,7 +12,7 @@ import argparse
 import copy
 import pathlib
 import random
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -20,7 +20,7 @@ from typing import Iterator, Sequence
 
 import torch
 from torch.serialization import safe_globals
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from config import (
     OUTPUT_DIR,
@@ -44,12 +44,12 @@ from train_sml import (
     ROW_INCREMENT,
     ReadingProgress,
     ResumeProgress,
-    TokenBlockDataset,
     TrainingDataState,
     TrainingResumeState,
     capture_rng_state,
     count_resume_batches,
     format_training_log,
+    get_special_token_id,
     is_step_limit_reached,
     iter_unseen_batches,
     load_tokenizer,
@@ -117,9 +117,9 @@ def resolve_swag_label(value: object) -> int:
     raise ValueError(f"Unsupported SWAG label value: {value!r}")
 
 
-def format_swag_example(row: Mapping[str, object]) -> str:
+def format_swag_parts(row: Mapping[str, object]) -> tuple[str, str]:
     """
-    Build a causal-LM target by appending the gold ending to the start phrase.
+    Return the conditioning start phrase and gold continuation separately.
     """
     label = resolve_swag_label(row["label"])
     startphrase = row["startphrase"]
@@ -128,7 +128,19 @@ def format_swag_example(row: Mapping[str, object]) -> str:
         raise ValueError("SWAG startphrase must be a string")
     if not isinstance(ending, str):
         raise ValueError(f"SWAG ending{label} must be a string")
-    return f"{startphrase}{ending}"
+    return startphrase.rstrip(), ending.lstrip()
+
+
+def join_swag_parts(startphrase: str, ending: str) -> str:
+    return f"{startphrase} {ending}"
+
+
+def format_swag_example(row: Mapping[str, object]) -> str:
+    """
+    Build a causal-LM target by appending the gold ending to the start phrase.
+    """
+    startphrase, ending = format_swag_parts(row)
+    return join_swag_parts(startphrase, ending)
 
 
 def load_swag_dataset(fine_tune_config: SwagFineTuneConfig):
@@ -150,14 +162,14 @@ def load_swag_dataset(fine_tune_config: SwagFineTuneConfig):
     )
 
 
-def iter_swag_texts(
+def iter_swag_parts(
     fine_tune_config: SwagFineTuneConfig,
     epoch: int = 0,
     progress: ReadingProgress | None = None,
     data_state: TrainingDataState | None = None,
-) -> Iterator[str]:
+) -> Iterator[tuple[str, str]]:
     """
-    Yield formatted SWAG examples, optionally shuffled and resumable by position.
+    Yield SWAG context/ending pairs, optionally shuffled and resumable by position.
     """
     dataset = load_swag_dataset(fine_tune_config)
     example_count = len(dataset)
@@ -185,21 +197,122 @@ def iter_swag_texts(
             data_state.input_file_index = 0
             data_state.line_number = position
 
-        yield format_swag_example(row)
+        yield format_swag_parts(row)
+
+
+def iter_swag_texts(
+    fine_tune_config: SwagFineTuneConfig,
+    epoch: int = 0,
+    progress: ReadingProgress | None = None,
+    data_state: TrainingDataState | None = None,
+) -> Iterator[str]:
+    """
+    Yield formatted SWAG examples, optionally shuffled and resumable by position.
+    """
+    for startphrase, ending in iter_swag_parts(
+        fine_tune_config,
+        epoch=epoch,
+        progress=progress,
+        data_state=data_state,
+    ):
+        yield join_swag_parts(startphrase, ending)
+
+
+class SwagExampleDataset(IterableDataset[dict[str, torch.Tensor]]):
+    def __init__(
+        self,
+        examples: Iterable[tuple[str, str]],
+        tokenizer: object,
+        sequence_length: int,
+        pad_token_id: int,
+        bos_token_id: int | None = None,
+        eos_token_id: int | None = None,
+        data_state: TrainingDataState | None = None,
+    ) -> None:
+        super().__init__()
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+        self.examples = examples
+        self.tokenizer = tokenizer
+        self.sequence_length = sequence_length
+        self.pad_token_id = pad_token_id
+        self.bos_token_id = bos_token_id
+        self.eos_token_id = eos_token_id
+        self.data_state = data_state
+
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        """
+        Yield one fixed-length causal-LM pair per SWAG example.
+
+        Labels outside the gold ending and EOS are set to ``pad_token_id`` so
+        the model loss ignores the conditioning context and padding positions.
+        """
+        bos_token_id = get_special_token_id(
+            self.tokenizer,
+            "bos_id",
+            self.bos_token_id,
+        )
+        eos_token_id = get_special_token_id(
+            self.tokenizer,
+            "eos_id",
+            self.eos_token_id,
+        )
+        if self.data_state is not None:
+            self.data_state.token_buffer = []
+
+        tokens_per_example = self.sequence_length + 1
+        for startphrase, ending in self.examples:
+            context_ids = list(self.tokenizer.encode(startphrase, out_type=int))
+            ending_ids = list(
+                self.tokenizer.encode(join_swag_parts("", ending), out_type=int)
+            )
+            if eos_token_id is not None:
+                ending_ids.append(eos_token_id)
+            example_tokens = []
+            if bos_token_id is not None:
+                example_tokens.append(bos_token_id)
+            example_tokens.extend(context_ids)
+            ending_start = len(example_tokens)
+            example_tokens.extend(ending_ids)
+            if len(example_tokens) > self.sequence_length:
+                if self.data_state is not None:
+                    self.data_state.token_buffer = []
+                continue
+
+            padded_tokens = example_tokens + [self.pad_token_id] * (
+                tokens_per_example - len(example_tokens)
+            )
+            labels = list(padded_tokens[1:])
+            ending_label_start = max(ending_start - 1, 0)
+            ending_label_end = ending_label_start + len(ending_ids)
+            labels[:ending_label_start] = [self.pad_token_id] * ending_label_start
+            labels[ending_label_end:] = [self.pad_token_id] * (
+                len(labels) - ending_label_end
+            )
+            if self.data_state is not None:
+                self.data_state.token_buffer = []
+
+            yield {
+                "input_ids": torch.tensor(padded_tokens[:-1], dtype=torch.long),
+                "labels": torch.tensor(labels, dtype=torch.long),
+            }
 
 
 def build_swag_dataloader(
     fine_tune_config: SwagFineTuneConfig,
     tokenizer: object,
     epoch: int,
+    pad_token_id: int = SMLConfig().pad_token_id,
+    bos_token_id: int | None = SMLConfig().bos_token_id,
+    eos_token_id: int | None = SMLConfig().eos_token_id,
     progress: ReadingProgress | None = None,
     data_state: TrainingDataState | None = None,
 ) -> DataLoader[dict[str, torch.Tensor]]:
     """
-    Stream SWAG examples through the same token-block dataset used for pretraining.
+    Stream one fixed-length SWAG example per batch with context labels masked.
     """
-    dataset = TokenBlockDataset(
-        texts=iter_swag_texts(
+    dataset = SwagExampleDataset(
+        examples=iter_swag_parts(
             fine_tune_config,
             epoch=epoch,
             progress=progress,
@@ -207,9 +320,12 @@ def build_swag_dataloader(
         ),
         tokenizer=tokenizer,
         sequence_length=fine_tune_config.sequence_length,
+        pad_token_id=pad_token_id,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
         data_state=data_state,
     )
-    return DataLoader(dataset, batch_size=fine_tune_config.batch_size)
+    return DataLoader(dataset, batch_size=1)
 
 
 def load_pretrained_model_config(
@@ -441,6 +557,7 @@ def fine_tune_swag(
             fine_tune_config=fine_tune_config,
             tokenizer=tokenizer,
             epoch=epoch,
+            pad_token_id=checkpoint_model_config.pad_token_id,
             progress=reading_progress,
             data_state=data_state,
         )
