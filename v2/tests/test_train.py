@@ -92,6 +92,7 @@ class TestTrainData:
         import train_sml
 
         assert sorted(train_sml.__all__) == [
+            "GradientAccumulationWindow",
             "METADATA_NAME",
             "MODEL_WEIGHTS_NAME",
             "OPTIMIZER_STATE_NAME",
@@ -103,15 +104,18 @@ class TestTrainData:
             "TrainingConfig",
             "TrainingDataState",
             "TrainingResumeState",
+            "accumulate_gradients",
             "apply_model_dtype",
             "build_lr_schedule",
             "build_parser",
             "clip_gradients_by_global_norm",
+            "consume_accumulated_grads",
             "count_resume_batches",
             "discover_input_files",
             "format_training_log",
             "get_special_token_id",
             "global_grad_norm",
+            "is_accumulation_window_ready",
             "is_step_limit_reached",
             "iter_mlx_batches",
             "iter_mlx_token_blocks",
@@ -125,6 +129,7 @@ class TestTrainData:
             "parse_args",
             "parse_checkpoint_data_state",
             "parse_checkpoint_input_files",
+            "reset_gradient_accumulation_window",
             "reset_training_data_state",
             "resolve_compute_dtype",
             "resolve_lr_total_steps",
@@ -791,6 +796,59 @@ class TestCanonicalMlxTraining:
         assert float(train_sml.global_grad_norm(grads).item()) == pytest.approx(5.0)
         assert float(grad_norm.item()) == pytest.approx(5.0)
         assert float(clipped_norm.item()) == pytest.approx(1.0)
+
+    def test_consume_full_accumulation_window_does_not_rescale(self):
+        mx = require_mlx()
+        import train_sml
+
+        window = train_sml.GradientAccumulationWindow()
+        for _ in range(4):
+            train_sml.accumulate_gradients(
+                window,
+                {"w": mx.array([1.0])},
+                2.0,
+                gradient_accumulation_steps=4,
+            )
+
+        grads, avg_loss, micro_batches = train_sml.consume_accumulated_grads(window, 4)
+        mx.eval(grads["w"])
+
+        assert micro_batches == 4
+        assert avg_loss == pytest.approx(2.0)
+        assert float(grads["w"].item()) == pytest.approx(1.0)
+        assert window.accumulated_grads is None
+
+    def test_consume_partial_accumulation_window_rescales_gradients(self):
+        mx = require_mlx()
+        import train_sml
+
+        window = train_sml.GradientAccumulationWindow()
+        for _ in range(3):
+            train_sml.accumulate_gradients(
+                window,
+                {"w": mx.array([2.0])},
+                4.0,
+                gradient_accumulation_steps=8,
+            )
+
+        grads, avg_loss, micro_batches = train_sml.consume_accumulated_grads(window, 8)
+        mx.eval(grads["w"])
+
+        assert micro_batches == 3
+        assert avg_loss == pytest.approx(4.0)
+        assert float(grads["w"].item()) == pytest.approx(2.0)
+
+    def test_is_accumulation_window_ready_only_after_full_window(self):
+        import train_sml
+
+        window = train_sml.GradientAccumulationWindow()
+        assert not train_sml.is_accumulation_window_ready(window, 4)
+
+        window.micro_step = 3
+        assert not train_sml.is_accumulation_window_ready(window, 4)
+
+        window.micro_step = 4
+        assert train_sml.is_accumulation_window_ready(window, 4)
 
     def test_resolve_mlx_checkpoint_path_uses_configured_name(self, tmp_path):
         import train_sml

@@ -38,26 +38,29 @@ from lora import (
 )
 from train_sml import (
     ROW_INCREMENT,
+    GradientAccumulationWindow,
     ReadingProgress,
     ResumeProgress,
     TrainingDataState,
     TrainingResumeState,
+    accumulate_gradients,
     apply_model_dtype,
     build_lr_schedule,
     clip_gradients_by_global_norm,
+    consume_accumulated_grads,
     count_resume_batches,
     format_training_log,
     get_special_token_id,
+    is_accumulation_window_ready,
     is_step_limit_reached,
     iter_mlx_batches,
     iter_unseen_batches,
     load_tokenizer,
     parse_checkpoint_data_state,
+    reset_gradient_accumulation_window,
     reset_training_data_state,
     resolve_lr_total_steps,
     set_seed,
-    tree_add,
-    tree_scale,
 )
 
 ENDING_KEY_PREFIX = "ending"
@@ -564,11 +567,64 @@ def fine_tune_swag(
     )
     resume_progress = ResumeProgress(batches_to_skip=legacy_batches_to_skip)
     model.train()
-    micro_step = 0
-    loss_sum = 0.0
-    accumulated_grads = None
+    accumulation = GradientAccumulationWindow()
     reading_progress = ReadingProgress()
     loss_and_grad = nn.value_and_grad(model, _loss_fn(model))
+
+    def complete_optimizer_step(
+        grads_to_step: dict,
+        avg_loss: float,
+        epoch_index: int,
+    ) -> bool:
+        nonlocal global_step
+        clipped_grads, grad_norm = clip_gradients_by_global_norm(
+            grads_to_step,
+            fine_tune_config.max_grad_norm,
+        )
+        optimizer.update(model, clipped_grads)
+        mx.eval(model.parameters(), optimizer.state)
+        global_step += ROW_INCREMENT
+
+        if global_step % fine_tune_config.log_every == 0 or global_step == 1:
+            lr = float(optimizer.learning_rate.item())
+            print(
+                format_training_log(
+                    epoch=epoch_index + 1,
+                    global_step=global_step,
+                    lr=lr,
+                    avg_loss=avg_loss,
+                    grad_norm=float(grad_norm.item()),
+                    timestamp=datetime.now(),
+                    progress=reading_progress,
+                )
+            )
+
+        if (
+            fine_tune_config.save_every > 0
+            and global_step % fine_tune_config.save_every == 0
+        ):
+            save_lora_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                checkpoint_model_config,
+                fine_tune_config,
+                global_step,
+                data_state=data_state,
+            )
+
+        if is_step_limit_reached(global_step, fine_tune_config.max_steps):
+            save_lora_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                checkpoint_model_config,
+                fine_tune_config,
+                global_step,
+                data_state=data_state,
+            )
+            return True
+        return False
 
     print(f"Dataset: {fine_tune_config.dataset_name}/{fine_tune_config.dataset_config}")
     print(f"Split: {fine_tune_config.dataset_split}")
@@ -582,6 +638,7 @@ def fine_tune_swag(
     for epoch in range(data_state.epoch, fine_tune_config.epochs):
         if epoch != data_state.epoch:
             reset_training_data_state(data_state, epoch)
+        reset_gradient_accumulation_window(accumulation)
         batches = build_swag_batches(
             fine_tune_config=fine_tune_config,
             tokenizer=tokenizer,
@@ -595,71 +652,31 @@ def fine_tune_swag(
         for batch in iter_unseen_batches(batches, resume_progress):
             loss, grads = loss_and_grad(batch["input_ids"], batch["labels"])
             mx.eval(loss, grads)
-            loss_sum += float(loss.item())
-            micro_step += ROW_INCREMENT
-
-            scaled_grads = tree_scale(
+            accumulate_gradients(
+                accumulation,
                 grads,
-                1.0 / fine_tune_config.gradient_accumulation_steps,
+                float(loss.item()),
+                fine_tune_config.gradient_accumulation_steps,
             )
-            accumulated_grads = (
-                scaled_grads
-                if accumulated_grads is None
-                else tree_add(accumulated_grads, scaled_grads)
-            )
-
-            if micro_step % fine_tune_config.gradient_accumulation_steps != 0:
+            if not is_accumulation_window_ready(
+                accumulation,
+                fine_tune_config.gradient_accumulation_steps,
+            ):
                 continue
 
-            clipped_grads, grad_norm = clip_gradients_by_global_norm(
-                accumulated_grads,
-                fine_tune_config.max_grad_norm,
+            grads_to_step, avg_loss, _ = consume_accumulated_grads(
+                accumulation,
+                fine_tune_config.gradient_accumulation_steps,
             )
-            optimizer.update(model, clipped_grads)
-            mx.eval(model.parameters(), optimizer.state)
-            global_step += ROW_INCREMENT
-            accumulated_grads = None
+            if complete_optimizer_step(grads_to_step, avg_loss, epoch):
+                return checkpoint_path
 
-            if global_step % fine_tune_config.log_every == 0 or global_step == 1:
-                avg_loss = loss_sum / fine_tune_config.gradient_accumulation_steps
-                lr = float(optimizer.learning_rate.item())
-                print(
-                    format_training_log(
-                        epoch=epoch + 1,
-                        global_step=global_step,
-                        lr=lr,
-                        avg_loss=avg_loss,
-                        grad_norm=float(grad_norm.item()),
-                        timestamp=datetime.now(),
-                        progress=reading_progress,
-                    )
-                )
-            loss_sum = 0.0
-
-            if (
-                fine_tune_config.save_every > 0
-                and global_step % fine_tune_config.save_every == 0
-            ):
-                save_lora_checkpoint(
-                    checkpoint_path,
-                    model,
-                    optimizer,
-                    checkpoint_model_config,
-                    fine_tune_config,
-                    global_step,
-                    data_state=data_state,
-                )
-
-            if is_step_limit_reached(global_step, fine_tune_config.max_steps):
-                save_lora_checkpoint(
-                    checkpoint_path,
-                    model,
-                    optimizer,
-                    checkpoint_model_config,
-                    fine_tune_config,
-                    global_step,
-                    data_state=data_state,
-                )
+        if accumulation.accumulated_grads is not None:
+            grads_to_step, avg_loss, _ = consume_accumulated_grads(
+                accumulation,
+                fine_tune_config.gradient_accumulation_steps,
+            )
+            if complete_optimizer_step(grads_to_step, avg_loss, epoch):
                 return checkpoint_path
 
     save_lora_checkpoint(
