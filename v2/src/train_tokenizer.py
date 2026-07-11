@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import random
 from pathlib import Path
 from typing import Iterator, NamedTuple, Sequence
 
@@ -10,6 +9,7 @@ import sentencepiece as spm
 
 from config import PROJECT_DIR, resolve_path
 import tokenizer
+from utils import shuffle_input_files
 
 SUCCESS_RETURN_CODE = 0
 INPUT_DIR = Path("~/Documents/data-common_pile/")
@@ -17,9 +17,10 @@ TOKENIZER_SHARD_NAME_REGEX = r".*-00[0-9][0-9]\.jsonl\.zst\Z"
 OUTPUT_DIR = PROJECT_DIR / "output"
 DEFAULT_TOKENIZER_MODEL_PATH = OUTPUT_DIR / "bpe_tokenizer.model"
 MAX_ROWS_PER_FILE = 32_768
+SHUFFLE_INPUT_FILES = True
 RANDOM_SEED = 42
 NUM_THREADS = 8
-INPUT_SENTENCE_SIZE = 524_288
+INPUT_SENTENCE_SIZE = 0  # Use 0 for no limit.
 SELF_TEST_SAMPLE_SIZE = 0
 SHUFFLE_INPUT_SENTENCE = True
 TRAIN_EXTREMELY_LARGE_CORPUS = False  # This is only for Unigram models.
@@ -55,8 +56,6 @@ def train_tokenizer(
     Feed SentencePiece from a lazy filtered iterator so compressed shards do not need to
     be materialized.
     """
-    random.seed(RANDOM_SEED)
-
     tokenizer_model_path = resolve_path(tokenizer_model_path)
     output_dir = tokenizer_model_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -69,6 +68,8 @@ def train_tokenizer(
         raise FileNotFoundError(
             f"No supported input files found in {resolve_path(INPUT_DIR)}"
         )
+    if SHUFFLE_INPUT_FILES:
+        input_files = shuffle_input_files(input_files, seed=RANDOM_SEED)
 
     text_iterable = tokenizer.FilteredTextIterable(
         input_files,

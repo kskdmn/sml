@@ -119,6 +119,61 @@ class TestTrainTokenizer:
             "dataset-0010.jsonl.zst",
         ] == [path.name for path in files]
 
+    def test_shuffle_input_files_uses_seeded_deterministic_order(self):
+        utils = load_module("utils", SRC_DIR / "utils.py")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            files = tuple(
+                root / name
+                for name in (
+                    "dataset-0000.jsonl.zst",
+                    "dataset-0001.jsonl.zst",
+                    "dataset-0002.jsonl.zst",
+                )
+            )
+
+            first_shuffle = utils.shuffle_input_files(files, seed=42)
+            second_shuffle = utils.shuffle_input_files(files, seed=42)
+
+        assert first_shuffle == second_shuffle
+        assert sorted(files, key=lambda path: path.name) != list(first_shuffle)
+
+    def test_train_tokenizer_shuffles_discovered_input_files(self, monkeypatch):
+        train_tokenizer = load_script()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            input_path = root / "sample-0000.jsonl.zst"
+            write_zst_rows(
+                input_path,
+                [{"text": "a" * train_tokenizer.tokenizer.MIN_TEXT_LENGTH}],
+            )
+            discovered = (input_path,)
+            shuffle_spy = Spy(return_value=discovered)
+            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(
+                train_tokenizer.tokenizer,
+                "discover_input_files",
+                Spy(return_value=discovered),
+            )
+            monkeypatch.setattr(
+                train_tokenizer,
+                "shuffle_input_files",
+                shuffle_spy,
+            )
+            monkeypatch.setattr(
+                train_tokenizer.spm.SentencePieceTrainer,
+                "train",
+                Spy(),
+            )
+            train_tokenizer.train_tokenizer()
+
+        shuffle_spy.assert_called_once_with(
+            discovered,
+            seed=train_tokenizer.RANDOM_SEED,
+        )
+
     def test_filtered_text_iterable_reads_only_first_rows_and_filters_min_text_length(
         self,
     ):

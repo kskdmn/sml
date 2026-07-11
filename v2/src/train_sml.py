@@ -20,6 +20,7 @@ from tokenizer import (
     filter_text,
     iter_jsonl_records,
 )
+from utils import shuffle_input_files
 
 
 ROW_INCREMENT = 1
@@ -192,12 +193,6 @@ def discover_input_files(
         and pattern.fullmatch(path.name) is not None
     ]
     return tuple(sorted(files, key=lambda path: path.name))
-
-
-def shuffle_input_files(input_files: Iterable[Path], seed: int) -> tuple[Path, ...]:
-    shuffled_files = list(input_files)
-    random.Random(seed).shuffle(shuffled_files)
-    return tuple(shuffled_files)
 
 
 def iter_texts(
