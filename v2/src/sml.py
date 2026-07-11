@@ -601,17 +601,17 @@ class GroupedQueryAttention(nn.Module):
         self.q_proj = nn.Linear(
             config.hidden_size,
             config.num_q_heads * self.head_dim,
-            bias=True,
+            bias=False,
         )
         self.k_proj = nn.Linear(
             config.hidden_size,
             config.num_kv_heads * self.head_dim,
-            bias=True,
+            bias=False,
         )
         self.v_proj = nn.Linear(
             config.hidden_size,
             config.num_kv_heads * self.head_dim,
-            bias=True,
+            bias=False,
         )
         self.o_proj = nn.Linear(
             config.num_q_heads * self.head_dim,

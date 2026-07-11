@@ -17,18 +17,20 @@ except (ImportError, RuntimeError) as exc:
 
 class TestSMLConfig:
     def test_default_config_targets_small_model_size(self):
-        from sml import estimate_model_size
+        from sml import count_parameters, create_model, estimate_model_size
         from sml import SMLConfig
 
         config = SMLConfig()
 
-        assert 24576 == config.vocab_size
-        assert 512 == config.hidden_size
+        assert 28672 == config.vocab_size
+        assert 768 == config.hidden_size
         assert 12 == config.num_layers
-        assert 8 == config.num_q_heads
-        assert 2 == config.num_kv_heads
-        assert 1536 == config.intermediate_size
-        assert 48771584 == estimate_model_size(config)
+        assert 12 == config.num_q_heads
+        assert 3 == config.num_kv_heads
+        assert 2176 == config.intermediate_size
+        assert 99896064 == estimate_model_size(config)
+        total_params, _ = count_parameters(create_model(config))
+        assert total_params == estimate_model_size(config)
         assert 0 == config.unk_token_id
         assert 1 == config.bos_token_id
         assert 2 == config.eos_token_id
