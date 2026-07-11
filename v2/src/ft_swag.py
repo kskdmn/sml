@@ -42,6 +42,7 @@ from train_sml import (
     ResumeProgress,
     TrainingDataState,
     TrainingResumeState,
+    apply_model_dtype,
     build_lr_schedule,
     clip_gradients_by_global_norm,
     count_resume_batches,
@@ -109,6 +110,7 @@ class SwagFineTuneConfig:
     log_every: int = 10
     save_every: int = 500
     seed: int = 42
+    autocast_dtype: str = "bfloat16"
 
 
 def resolve_swag_label(value: object) -> int:
@@ -525,6 +527,7 @@ def fine_tune_swag(
     model = SMLLanguageModel(checkpoint_model_config)
     load_pretrained_weights(model, pretrained_path)
     prepare_lora_model(model, fine_tune_config)
+    apply_model_dtype(model, fine_tune_config.autocast_dtype)
     total_params, trainable_params = count_parameters(model)
 
     lr_schedule = build_lr_schedule(
@@ -548,6 +551,7 @@ def fine_tune_swag(
             model,
             optimizer,
         )
+        apply_model_dtype(model, fine_tune_config.autocast_dtype)
 
     global_step = resume_state.step
     data_state = resume_state.data_state or TrainingDataState()
@@ -570,6 +574,7 @@ def fine_tune_swag(
     print(f"LoRA alpha: {fine_tune_config.lora.alpha}")
     print(f"Tokenizer vocab: {checkpoint_model_config.vocab_size:,}")
     print("Device: mlx")
+    print(f"Compute dtype: {fine_tune_config.autocast_dtype}")
     print(f"Parameters: total={total_params:,} trainable={trainable_params:,}")
 
     for epoch in range(data_state.epoch, fine_tune_config.epochs):

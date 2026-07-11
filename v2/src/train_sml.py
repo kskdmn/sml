@@ -49,6 +49,7 @@ __all__ = [
     "TrainingConfig",
     "TrainingDataState",
     "TrainingResumeState",
+    "apply_model_dtype",
     "build_parser",
     "build_lr_schedule",
     "clip_gradients_by_global_norm",
@@ -71,6 +72,7 @@ __all__ = [
     "parse_checkpoint_data_state",
     "parse_checkpoint_input_files",
     "reset_training_data_state",
+    "resolve_compute_dtype",
     "resolve_lr_total_steps",
     "resolve_mlx_checkpoint_path",
     "save_checkpoint",
@@ -116,6 +118,7 @@ class TrainingConfig:
     log_every: int = 10
     save_every: int = 1_000
     seed: int = 42
+    autocast_dtype: str = "bfloat16"
 
 
 def model_config_for_training(config):
@@ -419,6 +422,48 @@ def set_seed(seed: int) -> None:
     mx.random.seed(seed)
 
 
+def resolve_compute_dtype(name: str):
+    """
+    Map training dtype names to MLX dtypes.
+
+    ``none`` keeps float32 weights; otherwise parameters are cast before training.
+    """
+    mx = _mlx_core()
+    if name == "none":
+        return None
+    if name == "bfloat16":
+        return mx.bfloat16
+    if name == "float16":
+        return mx.float16
+    raise ValueError(f"Unsupported compute dtype: {name}")
+
+
+def _retie_embeddings_if_needed(model) -> None:
+    if model.config.tie_word_embeddings:
+        model.lm_head.weight = model.embed_tokens.weight
+
+
+def apply_model_dtype(model, autocast_dtype: str) -> None:
+    """
+    Cast model parameters to the configured MLX dtype and restore tied embeddings.
+    """
+    dtype = resolve_compute_dtype(autocast_dtype)
+    if dtype is None:
+        return
+
+    mx = _mlx_core()
+    _, tree_map, _ = _mlx_tree_utils()
+
+    def cast_array(value: object) -> object:
+        if isinstance(value, mx.array):
+            return value.astype(dtype)
+        return value
+
+    model.update(tree_map(cast_array, model.parameters()))
+    _retie_embeddings_if_needed(model)
+    mx.eval(model.parameters())
+
+
 def iter_mlx_token_blocks(
     texts: Iterable[str],
     tokenizer,
@@ -685,6 +730,7 @@ def train_model(
     )
     training_model_config = model_config_for_training(checkpoint_model_config)
     model = SMLLanguageModel(training_model_config)
+    apply_model_dtype(model, training_config.autocast_dtype)
     model.train()
     mx.eval(model.parameters())
     total_params, trainable_params = count_parameters(model)
@@ -705,6 +751,7 @@ def train_model(
     resume_state = TrainingResumeState()
     if resume_from_checkpoint:
         resume_state = load_training_checkpoint(checkpoint_path, model, optimizer)
+        apply_model_dtype(model, training_config.autocast_dtype)
         if resume_state.input_files:
             input_files = resume_state.input_files
 
@@ -725,6 +772,7 @@ def train_model(
     print(f"Input files: {len(input_files)}")
     print(f"Tokenizer vocab: {checkpoint_model_config.vocab_size:,}")
     print("Backend: mlx")
+    print(f"Compute dtype: {training_config.autocast_dtype}")
     print(f"Parameters: total={total_params:,} trainable={trainable_params:,}")
 
     for epoch in range(data_state.epoch, training_config.epochs):
@@ -836,11 +884,6 @@ def _loss_fn(model):
         return output.loss
 
     return loss_fn
-
-
-def _retie_embeddings_if_needed(model) -> None:
-    if model.config.tie_word_embeddings:
-        model.lm_head.weight = model.embed_tokens.weight
 
 
 def build_parser() -> argparse.ArgumentParser:

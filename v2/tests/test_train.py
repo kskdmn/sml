@@ -103,6 +103,7 @@ class TestTrainData:
             "TrainingConfig",
             "TrainingDataState",
             "TrainingResumeState",
+            "apply_model_dtype",
             "build_lr_schedule",
             "build_parser",
             "clip_gradients_by_global_norm",
@@ -125,6 +126,7 @@ class TestTrainData:
             "parse_checkpoint_data_state",
             "parse_checkpoint_input_files",
             "reset_training_data_state",
+            "resolve_compute_dtype",
             "resolve_lr_total_steps",
             "resolve_mlx_checkpoint_path",
             "save_checkpoint",
@@ -236,6 +238,53 @@ class TestTrainData:
             == training_config.tokenizer_model_path
         )
         assert not hasattr(training_config, "resume_from_checkpoint")
+
+    def test_training_config_defaults_to_bfloat16(self):
+        from train_sml import TrainingConfig
+
+        training_config = TrainingConfig()
+
+        assert "bfloat16" == training_config.autocast_dtype
+
+    def test_resolve_compute_dtype_maps_supported_names(self):
+        import mlx.core as mx
+        import train_sml
+
+        assert train_sml.resolve_compute_dtype("none") is None
+        assert mx.bfloat16 == train_sml.resolve_compute_dtype("bfloat16")
+        assert mx.float16 == train_sml.resolve_compute_dtype("float16")
+
+    def test_resolve_compute_dtype_rejects_unknown_name(self):
+        import train_sml
+
+        with pytest.raises(ValueError, match="Unsupported compute dtype"):
+            train_sml.resolve_compute_dtype("float64")
+
+    def test_apply_model_dtype_casts_parameters(self):
+        import mlx.core as mx
+        from mlx.utils import tree_flatten
+
+        import train_sml
+        from sml import create_model
+
+        model = create_model()
+        train_sml.apply_model_dtype(model, "bfloat16")
+
+        for _, parameter in tree_flatten(model.parameters()):
+            assert mx.bfloat16 == parameter.dtype
+
+    def test_apply_model_dtype_keeps_float32_when_disabled(self):
+        import mlx.core as mx
+        from mlx.utils import tree_flatten
+
+        import train_sml
+        from sml import create_model
+
+        model = create_model()
+        train_sml.apply_model_dtype(model, "none")
+
+        for _, parameter in tree_flatten(model.parameters()):
+            assert mx.float32 == parameter.dtype
 
     def test_discover_input_files_uses_supplied_regex_and_sorts_matches(self):
         import train_sml
