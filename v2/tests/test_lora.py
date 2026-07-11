@@ -8,15 +8,17 @@ SRC_DIR = PROJECT_DIR / "src"
 sys.path.insert(0, str(SRC_DIR))
 
 
-try:
-    import torch
-    import torch.nn as nn
-except ImportError:  # pragma: no cover - exercised only before torch is installed
-    torch = None
-    nn = None
+def require_mlx_runtime():
+    try:
+        import mlx.core as mx
+        import mlx.nn  # noqa: F401
+
+        mx.eval(mx.array([0]))
+        return mx
+    except (ImportError, RuntimeError) as exc:
+        pytest.skip(f"mlx is not available: {exc}")
 
 
-@pytest.mark.skipif(torch is None, reason="torch is not installed")
 class TestLoRA:
     def tiny_config(self):
         from lora import LoRAConfig
@@ -42,23 +44,52 @@ class TestLoRA:
             LoRAConfig(rank=4, alpha=8.0, dropout=0.0, target_modules=("q_proj",)),
         )
 
+    def test_lora_config_keeps_expected_defaults(self):
+        from lora import LoRAConfig
+
+        config = LoRAConfig()
+
+        assert 16 == config.rank
+        assert 32.0 == config.alpha
+        assert "q_proj" in config.target_modules
+
+    def test_lora_linear_validates_rank_and_alpha(self):
+        require_mlx_runtime()
+        import mlx.nn as nn
+        from lora import LoRALinear
+
+        linear = nn.Linear(8, 4)
+
+        with pytest.raises(ValueError, match="rank must be positive"):
+            LoRALinear(linear, rank=0, alpha=8.0)
+        with pytest.raises(ValueError, match="alpha must be positive"):
+            LoRALinear(linear, rank=4, alpha=0.0)
+
     def test_apply_lora_freezes_base_weights(self):
+        mx = require_mlx_runtime()
         from lora import apply_lora, lora_parameters
         from sml import SMLLanguageModel
 
         config, lora_config = self.tiny_config()
         model = SMLLanguageModel(config)
-        original_q_weight = model.layers[0].self_attn.q_proj.weight.detach().clone()
+        original_q_weight = model.layers[0].self_attn.q_proj.weight
 
         apply_lora(model, lora_config)
         trainable = lora_parameters(model)
 
         assert 2 == len(trainable)
-        assert not model.layers[0].self_attn.q_proj.linear.weight.requires_grad
-        assert torch.equal(original_q_weight, model.layers[0].self_attn.q_proj.linear.weight.detach())
+        assert "weight" not in model.layers[0].self_attn.q_proj.linear.trainable_parameters()
+        assert bool(
+            mx.array_equal(
+                original_q_weight,
+                model.layers[0].self_attn.q_proj.linear.weight,
+            ).item()
+        )
 
-    def test_apply_lora_leaves_only_adapter_parameters_trainable(self):
+    def test_apply_lora_leaves_only_adapter_arrays_trainable(self):
+        require_mlx_runtime()
         from lora import apply_lora, lora_parameters
+        from mlx.utils import tree_flatten
         from sml import SMLLanguageModel
 
         config, lora_config = self.tiny_config()
@@ -66,82 +97,69 @@ class TestLoRA:
 
         apply_lora(model, lora_config)
 
-        adapter_parameter_ids = {id(parameter) for parameter in lora_parameters(model)}
-        trainable_parameter_ids = {
-            id(parameter) for parameter in model.parameters() if parameter.requires_grad
+        adapter_array_ids = {id(parameter) for parameter in lora_parameters(model)}
+        trainable_array_ids = {
+            id(parameter) for _, parameter in tree_flatten(model.trainable_parameters())
         }
-        assert adapter_parameter_ids == trainable_parameter_ids
+        assert adapter_array_ids == trainable_array_ids
 
-    def test_apply_lora_places_adapters_on_base_device(self):
-        from lora import apply_lora
-        from sml import SMLLanguageModel
-
-        config, lora_config = self.tiny_config()
-        model = SMLLanguageModel(config).to("cpu")
-        apply_lora(model, lora_config)
-
-        wrapped = model.layers[0].self_attn.q_proj
-        assert wrapped.lora_A.device == wrapped.linear.weight.device
-        assert wrapped.lora_B.device == wrapped.linear.weight.device
-
-    def test_lora_forward_changes_output(self):
+    def test_lora_forward_changes_output_after_nonzero_b(self):
+        mx = require_mlx_runtime()
+        import mlx.nn as nn
         from lora import LoRALinear
 
         linear = nn.Linear(8, 4, bias=True)
         lora = LoRALinear(linear, rank=4, alpha=8.0)
-        x = torch.randn(2, 8)
-
-        with torch.no_grad():
-            lora.lora_B.fill_(0.1)
+        x = mx.random.normal(shape=(2, 8))
+        lora.lora_B = mx.full(lora.lora_B.shape, 0.1)
 
         base_output = linear(x)
         lora_output = lora(x)
+        mx.eval(base_output, lora_output)
 
-        assert not torch.allclose(base_output, lora_output)
+        assert not bool(mx.allclose(base_output, lora_output).item())
 
-    def test_lora_forward_matches_activation_dtype(self):
+    def test_lora_forward_matches_base_output_dtype(self):
+        mx = require_mlx_runtime()
+        import mlx.nn as nn
         from lora import LoRALinear
 
         linear = nn.Linear(8, 4, bias=False)
+        linear.weight = linear.weight.astype(mx.float16)
         lora = LoRALinear(linear, rank=4, alpha=8.0)
-        x = torch.randn(2, 8)
+        lora.lora_B = mx.full(lora.lora_B.shape, 0.1)
+        x = mx.random.normal(shape=(2, 8)).astype(mx.float16)
 
-        with torch.no_grad():
-            lora.lora_B.fill_(0.1)
+        output = lora(x)
+        mx.eval(output)
 
-        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-            output = lora(x)
+        assert mx.float16 == output.dtype
 
-        assert output.dtype == torch.bfloat16
-
-    def test_merge_lora_updates_base_linear(self):
-        from lora import LoRALinear, merge_lora
+    def test_merge_lora_preserves_output_and_restores_base_linear(self):
+        mx = require_mlx_runtime()
+        import mlx.nn as nn
+        from lora import apply_lora, merge_lora
         from sml import SMLLanguageModel
 
         config, lora_config = self.tiny_config()
         model = SMLLanguageModel(config)
-        apply_lora = __import__("lora").apply_lora
         apply_lora(model, lora_config)
+        model.layers[0].self_attn.q_proj.lora_B = mx.full(
+            model.layers[0].self_attn.q_proj.lora_B.shape,
+            0.05,
+        )
 
-        with torch.no_grad():
-            model.layers[0].self_attn.q_proj.lora_B.fill_(0.05)
-
-        x = torch.randn(1, 1, config.hidden_size)
-        wrapped = model.layers[0].self_attn.q_proj
-        expected_delta = (
-            wrapped.scaling
-            * (x @ wrapped.lora_A.T @ wrapped.lora_B.T)
-        ).detach()
-        before = model.layers[0].self_attn(x, kv_cache=None).detach()
-
+        x = mx.random.normal(shape=(1, 1, config.hidden_size))
+        before = model.layers[0].self_attn(x, kv_cache=None)
         merge_lora(model)
-        after = model.layers[0].self_attn(x, kv_cache=None).detach()
+        after = model.layers[0].self_attn(x, kv_cache=None)
+        mx.eval(before, after)
 
         assert isinstance(model.layers[0].self_attn.q_proj, nn.Linear)
-        assert torch.allclose(before, after, atol=1e-05, rtol=1e-05)
-        assert expected_delta.abs().sum().item() > 0.0
+        assert bool(mx.allclose(before, after, atol=1e-5, rtol=1e-5).item())
 
     def test_lora_state_dict_round_trip(self):
+        mx = require_mlx_runtime()
         from lora import apply_lora, load_lora_state_dict, lora_state_dict
         from sml import SMLLanguageModel
 
@@ -150,12 +168,26 @@ class TestLoRA:
         target = SMLLanguageModel(config)
         apply_lora(source, lora_config)
         apply_lora(target, lora_config)
-
-        with torch.no_grad():
-            source.layers[0].self_attn.q_proj.lora_A.fill_(0.25)
-            source.layers[0].self_attn.q_proj.lora_B.fill_(0.5)
+        source.layers[0].self_attn.q_proj.lora_A = mx.full(
+            source.layers[0].self_attn.q_proj.lora_A.shape,
+            0.25,
+        )
+        source.layers[0].self_attn.q_proj.lora_B = mx.full(
+            source.layers[0].self_attn.q_proj.lora_B.shape,
+            0.5,
+        )
 
         load_lora_state_dict(target, lora_state_dict(source))
 
-        assert torch.equal(source.layers[0].self_attn.q_proj.lora_A, target.layers[0].self_attn.q_proj.lora_A)
-        assert torch.equal(source.layers[0].self_attn.q_proj.lora_B, target.layers[0].self_attn.q_proj.lora_B)
+        assert bool(
+            mx.array_equal(
+                source.layers[0].self_attn.q_proj.lora_A,
+                target.layers[0].self_attn.q_proj.lora_A,
+            ).item()
+        )
+        assert bool(
+            mx.array_equal(
+                source.layers[0].self_attn.q_proj.lora_B,
+                target.layers[0].self_attn.q_proj.lora_B,
+            ).item()
+        )

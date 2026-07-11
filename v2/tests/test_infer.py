@@ -1,4 +1,5 @@
 import io
+import json
 import sys
 import tempfile
 from dataclasses import asdict
@@ -14,9 +15,24 @@ sys.path.insert(0, str(SRC_DIR))
 
 
 try:
-    import torch
-except ImportError:  # pragma: no cover - exercised only before torch is installed
-    torch = None
+    import mlx.core as mx
+except ImportError as exc:  # pragma: no cover - depends on host
+    mx = None
+    _MLX_IMPORT_ERROR = exc
+else:
+    _MLX_IMPORT_ERROR = None
+
+
+def require_mlx_runtime():
+    if _MLX_IMPORT_ERROR is not None:
+        pytest.skip(f"mlx is not available: {_MLX_IMPORT_ERROR}")
+    try:
+        import mlx.nn  # noqa: F401
+
+        mx.eval(mx.array([0]))
+    except (ImportError, RuntimeError) as exc:  # pragma: no cover - depends on host
+        pytest.skip(f"mlx is not available: {exc}")
+    return mx
 
 
 class FakeTokenizer:
@@ -39,7 +55,6 @@ class FakeGenerationModel:
         self.generate = Spy(return_value=generated_ids)
 
 
-@pytest.mark.skipif(torch is None, reason="torch is not installed")
 class TestInferenceInterface:
     def tiny_config(self):
         from sml import SMLConfig
@@ -62,16 +77,18 @@ class TestInferenceInterface:
         )
 
     def test_encode_prompt_adds_bos_and_batch_dimension(self):
+        mx = require_mlx_runtime()
         import infer_sml
 
         input_ids = infer_sml.encode_prompt(
             FakeTokenizer(),
             "4 5",
             bos_token_id=1,
-            device=torch.device("cpu"),
         )
 
-        assert torch.equal(torch.tensor([[1, 4, 5]]), input_ids)
+        mx.eval(input_ids)
+        assert [[1, 4, 5]] == input_ids.tolist()
+        assert mx.int32 == input_ids.dtype
 
     def test_decode_token_ids_omits_bos_pad_and_stops_at_eos(self):
         import infer_sml
@@ -87,6 +104,7 @@ class TestInferenceInterface:
         assert '4 5' == text
 
     def test_load_model_restores_checkpoint_config_and_weights(self):
+        mx = require_mlx_runtime()
         import infer_sml
         from sml import SMLLanguageModel
 
@@ -94,22 +112,23 @@ class TestInferenceInterface:
         model = SMLLanguageModel(config)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            checkpoint_path = Path(tmp_dir) / "sml.pt"
-            torch.save(
-                {
-                    "model_config": asdict(config),
-                    "model_state_dict": model.state_dict(),
-                },
-                checkpoint_path,
+            checkpoint_path = Path(tmp_dir) / "sml"
+            checkpoint_path.mkdir()
+            (checkpoint_path / "metadata.json").write_text(
+                json.JSONEncoder().encode({"model_config": asdict(config)}),
+                encoding="utf-8",
             )
+            model.save_weights(str(checkpoint_path / "model.safetensors"))
 
-            loaded = infer_sml.load_model(checkpoint_path, torch.device("cpu"))
+            loaded = infer_sml.load_model(checkpoint_path)
 
         assert not loaded.training
-        output = loaded(torch.tensor([[1, 4, 5]]))
+        output = loaded(mx.array([[1, 4, 5]], dtype=mx.int32))
+        mx.eval(output.logits)
         assert (1, 3, config.vocab_size) == tuple(output.logits.shape)
 
     def test_load_model_maps_legacy_max_position_embeddings_config(self):
+        require_mlx_runtime()
         import infer_sml
         from sml import SMLConfig
         from sml import SMLLanguageModel
@@ -123,29 +142,35 @@ class TestInferenceInterface:
         legacy_model_config.pop("rope_scaling_factor")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            checkpoint_path = Path(tmp_dir) / "sml.pt"
-            torch.save(
-                {
-                    "model_config": legacy_model_config,
-                    "model_state_dict": model.state_dict(),
-                },
-                checkpoint_path,
+            checkpoint_path = Path(tmp_dir) / "sml"
+            checkpoint_path.mkdir()
+            (checkpoint_path / "metadata.json").write_text(
+                json.JSONEncoder().encode({"model_config": legacy_model_config}),
+                encoding="utf-8",
             )
+            model.save_weights(str(checkpoint_path / "model.safetensors"))
 
-            loaded = infer_sml.load_model(checkpoint_path, torch.device("cpu"))
+            loaded = infer_sml.load_model(checkpoint_path)
 
         assert config.original_max_position_embeddings == loaded.config.original_max_position_embeddings
         assert SMLConfig().rope_scaling_factor == loaded.config.rope_scaling_factor
 
-    def test_generate_text_omits_prompt_by_default(self, monkeypatch):
+    def test_load_checkpoint_metadata_requires_dictionary(self):
         import infer_sml
 
-        model = FakeGenerationModel(torch.tensor([[1, 4, 5, 6, 2]]))
-        monkeypatch.setattr(
-            infer_sml,
-            "resolve_device",
-            Spy(return_value=torch.device("cpu")),
-        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = Path(tmp_dir) / "sml"
+            checkpoint_path.mkdir()
+            (checkpoint_path / "metadata.json").write_text("[]", encoding="utf-8")
+
+            with pytest.raises(ValueError, match="metadata must contain a dictionary"):
+                infer_sml.load_checkpoint_metadata(checkpoint_path)
+
+    def test_generate_text_omits_prompt_by_default(self, monkeypatch):
+        mx = require_mlx_runtime()
+        import infer_sml
+
+        model = FakeGenerationModel(mx.array([[1, 4, 5, 6, 2]], dtype=mx.int32))
         monkeypatch.setattr(
             infer_sml,
             "load_tokenizer",
@@ -165,14 +190,10 @@ class TestInferenceInterface:
         assert 0 == infer_sml.resolve_max_new_tokens(None, 16, 20)
 
     def test_generate_text_uses_remaining_context_window_by_default(self, monkeypatch):
+        mx = require_mlx_runtime()
         import infer_sml
 
-        model = FakeGenerationModel(torch.tensor([[1, 4, 5, 6, 2]]))
-        monkeypatch.setattr(
-            infer_sml,
-            "resolve_device",
-            Spy(return_value=torch.device("cpu")),
-        )
+        model = FakeGenerationModel(mx.array([[1, 4, 5, 6, 2]], dtype=mx.int32))
         monkeypatch.setattr(
             infer_sml,
             "load_tokenizer",
@@ -286,11 +307,16 @@ class TestInferenceInterface:
 
     def test_main_omits_prompt_by_default(self, monkeypatch):
         import infer_sml
-        from sml import GenerationConfig
 
+        generation_config = object()
         generate_text = Spy(return_value="hello world")
         print_ = Spy()
         monkeypatch.setattr(infer_sml, "generate_text", generate_text)
+        monkeypatch.setattr(
+            infer_sml,
+            "generation_config_from_args",
+            Spy(return_value=generation_config),
+        )
         monkeypatch.setattr("builtins.print", print_)
 
         exit_code = infer_sml.main(
@@ -305,40 +331,23 @@ class TestInferenceInterface:
         generate_text.assert_called_once_with(
             prompt="hello",
             max_new_tokens=3,
-            device_name="auto",
             include_prompt=False,
-            generation_config=GenerationConfig(),
-        )
-        print_.assert_called_once_with("hello world")
-
-    def test_main_passes_device_from_cli_args(self, monkeypatch):
-        import infer_sml
-        from sml import GenerationConfig
-
-        generate_text = Spy(return_value="hello world")
-        print_ = Spy()
-        monkeypatch.setattr(infer_sml, "generate_text", generate_text)
-        monkeypatch.setattr("builtins.print", print_)
-
-        exit_code = infer_sml.main(["hello", "--device", "cuda:0"])
-
-        assert 0 == exit_code
-        generate_text.assert_called_once_with(
-            prompt="hello",
-            max_new_tokens=None,
-            device_name="cuda:0",
-            include_prompt=False,
-            generation_config=GenerationConfig(),
+            generation_config=generation_config,
         )
         print_.assert_called_once_with("hello world")
 
     def test_main_can_include_prompt_from_cli_args(self, monkeypatch):
         import infer_sml
-        from sml import GenerationConfig
 
+        generation_config = object()
         generate_text = Spy(return_value="hello world")
         print_ = Spy()
         monkeypatch.setattr(infer_sml, "generate_text", generate_text)
+        monkeypatch.setattr(
+            infer_sml,
+            "generation_config_from_args",
+            Spy(return_value=generation_config),
+        )
         monkeypatch.setattr("builtins.print", print_)
 
         exit_code = infer_sml.main(["hello", "--include-prompt"])
@@ -347,15 +356,13 @@ class TestInferenceInterface:
         generate_text.assert_called_once_with(
             prompt="hello",
             max_new_tokens=None,
-            device_name="auto",
             include_prompt=True,
-            generation_config=GenerationConfig(),
+            generation_config=generation_config,
         )
         print_.assert_called_once_with("hello world")
 
     def test_parse_args_accepts_decoding_flags(self):
         import infer_sml
-        from sml import GenerationConfig
 
         args = infer_sml.parse_args(
             [
@@ -373,7 +380,11 @@ class TestInferenceInterface:
             ]
         )
 
-        assert GenerationConfig(temperature=0.8, top_p=0.9, repetition_penalty=1.2, no_repeat_ngram_size=3, seed=7) == infer_sml.generation_config_from_args(args)
+        assert 0.8 == args.temperature
+        assert 0.9 == args.top_p
+        assert 1.2 == args.repetition_penalty
+        assert 3 == args.no_repeat_ngram_size
+        assert 7 == args.seed
 
     def test_main_can_start_openai_compatible_server(self, monkeypatch):
         import infer_sml
@@ -398,29 +409,6 @@ class TestInferenceInterface:
             host="0.0.0.0",
             port=9000,
             model_name="sml-test",
-            device_name="auto",
-        )
-
-    def test_main_passes_device_to_openai_compatible_server(self, monkeypatch):
-        import infer_sml
-
-        run_server = Spy()
-        monkeypatch.setattr(infer_sml, "run_openai_compatible_server", run_server)
-
-        exit_code = infer_sml.main(
-            [
-                "--serve",
-                "--device",
-                "cpu",
-            ]
-        )
-
-        assert 0 == exit_code
-        run_server.assert_called_once_with(
-            host="127.0.0.1",
-            port=8000,
-            model_name=infer_sml.DEFAULT_MODEL_NAME,
-            device_name="cpu",
         )
 
     @pytest.mark.parametrize(
@@ -443,10 +431,3 @@ class TestInferenceInterface:
         monkeypatch.setattr(sys, "stderr", io.StringIO())
         with pytest.raises(SystemExit):
             infer_sml.parse_args(argv)
-
-    def test_parse_args_defaults_device_to_auto(self):
-        import infer_sml
-
-        args = infer_sml.parse_args(["hello"])
-
-        assert 'auto' == args.device

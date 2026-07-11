@@ -6,12 +6,32 @@ from types import SimpleNamespace
 
 from helpers import Spy
 import pytest
-import torch
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"
 sys.path.insert(0, str(SRC_DIR))
+
+
+try:
+    import mlx.core as mx
+except ImportError as exc:  # pragma: no cover - depends on host
+    mx = None
+    _MLX_IMPORT_ERROR = exc
+else:
+    _MLX_IMPORT_ERROR = None
+
+
+def require_mlx_runtime():
+    if _MLX_IMPORT_ERROR is not None:
+        pytest.skip(f"mlx is not available: {_MLX_IMPORT_ERROR}")
+    try:
+        import mlx.nn  # noqa: F401
+
+        mx.eval(mx.array([0]))
+    except (ImportError, RuntimeError) as exc:  # pragma: no cover - depends on host
+        pytest.skip(f"mlx is not available: {exc}")
+    return mx
 
 
 class FakeTokenizer:
@@ -50,39 +70,53 @@ class FakeModel:
         self.max_new_tokens = None
 
     def __call__(self, input_ids):
-        self.calls.append(input_ids.detach().cpu().tolist())
-        logits = torch.full(
-            (*input_ids.shape, 128),
-            -100.0,
-            dtype=torch.float32,
-            device=input_ids.device,
+        mx = require_mlx_runtime()
+        mx.eval(input_ids)
+        self.calls.append(input_ids.tolist())
+        next_token_ids = mx.concatenate(
+            [
+                input_ids[:, 1:],
+                mx.full((input_ids.shape[0], 1), 0, dtype=mx.int32),
+            ],
+            axis=1,
         )
-        for position in range(input_ids.shape[1] - 1):
-            next_token_id = int(input_ids[0, position + 1])
-            logits[0, position, next_token_id] = 100.0
+        vocab_ids = mx.arange(128, dtype=mx.int32).reshape(1, 1, 128)
+        logits = mx.where(
+            vocab_ids == next_token_ids[:, :, None],
+            mx.full(
+                (*input_ids.shape, 128),
+                100.0,
+                dtype=mx.float32,
+            ),
+            mx.full(
+                (*input_ids.shape, 128),
+                -100.0,
+                dtype=mx.float32,
+            ),
+        )
         return SimpleNamespace(logits=logits)
 
     def generate(self, input_ids, max_new_tokens, eos_token_id):
+        mx = require_mlx_runtime()
         self.max_new_tokens = max_new_tokens
         self.eos_token_id = eos_token_id
-        continuation = torch.arange(
+        continuation = mx.arange(
             6,
             6 + max_new_tokens,
-            dtype=torch.long,
-            device=input_ids.device,
-        ).unsqueeze(0)
-        return torch.cat((input_ids, continuation), dim=1)
+            dtype=mx.int32,
+        ).reshape(1, max_new_tokens)
+        return mx.concatenate((input_ids, continuation), axis=1)
 
 
 class TestEvalUtils:
     def test_loglikelihood_scores_only_continuation_tokens(self):
+        require_mlx_runtime()
         import eval_utils
 
         model = FakeModel()
         lm = eval_utils.SMLEvalLM(
             model=model,
             tokenizer=FakeTokenizer(),
-            device=torch.device("cpu"),
         )
         request = SimpleNamespace(args=("4 5", " 6 7"))
 
@@ -95,13 +129,13 @@ class TestEvalUtils:
         assert [[[1, 4, 5, 6, 7]]] == model.calls
 
     def test_loglikelihood_tokenizes_context_and_continuation_together(self):
+        require_mlx_runtime()
         import eval_utils
 
         model = FakeModel()
         lm = eval_utils.SMLEvalLM(
             model=model,
             tokenizer=BoundaryTokenizer(),
-            device=torch.device("cpu"),
         )
         request = SimpleNamespace(args=("a", "b"))
 
@@ -117,7 +151,6 @@ class TestEvalUtils:
         lm = eval_utils.SMLEvalLM(
             model=FakeModel(effective_max_position_embeddings=3),
             tokenizer=FakeTokenizer(),
-            device=torch.device("cpu"),
         )
         request = SimpleNamespace(args=("4 5", " 6"))
 
@@ -125,13 +158,13 @@ class TestEvalUtils:
             lm.loglikelihood([request])
 
     def test_generate_until_caps_completion_and_applies_earliest_stop(self):
+        require_mlx_runtime()
         import eval_utils
 
         model = FakeModel(effective_max_position_embeddings=6)
         lm = eval_utils.SMLEvalLM(
             model=model,
             tokenizer=FakeTokenizer(),
-            device=torch.device("cpu"),
         )
         request = SimpleNamespace(
             args=(
@@ -160,7 +193,7 @@ class TestEvalUtils:
 
         result = eval_utils.evaluate_lm(
             lm=lm,
-            checkpoint_path=Path("v1/output/sml.pt"),
+            checkpoint_path=Path("v2/output/sml"),
             tasks=["hellaswag"],
             limit=2,
         )
@@ -168,7 +201,7 @@ class TestEvalUtils:
         assert expected is result
         simple_evaluate.assert_called_once_with(
             model=lm,
-            model_args={"path": "v1/output/sml.pt"},
+            model_args={"path": "v2/output/sml"},
             tasks=["hellaswag"],
             num_fewshot=0,
             batch_size=1,
@@ -184,9 +217,9 @@ class TestEvalUtils:
 
             eval_utils.write_results(
                 output_path,
-                {"checkpoint": Path("v1/output/sml.pt")},
+                {"checkpoint": Path("v2/output/sml")},
             )
 
             saved = json.loads(output_path.read_text(encoding="utf-8"))
 
-        assert 'v1/output/sml.pt' == saved['checkpoint']
+        assert 'v2/output/sml' == saved['checkpoint']

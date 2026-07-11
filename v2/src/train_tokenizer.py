@@ -10,10 +10,10 @@ import sentencepiece as spm
 from config import INPUT_DIR, OUTPUT_DIR, SUCCESS_RETURN_CODE, resolve_path
 import tokenizer
 
-VOCAB_SIZE = 24_576
+VOCAB_SIZE = 28_672
 RANDOM_SEED = 42
 NUM_THREADS = 8
-INPUT_SENTENCE_SIZE = 500_000
+INPUT_SENTENCE_SIZE = 524_288
 SELF_TEST_SAMPLE_SIZE = 0
 CHARACTER_COVERAGE = 0.9995  # 1.0 for small character sets (e.g. English clean datasets), 0.9995 for Pile/web-like datasets
 BYTE_FALLBACK = True

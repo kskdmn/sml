@@ -2,11 +2,11 @@ from pathlib import Path
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-SML_MLX_PATH = PROJECT_DIR / "src" / "sml_mlx.py"
+SML_PATH = PROJECT_DIR / "src" / "sml.py"
 
 
 def test_grouped_query_attention_always_uses_fused_mlx_attention() -> None:
-    source = SML_MLX_PATH.read_text(encoding="utf-8")
+    source = SML_PATH.read_text(encoding="utf-8")
     attention_source = source[
         source.index("class GroupedQueryAttention") : source.index(
             "class SwiGLUFeedForward"

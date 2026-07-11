@@ -1,20 +1,28 @@
 """
-Low-rank adaptation (LoRA) helpers for SML fine-tuning.
+Low-rank adaptation (LoRA) helpers for MLX SML fine-tuning.
 
 Wraps selected ``nn.Linear`` layers with trainable low-rank deltas while keeping
-base weights frozen. ``merge_lora`` folds adapters into the base weights so
-merged checkpoints load through the standard inference path.
+base weights frozen. ``merge_lora`` folds adapters into base weights so merged
+checkpoints load through the standard inference path.
 """
 
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import torch
-import torch.nn as nn
+import mlx.core as mx
+
+try:
+    import mlx.nn as nn
+except RuntimeError as exc:  # pragma: no cover - depends on host MLX access
+    nn = None
+    _MLX_IMPORT_ERROR = exc
+    _ModuleBase = object
+else:
+    _MLX_IMPORT_ERROR = None
+    _ModuleBase = nn.Module
 
 if TYPE_CHECKING:
     from sml import SMLLanguageModel
@@ -45,10 +53,16 @@ class LoRAConfig:
     )
 
 
-class LoRALinear(nn.Module):
+def _require_mlx_nn():
+    if nn is None:
+        raise RuntimeError(f"mlx.nn is not available: {_MLX_IMPORT_ERROR}")
+    return nn
+
+
+class LoRALinear(_ModuleBase):
     def __init__(
         self,
-        linear: nn.Linear,
+        linear,
         rank: int,
         alpha: float,
         dropout: float = 0.0,
@@ -56,6 +70,7 @@ class LoRALinear(nn.Module):
         """
         Compute ``linear(x) + scaling * (x @ A.T @ B.T)`` with base weights frozen.
         """
+        mlx_nn = _require_mlx_nn()
         super().__init__()
         if rank <= 0:
             raise ValueError("LoRA rank must be positive")
@@ -65,46 +80,40 @@ class LoRALinear(nn.Module):
         self.linear = linear
         self.rank = rank
         self.scaling = alpha / rank
-        self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
-        device = linear.weight.device
-        self.lora_A = nn.Parameter(torch.empty(rank, linear.in_features, device=device))
-        self.lora_B = nn.Parameter(torch.empty(linear.out_features, rank, device=device))
-        self.reset_lora_parameters()
+        self.lora_dropout = mlx_nn.Dropout(dropout) if dropout > 0.0 else mlx_nn.Identity()
+        input_dims = linear.weight.shape[1]
+        output_dims = linear.weight.shape[0]
+        self.lora_A = mx.random.normal(shape=(rank, input_dims)) * 0.01
+        self.lora_B = mx.zeros((output_dims, rank), dtype=linear.weight.dtype)
+        self.linear.freeze()
 
-        for parameter in self.linear.parameters():
-            parameter.requires_grad = False
-
-    def reset_lora_parameters(self) -> None:
-        """
-        Initialize A with Kaiming uniform noise and B with zeros (standard LoRA init).
-        """
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: mx.array) -> mx.array:
         output = self.linear(x)
-        # Outer autocast can keep matmul operands in bf16 even after .float().
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            lora_x = self.lora_dropout(x).to(dtype=self.lora_A.dtype)
-            lora_output = lora_x @ self.lora_A.T @ self.lora_B.T
-        return output + lora_output.to(dtype=output.dtype) * self.scaling
+        lora_x = self.lora_dropout(x)
+        lora_output = lora_x @ self.lora_A.T @ self.lora_B.T
+        if lora_output.dtype != output.dtype:
+            lora_output = lora_output.astype(output.dtype)
+        return output + self.scaling * lora_output
 
-    def merge(self) -> nn.Linear:
+    def merge(self):
         """
         Fold the low-rank delta into the wrapped linear layer and return it.
         """
-        delta = self.lora_B @ self.lora_A
-        self.linear.weight.data.add_(self.scaling * delta.to(dtype=self.linear.weight.dtype))
+        delta = self.scaling * (self.lora_B @ self.lora_A)
+        if delta.dtype != self.linear.weight.dtype:
+            delta = delta.astype(self.linear.weight.dtype)
+        self.linear.weight = self.linear.weight + delta
         return self.linear
 
 
-def apply_lora(model: SMLLanguageModel, config: LoRAConfig) -> SMLLanguageModel:
+def apply_lora(model: "SMLLanguageModel", config: LoRAConfig) -> "SMLLanguageModel":
     """
     Replace matching linear projections with ``LoRALinear`` wrappers in place.
     """
-    target_modules: list[tuple[str, nn.Linear]] = []
+    mlx_nn = _require_mlx_nn()
+    target_modules: list[tuple[str, object]] = []
     for name, module in list(model.named_modules()):
-        if not isinstance(module, nn.Linear):
+        if not isinstance(module, mlx_nn.Linear):
             continue
 
         short_name = name.rsplit(".", 1)[-1]
@@ -116,35 +125,49 @@ def apply_lora(model: SMLLanguageModel, config: LoRAConfig) -> SMLLanguageModel:
     if not target_modules:
         return model
 
-    for parameter in model.parameters():
-        parameter.requires_grad = False
-
+    model.freeze()
     for name, module in target_modules:
-        parent_name, child_name = name.rsplit(".", 1)
-        parent = model.get_submodule(parent_name)
-        setattr(
-            parent,
-            child_name,
-            LoRALinear(
-                module,
-                rank=config.rank,
-                alpha=config.alpha,
-                dropout=config.dropout,
-            ),
+        parent, child_name = _split_parent(model, name)
+        wrapper = LoRALinear(
+            module,
+            rank=config.rank,
+            alpha=config.alpha,
+            dropout=config.dropout,
         )
+        wrapper.unfreeze(keys=[LORA_A_SUFFIX, LORA_B_SUFFIX], recurse=False)
+        setattr(parent, child_name, wrapper)
 
     return model
 
 
-def iter_lora_modules(model: nn.Module) -> Iterator[LoRALinear]:
+def _get_submodule(module, path: str):
+    current = module
+    if not path:
+        return current
+    for part in path.split("."):
+        if isinstance(current, (list, tuple)):
+            current = current[int(part)]
+        else:
+            current = getattr(current, part)
+    return current
+
+
+def _split_parent(model, name: str):
+    if "." not in name:
+        return model, name
+    parent_name, child_name = name.rsplit(".", 1)
+    return _get_submodule(model, parent_name), child_name
+
+
+def iter_lora_modules(model) -> Iterator[LoRALinear]:
     for module in model.modules():
         if isinstance(module, LoRALinear):
             yield module
 
 
-def lora_parameters(model: nn.Module) -> list[nn.Parameter]:
+def lora_parameters(model) -> list[mx.array]:
     """
-    Return only LoRA adapter parameters for optimizer construction.
+    Return only LoRA adapter arrays for optimizer construction.
     """
     return [
         parameter
@@ -153,22 +176,22 @@ def lora_parameters(model: nn.Module) -> list[nn.Parameter]:
     ]
 
 
-def lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+def lora_state_dict(model) -> dict[str, mx.array]:
     """
-    Collect adapter tensors keyed by their location in the full model state dict.
+    Collect adapter arrays keyed by their location in the full model state.
     """
-    state: dict[str, torch.Tensor] = {}
+    state: dict[str, mx.array] = {}
     for name, module in model.named_modules():
         if not isinstance(module, LoRALinear):
             continue
-        state[f"{name}.{LORA_A_SUFFIX}"] = module.lora_A.detach().cpu()
-        state[f"{name}.{LORA_B_SUFFIX}"] = module.lora_B.detach().cpu()
+        state[f"{name}.{LORA_A_SUFFIX}"] = module.lora_A
+        state[f"{name}.{LORA_B_SUFFIX}"] = module.lora_B
     return state
 
 
-def load_lora_state_dict(model: nn.Module, state: dict[str, torch.Tensor]) -> None:
+def load_lora_state_dict(model, state: dict[str, mx.array]) -> None:
     """
-    Restore adapter tensors produced by ``lora_state_dict``.
+    Restore adapter arrays produced by ``lora_state_dict``.
     """
     for name, module in model.named_modules():
         if not isinstance(module, LoRALinear):
@@ -178,12 +201,16 @@ def load_lora_state_dict(model: nn.Module, state: dict[str, torch.Tensor]) -> No
         key_b = f"{name}.{LORA_B_SUFFIX}"
         if key_a not in state or key_b not in state:
             raise ValueError(f"LoRA checkpoint is missing adapter weights for {name}")
+        if tuple(state[key_a].shape) != tuple(module.lora_A.shape):
+            raise ValueError(f"LoRA checkpoint has wrong A shape for {name}")
+        if tuple(state[key_b].shape) != tuple(module.lora_B.shape):
+            raise ValueError(f"LoRA checkpoint has wrong B shape for {name}")
 
-        module.lora_A.data.copy_(state[key_a])
-        module.lora_B.data.copy_(state[key_b])
+        module.lora_A = state[key_a].astype(module.lora_A.dtype)
+        module.lora_B = state[key_b].astype(module.lora_B.dtype)
 
 
-def merge_lora(model: nn.Module) -> None:
+def merge_lora(model) -> None:
     """
     Replace every ``LoRALinear`` wrapper with its merged base linear layer.
     """
@@ -191,16 +218,15 @@ def merge_lora(model: nn.Module) -> None:
         if not isinstance(module, LoRALinear):
             continue
 
-        parent_name, child_name = name.rsplit(".", 1)
-        parent = model.get_submodule(parent_name)
+        parent, child_name = _split_parent(model, name)
         setattr(parent, child_name, module.merge())
 
 
-def count_lora_modules(model: nn.Module) -> int:
+def count_lora_modules(model) -> int:
     return sum(1 for _ in iter_lora_modules(model))
 
 
-def require_lora_modules(model: nn.Module, target_modules: Iterable[str]) -> None:
+def require_lora_modules(model, target_modules: Iterable[str]) -> None:
     """
     Fail fast when no projection matched the configured target module names.
     """

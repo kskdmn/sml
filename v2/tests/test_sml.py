@@ -1,7 +1,6 @@
 import sys
 from pathlib import Path
 
-from helpers import Spy
 import pytest
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -10,9 +9,10 @@ sys.path.insert(0, str(SRC_DIR))
 
 
 try:
-    import torch
-except ImportError:  # pragma: no cover - exercised only before torch is installed
-    torch = None
+    import mlx.core as mx
+    import mlx.nn
+except (ImportError, RuntimeError) as exc:
+    pytestmark = pytest.mark.skip(reason=f"mlx is not available: {exc}")
 
 
 class TestSMLConfig:
@@ -98,7 +98,6 @@ class TestSMLSchedule:
         assert 1.0 == lr_lambda(step=1000, total_steps=None, warmup_steps=100, min_lr_ratio=0.1)
 
 
-@pytest.mark.skipif(torch is None, reason="torch is not installed")
 class TestSMLModel:
     def tiny_config(self):
         from sml import SMLConfig
@@ -125,12 +124,14 @@ class TestSMLModel:
 
         config = self.tiny_config()
         model = SMLLanguageModel(config)
-        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+        input_ids = mx.random.randint(0, config.vocab_size, shape=(2, 8))
 
         output = model(input_ids, labels=input_ids)
+        mx.eval(output.logits, output.loss)
 
-        assert (2, 8, config.vocab_size) == tuple(output.logits.shape)
-        assert 0 == output.loss.dim()
+        assert (2, 8, config.vocab_size) == output.logits.shape
+        assert output.loss is not None
+        assert () == output.loss.shape
 
     def test_rotary_cache_covers_scaled_context_length(self):
         from sml import SMLLanguageModel
@@ -147,25 +148,26 @@ class TestSMLModel:
 
         config = self.tiny_config()
         model = SMLLanguageModel(config)
-        input_ids = torch.randint(
+        input_ids = mx.random.randint(
             0,
             config.vocab_size,
-            (1, config.effective_max_position_embeddings),
+            shape=(1, config.effective_max_position_embeddings),
         )
 
         output = model(input_ids)
+        mx.eval(output.logits)
 
-        assert (1, config.effective_max_position_embeddings, config.vocab_size) == tuple(output.logits.shape)
+        assert (1, config.effective_max_position_embeddings, config.vocab_size) == output.logits.shape
 
     def test_forward_rejects_tokens_beyond_scaled_context_length(self):
         from sml import SMLLanguageModel
 
         config = self.tiny_config()
         model = SMLLanguageModel(config)
-        input_ids = torch.randint(
+        input_ids = mx.random.randint(
             0,
             config.vocab_size,
-            (1, config.effective_max_position_embeddings + 1),
+            shape=(1, config.effective_max_position_embeddings + 1),
         )
 
         with pytest.raises(ValueError, match='effective_max_position_embeddings'):
@@ -178,50 +180,28 @@ class TestSMLModel:
 
         assert model.lm_head.weight is model.embed_tokens.weight
 
-    def test_training_forward_uses_gradient_checkpointing_when_enabled(self, monkeypatch):
-        import torch.utils.checkpoint
-        from sml import SMLLanguageModel
-
-        config = self.tiny_config()
-        model = SMLLanguageModel(config)
-        model.train()
-        input_ids = torch.randint(0, config.vocab_size, (2, 8))
-
-        checkpoint = Spy(
-            wraps=torch.utils.checkpoint.checkpoint,
-        )
-        monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", checkpoint)
-
-        output = model(input_ids, labels=input_ids)
-        assert config.num_layers == checkpoint.call_count
-
-        assert 0 == output.loss.dim()
-        output.loss.backward()
-        assert model.embed_tokens.weight.grad is not None
-        for call in checkpoint.call_args_list:
-            assert False is call.kwargs['use_reentrant']
-
     def test_generate_appends_requested_tokens_and_uses_cache(self):
         from sml import SMLLanguageModel
 
         config = self.tiny_config()
         model = SMLLanguageModel(config)
-        prompt = torch.tensor([[config.bos_token_id, 5, 6]], dtype=torch.long)
+        prompt = mx.array([[config.bos_token_id, 5, 6]], dtype=mx.int32)
 
         generated = model.generate(prompt, max_new_tokens=4)
+        mx.eval(generated)
 
-        assert (1, 7) == tuple(generated.shape)
-        assert torch.equal(prompt, generated[:, :prompt.shape[1]])
+        assert (1, 7) == generated.shape
+        assert bool(mx.all(prompt == generated[:, : prompt.shape[1]]).item())
 
     def test_generate_rejects_requested_tokens_beyond_scaled_context_length(self):
         from sml import SMLLanguageModel
 
         config = self.tiny_config()
         model = SMLLanguageModel(config)
-        prompt = torch.full(
+        prompt = mx.full(
             (1, config.effective_max_position_embeddings),
             config.bos_token_id,
-            dtype=torch.long,
+            dtype=mx.int32,
         )
 
         with pytest.raises(ValueError, match='effective_max_position_embeddings'):
@@ -230,23 +210,25 @@ class TestSMLModel:
     def test_repetition_penalty_reduces_repeated_token_logit(self):
         from sml import apply_repetition_penalty
 
-        logits = torch.tensor([[1.0, 2.0, 3.0]])
-        input_ids = torch.tensor([[1, 1, 2]])
+        logits = mx.array([[1.0, 2.0, 3.0]])
+        input_ids = mx.array([[1, 1, 2]])
         adjusted = apply_repetition_penalty(logits, input_ids, penalty=2.0)
+        mx.eval(adjusted)
 
-        assert 1.0 == adjusted[0, 0].item()
-        assert 1.0 == adjusted[0, 1].item()
-        assert 1.5 == adjusted[0, 2].item()
+        assert 1.0 == pytest.approx(adjusted[0, 0].item())
+        assert 1.0 == pytest.approx(adjusted[0, 1].item())
+        assert 1.5 == pytest.approx(adjusted[0, 2].item())
 
     def test_no_repeat_ngram_blocks_repeated_trigram(self):
         from sml import apply_no_repeat_ngram
 
-        logits = torch.tensor([[0.0, 0.0, 0.0, 5.0]])
-        generated = torch.tensor([[0, 1, 2, 0, 1]])
+        logits = mx.array([[0.0, 0.0, 0.0, 5.0]])
+        generated = mx.array([[0, 1, 2, 0, 1]])
         adjusted = apply_no_repeat_ngram(logits, generated, ngram_size=3)
+        mx.eval(adjusted)
 
-        assert torch.isinf(adjusted[0, 2])
-        assert 5.0 == adjusted[0, 3].item()
+        assert bool(mx.isinf(adjusted[0, 2]).item())
+        assert 5.0 == pytest.approx(adjusted[0, 3].item())
 
     def test_generate_uses_repetition_penalty_without_sampling(self):
         from sml import GenerationConfig
@@ -254,7 +236,7 @@ class TestSMLModel:
 
         config = self.tiny_config()
         model = SMLLanguageModel(config)
-        prompt = torch.tensor([[config.bos_token_id, 5, 6]], dtype=torch.long)
+        prompt = mx.array([[config.bos_token_id, 5, 6]], dtype=mx.int32)
 
         greedy = model.generate(
             prompt,
@@ -266,10 +248,11 @@ class TestSMLModel:
             max_new_tokens=3,
             generation_config=GenerationConfig(repetition_penalty=10.0),
         )
+        mx.eval(greedy, penalized)
 
-        assert (1, 6) == tuple(greedy.shape)
-        assert (1, 6) == tuple(penalized.shape)
-        assert not torch.equal(greedy, penalized)
+        assert (1, 6) == greedy.shape
+        assert (1, 6) == penalized.shape
+        assert not bool(mx.all(greedy == penalized).item())
 
     def test_generate_sampling_is_reproducible_with_seed(self):
         from sml import GenerationConfig
@@ -277,7 +260,7 @@ class TestSMLModel:
 
         config = self.tiny_config()
         model = SMLLanguageModel(config)
-        prompt = torch.tensor([[config.bos_token_id, 5, 6]], dtype=torch.long)
+        prompt = mx.array([[config.bos_token_id, 5, 6]], dtype=mx.int32)
         generation_config = GenerationConfig(temperature=0.8, top_p=0.9, seed=123)
 
         first = model.generate(
@@ -290,8 +273,9 @@ class TestSMLModel:
             max_new_tokens=4,
             generation_config=generation_config,
         )
+        mx.eval(first, second)
 
-        assert torch.equal(first, second)
+        assert bool(mx.all(first == second).item())
 
     def test_forward_accepts_large_rope_scaling_factor(self):
         from dataclasses import replace
@@ -304,15 +288,16 @@ class TestSMLModel:
             rope_scaling_factor=4.0,
         )
         model = SMLLanguageModel(config)
-        input_ids = torch.randint(
+        input_ids = mx.random.randint(
             0,
             config.vocab_size,
-            (1, config.effective_max_position_embeddings),
+            shape=(1, config.effective_max_position_embeddings),
         )
 
         output = model(input_ids)
+        mx.eval(output.logits)
 
-        assert (1, config.effective_max_position_embeddings, config.vocab_size) == tuple(output.logits.shape)
+        assert (1, config.effective_max_position_embeddings, config.vocab_size) == output.logits.shape
         assert 64 == model.layers[0].self_attn.rope.cos_cached.shape[0]
 
     def test_resolve_yarn_attention_factor_supports_mscale_ratio(self):
@@ -340,12 +325,18 @@ class TestSMLModel:
     def test_causal_lm_loss_uses_aligned_next_token_labels(self):
         from sml import compute_causal_lm_loss
 
-        logits = torch.full((1, 3, 5), -10.0)
-        labels = torch.tensor([[1, 2, 3]], dtype=torch.long)
-        logits[0, 0, 1] = 10.0
-        logits[0, 1, 2] = 10.0
-        logits[0, 2, 3] = 10.0
+        logits = mx.array(
+            [
+                [
+                    [-10.0, 10.0, -10.0, -10.0, -10.0],
+                    [-10.0, -10.0, 10.0, -10.0, -10.0],
+                    [-10.0, -10.0, -10.0, 10.0, -10.0],
+                ]
+            ]
+        )
+        labels = mx.array([[1, 2, 3]], dtype=mx.int32)
 
         loss = compute_causal_lm_loss(logits, labels, pad_token_id=4)
+        mx.eval(loss)
 
         assert loss.item() < 0.001

@@ -1,9 +1,8 @@
 """
 Winogrande evaluation for the local SML checkpoint and tokenizer.
 
-Results default to ``v2/output/winogrande.json``. Override paths and runtime
-with ``--checkpoint``, ``--tokenizer``, ``--device``, ``--limit``, and
-``--output``.
+Results default to ``v2/output/winogrande.json``. Override paths with
+``--checkpoint``, ``--tokenizer``, ``--limit``, and ``--output``.
 """
 
 from __future__ import annotations
@@ -66,7 +65,6 @@ def main(argv: list[str] | None = None) -> int:
     lm = SMLEvalLM.from_checkpoint(
         checkpoint_path=args.checkpoint,
         tokenizer_model_path=args.tokenizer,
-        device_name=args.device,
     )
     results = require_results(
         evaluate_winogrande(

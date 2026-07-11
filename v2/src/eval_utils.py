@@ -13,8 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-import torch
-import torch.nn.functional as F
+import mlx.core as mx
 from lm_eval import simple_evaluate
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
@@ -28,40 +27,34 @@ from infer_sml import (
     encode_prompt,
     load_model,
 )
-from sml import SMLLanguageModel
-from train_sml import load_tokenizer, resolve_device
+from train_sml import load_tokenizer
 
 
 class SMLEvalLM(LM):
     def __init__(
         self,
-        model: SMLLanguageModel,
+        model: Any,
         tokenizer: InferenceTokenizer,
-        device: torch.device,
     ) -> None:
         """
-        Keep the local model, tokenizer, and runtime device together for lm-eval.
+        Keep the local model and tokenizer together for lm-eval.
         """
         super().__init__()
         self.model = model
         self.tokenizer = tokenizer
-        self._device = device
 
     @classmethod
     def from_checkpoint(
         cls,
         checkpoint_path: Path,
         tokenizer_model_path: Path,
-        device_name: str = "auto",
     ) -> SMLEvalLM:
         """
-        Resolve the device once so checkpoint weights and tokenized prompts match.
+        Load the checkpoint and tokenizer used by benchmark tasks.
         """
-        device = resolve_device(device_name)
         return cls(
-            model=load_model(checkpoint_path, device),
+            model=load_model(checkpoint_path),
             tokenizer=load_tokenizer(tokenizer_model_path),
-            device=device,
         )
 
     def loglikelihood(
@@ -85,26 +78,22 @@ class SMLEvalLM(LM):
                     f"{len(token_ids)} > {max_length}"
                 )
 
-            input_ids = torch.tensor(
+            input_ids = mx.array(
                 [token_ids],
-                dtype=torch.long,
-                device=self.device,
+                dtype=mx.int32,
             )
-            with torch.no_grad():
-                output = self.model(input_ids)
+            output = self.model(input_ids)
 
             logits = output.logits
-            log_probs = F.log_softmax(logits, dim=-1)
+            log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             continuation_positions = range(continuation_start, len(token_ids))
             logprob = 0.0
             is_greedy = True
             for target_position in continuation_positions:
                 predictor_position = target_position - 1
                 target_token_id = token_ids[target_position]
-                logprob += float(
-                    log_probs[0, predictor_position, target_token_id].item()
-                )
-                greedy_token_id = int(logits[0, predictor_position].argmax().item())
+                logprob += float(log_probs[0, predictor_position, target_token_id].item())
+                greedy_token_id = int(mx.argmax(logits[0, predictor_position]).item())
                 is_greedy = is_greedy and greedy_token_id == target_token_id
 
             result = (logprob, is_greedy)
@@ -164,7 +153,6 @@ class SMLEvalLM(LM):
                 self.tokenizer,
                 context,
                 bos_token_id=self.model.config.bos_token_id,
-                device=self.device,
             )
             prompt_length = input_ids.shape[1]
             max_length = self.model.config.effective_max_position_embeddings
@@ -181,7 +169,8 @@ class SMLEvalLM(LM):
                 max_new_tokens=max_new_tokens,
                 eos_token_id=self.model.config.eos_token_id,
             )
-            generated_ids = generated[0, prompt_length:].detach().cpu().tolist()
+            mx.eval(generated)
+            generated_ids = generated[0, prompt_length:].tolist()
             completion = decode_token_ids(
                 self.tokenizer,
                 generated_ids,
@@ -239,16 +228,15 @@ def write_results(output_path: Path, results: dict[str, Any]) -> None:
     Serialize lm-eval results, including Path and numpy-like values.
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(
+    with output_path.open("w", encoding="utf-8") as output_file:
+        json.dump(
             results,
+            output_file,
             indent=2,
             ensure_ascii=False,
             default=handle_non_serializable,
         )
-        + "\n",
-        encoding="utf-8",
-    )
+        output_file.write("\n")
 
 
 def build_eval_parser(
@@ -257,7 +245,7 @@ def build_eval_parser(
     limit_help: str,
 ) -> argparse.ArgumentParser:
     """
-    Build the shared checkpoint/tokenizer/device/output parser.
+    Build the shared checkpoint/tokenizer/output parser.
     """
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
@@ -271,11 +259,6 @@ def build_eval_parser(
         type=Path,
         default=TOKENIZER_MODEL_PATH,
         help=f"SentencePiece model path (default: {TOKENIZER_MODEL_PATH})",
-    )
-    parser.add_argument(
-        "--device",
-        default="auto",
-        help="PyTorch device such as auto, cpu, cuda, cuda:0, or mps",
     )
     parser.add_argument(
         "--limit",

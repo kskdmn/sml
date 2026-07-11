@@ -2,5 +2,6 @@
 
 ## Updates
 
-- Optimize the model for MLX because the training on PyTorch+MPS was very slow.
+- Target Apple Silicon through MLX only.
+- Remove the legacy accelerator-specific training path.
 - Remove attention dropout to use MLX fast attention.

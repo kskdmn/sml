@@ -2,6 +2,8 @@ import importlib
 import sys
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"
@@ -19,13 +21,18 @@ class TestModuleLayout:
         assert hasattr(tokenizer, "filter_text")
 
     def test_model_training_and_inference_configs_live_with_owners(self):
-        sml = importlib.import_module("sml")
+        try:
+            sml = importlib.import_module("sml")
+        except (ImportError, RuntimeError) as exc:
+            pytest.skip(f"mlx is not available: {exc}")
+
         train_sml = importlib.import_module("train_sml")
         infer_sml = importlib.import_module("infer_sml")
         lora = importlib.import_module("lora")
         ft_swag = importlib.import_module("ft_swag")
 
         assert hasattr(sml, "SMLConfig")
+        assert hasattr(sml, "SMLLanguageModel")
         assert hasattr(train_sml, "TrainingConfig")
         assert hasattr(infer_sml, "GenerationConfig")
         assert hasattr(lora, "LoRAConfig")

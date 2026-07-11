@@ -1,7 +1,7 @@
 """
 Inference entrypoint for SML checkpoints.
 
-Default files (under ``v2/output/``): checkpoint ``sml.pt``, tokenizer
+Default files (under ``v2/output/``): checkpoint directory ``sml`` and tokenizer
 ``bpe_tokenizer.model``. Both must exist before inference.
 
 One-shot CLI generation accepts decoding flags documented on
@@ -21,23 +21,20 @@ from __future__ import annotations
 
 import argparse
 import json
-import pathlib
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
-import torch
-from torch.serialization import safe_globals
+import mlx.core as mx
 
 from config import OUTPUT_DIR, SUCCESS_RETURN_CODE, TOKENIZER_MODEL_PATH, resolve_path
-from sml import GenerationConfig, SMLConfig, SMLLanguageModel
 from tokenizer import CONVERSATION_SPECIAL_TOKENS
-from train_sml import load_tokenizer, resolve_device
+from train_sml import load_tokenizer
 
 
-DEFAULT_CHECKPOINT_PATH = OUTPUT_DIR / "sml.pt"
+DEFAULT_CHECKPOINT_PATH = OUTPUT_DIR / "sml"
 DEFAULT_MODEL_NAME = "sml"
 CONVERSATION_ROLE_NAMES = ("system", "user", "assistant")
 CONVERSATION_ROLE_TOKENS = dict(
@@ -58,25 +55,18 @@ class InferenceTokenizer(Protocol):
         ...
 
 
-def load_checkpoint(checkpoint_path: Path, device: torch.device) -> dict[str, Any]:
+def load_checkpoint_metadata(checkpoint_path: Path) -> dict[str, Any]:
     """
-    Load a checkpoint dict, allowlisting POSIX paths in older payloads.
-
-    Maps tensor storage to the selected torch device. PyTorch 2.6+ defaults
-    ``torch.load`` to ``weights_only=True``; this helper uses ``safe_globals``
-    for trusted local checkpoints. Typical keys include ``step``, ``model_config``,
-    ``training_config``, ``input_files``, ``data_state``, ``model_state_dict``,
-    ``optimizer_state_dict``, and ``scheduler_state_dict``.
+    Load the JSON metadata saved next to MLX checkpoint weights.
     """
-    path = resolve_path(checkpoint_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Checkpoint does not exist: {path}")
+    metadata_path = resolve_path(checkpoint_path) / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Checkpoint metadata does not exist: {metadata_path}")
 
-    with safe_globals([pathlib.PosixPath]):
-        checkpoint = torch.load(path, map_location=device)
-    if not isinstance(checkpoint, dict):
-        raise ValueError(f"Checkpoint must contain a dictionary: {path}")
-    return checkpoint
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Checkpoint metadata must contain a dictionary: {metadata_path}")
+    return metadata
 
 
 def normalize_model_config(model_config: dict[str, Any]) -> dict[str, Any]:
@@ -94,23 +84,22 @@ def normalize_model_config(model_config: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def load_model(checkpoint_path: Path, device: torch.device) -> SMLLanguageModel:
+def load_model(checkpoint_path: Path) -> SMLLanguageModel:
     """
-    Checkpoint files must contain both shape config and weights; returned models are
-    moved to the requested device and switched to eval mode.
+    Checkpoint directories must contain shape config metadata and MLX weights.
     """
-    checkpoint = load_checkpoint(checkpoint_path, device)
-    model_config = checkpoint.get("model_config")
-    model_state_dict = checkpoint.get("model_state_dict")
+    from sml import SMLConfig, SMLLanguageModel
+
+    checkpoint_dir = resolve_path(checkpoint_path)
+    metadata = load_checkpoint_metadata(checkpoint_dir)
+    model_config = metadata.get("model_config")
     if not isinstance(model_config, dict):
         raise ValueError("Checkpoint is missing model_config")
-    if not isinstance(model_state_dict, dict):
-        raise ValueError("Checkpoint is missing model_state_dict")
 
     model = SMLLanguageModel(SMLConfig(**normalize_model_config(model_config)))
-    model.load_state_dict(model_state_dict)
-    model.to(device)
+    model.load_weights(str(checkpoint_dir / "model.safetensors"))
     model.eval()
+    mx.eval(model.parameters())
     return model
 
 
@@ -118,8 +107,7 @@ def encode_prompt(
     tokenizer: InferenceTokenizer,
     prompt: str,
     bos_token_id: int | None,
-    device: torch.device,
-) -> torch.Tensor:
+) -> mx.array:
     """
     Insert BOS before batching because training may have taught the model to expect an
     explicit document-start token.
@@ -127,7 +115,7 @@ def encode_prompt(
     token_ids = tokenizer.encode(prompt, out_type=int)
     if bos_token_id is not None:
         token_ids = [bos_token_id, *token_ids]
-    return torch.tensor([token_ids], dtype=torch.long, device=device)
+    return mx.array([token_ids], dtype=mx.int32)
 
 
 def decode_token_ids(
@@ -174,7 +162,6 @@ def generate_text(
     checkpoint_path: Path = DEFAULT_CHECKPOINT_PATH,
     tokenizer_model_path: Path = TOKENIZER_MODEL_PATH,
     max_new_tokens: int | None = None,
-    device_name: str = "auto",
     include_prompt: bool = False,
     generation_config: GenerationConfig | None = None,
 ) -> str:
@@ -185,14 +172,12 @@ def generate_text(
     if max_new_tokens is not None and max_new_tokens < 0:
         raise ValueError("max_new_tokens must be non-negative")
 
-    device = resolve_device(device_name)
     tokenizer = load_tokenizer(tokenizer_model_path)
-    model = load_model(checkpoint_path, device)
+    model = load_model(checkpoint_path)
     input_ids = encode_prompt(
         tokenizer,
         prompt,
         bos_token_id=model.config.bos_token_id,
-        device=device,
     )
     max_length = model.config.effective_max_position_embeddings
     input_length = input_ids.shape[1]
@@ -207,16 +192,16 @@ def generate_text(
         input_length,
     )
 
-    with torch.no_grad():
-        generated = model.generate(
-            input_ids,
-            max_new_tokens=resolved_max_new_tokens,
-            eos_token_id=model.config.eos_token_id,
-            generation_config=generation_config,
-        )
+    generated = model.generate(
+        input_ids,
+        max_new_tokens=resolved_max_new_tokens,
+        eos_token_id=model.config.eos_token_id,
+        generation_config=generation_config,
+    )
+    mx.eval(generated)
 
     start_index = 0 if include_prompt else input_ids.shape[1]
-    generated_ids = generated[0, start_index:].detach().cpu().tolist()
+    generated_ids = generated[0, start_index:].tolist()
     return decode_token_ids(
         tokenizer,
         generated_ids,
@@ -540,7 +525,7 @@ class OpenAICompatibleHTTPHandler(BaseHTTPRequestHandler):
         Set Content-Length explicitly before writing bytes for compatibility with simple
         HTTP clients.
         """
-        body = json.dumps(payload).encode("utf-8")
+        body = json.JSONEncoder().encode(payload).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -568,18 +553,14 @@ def run_openai_compatible_server(
     host: str = "127.0.0.1",
     port: int = 8000,
     model_name: str = DEFAULT_MODEL_NAME,
-    device_name: str = "auto",
 ) -> None:
     """
     ThreadingHTTPServer allows concurrent local requests; KeyboardInterrupt is swallowed
     so the CLI exits cleanly.
     """
-    def generate_with_device(**kwargs: Any) -> str:
-        return generate_text(**kwargs, device_name=device_name)
-
     handler_class = make_openai_compatible_handler(
         model_name,
-        generator=generate_with_device,
+        generator=generate_text,
     )
     server = ThreadingHTTPServer((host, port), handler_class)
     print(f"Serving SML OpenAI-compatible API at http://{host}:{port}/v1")
@@ -598,6 +579,8 @@ def generation_config_from_args(args: argparse.Namespace) -> GenerationConfig:
     ``infer_sml.py`` exposes these knobs as ``--temperature``, ``--top-p``,
     ``--repetition-penalty``, ``--no-repeat-ngram-size``, and ``--seed``.
     """
+    from sml import GenerationConfig
+
     return GenerationConfig(
         temperature=args.temperature,
         top_p=args.top_p,
@@ -645,11 +628,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Maximum generated tokens. Defaults to the remaining context window "
             "(effective_max_position_embeddings minus prompt length)."
         ),
-    )
-    parser.add_argument(
-        "--device",
-        default="auto",
-        help="PyTorch device such as auto, cpu, cuda, cuda:0, or mps.",
     )
     parser.add_argument(
         "--include-prompt",
@@ -716,14 +694,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             host=args.host,
             port=args.port,
             model_name=args.model,
-            device_name=args.device,
         )
         return SUCCESS_RETURN_CODE
 
     text = generate_text(
         prompt=args.prompt,
         max_new_tokens=args.max_new_tokens,
-        device_name=args.device,
         include_prompt=args.include_prompt,
         generation_config=generation_config_from_args(args),
     )

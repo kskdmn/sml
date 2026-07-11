@@ -1,32 +1,24 @@
 from __future__ import annotations
 
 import argparse
-import pathlib
+import json
+import math
 import random
 import re
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator, Protocol, Sequence, TypeVar
+from typing import Protocol, Sequence, TypeVar
 
 import sentencepiece as spm
-import torch
-from torch.serialization import safe_globals
-from torch.utils.data import DataLoader, IterableDataset
 
 from config import (
     INPUT_DIR,
     INPUT_FILE_NAME_REGEX,
     OUTPUT_DIR,
-    SUCCESS_RETURN_CODE,
     TOKENIZER_MODEL_PATH,
     resolve_path,
-)
-from sml import (
-    SMLConfig,
-    SMLLanguageModel,
-    count_parameters,
-    lr_lambda,
 )
 from tokenizer import (
     HIDDEN_FILE_PREFIX,
@@ -37,6 +29,14 @@ from tokenizer import (
 
 
 ROW_INCREMENT = 1
+SUCCESS_RETURN_CODE = 0
+MODEL_WEIGHTS_NAME = "model.safetensors"
+OPTIMIZER_STATE_NAME = "optimizer.npz"
+METADATA_NAME = "metadata.json"
+STOCHASTIC_RESUME_NOTE = (
+    "Resume restores model weights, optimizer state, and data position; "
+    "stochastic continuity is not guaranteed."
+)
 BatchT = TypeVar("BatchT")
 
 
@@ -46,22 +46,22 @@ class TrainingConfig:
     Training hyperparameters and I/O paths.
 
     ``train_sml.py`` reads these defaults from code; the CLI only exposes
-    ``--resume``. Edit fields here (or pass a custom instance to
-    ``train_sml.train_model``) instead of adding CLI flags.
+    ``--resume``. Edit fields here, or pass a custom instance to
+    ``train_sml.train_model``, instead of adding CLI flags.
     """
 
     input_dir: Path = INPUT_DIR
-    input_file_name_regex: str = INPUT_FILE_NAME_REGEX  # Regex matched against each file name.
+    input_file_name_regex: str = INPUT_FILE_NAME_REGEX
     output_dir: Path = OUTPUT_DIR
     tokenizer_model_path: Path = TOKENIZER_MODEL_PATH
-    checkpoint_name: str = "sml.pt"
+    checkpoint_name: str = "sml"
     sequence_length: int = 1_024
     batch_size: int = 1
-    max_steps: int | None = None  # Maximum optimizer steps. Set to None to train until epochs/data end.
-    lr_total_steps: int | None = 100_000  # LR schedule horizon. Falls back to max_steps when None.
+    max_steps: int | None = None
+    lr_total_steps: int | None = 100_000
     epochs: int = 1
-    max_rows_per_file: int | None = 32_768  # Maximum rows read from each input file per epoch. Set to None for all rows.
-    shuffle_input_files: bool = True  # Shuffle model-training shards deterministically with seed.
+    max_rows_per_file: int | None = 32_768
+    shuffle_input_files: bool = True
     learning_rate: float = 3e-4
     weight_decay: float = 0.1
     gradient_accumulation_steps: int = 8
@@ -69,13 +69,11 @@ class TrainingConfig:
     warmup_steps: int = int(lr_total_steps if lr_total_steps is not None else 100 * 0.01)
     min_lr_ratio: float = 0.1
     log_every: int = 10
-    save_every: int = 1_000  # 0 for never, positive for every N steps
+    save_every: int = 1_000
     seed: int = 42
-    device: str = "auto"
-    autocast_dtype: str = "bfloat16"
 
 
-def model_config_for_training(config: SMLConfig) -> SMLConfig:
+def model_config_for_training(config):
     """
     Return a copy that trains with standard RoPE inside ``sequence_length``.
 
@@ -184,83 +182,6 @@ def iter_texts(
                 yield text
 
 
-class TokenBlockDataset(IterableDataset[dict[str, torch.Tensor]]):
-    def __init__(
-        self,
-        texts: Iterable[str],
-        tokenizer: TextTokenizer,
-        sequence_length: int,
-        stride: int | None = None,
-        bos_token_id: int | None = None,
-        eos_token_id: int | None = None,
-        data_state: TrainingDataState | None = None,
-    ) -> None:
-        """
-        Stride defaults to non-overlapping blocks; special-token fallbacks are resolved
-        later because tokenizers may expose methods instead of IDs.
-        """
-        super().__init__()
-        if sequence_length <= 0:
-            raise ValueError("sequence_length must be positive")
-        self.texts = texts
-        self.tokenizer = tokenizer
-        self.sequence_length = sequence_length
-        self.stride = sequence_length if stride is None else stride
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.data_state = data_state
-
-    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        """
-        Maintain a rolling token buffer so streamed documents become fixed-size
-        next-token training pairs.
-        """
-        buffer = [] if self.data_state is None else list(self.data_state.token_buffer)
-        tokens_per_block = self.sequence_length + 1
-        bos_token_id = get_special_token_id(
-            self.tokenizer,
-            "bos_id",
-            self.bos_token_id,
-        )
-        eos_token_id = get_special_token_id(
-            self.tokenizer,
-            "eos_id",
-            self.eos_token_id,
-        )
-
-        def iter_ready_blocks() -> Iterator[dict[str, torch.Tensor]]:
-            while len(buffer) >= tokens_per_block:
-                block = buffer[:tokens_per_block]
-                del buffer[: self.stride]
-                if self.data_state is not None:
-                    self.data_state.token_buffer = list(buffer)
-                yield {
-                    "input_ids": torch.tensor(block[:-1], dtype=torch.long),
-                    "labels": torch.tensor(block[1:], dtype=torch.long),
-                }
-
-        yield from iter_ready_blocks()
-        for text in self.texts:
-            """
-            Current: Add BOS and EOS tokens to the buffer.
-
-            Other options:
-            - Add EOS to the buffer only.
-            - Add document-boundary attention masks.
-            - Add padding tokens.
-            """
-            token_ids = self.tokenizer.encode(text, out_type=int)
-            if bos_token_id is not None:
-                buffer.append(bos_token_id)
-            buffer.extend(token_ids)
-            if eos_token_id is not None:
-                buffer.append(eos_token_id)
-            if self.data_state is not None:
-                self.data_state.token_buffer = list(buffer)
-
-            yield from iter_ready_blocks()
-
-
 def get_special_token_id(
     tokenizer: object,
     name: str,
@@ -286,197 +207,6 @@ def load_tokenizer(path: Path) -> spm.SentencePieceProcessor:
     if not model_path.exists():
         raise FileNotFoundError(f"Tokenizer model does not exist: {model_path}")
     return spm.SentencePieceProcessor(model_file=str(model_path))
-
-
-def resolve_device(device: str) -> torch.device:
-    """
-    Auto mode prefers MPS, then CUDA, then CPU so local accelerator support is used when
-    available.
-    """
-    if device != "auto":
-        return torch.device(device)
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
-
-
-def resolve_autocast_dtype(name: str) -> torch.dtype | None:
-    """
-    Keep mixed precision opt-in by name because CPU runs should avoid autocast while
-    accelerators may benefit.
-    """
-    if name == "none":
-        return None
-    if name == "bfloat16":
-        return torch.bfloat16
-    if name == "float16":
-        return torch.float16
-    raise ValueError(f"Unsupported autocast dtype: {name}")
-
-
-def set_seed(seed: int) -> None:
-    """
-    Seed CUDA separately when present so runs are closer to reproducible across
-    supported devices.
-    """
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def build_dataloader(
-    input_files: Iterable[Path],
-    tokenizer: TextTokenizer,
-    sequence_length: int,
-    batch_size: int,
-    max_rows_per_file: int | None,
-    progress: ReadingProgress | None = None,
-    data_state: TrainingDataState | None = None,
-) -> DataLoader[dict[str, torch.Tensor]]:
-    """
-    Wrap the streaming dataset directly; no extra workers are introduced because the
-    iterator owns shard state.
-    """
-    dataset = TokenBlockDataset(
-        texts=iter_texts(
-            input_files,
-            max_rows_per_file=max_rows_per_file,
-            progress=progress,
-            data_state=data_state,
-        ),
-        tokenizer=tokenizer,
-        sequence_length=sequence_length,
-        data_state=data_state,
-    )
-    return DataLoader(dataset, batch_size=batch_size)
-
-
-def is_mps_rng_available() -> bool:
-    return (
-        hasattr(torch, "mps")
-        and hasattr(torch.mps, "get_rng_state")
-        and hasattr(torch.mps, "set_rng_state")
-        and hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_available()
-    )
-
-
-def capture_rng_state() -> dict[str, object]:
-    return {
-        "python_rng_state": random.getstate(),
-        "torch_rng_state": torch.get_rng_state(),
-        "cuda_rng_state_all": (
-            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-        ),
-        "mps_rng_state": torch.mps.get_rng_state() if is_mps_rng_available() else None,
-    }
-
-
-def restore_rng_state(checkpoint: dict[object, object]) -> None:
-    random.setstate(checkpoint["python_rng_state"])
-    torch.set_rng_state(checkpoint["torch_rng_state"].cpu())
-
-    cuda_rng_state_all = checkpoint["cuda_rng_state_all"]
-    if cuda_rng_state_all is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(
-            [cuda_rng_state.cpu() for cuda_rng_state in cuda_rng_state_all]
-        )
-
-    mps_rng_state = checkpoint["mps_rng_state"]
-    if mps_rng_state is not None and is_mps_rng_available():
-        torch.mps.set_rng_state(mps_rng_state.cpu())
-
-
-def save_checkpoint(
-    path: Path,
-    model: SMLLanguageModel,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LambdaLR,
-    model_config: SMLConfig,
-    training_config: TrainingConfig,
-    step: int,
-    input_files: Iterable[Path] = (),
-    data_state: TrainingDataState | None = None,
-) -> None:
-    """
-    Persist configs with state dicts so inference can reconstruct the exact model shape
-    later.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_input_files = [str(input_file) for input_file in input_files]
-    torch.save(
-        {
-            "step": step,
-            "model_config": asdict(model_config),
-            "training_config": asdict(training_config),
-            "input_files": checkpoint_input_files,
-            "data_state": None if data_state is None else asdict(data_state),
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            **capture_rng_state(),
-        },
-        path,
-    )
-
-
-def load_training_checkpoint(
-    path: Path,
-    model: SMLLanguageModel,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LambdaLR,
-    device: torch.device,
-) -> TrainingResumeState:
-    """
-    Restore model, optimizer, scheduler, and RNG state from a training checkpoint.
-
-    Missing checkpoints are an invalid explicit resume request. Checkpoints are
-    full training dictionaries written to ``output_dir / checkpoint_name``
-    (default ``v2/output/sml.pt``) with keys such as ``step``, ``model_config``,
-    ``training_config``, ``input_files``, ``data_state``, ``model_state_dict``,
-    ``optimizer_state_dict``, and ``scheduler_state_dict``.
-
-    PyTorch 2.6+ defaults ``torch.load`` to ``weights_only=True``. Use
-    ``weights_only=False`` for trusted local checkpoints, or load through this
-    helper or ``infer_sml.load_checkpoint``, which allowlist the needed types.
-    """
-    checkpoint_path = resolve_path(path)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
-
-    with safe_globals([pathlib.PosixPath]):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-    if not isinstance(checkpoint, dict):
-        raise ValueError(f"Checkpoint must contain a dictionary: {checkpoint_path}")
-
-    step = checkpoint.get("step")
-    model_state_dict = checkpoint.get("model_state_dict")
-    optimizer_state_dict = checkpoint.get("optimizer_state_dict")
-    scheduler_state_dict = checkpoint.get("scheduler_state_dict")
-    if not isinstance(step, int):
-        raise ValueError("Checkpoint is missing step")
-    if not isinstance(model_state_dict, dict):
-        raise ValueError("Checkpoint is missing model_state_dict")
-    if not isinstance(optimizer_state_dict, dict):
-        raise ValueError("Checkpoint is missing optimizer_state_dict")
-    if not isinstance(scheduler_state_dict, dict):
-        raise ValueError("Checkpoint is missing scheduler_state_dict")
-
-    model.load_state_dict(model_state_dict)
-    optimizer.load_state_dict(optimizer_state_dict)
-    scheduler.load_state_dict(scheduler_state_dict)
-    restore_rng_state(checkpoint)
-
-    input_files = parse_checkpoint_input_files(checkpoint.get("input_files", ()))
-    data_state = parse_checkpoint_data_state(checkpoint.get("data_state"))
-    return TrainingResumeState(
-        step=step,
-        input_files=input_files,
-        data_state=data_state,
-    )
 
 
 def parse_checkpoint_input_files(input_files: object) -> tuple[Path, ...]:
@@ -517,7 +247,7 @@ def reset_training_data_state(data_state: TrainingDataState, epoch: int) -> None
 def count_resume_batches(global_step: int, training_config: TrainingConfig) -> int:
     """
     A checkpoint step represents completed optimizer steps; each completed step consumed
-    one gradient-accumulation window of dataloader batches.
+    one gradient-accumulation window of streamed batches.
     """
     return global_step * training_config.gradient_accumulation_steps
 
@@ -589,18 +319,298 @@ def format_training_log(
     return " ".join(parts)
 
 
+def lr_lambda(
+    step: int,
+    total_steps: int | None,
+    warmup_steps: int,
+    min_lr_ratio: float,
+) -> float:
+    """
+    Warm up linearly, then either hold constant when no horizon is known or cosine-decay
+    to a configured floor.
+    """
+    if step < warmup_steps:
+        return float(step + 1) / float(max(1, warmup_steps))
+    if total_steps is None:
+        return 1.0
+    progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+    return max(min_lr_ratio, cosine)
+
+
+def _mlx_core():
+    import mlx.core as mx
+
+    return mx
+
+
+def _mlx_nn():
+    import mlx.nn as nn
+
+    return nn
+
+
+def _mlx_optimizers():
+    import mlx.optimizers as optim
+
+    return optim
+
+
+def _mlx_tree_utils():
+    from mlx.utils import tree_flatten, tree_map, tree_unflatten
+
+    return tree_flatten, tree_map, tree_unflatten
+
+
+def _model_modules():
+    from sml import SMLConfig, SMLLanguageModel, count_parameters
+
+    return SMLConfig, SMLLanguageModel, count_parameters
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    mx = _mlx_core()
+    mx.random.seed(seed)
+
+
+def iter_mlx_token_blocks(
+    texts: Iterable[str],
+    tokenizer,
+    sequence_length: int,
+    stride: int | None = None,
+    bos_token_id: int | None = None,
+    eos_token_id: int | None = None,
+    data_state: TrainingDataState | None = None,
+) -> Iterator[dict[str, list[int]]]:
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+
+    buffer = [] if data_state is None else list(data_state.token_buffer)
+    tokens_per_block = sequence_length + 1
+    stride = sequence_length if stride is None else stride
+    bos_token_id = get_special_token_id(tokenizer, "bos_id", bos_token_id)
+    eos_token_id = get_special_token_id(tokenizer, "eos_id", eos_token_id)
+
+    def iter_ready_blocks() -> Iterator[dict[str, list[int]]]:
+        while len(buffer) >= tokens_per_block:
+            block = buffer[:tokens_per_block]
+            del buffer[:stride]
+            if data_state is not None:
+                data_state.token_buffer = list(buffer)
+            yield {
+                "input_ids": [int(token_id) for token_id in block[:-1]],
+                "labels": [int(token_id) for token_id in block[1:]],
+            }
+
+    yield from iter_ready_blocks()
+    for text in texts:
+        token_ids = tokenizer.encode(text, out_type=int)
+        if bos_token_id is not None:
+            buffer.append(bos_token_id)
+        buffer.extend(int(token_id) for token_id in token_ids)
+        if eos_token_id is not None:
+            buffer.append(eos_token_id)
+        if data_state is not None:
+            data_state.token_buffer = list(buffer)
+        yield from iter_ready_blocks()
+
+
+def iter_mlx_batches(
+    examples: Iterable[dict[str, object]],
+    batch_size: int,
+) -> Iterator[dict[str, object]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    batch: list[dict[str, object]] = []
+    for example in examples:
+        batch.append(example)
+        if len(batch) == batch_size:
+            yield _collate_mlx_batch(batch)
+            batch = []
+    if batch:
+        yield _collate_mlx_batch(batch)
+
+
+def _as_token_list(value: object) -> list[int]:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if not isinstance(value, list):
+        raise TypeError("token values must be list-like")
+    return [int(token_id) for token_id in value]
+
+
+def _collate_mlx_batch(batch: list[dict[str, object]]) -> dict[str, object]:
+    mx = _mlx_core()
+    input_ids = [_as_token_list(example["input_ids"]) for example in batch]
+    labels = [_as_token_list(example["labels"]) for example in batch]
+    return {
+        "input_ids": mx.array(input_ids, dtype=mx.int32),
+        "labels": mx.array(labels, dtype=mx.int32),
+    }
+
+
+def build_lr_schedule(
+    learning_rate: float,
+    total_steps: int | None,
+    warmup_steps: int,
+    min_lr_ratio: float,
+):
+    mx = _mlx_core()
+
+    def schedule(step):
+        warmup_denominator = float(max(1, warmup_steps))
+        warmup_multiplier = (step + 1) / warmup_denominator
+        if total_steps is None:
+            decay_multiplier = mx.array(1.0)
+        else:
+            progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            progress = mx.minimum(mx.array(1.0), progress)
+            cosine = 0.5 * (1.0 + mx.cos(math.pi * progress))
+            decay_multiplier = mx.maximum(mx.array(min_lr_ratio), cosine)
+        multiplier = mx.where(step < warmup_steps, warmup_multiplier, decay_multiplier)
+        return learning_rate * multiplier
+
+    return schedule
+
+
+def tree_add(left: dict, right: dict) -> dict:
+    _, tree_map, _ = _mlx_tree_utils()
+    return tree_map(lambda a, b: a + b, left, right)
+
+
+def tree_scale(tree: dict, scale: float | object) -> dict:
+    _, tree_map, _ = _mlx_tree_utils()
+    return tree_map(lambda value: value * scale, tree)
+
+
+def global_grad_norm(grads: dict):
+    mx = _mlx_core()
+    tree_flatten, _, _ = _mlx_tree_utils()
+    total = mx.array(0.0)
+    for _, grad in tree_flatten(grads):
+        total = total + mx.sum(grad.astype(mx.float32) * grad.astype(mx.float32))
+    return mx.sqrt(total)
+
+
+def clip_gradients_by_global_norm(
+    grads: dict,
+    max_norm: float,
+) -> tuple[dict, object]:
+    mx = _mlx_core()
+    grad_norm = global_grad_norm(grads)
+    scale = mx.where(
+        grad_norm > max_norm,
+        mx.array(max_norm) / mx.maximum(grad_norm, mx.array(1e-12)),
+        mx.array(1.0),
+    )
+    return tree_scale(grads, scale), grad_norm
+
+
+def resolve_mlx_checkpoint_path(training_config: TrainingConfig) -> Path:
+    output_dir = resolve_path(training_config.output_dir)
+    checkpoint_name = Path(training_config.checkpoint_name)
+    if checkpoint_name.suffix == ".pt":
+        checkpoint_name = checkpoint_name.with_suffix("")
+        checkpoint_name = Path(f"{checkpoint_name.name}_mlx")
+    return output_dir / checkpoint_name
+
+
+def _json_ready(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def save_checkpoint(
+    checkpoint_path: Path,
+    model,
+    optimizer,
+    model_config,
+    training_config: TrainingConfig,
+    step: int,
+    input_files: Iterable[Path] = (),
+    data_state: TrainingDataState | None = None,
+) -> None:
+    mx = _mlx_core()
+    tree_flatten, _, _ = _mlx_tree_utils()
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    model.save_weights(str(checkpoint_path / MODEL_WEIGHTS_NAME))
+    optimizer_state = tree_flatten(optimizer.state, destination={})
+    mx.savez(str(checkpoint_path / OPTIMIZER_STATE_NAME), **optimizer_state)
+    metadata = {
+        "step": step,
+        "model_config": _json_ready(asdict(model_config)),
+        "training_config": _json_ready(asdict(training_config)),
+        "input_files": [str(input_file) for input_file in input_files],
+        "data_state": None if data_state is None else _json_ready(asdict(data_state)),
+        "stochastic_resume": "not_guaranteed",
+        "resume_note": STOCHASTIC_RESUME_NOTE,
+    }
+    with (checkpoint_path / METADATA_NAME).open("w", encoding="utf-8") as metadata_file:
+        json.dump(metadata, metadata_file, indent=2, sort_keys=True)
+
+
+def load_training_checkpoint(
+    checkpoint_path: Path,
+    model,
+    optimizer,
+) -> TrainingResumeState:
+    checkpoint_path = resolve_path(checkpoint_path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
+
+    mx = _mlx_core()
+    _, _, tree_unflatten = _mlx_tree_utils()
+    weights_path = checkpoint_path / MODEL_WEIGHTS_NAME
+    optimizer_path = checkpoint_path / OPTIMIZER_STATE_NAME
+    metadata_path = checkpoint_path / METADATA_NAME
+    for required_path in (weights_path, optimizer_path, metadata_path):
+        if not required_path.exists():
+            raise ValueError(f"Checkpoint is missing {required_path.name}")
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Checkpoint metadata must be a dictionary: {metadata_path}")
+    step = metadata.get("step")
+    if not isinstance(step, int):
+        raise ValueError("Checkpoint metadata is missing step")
+
+    model.load_weights(str(weights_path))
+    optimizer_arrays = mx.load(str(optimizer_path))
+    if not isinstance(optimizer_arrays, dict):
+        raise ValueError("Optimizer checkpoint must contain a state dictionary")
+    optimizer.state = tree_unflatten(optimizer_arrays)
+    mx.eval(model.parameters(), optimizer.state)
+
+    input_files = metadata.get("input_files", ())
+    if not isinstance(input_files, list):
+        raise ValueError("Checkpoint metadata input_files must be a list")
+    data_state = parse_checkpoint_data_state(metadata.get("data_state"))
+    return TrainingResumeState(
+        step=step,
+        input_files=tuple(resolve_path(Path(str(input_file))) for input_file in input_files),
+        data_state=data_state,
+    )
+
+
 def train_model(
     training_config: TrainingConfig | None = None,
-    model_config: SMLConfig | None = None,
+    model_config=None,
     resume_from_checkpoint: bool = False,
 ) -> Path:
-    """
-    The tokenizer vocab and requested sequence length are folded into the checkpoint
-    config before weights are allocated. Training runs with YaRN disabled; the saved
-    config keeps the inference rope_scaling_factor for load-time context extension.
-    """
     training_config = TrainingConfig() if training_config is None else training_config
+    SMLConfig, SMLLanguageModel, count_parameters = _model_modules()
     base_model_config = SMLConfig() if model_config is None else model_config
+
+    mx = _mlx_core()
+    nn = _mlx_nn()
+    optim = _mlx_optimizers()
 
     set_seed(training_config.seed)
     output_dir = resolve_path(training_config.output_dir)
@@ -627,36 +637,27 @@ def train_model(
         ),
     )
     training_model_config = model_config_for_training(checkpoint_model_config)
-    device = resolve_device(training_config.device)
-    autocast_dtype = resolve_autocast_dtype(training_config.autocast_dtype)
-    model = SMLLanguageModel(training_model_config).to(device)
+    model = SMLLanguageModel(training_model_config)
+    model.train()
+    mx.eval(model.parameters())
     total_params, trainable_params = count_parameters(model)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=training_config.learning_rate,
+    lr_schedule = build_lr_schedule(
+        learning_rate=training_config.learning_rate,
+        total_steps=resolve_lr_total_steps(training_config),
+        warmup_steps=training_config.warmup_steps,
+        min_lr_ratio=training_config.min_lr_ratio,
+    )
+    optimizer = optim.AdamW(
+        learning_rate=lr_schedule,
         weight_decay=training_config.weight_decay,
     )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda step: lr_lambda(
-            step=step,
-            total_steps=resolve_lr_total_steps(training_config),
-            warmup_steps=training_config.warmup_steps,
-            min_lr_ratio=training_config.min_lr_ratio,
-        ),
-    )
+    optimizer.init(model.trainable_parameters())
 
-    checkpoint_path = output_dir / training_config.checkpoint_name
+    checkpoint_path = resolve_mlx_checkpoint_path(training_config)
     resume_state = TrainingResumeState()
     if resume_from_checkpoint:
-        resume_state = load_training_checkpoint(
-            checkpoint_path,
-            model,
-            optimizer,
-            scheduler,
-            device,
-        )
+        resume_state = load_training_checkpoint(checkpoint_path, model, optimizer)
         if resume_state.input_files:
             input_files = resume_state.input_files
 
@@ -668,71 +669,71 @@ def train_model(
         else 0
     )
     resume_progress = ResumeProgress(batches_to_skip=legacy_batches_to_skip)
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
     micro_step = 0
     loss_sum = 0.0
+    accumulated_grads = None
     reading_progress = ReadingProgress()
+    loss_and_grad = nn.value_and_grad(model, _loss_fn(model))
 
     print(f"Input files: {len(input_files)}")
     print(f"Tokenizer vocab: {checkpoint_model_config.vocab_size:,}")
-    print(f"Device: {device}")
+    print("Backend: mlx")
     print(f"Parameters: total={total_params:,} trainable={trainable_params:,}")
 
     for epoch in range(data_state.epoch, training_config.epochs):
         if epoch != data_state.epoch:
             reset_training_data_state(data_state, epoch)
-        dataloader = build_dataloader(
-            input_files=input_files,
+        blocks = iter_mlx_token_blocks(
+            texts=iter_texts(
+                input_files,
+                max_rows_per_file=training_config.max_rows_per_file,
+                progress=reading_progress,
+                data_state=data_state,
+            ),
             tokenizer=tokenizer,
             sequence_length=training_config.sequence_length,
-            batch_size=training_config.batch_size,
-            max_rows_per_file=training_config.max_rows_per_file,
-            progress=reading_progress,
             data_state=data_state,
         )
-        for batch in iter_unseen_batches(dataloader, resume_progress):
-            input_ids = batch["input_ids"].to(device)
-            labels = batch["labels"].to(device)
-
-            use_autocast = autocast_dtype is not None and device.type != "cpu"
-            with torch.autocast(
-                device_type=device.type,
-                dtype=autocast_dtype or torch.float32,
-                enabled=use_autocast,
-            ):
-                output = model(input_ids, labels=labels)
-                if output.loss is None:
-                    raise RuntimeError("Model did not return a training loss")
-                loss = output.loss
-
-            loss_sum += loss.item()
+        batches = iter_mlx_batches(blocks, batch_size=training_config.batch_size)
+        for batch in iter_unseen_batches(batches, resume_progress):
+            loss, grads = loss_and_grad(batch["input_ids"], batch["labels"])
+            mx.eval(loss, grads)
+            loss_sum += float(loss.item())
             micro_step += ROW_INCREMENT
-            loss = loss / training_config.gradient_accumulation_steps
-            loss.backward()
+
+            scaled_grads = tree_scale(
+                grads,
+                1.0 / training_config.gradient_accumulation_steps,
+            )
+            accumulated_grads = (
+                scaled_grads
+                if accumulated_grads is None
+                else tree_add(accumulated_grads, scaled_grads)
+            )
 
             if micro_step % training_config.gradient_accumulation_steps != 0:
                 continue
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
+            clipped_grads, grad_norm = clip_gradients_by_global_norm(
+                accumulated_grads,
                 training_config.max_grad_norm,
             )
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            scheduler.step()
+            optimizer.update(model, clipped_grads)
+            _retie_embeddings_if_needed(model)
+            mx.eval(model.parameters(), optimizer.state)
             global_step += ROW_INCREMENT
+            accumulated_grads = None
 
             if global_step % training_config.log_every == 0 or global_step == 1:
                 avg_loss = loss_sum / training_config.gradient_accumulation_steps
-                lr = scheduler.get_last_lr()[0]
+                lr = float(optimizer.learning_rate.item())
                 print(
                     format_training_log(
                         epoch=epoch + 1,
                         global_step=global_step,
                         lr=lr,
                         avg_loss=avg_loss,
-                        grad_norm=float(grad_norm),
+                        grad_norm=float(grad_norm.item()),
                         timestamp=datetime.now(),
                         progress=reading_progress,
                     )
@@ -747,7 +748,6 @@ def train_model(
                     checkpoint_path,
                     model,
                     optimizer,
-                    scheduler,
                     checkpoint_model_config,
                     training_config,
                     global_step,
@@ -760,7 +760,6 @@ def train_model(
                     checkpoint_path,
                     model,
                     optimizer,
-                    scheduler,
                     checkpoint_model_config,
                     training_config,
                     global_step,
@@ -773,7 +772,6 @@ def train_model(
         checkpoint_path,
         model,
         optimizer,
-        scheduler,
         checkpoint_model_config,
         training_config,
         global_step,
@@ -783,29 +781,40 @@ def train_model(
     return checkpoint_path
 
 
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    """
-    Keep CLI surface narrow; training configuration defaults live in TrainingConfig.
-    """
-    parser = argparse.ArgumentParser(description="Train the SML language model.")
+def _loss_fn(model):
+    def loss_fn(input_ids, labels):
+        output = model(input_ids, labels=labels)
+        if output.loss is None:
+            raise RuntimeError("Model did not return a training loss")
+        return output.loss
+
+    return loss_fn
+
+
+def _retie_embeddings_if_needed(model) -> None:
+    if model.config.tie_word_embeddings:
+        model.lm_head.weight = model.embed_tokens.weight
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train the MLX SML language model.")
     parser.add_argument(
         "--resume",
         action="store_true",
         help=(
-            "Resume from output_dir/checkpoint_name (default v2/output/sml.pt). "
-            "Restores model, optimizer, scheduler, and RNG state, then continues "
-            "from the saved training step and data position. The checkpoint must "
-            "already exist; without --resume, training starts from scratch and "
-            "overwrites the checkpoint when it is saved."
+            "Resume from the MLX checkpoint directory derived from "
+            "output_dir/checkpoint_name. The checkpoint must already exist. "
+            "Stochastic continuity is not guaranteed."
         ),
     )
-    return parser.parse_args(argv)
+    return parser
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """
-    Parse the small CLI surface, then delegate training to the config-based API.
-    """
     args = parse_args(argv)
     checkpoint_path = train_model(
         training_config=TrainingConfig(),

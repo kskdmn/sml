@@ -20,14 +20,14 @@ class TestWinograndeEval:
 
         result = eval_winogrande.evaluate_winogrande(
             lm=lm,
-            checkpoint_path=Path("v1/output/sml.pt"),
+            checkpoint_path=Path("v2/output/sml"),
             limit=3,
         )
 
         assert expected is result
         evaluate_lm.assert_called_once_with(
             lm=lm,
-            checkpoint_path=Path("v1/output/sml.pt"),
+            checkpoint_path=Path("v2/output/sml"),
             tasks=["winogrande"],
             limit=3,
         )
@@ -51,13 +51,12 @@ class TestWinograndeEval:
         monkeypatch.setattr(eval_winogrande, "make_table", Spy(return_value="table"))
         monkeypatch.setattr("builtins.print", print_output)
 
-        return_code = eval_winogrande.main(["--device", "cpu", "--limit", "2"])
+        return_code = eval_winogrande.main(["--limit", "2"])
 
         assert 0 == return_code
         from_checkpoint.assert_called_once_with(
             checkpoint_path=eval_winogrande.DEFAULT_CHECKPOINT_PATH,
             tokenizer_model_path=eval_winogrande.TOKENIZER_MODEL_PATH,
-            device_name="cpu",
         )
         evaluate_winogrande.assert_called_once_with(
             lm=lm,
