@@ -67,9 +67,9 @@ class TrainingConfig:
     sequence_length: int = 1_024
     batch_size: int = 1
     max_steps: int | None = None
-    lr_total_steps: int | None = 100_000
+    lr_total_steps: int | None = 268_000
     epochs: int = 1
-    max_rows_per_file: int | None = 32_768
+    max_rows_per_file: int | None = 40_960
     shuffle_input_files: bool = True
     learning_rate: float = 3e-4
     weight_decay: float = 0.1

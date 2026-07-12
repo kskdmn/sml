@@ -185,9 +185,7 @@ class TestFtSwag:
         assert 1 == progress.line_number
         assert 1 == progress.example_index
 
-    def test_build_swag_batches_masks_context_and_scores_gold_ending_and_eos(
-        self, monkeypatch
-    ):
+    def test_build_swag_batches_scores_all_candidate_endings_and_eos(self, monkeypatch):
         mx = require_mlx_runtime()
         import ft_swag
         from ft_swag import SwagFineTuneConfig
@@ -201,7 +199,9 @@ class TestFtSwag:
                 return {
                     "ctx": [10, 11],
                     " end": [20, 21],
-                    "ctx end": [10, 11, 20, 21],
+                    " wrong": [30],
+                    " maybe": [31, 32],
+                    " nope": [33],
                 }[text]
 
         rows = [
@@ -209,8 +209,8 @@ class TestFtSwag:
                 "startphrase": "ctx",
                 "ending0": " end",
                 "ending1": " wrong",
-                "ending2": " wrong",
-                "ending3": " wrong",
+                "ending2": " maybe",
+                "ending3": " nope",
                 "label": 0,
             },
         ]
@@ -230,10 +230,26 @@ class TestFtSwag:
             )
         )
 
-        assert [[1, 10, 11, 20, 21, 2]] == batches[0]["input_ids"].tolist()
-        assert [[3, 3, 20, 21, 2, 3]] == batches[0]["labels"].tolist()
+        assert [
+            [
+                [1, 10, 11, 20, 21, 2],
+                [1, 10, 11, 30, 2, 3],
+                [1, 10, 11, 31, 32, 2],
+                [1, 10, 11, 33, 2, 3],
+            ]
+        ] == batches[0]["input_ids"].tolist()
+        assert [
+            [
+                [3, 3, 20, 21, 2, 3],
+                [3, 3, 30, 2, 3, 3],
+                [3, 3, 31, 32, 2, 3],
+                [3, 3, 33, 2, 3, 3],
+            ]
+        ] == batches[0]["labels"].tolist()
+        assert [0] == batches[0]["candidate_labels"].tolist()
         assert mx.int32 == batches[0]["input_ids"].dtype
         assert mx.int32 == batches[0]["labels"].dtype
+        assert mx.int32 == batches[0]["candidate_labels"].dtype
 
     def test_build_swag_batches_pads_short_examples_without_packing(self, monkeypatch):
         require_mlx_runtime()
@@ -244,8 +260,15 @@ class TestFtSwag:
 
         monkeypatch.setattr(
             ft_swag,
-            "iter_swag_parts",
-            Spy(return_value=iter([("", "4"), ("", "5")])),
+            "iter_swag_examples",
+            Spy(
+                return_value=iter(
+                    [
+                        ("", ("4", "5", "6", "7"), 0),
+                        ("", ("8", "9", "10", "11"), 2),
+                    ]
+                )
+            ),
         )
         batches = list(
             ft_swag.build_swag_batches(
@@ -256,8 +279,15 @@ class TestFtSwag:
         )
 
         assert 1 == len(batches)
-        assert [[1, 4, 2], [1, 5, 2]] == batches[0]["input_ids"].tolist()
-        assert [[4, 2, 3], [5, 2, 3]] == batches[0]["labels"].tolist()
+        assert [
+            [[1, 4, 2], [1, 5, 2], [1, 6, 2], [1, 7, 2]],
+            [[1, 8, 2], [1, 9, 2], [1, 10, 2], [1, 11, 2]],
+        ] == batches[0]["input_ids"].tolist()
+        assert [
+            [[4, 2, 3], [5, 2, 3], [6, 2, 3], [7, 2, 3]],
+            [[8, 2, 3], [9, 2, 3], [10, 2, 3], [11, 2, 3]],
+        ] == batches[0]["labels"].tolist()
+        assert [0, 2] == batches[0]["candidate_labels"].tolist()
 
     def test_build_swag_batches_skips_examples_longer_than_sequence(self, monkeypatch):
         require_mlx_runtime()
@@ -268,8 +298,8 @@ class TestFtSwag:
 
         monkeypatch.setattr(
             ft_swag,
-            "iter_swag_parts",
-            Spy(return_value=iter([("", "4 5 6 7")])),
+            "iter_swag_examples",
+            Spy(return_value=iter([("", ("4", "5", "6", "7 8 9 10"), 0)])),
         )
         batches = list(
             ft_swag.build_swag_batches(
@@ -292,8 +322,8 @@ class TestFtSwag:
 
         monkeypatch.setattr(
             ft_swag,
-            "iter_swag_parts",
-            Spy(return_value=iter([("", "4 5 6")])),
+            "iter_swag_examples",
+            Spy(return_value=iter([("", ("4 5 6", "7", "8", "9"), 0)])),
         )
         batches = list(
             ft_swag.build_swag_batches(
@@ -304,8 +334,48 @@ class TestFtSwag:
         )
 
         assert 1 == len(batches)
-        assert [[1, 4, 5, 6, 2]] == batches[0]["input_ids"].tolist()
-        assert [[4, 5, 6, 2, 3]] == batches[0]["labels"].tolist()
+        assert [
+            [[1, 4, 5, 6, 2], [1, 7, 2, 3, 3], [1, 8, 2, 3, 3], [1, 9, 2, 3, 3]]
+        ] == batches[0]["input_ids"].tolist()
+        assert [
+            [[4, 5, 6, 2, 3], [7, 2, 3, 3, 3], [8, 2, 3, 3, 3], [9, 2, 3, 3, 3]]
+        ] == batches[0]["labels"].tolist()
+
+    def test_swag_ranking_scores_sum_candidate_continuation_loglikelihoods(self):
+        mx = require_mlx_runtime()
+        import ft_swag
+
+        class CandidateModel:
+            def __call__(self, input_ids):
+                next_token_ids = mx.concatenate(
+                    [
+                        input_ids[:, 1:],
+                        mx.zeros((input_ids.shape[0], 1), dtype=mx.int32),
+                    ],
+                    axis=1,
+                )
+                logits = mx.full((*input_ids.shape, 64), -10.0)
+                logits = mx.put_along_axis(
+                    logits,
+                    mx.expand_dims(next_token_ids, axis=-1),
+                    mx.full((*input_ids.shape, 1), 10.0),
+                    axis=-1,
+                )
+                return type("Output", (), {"logits": logits})()
+
+        input_ids = mx.array([[[1, 20, 21], [1, 30, 31]]], dtype=mx.int32)
+        labels = mx.array([[[20, 21, 3], [32, 3, 3]]], dtype=mx.int32)
+
+        scores = ft_swag.score_swag_candidates(
+            CandidateModel(),
+            input_ids,
+            labels,
+            pad_token_id=3,
+        )
+        mx.eval(scores)
+
+        assert scores.shape == (1, 2)
+        assert float(scores[0, 0].item()) > float(scores[0, 1].item())
 
     def test_parse_args_defaults_to_fresh_fine_tuning(self):
         import ft_swag

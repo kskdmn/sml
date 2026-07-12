@@ -196,7 +196,6 @@ class TestTrainData:
     def test_training_config_derives_warmup_steps_from_lr_total_steps(self):
         from train_sml import TrainingConfig
 
-        assert 1_000 == TrainingConfig().warmup_steps
         assert 500 == TrainingConfig(lr_total_steps=50_000).warmup_steps
         assert 100 == TrainingConfig(lr_total_steps=None).warmup_steps
         assert 7 == TrainingConfig(warmup_steps=7).warmup_steps

@@ -1,8 +1,8 @@
 """
 Fine-tune an SML MLX checkpoint on the SWAG train split with LoRA adapters.
 
-Loads ``allenai/swag`` (``regular`` config) and trains low-rank adapters on the
-gold continuation for each ``startphrase``. Defaults read from
+Loads ``allenai/swag`` (``regular`` config) and trains low-rank adapters to rank
+the gold continuation above the other candidate endings. Defaults read from
 ``SwagFineTuneConfig`` in this module; the CLI exposes ``--resume`` only.
 """
 
@@ -61,7 +61,6 @@ from train_sml import (
     format_training_log,
     is_accumulation_window_ready,
     is_step_limit_reached,
-    iter_mlx_batches,
     iter_unseen_batches,
     parse_checkpoint_data_state,
     reset_gradient_accumulation_window,
@@ -69,7 +68,6 @@ from train_sml import (
     resolve_lr_total_steps,
 )
 from utils import (
-    build_loss_fn,
     build_lr_schedule,
     get_special_token_id,
     json_ready,
@@ -78,6 +76,7 @@ from utils import (
 )
 
 ENDING_KEY_PREFIX = "ending"
+SWAG_ENDING_COUNT = 4
 SWAG_PROGRESS_NAME = "swag-train"
 LORA_STATE_NAME = "lora.npz"
 STOCHASTIC_RESUME_NOTE = (
@@ -137,26 +136,41 @@ def resolve_swag_label(value: object) -> int:
     SWAG labels are stored as ints, strings, or Hugging Face ClassLabel values.
     """
     if isinstance(value, int):
-        return value
+        label = value
     if isinstance(value, str):
-        return int(value)
-    if hasattr(value, "item"):
-        return int(value.item())
-    raise ValueError(f"Unsupported SWAG label value: {value!r}")
+        label = int(value)
+    elif hasattr(value, "item"):
+        label = int(value.item())
+    elif not isinstance(value, int):
+        raise ValueError(f"Unsupported SWAG label value: {value!r}")
+    if label < 0 or label >= SWAG_ENDING_COUNT:
+        raise ValueError(f"SWAG label must be in [0, {SWAG_ENDING_COUNT})")
+    return label
+
+
+def format_swag_example(row: Mapping[str, object]) -> tuple[str, tuple[str, ...], int]:
+    """
+    Return the conditioning start phrase, all candidate endings, and gold label.
+    """
+    label = resolve_swag_label(row["label"])
+    startphrase = row["startphrase"]
+    if not isinstance(startphrase, str):
+        raise ValueError("SWAG startphrase must be a string")
+    endings = []
+    for ending_index in range(SWAG_ENDING_COUNT):
+        ending = row[f"{ENDING_KEY_PREFIX}{ending_index}"]
+        if not isinstance(ending, str):
+            raise ValueError(f"SWAG ending{ending_index} must be a string")
+        endings.append(ending.lstrip())
+    return startphrase.rstrip(), tuple(endings), label
 
 
 def format_swag_parts(row: Mapping[str, object]) -> tuple[str, str]:
     """
     Return the conditioning start phrase and gold continuation separately.
     """
-    label = resolve_swag_label(row["label"])
-    startphrase = row["startphrase"]
-    ending = row[f"{ENDING_KEY_PREFIX}{label}"]
-    if not isinstance(startphrase, str):
-        raise ValueError("SWAG startphrase must be a string")
-    if not isinstance(ending, str):
-        raise ValueError(f"SWAG ending{label} must be a string")
-    return startphrase.rstrip(), ending.lstrip()
+    startphrase, endings, label = format_swag_example(row)
+    return startphrase, endings[label]
 
 
 def join_swag_parts(startphrase: str, ending: str) -> str:
@@ -182,14 +196,14 @@ def load_swag_dataset(fine_tune_config: SwagFineTuneConfig):
     )
 
 
-def iter_swag_parts(
+def iter_swag_examples(
     fine_tune_config: SwagFineTuneConfig,
     epoch: int = 0,
     progress: ReadingProgress | None = None,
     data_state: TrainingDataState | None = None,
-) -> Iterator[tuple[str, str]]:
+) -> Iterator[tuple[str, tuple[str, ...], int]]:
     """
-    Yield SWAG context/ending pairs, optionally shuffled and resumable by position.
+    Yield SWAG context/candidate-ending examples, optionally shuffled and resumable.
     """
     dataset = load_swag_dataset(fine_tune_config)
     example_count = len(dataset)
@@ -217,13 +231,31 @@ def iter_swag_parts(
             data_state.input_file_index = 0
             data_state.line_number = position
 
-        yield format_swag_parts(row)
+        yield format_swag_example(row)
+
+
+def iter_swag_parts(
+    fine_tune_config: SwagFineTuneConfig,
+    epoch: int = 0,
+    progress: ReadingProgress | None = None,
+    data_state: TrainingDataState | None = None,
+) -> Iterator[tuple[str, str]]:
+    """
+    Yield only gold context/ending pairs for callers that need continuation text.
+    """
+    for startphrase, endings, label in iter_swag_examples(
+        fine_tune_config,
+        epoch=epoch,
+        progress=progress,
+        data_state=data_state,
+    ):
+        yield startphrase, endings[label]
 
 
 class SwagExampleDataset:
     def __init__(
         self,
-        examples: Iterable[tuple[str, str]],
+        examples: Iterable[tuple[str, tuple[str, ...], int]],
         tokenizer: object,
         sequence_length: int,
         pad_token_id: int,
@@ -243,10 +275,10 @@ class SwagExampleDataset:
 
     def __iter__(self) -> Iterator[dict[str, list[int]]]:
         """
-        Yield one fixed-length causal-LM pair per SWAG example.
+        Yield one fixed-length candidate-ranking example per SWAG row.
 
-        Labels outside the gold ending and EOS are set to ``pad_token_id`` so
-        the model loss ignores the conditioning context and padding positions.
+        Labels outside each candidate ending and EOS are set to ``pad_token_id`` so
+        candidate scores use only continuation tokens.
         """
         bos_token_id = get_special_token_id(
             self.tokenizer,
@@ -261,42 +293,84 @@ class SwagExampleDataset:
         if self.data_state is not None:
             self.data_state.token_buffer = []
 
-        tokens_per_example = self.sequence_length + 1
-        for startphrase, ending in self.examples:
+        tokens_per_candidate = self.sequence_length + 1
+        for startphrase, endings, label in self.examples:
             context_ids = list(self.tokenizer.encode(startphrase, out_type=int))
-            ending_ids = list(
-                self.tokenizer.encode(join_swag_parts("", ending), out_type=int)
-            )
-            if eos_token_id is not None:
-                ending_ids.append(eos_token_id)
-            example_tokens: list[int] = []
-            if bos_token_id is not None:
-                example_tokens.append(bos_token_id)
-            example_tokens.extend(int(token_id) for token_id in context_ids)
-            ending_start = len(example_tokens)
-            example_tokens.extend(int(token_id) for token_id in ending_ids)
-            if len(example_tokens) > self.sequence_length:
+            candidate_input_ids: list[list[int]] = []
+            candidate_labels: list[list[int]] = []
+            should_skip = False
+            for ending in endings:
+                ending_ids = list(
+                    self.tokenizer.encode(join_swag_parts("", ending), out_type=int)
+                )
+                if eos_token_id is not None:
+                    ending_ids.append(eos_token_id)
+                example_tokens: list[int] = []
+                if bos_token_id is not None:
+                    example_tokens.append(bos_token_id)
+                example_tokens.extend(int(token_id) for token_id in context_ids)
+                ending_start = len(example_tokens)
+                example_tokens.extend(int(token_id) for token_id in ending_ids)
+                if len(example_tokens) > self.sequence_length:
+                    should_skip = True
+                    break
+
+                padded_tokens = example_tokens + [self.pad_token_id] * (
+                    tokens_per_candidate - len(example_tokens)
+                )
+                labels = list(padded_tokens[1:])
+                ending_label_start = max(ending_start - 1, 0)
+                ending_label_end = ending_label_start + len(ending_ids)
+                labels[:ending_label_start] = [self.pad_token_id] * ending_label_start
+                labels[ending_label_end:] = [self.pad_token_id] * (
+                    len(labels) - ending_label_end
+                )
+                candidate_input_ids.append(
+                    [int(token_id) for token_id in padded_tokens[:-1]]
+                )
+                candidate_labels.append([int(token_id) for token_id in labels])
+            if should_skip:
                 if self.data_state is not None:
                     self.data_state.token_buffer = []
                 continue
-
-            padded_tokens = example_tokens + [self.pad_token_id] * (
-                tokens_per_example - len(example_tokens)
-            )
-            labels = list(padded_tokens[1:])
-            ending_label_start = max(ending_start - 1, 0)
-            ending_label_end = ending_label_start + len(ending_ids)
-            labels[:ending_label_start] = [self.pad_token_id] * ending_label_start
-            labels[ending_label_end:] = [self.pad_token_id] * (
-                len(labels) - ending_label_end
-            )
             if self.data_state is not None:
                 self.data_state.token_buffer = []
 
             yield {
-                "input_ids": [int(token_id) for token_id in padded_tokens[:-1]],
-                "labels": [int(token_id) for token_id in labels],
+                "input_ids": candidate_input_ids,
+                "labels": candidate_labels,
+                "candidate_labels": label,
             }
+
+
+def iter_swag_batches(
+    examples: Iterable[dict[str, object]],
+    batch_size: int,
+) -> Iterator[dict[str, object]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    batch: list[dict[str, object]] = []
+    for example in examples:
+        batch.append(example)
+        if len(batch) == batch_size:
+            yield collate_swag_batch(batch)
+            batch = []
+    if batch:
+        yield collate_swag_batch(batch)
+
+
+def collate_swag_batch(batch: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "input_ids": mx.array(
+            [example["input_ids"] for example in batch], dtype=mx.int32
+        ),
+        "labels": mx.array([example["labels"] for example in batch], dtype=mx.int32),
+        "candidate_labels": mx.array(
+            [example["candidate_labels"] for example in batch],
+            dtype=mx.int32,
+        ),
+    }
 
 
 def build_swag_batches(
@@ -313,7 +387,7 @@ def build_swag_batches(
     Stream fixed-length SWAG examples in MLX batches with context labels masked.
     """
     examples = SwagExampleDataset(
-        examples=iter_swag_parts(
+        examples=iter_swag_examples(
             fine_tune_config,
             epoch=epoch,
             progress=progress,
@@ -326,7 +400,57 @@ def build_swag_batches(
         eos_token_id=eos_token_id,
         data_state=data_state,
     )
-    return iter_mlx_batches(examples, batch_size=fine_tune_config.batch_size)
+    return iter_swag_batches(examples, batch_size=fine_tune_config.batch_size)
+
+
+def score_swag_candidates(
+    model,
+    input_ids: mx.array,
+    labels: mx.array,
+    pad_token_id: int,
+) -> mx.array:
+    """
+    Score each SWAG candidate by summed continuation log-likelihood.
+    """
+    if len(input_ids.shape) != 3:
+        raise ValueError("input_ids must have shape (batch, candidates, sequence)")
+    if input_ids.shape != labels.shape:
+        raise ValueError("labels must have the same shape as input_ids")
+
+    batch_size, candidate_count, sequence_length = input_ids.shape
+    flat_input_ids = input_ids.reshape((batch_size * candidate_count, sequence_length))
+    flat_labels = labels.reshape((batch_size * candidate_count, sequence_length))
+    output = model(flat_input_ids)
+    logits = output.logits
+    log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    token_log_probs = mx.squeeze(
+        mx.take_along_axis(
+            log_probs,
+            mx.expand_dims(flat_labels, axis=-1),
+            axis=-1,
+        ),
+        axis=-1,
+    )
+    label_mask = flat_labels != pad_token_id
+    scores = mx.sum(mx.where(label_mask, token_log_probs, 0.0), axis=-1)
+    return scores.reshape((batch_size, candidate_count))
+
+
+def build_swag_ranking_loss_fn(model, pad_token_id: int):
+    """
+    Return the multiple-choice ranking loss used for SWAG LoRA fine-tuning.
+    """
+
+    def loss_fn(input_ids, labels, candidate_labels):
+        scores = score_swag_candidates(
+            model,
+            input_ids,
+            labels,
+            pad_token_id=pad_token_id,
+        )
+        return nn.losses.cross_entropy(scores, candidate_labels, reduction="mean")
+
+    return loss_fn
 
 
 def load_pretrained_model_config(checkpoint_path: Path) -> SMLConfig:
@@ -521,7 +645,10 @@ def fine_tune_swag(
     model.train()
     accumulation = GradientAccumulationWindow()
     reading_progress = ReadingProgress()
-    loss_and_grad = nn.value_and_grad(model, build_loss_fn(model))
+    loss_and_grad = nn.value_and_grad(
+        model,
+        build_swag_ranking_loss_fn(model, checkpoint_model_config.pad_token_id),
+    )
 
     def complete_optimizer_step(
         grads_to_step: dict,
@@ -602,7 +729,11 @@ def fine_tune_swag(
             data_state=data_state,
         )
         for batch in iter_unseen_batches(batches, resume_progress):
-            loss, grads = loss_and_grad(batch["input_ids"], batch["labels"])
+            loss, grads = loss_and_grad(
+                batch["input_ids"],
+                batch["labels"],
+                batch["candidate_labels"],
+            )
             mx.eval(loss, grads)
             accumulate_gradients(
                 accumulation,
