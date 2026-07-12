@@ -18,26 +18,36 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, Sequence
 
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_unflatten
+
 from config import (
+    BOS_TOKEN_ID,
     DEFAULT_MODEL_PATH,
     DEFAULT_TOKENIZER_MODEL_PATH,
+    EOS_TOKEN_ID,
+    METADATA_NAME,
+    MODEL_WEIGHTS_NAME,
+    OPTIMIZER_STATE_NAME,
     OUTPUT_DIR,
+    PAD_TOKEN_ID,
     PROJECT_DIR,
     SUCCESS_RETURN_CODE,
     resolve_path,
 )
-from infer_sml import load_checkpoint_metadata, normalize_model_config
+from infer_sml import load_checkpoint_metadata
 from lora import (
     LoRAConfig,
     apply_lora,
     load_lora_state_dict,
-    lora_parameters,
     lora_state_dict,
     merge_lora,
     require_lora_modules,
 )
+from sml import SMLConfig, SMLLanguageModel, count_parameters
 from train_sml import (
-    ROW_INCREMENT,
     GradientAccumulationWindow,
     ReadingProgress,
     ResumeProgress,
@@ -45,37 +55,35 @@ from train_sml import (
     TrainingResumeState,
     accumulate_gradients,
     apply_model_dtype,
-    build_lr_schedule,
     clip_gradients_by_global_norm,
     consume_accumulated_grads,
     count_resume_batches,
     format_training_log,
-    get_special_token_id,
     is_accumulation_window_ready,
     is_step_limit_reached,
     iter_mlx_batches,
     iter_unseen_batches,
-    load_tokenizer,
     parse_checkpoint_data_state,
     reset_gradient_accumulation_window,
     reset_training_data_state,
     resolve_lr_total_steps,
+)
+from utils import (
+    build_loss_fn,
+    build_lr_schedule,
+    get_special_token_id,
+    json_ready,
+    load_tokenizer,
     set_seed,
 )
 
 ENDING_KEY_PREFIX = "ending"
 SWAG_PROGRESS_NAME = "swag-train"
-MODEL_WEIGHTS_NAME = "model.safetensors"
 LORA_STATE_NAME = "lora.npz"
-OPTIMIZER_STATE_NAME = "optimizer.npz"
-METADATA_NAME = "metadata.json"
 STOCHASTIC_RESUME_NOTE = (
     "Resume restores model adapters, optimizer state, and data position; "
     "stochastic continuity is not guaranteed."
 )
-DEFAULT_PAD_TOKEN_ID = 3
-DEFAULT_BOS_TOKEN_ID = 1
-DEFAULT_EOS_TOKEN_ID = 2
 
 
 @dataclass(slots=True)
@@ -108,14 +116,20 @@ class SwagFineTuneConfig:
     weight_decay: float = 0.0
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
-    warmup_steps: int = int(
-        (lr_total_steps if lr_total_steps is not None else 10_000) * 0.01
-    )
+    warmup_steps: int | None = None  # None derives 1% of lr_total_steps.
     min_lr_ratio: float = 0.1
     log_every: int = 10
     save_every: int = 500
     seed: int = 42
     autocast_dtype: str = "bfloat16"
+
+    def __post_init__(self) -> None:
+        """
+        Derive warmup from the schedule horizon unless the caller sets it explicitly.
+        """
+        if self.warmup_steps is None:
+            horizon = 10_000 if self.lr_total_steps is None else self.lr_total_steps
+            self.warmup_steps = int(horizon * 0.01)
 
 
 def resolve_swag_label(value: object) -> int:
@@ -196,7 +210,7 @@ def iter_swag_parts(
 
     start_position = 0
     if data_state is not None and data_state.line_number is not None:
-        start_position = data_state.line_number + ROW_INCREMENT
+        start_position = data_state.line_number + 1
 
     for position, example_index in enumerate(indices):
         if position < start_position:
@@ -273,7 +287,7 @@ class SwagExampleDataset:
         if self.data_state is not None:
             self.data_state.token_buffer = []
 
-        tokens_per_example = self.sequence_length + ROW_INCREMENT
+        tokens_per_example = self.sequence_length + 1
         for startphrase, ending in self.examples:
             context_ids = list(self.tokenizer.encode(startphrase, out_type=int))
             ending_ids = list(
@@ -296,7 +310,7 @@ class SwagExampleDataset:
                 tokens_per_example - len(example_tokens)
             )
             labels = list(padded_tokens[1:])
-            ending_label_start = max(ending_start - ROW_INCREMENT, 0)
+            ending_label_start = max(ending_start - 1, 0)
             ending_label_end = ending_label_start + len(ending_ids)
             labels[:ending_label_start] = [self.pad_token_id] * ending_label_start
             labels[ending_label_end:] = [self.pad_token_id] * (
@@ -315,9 +329,9 @@ def build_swag_batches(
     fine_tune_config: SwagFineTuneConfig,
     tokenizer: object,
     epoch: int,
-    pad_token_id: int = DEFAULT_PAD_TOKEN_ID,
-    bos_token_id: int | None = DEFAULT_BOS_TOKEN_ID,
-    eos_token_id: int | None = DEFAULT_EOS_TOKEN_ID,
+    pad_token_id: int = PAD_TOKEN_ID,
+    bos_token_id: int | None = BOS_TOKEN_ID,
+    eos_token_id: int | None = EOS_TOKEN_ID,
     progress: ReadingProgress | None = None,
     data_state: TrainingDataState | None = None,
 ) -> Iterator[dict[str, object]]:
@@ -341,32 +355,21 @@ def build_swag_batches(
     return iter_mlx_batches(examples, batch_size=fine_tune_config.batch_size)
 
 
-def build_swag_dataloader(*args, **kwargs):
-    """
-    Backward-compatible alias for callers that still use the old helper name.
-    """
-    return build_swag_batches(*args, **kwargs)
-
-
-def load_pretrained_model_config(checkpoint_path: Path):
+def load_pretrained_model_config(checkpoint_path: Path) -> SMLConfig:
     """
     Read ``model_config`` from MLX checkpoint metadata without loading weights.
     """
-    from sml import SMLConfig
-
     metadata = load_checkpoint_metadata(checkpoint_path)
     model_config = metadata.get("model_config")
     if not isinstance(model_config, dict):
         raise ValueError("Checkpoint is missing model_config")
-    return SMLConfig(**normalize_model_config(model_config))
+    return SMLConfig(**model_config)
 
 
 def load_pretrained_weights(model, checkpoint_path: Path) -> None:
     """
     Initialize model parameters from a pretrained MLX checkpoint directory.
     """
-    import mlx.core as mx
-
     checkpoint_dir = resolve_path(checkpoint_path)
     model.load_weights(str(checkpoint_dir / MODEL_WEIGHTS_NAME))
     mx.eval(model.parameters())
@@ -381,16 +384,6 @@ def prepare_lora_model(
     """
     apply_lora(model, fine_tune_config.lora)
     require_lora_modules(model, fine_tune_config.lora.target_modules)
-
-
-def _json_ready(value: object) -> object:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_ready(item) for item in value]
-    return value
 
 
 def build_merged_model(model):
@@ -414,9 +407,6 @@ def save_lora_checkpoint(
     """
     Persist merged weights, LoRA adapters, optimizer state, and training metadata.
     """
-    import mlx.core as mx
-    from mlx.utils import tree_flatten
-
     path.mkdir(parents=True, exist_ok=True)
     merged_model = build_merged_model(model)
     merged_model.save_weights(str(path / MODEL_WEIGHTS_NAME))
@@ -425,13 +415,13 @@ def save_lora_checkpoint(
     mx.savez(str(path / OPTIMIZER_STATE_NAME), **optimizer_state)
     metadata = {
         "step": step,
-        "model_config": _json_ready(asdict(model_config)),
-        "training_config": _json_ready(asdict(fine_tune_config)),
-        "lora_config": _json_ready(asdict(fine_tune_config.lora)),
+        "model_config": json_ready(asdict(model_config)),
+        "training_config": json_ready(asdict(fine_tune_config)),
+        "lora_config": json_ready(asdict(fine_tune_config.lora)),
         "pretrained_checkpoint_path": str(
             resolve_path(fine_tune_config.pretrained_checkpoint_path)
         ),
-        "data_state": None if data_state is None else _json_ready(asdict(data_state)),
+        "data_state": None if data_state is None else json_ready(asdict(data_state)),
         "stochastic_resume": "not_guaranteed",
         "resume_note": STOCHASTIC_RESUME_NOTE,
     }
@@ -447,9 +437,6 @@ def load_lora_checkpoint(
     """
     Restore LoRA adapters, optimizer state, and data position from a checkpoint.
     """
-    import mlx.core as mx
-    from mlx.utils import tree_unflatten
-
     checkpoint_path = resolve_path(path)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
@@ -501,25 +488,18 @@ def fine_tune_swag(
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / fine_tune_config.checkpoint_name
 
-    if resume_from_checkpoint:
-        pretrained_path = resolve_path(fine_tune_config.pretrained_checkpoint_path)
-        config_checkpoint_path = checkpoint_path
-    else:
-        pretrained_path = resolve_path(fine_tune_config.pretrained_checkpoint_path)
-        if not pretrained_path.exists():
-            raise FileNotFoundError(
-                f"Pretrained checkpoint does not exist: {pretrained_path}"
-            )
-        config_checkpoint_path = pretrained_path
+    pretrained_path = resolve_path(fine_tune_config.pretrained_checkpoint_path)
+    if not pretrained_path.exists():
+        raise FileNotFoundError(
+            f"Pretrained checkpoint does not exist: {pretrained_path}"
+        )
+    config_checkpoint_path = (
+        checkpoint_path if resume_from_checkpoint else pretrained_path
+    )
 
     set_seed(fine_tune_config.seed)
     tokenizer = load_tokenizer(fine_tune_config.tokenizer_model_path)
     base_model_config = load_pretrained_model_config(config_checkpoint_path)
-    import mlx.core as mx
-    import mlx.nn as nn
-    import mlx.optimizers as optim
-    from sml import SMLConfig, SMLLanguageModel, count_parameters
-
     checkpoint_model_config = replace(
         base_model_config,
         vocab_size=tokenizer.get_piece_size(),
@@ -546,8 +526,6 @@ def fine_tune_swag(
         weight_decay=fine_tune_config.weight_decay,
     )
     optimizer.init(model.trainable_parameters())
-    if not lora_parameters(model):
-        require_lora_modules(model, fine_tune_config.lora.target_modules)
 
     resume_state = TrainingResumeState()
     if resume_from_checkpoint:
@@ -569,7 +547,7 @@ def fine_tune_swag(
     model.train()
     accumulation = GradientAccumulationWindow()
     reading_progress = ReadingProgress()
-    loss_and_grad = nn.value_and_grad(model, _loss_fn(model))
+    loss_and_grad = nn.value_and_grad(model, build_loss_fn(model))
 
     def complete_optimizer_step(
         grads_to_step: dict,
@@ -583,7 +561,7 @@ def fine_tune_swag(
         )
         optimizer.update(model, clipped_grads)
         mx.eval(model.parameters(), optimizer.state)
-        global_step += ROW_INCREMENT
+        global_step += 1
 
         if global_step % fine_tune_config.log_every == 0 or global_step == 1:
             lr = float(optimizer.learning_rate.item())
@@ -599,6 +577,18 @@ def fine_tune_swag(
                 )
             )
 
+        if is_step_limit_reached(global_step, fine_tune_config.max_steps):
+            save_lora_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                checkpoint_model_config,
+                fine_tune_config,
+                global_step,
+                data_state=data_state,
+            )
+            return True
+
         if (
             fine_tune_config.save_every > 0
             and global_step % fine_tune_config.save_every == 0
@@ -612,18 +602,6 @@ def fine_tune_swag(
                 global_step,
                 data_state=data_state,
             )
-
-        if is_step_limit_reached(global_step, fine_tune_config.max_steps):
-            save_lora_checkpoint(
-                checkpoint_path,
-                model,
-                optimizer,
-                checkpoint_model_config,
-                fine_tune_config,
-                global_step,
-                data_state=data_state,
-            )
-            return True
         return False
 
     print(f"Dataset: {fine_tune_config.dataset_name}/{fine_tune_config.dataset_config}")
@@ -689,16 +667,6 @@ def fine_tune_swag(
         data_state=data_state,
     )
     return checkpoint_path
-
-
-def _loss_fn(model):
-    def loss_fn(input_ids, labels):
-        output = model(input_ids, labels=labels)
-        if output.loss is None:
-            raise RuntimeError("Model did not return a training loss")
-        return output.loss
-
-    return loss_fn
 
 
 def build_parser() -> argparse.ArgumentParser:

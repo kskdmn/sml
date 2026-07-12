@@ -68,9 +68,7 @@ class TestInferenceInterface:
             intermediate_size=16,
             original_max_position_embeddings=16,
             rope_scaling_factor=2.0,
-            attention_dropout=0.0,
             hidden_dropout=0.0,
-            gradient_checkpointing=False,
             bos_token_id=1,
             eos_token_id=2,
             pad_token_id=3,
@@ -126,37 +124,6 @@ class TestInferenceInterface:
         output = loaded(mx.array([[1, 4, 5]], dtype=mx.int32))
         mx.eval(output.logits)
         assert (1, 3, config.vocab_size) == tuple(output.logits.shape)
-
-    def test_load_model_maps_legacy_max_position_embeddings_config(self):
-        require_mlx_runtime()
-        import infer_sml
-        from sml import SMLConfig
-        from sml import SMLLanguageModel
-
-        config = self.tiny_config()
-        model = SMLLanguageModel(config)
-        legacy_model_config = asdict(config)
-        legacy_model_config["max_position_embeddings"] = legacy_model_config.pop(
-            "original_max_position_embeddings"
-        )
-        legacy_model_config.pop("rope_scaling_factor")
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            checkpoint_path = Path(tmp_dir) / "sml"
-            checkpoint_path.mkdir()
-            (checkpoint_path / "metadata.json").write_text(
-                json.JSONEncoder().encode({"model_config": legacy_model_config}),
-                encoding="utf-8",
-            )
-            model.save_weights(str(checkpoint_path / "model.safetensors"))
-
-            loaded = infer_sml.load_model(checkpoint_path)
-
-        assert (
-            config.original_max_position_embeddings
-            == loaded.config.original_max_position_embeddings
-        )
-        assert SMLConfig().rope_scaling_factor == loaded.config.rope_scaling_factor
 
     def test_load_checkpoint_metadata_requires_dictionary(self):
         import infer_sml

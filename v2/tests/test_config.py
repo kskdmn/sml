@@ -26,7 +26,14 @@ class TestConfig:
             config.OUTPUT_DIR / "bpe_tokenizer.model"
             == config.DEFAULT_TOKENIZER_MODEL_PATH
         )
-        assert not hasattr(config, "INPUT_DIR")
-        assert not hasattr(config, "INPUT_FILE_NAME_REGEX")
+        assert Path("~/Documents/data-common_pile/") == config.INPUT_DIR
+        assert r".*-00[0-9][0-9]\.jsonl\.zst\Z" == config.INPUT_FILE_NAME_REGEX
+        assert "model.safetensors" == config.MODEL_WEIGHTS_NAME
+        assert "optimizer.npz" == config.OPTIMIZER_STATE_NAME
+        assert "metadata.json" == config.METADATA_NAME
+        assert 0 == config.UNK_TOKEN_ID
+        assert 1 == config.BOS_TOKEN_ID
+        assert 2 == config.EOS_TOKEN_ID
+        assert 3 == config.PAD_TOKEN_ID
         assert Path("/tmp/example") == config.resolve_path(Path("/tmp/example"))
         assert Path.home() / "example" == config.resolve_path(Path("~/example"))

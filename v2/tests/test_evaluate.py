@@ -108,13 +108,13 @@ class FakeModel:
         return mx.concatenate((input_ids, continuation), axis=1)
 
 
-class TestEvalUtils:
+class TestSMLEvalLM:
     def test_loglikelihood_scores_only_continuation_tokens(self):
         require_mlx_runtime()
-        import eval_utils
+        import evaluate_sml
 
         model = FakeModel()
-        lm = eval_utils.SMLEvalLM(
+        lm = evaluate_sml.SMLEvalLM(
             model=model,
             tokenizer=FakeTokenizer(),
         )
@@ -130,10 +130,10 @@ class TestEvalUtils:
 
     def test_loglikelihood_tokenizes_context_and_continuation_together(self):
         require_mlx_runtime()
-        import eval_utils
+        import evaluate_sml
 
         model = FakeModel()
-        lm = eval_utils.SMLEvalLM(
+        lm = evaluate_sml.SMLEvalLM(
             model=model,
             tokenizer=BoundaryTokenizer(),
         )
@@ -146,9 +146,9 @@ class TestEvalUtils:
         assert [[[1, 10, 20]]] == model.calls
 
     def test_loglikelihood_rejects_sequences_beyond_checkpoint_context(self):
-        import eval_utils
+        import evaluate_sml
 
-        lm = eval_utils.SMLEvalLM(
+        lm = evaluate_sml.SMLEvalLM(
             model=FakeModel(effective_max_position_embeddings=3),
             tokenizer=FakeTokenizer(),
         )
@@ -159,10 +159,10 @@ class TestEvalUtils:
 
     def test_generate_until_caps_completion_and_applies_earliest_stop(self):
         require_mlx_runtime()
-        import eval_utils
+        import evaluate_sml
 
         model = FakeModel(effective_max_position_embeddings=6)
-        lm = eval_utils.SMLEvalLM(
+        lm = evaluate_sml.SMLEvalLM(
             model=model,
             tokenizer=FakeTokenizer(),
         )
@@ -184,14 +184,14 @@ class TestEvalUtils:
         assert 2 == model.eos_token_id
 
     def test_evaluate_lm_passes_common_lm_eval_options(self, monkeypatch):
-        import eval_utils
+        import evaluate_sml
 
         lm = object()
         expected = {"results": {"hellaswag": {"acc,none": 0.0}}}
         simple_evaluate = Spy(return_value=expected)
-        monkeypatch.setattr(eval_utils, "simple_evaluate", simple_evaluate)
+        monkeypatch.setattr(evaluate_sml, "simple_evaluate", simple_evaluate)
 
-        result = eval_utils.evaluate_lm(
+        result = evaluate_sml.evaluate_lm(
             lm=lm,
             checkpoint_path=Path("v2/output/sml"),
             tasks=["hellaswag"],
@@ -209,39 +209,13 @@ class TestEvalUtils:
             log_samples=False,
         )
 
-    def test_build_eval_parser_accepts_model_option_for_checkpoint_path(self):
-        import eval_utils
-
-        parser = eval_utils.build_eval_parser(
-            description="Evaluate.",
-            default_results_path=Path("results.json"),
-            limit_help="limit examples",
-        )
-
-        args = parser.parse_args(["--model", "/tmp/custom-sml"])
-
-        assert Path("/tmp/custom-sml") == args.checkpoint
-
-    def test_build_eval_parser_accepts_tokenizer_model_option(self):
-        import eval_utils
-
-        parser = eval_utils.build_eval_parser(
-            description="Evaluate.",
-            default_results_path=Path("results.json"),
-            limit_help="limit examples",
-        )
-
-        args = parser.parse_args(["--tokenizer-model", "/tmp/custom-tokenizer.model"])
-
-        assert Path("/tmp/custom-tokenizer.model") == args.tokenizer_model
-
     def test_write_results_creates_parent_directory_and_serializes_paths(self):
-        import eval_utils
+        import evaluate_sml
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             output_path = Path(tmp_dir) / "nested" / "results.json"
 
-            eval_utils.write_results(
+            evaluate_sml.write_results(
                 output_path,
                 {"checkpoint": Path("v2/output/sml")},
             )
@@ -249,3 +223,118 @@ class TestEvalUtils:
             saved = json.loads(output_path.read_text(encoding="utf-8"))
 
         assert "v2/output/sml" == saved["checkpoint"]
+
+
+class TestEvalCli:
+    def patch_eval_pipeline(self, monkeypatch, lm, results):
+        import evaluate_sml
+
+        from_checkpoint = Spy(return_value=lm)
+        evaluate_lm = Spy(return_value=results)
+        write_results = Spy()
+        print_output = Spy()
+        monkeypatch.setattr(evaluate_sml.SMLEvalLM, "from_checkpoint", from_checkpoint)
+        monkeypatch.setattr(evaluate_sml, "evaluate_lm", evaluate_lm)
+        monkeypatch.setattr(evaluate_sml, "write_results", write_results)
+        monkeypatch.setattr(evaluate_sml, "make_table", Spy(return_value="table"))
+        monkeypatch.setattr("builtins.print", print_output)
+        return from_checkpoint, evaluate_lm, write_results, print_output
+
+    @pytest.mark.parametrize("benchmark", ["hellaswag", "winogrande"])
+    def test_main_loads_default_checkpoint_and_writes_results(
+        self, monkeypatch, benchmark
+    ):
+        import evaluate_sml
+        from config import DEFAULT_MODEL_PATH, DEFAULT_TOKENIZER_MODEL_PATH, OUTPUT_DIR
+
+        lm = object()
+        results = {"results": {benchmark: {"acc,none": 0.0}}}
+        from_checkpoint, evaluate_lm, write_results, print_output = (
+            self.patch_eval_pipeline(monkeypatch, lm, results)
+        )
+
+        return_code = evaluate_sml.main(["--benchmark", benchmark, "--limit", "2"])
+
+        assert 0 == return_code
+        from_checkpoint.assert_called_once_with(
+            checkpoint_path=DEFAULT_MODEL_PATH,
+            tokenizer_model_path=DEFAULT_TOKENIZER_MODEL_PATH,
+        )
+        evaluate_lm.assert_called_once_with(
+            lm=lm,
+            checkpoint_path=DEFAULT_MODEL_PATH,
+            tasks=[benchmark],
+            limit=2,
+        )
+        write_results.assert_called_once_with(
+            OUTPUT_DIR / f"{benchmark}.json",
+            results,
+        )
+        print_output.assert_called_once_with("table")
+
+    def test_main_accepts_model_path_alias(self, monkeypatch):
+        import evaluate_sml
+        from config import DEFAULT_TOKENIZER_MODEL_PATH
+
+        lm = object()
+        results = {"results": {"hellaswag": {"acc,none": 0.0}}}
+        from_checkpoint, _, _, _ = self.patch_eval_pipeline(monkeypatch, lm, results)
+
+        return_code = evaluate_sml.main(
+            ["--benchmark", "hellaswag", "--model", "/tmp/custom-sml"]
+        )
+
+        assert 0 == return_code
+        from_checkpoint.assert_called_once_with(
+            checkpoint_path=Path("/tmp/custom-sml"),
+            tokenizer_model_path=DEFAULT_TOKENIZER_MODEL_PATH,
+        )
+
+    def test_main_accepts_tokenizer_model_path(self, monkeypatch):
+        import evaluate_sml
+        from config import DEFAULT_MODEL_PATH
+
+        lm = object()
+        results = {"results": {"hellaswag": {"acc,none": 0.0}}}
+        from_checkpoint, _, _, _ = self.patch_eval_pipeline(monkeypatch, lm, results)
+
+        return_code = evaluate_sml.main(
+            ["--benchmark", "hellaswag", "--tokenizer-model", "/tmp/custom.model"]
+        )
+
+        assert 0 == return_code
+        from_checkpoint.assert_called_once_with(
+            checkpoint_path=DEFAULT_MODEL_PATH,
+            tokenizer_model_path=Path("/tmp/custom.model"),
+        )
+
+    def test_main_accepts_output_path(self, monkeypatch):
+        import evaluate_sml
+
+        lm = object()
+        results = {"results": {"winogrande": {"acc,none": 0.0}}}
+        _, _, write_results, _ = self.patch_eval_pipeline(monkeypatch, lm, results)
+
+        return_code = evaluate_sml.main(
+            ["--benchmark", "winogrande", "--output", "/tmp/custom-results.json"]
+        )
+
+        assert 0 == return_code
+        write_results.assert_called_once_with(
+            Path("/tmp/custom-results.json"),
+            results,
+        )
+
+    def test_main_requires_benchmark_option(self, monkeypatch, capsys):
+        import evaluate_sml
+
+        with pytest.raises(SystemExit):
+            evaluate_sml.parse_args([])
+        assert "--benchmark" in capsys.readouterr().err
+
+    def test_main_rejects_unknown_benchmark(self, monkeypatch, capsys):
+        import evaluate_sml
+
+        with pytest.raises(SystemExit):
+            evaluate_sml.parse_args(["--benchmark", "mmlu"])
+        assert "invalid choice" in capsys.readouterr().err

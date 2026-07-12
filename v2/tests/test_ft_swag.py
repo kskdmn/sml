@@ -416,7 +416,6 @@ class TestFtSwag:
     def test_fine_tune_swag_forces_yarn_rope_scaling_for_lora_model(self, monkeypatch):
         require_mlx_runtime()
         import ft_swag
-        import sml
         from ft_swag import SwagFineTuneConfig
         from sml import SMLConfig
 
@@ -443,7 +442,6 @@ class TestFtSwag:
             intermediate_size=32,
             original_max_position_embeddings=16,
             rope_scaling_factor=1.0,
-            attention_dropout=0.0,
             hidden_dropout=0.0,
         )
 
@@ -455,7 +453,7 @@ class TestFtSwag:
             "load_pretrained_model_config",
             Spy(return_value=base_model_config),
         )
-        monkeypatch.setattr(sml, "SMLLanguageModel", capture_model_config)
+        monkeypatch.setattr(ft_swag, "SMLLanguageModel", capture_model_config)
 
         with pytest.raises(StopAfterModelConstruction):
             ft_swag.fine_tune_swag(
@@ -486,9 +484,7 @@ class TestFtSwag:
             intermediate_size=16,
             original_max_position_embeddings=16,
             rope_scaling_factor=1.0,
-            attention_dropout=0.0,
             hidden_dropout=0.0,
-            gradient_checkpointing=False,
             bos_token_id=1,
             eos_token_id=2,
             pad_token_id=3,
@@ -577,8 +573,8 @@ class TestFtSwag:
             (
                 '{"model_config": {"vocab_size": 32, "hidden_size": 16, '
                 '"num_layers": 1, "num_q_heads": 4, "num_kv_heads": 2, '
-                '"intermediate_size": 32, "max_position_embeddings": 16, '
-                '"attention_dropout": 0.0, "hidden_dropout": 0.0}}'
+                '"intermediate_size": 32, "original_max_position_embeddings": 16, '
+                '"hidden_dropout": 0.0}}'
             ),
             encoding="utf-8",
         )
@@ -587,8 +583,9 @@ class TestFtSwag:
 
         assert 16 == model_config.original_max_position_embeddings
 
+    @pytest.mark.parametrize("resume_from_checkpoint", [False, True])
     def test_fine_tune_swag_validates_pretrained_checkpoint_path(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, resume_from_checkpoint
     ):
         import ft_swag
         from ft_swag import SwagFineTuneConfig
@@ -610,5 +607,6 @@ class TestFtSwag:
                     pretrained_checkpoint_path=missing_checkpoint,
                     tokenizer_model_path=Path(__file__),
                     output_dir=tmp_path,
-                )
+                ),
+                resume_from_checkpoint=resume_from_checkpoint,
             )

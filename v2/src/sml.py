@@ -7,6 +7,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
+from config import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, UNK_TOKEN_ID
+
 
 @dataclass(slots=True)
 class SMLConfig:
@@ -16,6 +18,12 @@ class SMLConfig:
     ``rope_scaling_factor`` is the inference context multiplier saved in checkpoints.
     Training disables YaRN and uses standard RoPE; see
     ``train_sml.model_config_for_training``.
+
+    Two v1 knobs are intentionally absent. ``attention_dropout`` does not exist
+    because ``mx.fast.scaled_dot_product_attention`` does not expose dropout and
+    the fused kernel is always used; ``hidden_dropout`` is the only dropout
+    option. ``gradient_checkpointing`` does not exist because the MLX training
+    path does not implement it.
     """
 
     vocab_size: int = 28_672
@@ -42,18 +50,12 @@ class SMLConfig:
     )
     yarn_truncate: bool = True  # Floor/ceil band cutoffs in the YaRN correction range.
     rms_norm_eps: float = 1e-6
-    attention_dropout: float = (
-        0.005  # If overfitting, try 0.05 (usually more disruptive than hidden_dropout)
-    )
     hidden_dropout: float = 0.01  # If overfitting, try 0.1
     initializer_range: float = 0.02
-    gradient_checkpointing: bool = (
-        False  # Trade extra compute for lower activation memory during training.
-    )
-    pad_token_id: int = 3
-    bos_token_id: int = 1
-    eos_token_id: int = 2
-    unk_token_id: int = 0
+    pad_token_id: int = PAD_TOKEN_ID
+    bos_token_id: int = BOS_TOKEN_ID
+    eos_token_id: int = EOS_TOKEN_ID
+    unk_token_id: int = UNK_TOKEN_ID
     tie_word_embeddings: bool = True
     use_cache: bool = True  # For inference/generation.
 
@@ -306,17 +308,6 @@ def _init_embedding(
     embedding.weight = weight
 
 
-def _replace_vector_value(vector: mx.array, index: int, value: mx.array) -> mx.array:
-    value = value.reshape((1,))
-    pieces = []
-    if index > 0:
-        pieces.append(vector[:index])
-    pieces.append(value)
-    if index + 1 < vector.shape[0]:
-        pieces.append(vector[index + 1 :])
-    return mx.concatenate(pieces, axis=0)
-
-
 def apply_repetition_penalty(
     logits: mx.array,
     input_ids: mx.array,
@@ -328,16 +319,14 @@ def apply_repetition_penalty(
     if penalty == 1.0:
         return logits
 
-    adjusted_rows = []
-    for batch_idx in range(input_ids.shape[0]):
-        row = logits[batch_idx]
-        token_ids = {int(token_id) for token_id in input_ids[batch_idx].tolist()}
-        for token_id in token_ids:
-            score = row[token_id]
-            replacement = mx.where(score > 0, score / penalty, score * penalty)
-            row = _replace_vector_value(row, token_id, replacement)
-        adjusted_rows.append(row)
-    return mx.stack(adjusted_rows, axis=0)
+    seen = mx.put_along_axis(
+        mx.zeros(logits.shape, dtype=mx.bool_),
+        input_ids,
+        mx.ones(input_ids.shape, dtype=mx.bool_),
+        axis=-1,
+    )
+    penalized = mx.where(logits > 0, logits / penalty, logits * penalty)
+    return mx.where(seen, penalized, logits)
 
 
 def apply_no_repeat_ngram(
@@ -357,15 +346,20 @@ def apply_no_repeat_ngram(
         token_ids = [int(token_id) for token_id in generated[batch_idx].tolist()]
         if len(token_ids) + 1 >= ngram_size:
             prefix = tuple(token_ids[-(ngram_size - 1) :])
-            banned: set[int] = set()
-            for start in range(len(token_ids) - ngram_size + 1):
-                if tuple(token_ids[start : start + ngram_size - 1]) == prefix:
-                    banned.add(token_ids[start + ngram_size - 1])
-            for token_id in banned:
-                row = _replace_vector_value(
+            banned = sorted(
+                {
+                    token_ids[start + ngram_size - 1]
+                    for start in range(len(token_ids) - ngram_size + 1)
+                    if tuple(token_ids[start : start + ngram_size - 1]) == prefix
+                }
+            )
+            if banned:
+                banned_ids = mx.array(banned)
+                row = mx.put_along_axis(
                     row,
-                    token_id,
-                    mx.array(-math.inf, dtype=row.dtype),
+                    banned_ids,
+                    mx.full(banned_ids.shape, -math.inf, dtype=row.dtype),
+                    axis=-1,
                 )
         adjusted_rows.append(row)
     return mx.stack(adjusted_rows, axis=0)
@@ -640,10 +634,10 @@ class GroupedQueryAttention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update(self.layer_idx, k, v)
 
-        # MLX fast attention does not expose attention-dropout, so the MLX
-        # model ignores config.attention_dropout to keep the fused GQA path.
-        # Always use the lower-right causal mask so cached multi-token chunks
-        # cannot attend to future keys within the chunk.
+        # MLX fast attention does not expose attention-dropout, so SMLConfig
+        # deliberately has no attention_dropout knob and the fused GQA path is
+        # always used. Always use the lower-right causal mask so cached
+        # multi-token chunks cannot attend to future keys within the chunk.
         output = mx.fast.scaled_dot_product_attention(
             q,
             k,
@@ -720,6 +714,22 @@ class SMLLanguageModel(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 
+    def _validate_token_ids(self, token_ids: mx.array, name: str) -> None:
+        """
+        Reject out-of-vocabulary ids before the embedding and loss gathers read
+        undefined GPU memory and silently return garbage.
+        """
+        if token_ids.size == 0:
+            return
+        min_id = mx.min(token_ids)
+        max_id = mx.max(token_ids)
+        mx.eval(min_id, max_id)
+        if int(min_id.item()) < 0 or int(max_id.item()) >= self.config.vocab_size:
+            raise ValueError(
+                f"{name} must be within [0, {self.config.vocab_size}); "
+                f"found values in [{int(min_id.item())}, {int(max_id.item())}]"
+            )
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -734,6 +744,9 @@ class SMLLanguageModel(nn.Module):
                 "input sequence length exceeds effective_max_position_embeddings: "
                 f"{total_seq_len} > {self.config.effective_max_position_embeddings}"
             )
+        self._validate_token_ids(input_ids, "input_ids")
+        if labels is not None:
+            self._validate_token_ids(labels, "labels")
 
         x = self.embed_tokens(input_ids)
         for layer in self.layers:
@@ -870,22 +883,3 @@ def estimate_model_size(config: SMLConfig) -> int:
         + norm_params
         + untied_head_params
     )
-
-
-def lr_lambda(
-    step: int,
-    total_steps: int | None,
-    warmup_steps: int,
-    min_lr_ratio: float,
-) -> float:
-    """
-    Warm up linearly, then either hold constant when no horizon is known or cosine-decay
-    to a configured floor.
-    """
-    if step < warmup_steps:
-        return float(step + 1) / float(max(1, warmup_steps))
-    if total_steps is None:
-        return 1.0
-    progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-    cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-    return max(min_lr_ratio, cosine)

@@ -41,7 +41,8 @@ class TestSMLConfig:
         assert 32.0 == config.yarn_beta_fast
         assert 1.0 == config.yarn_beta_slow
         assert 4096 == config.effective_max_position_embeddings
-        assert not config.gradient_checkpointing
+        assert not hasattr(config, "attention_dropout")
+        assert not hasattr(config, "gradient_checkpointing")
 
     def test_invalid_attention_shape_is_rejected(self):
         from sml import SMLConfig
@@ -93,15 +94,6 @@ class TestSMLConfig:
         assert 8192 == config.effective_max_position_embeddings
 
 
-class TestSMLSchedule:
-    def test_lr_schedule_stays_constant_after_warmup_without_total_steps(self):
-        from sml import lr_lambda
-
-        assert 1.0 == lr_lambda(
-            step=1000, total_steps=None, warmup_steps=100, min_lr_ratio=0.1
-        )
-
-
 class TestSMLModel:
     def tiny_config(self):
         from sml import SMLConfig
@@ -115,9 +107,7 @@ class TestSMLModel:
             intermediate_size=32,
             original_max_position_embeddings=32,
             rope_scaling_factor=2.0,
-            attention_dropout=0.0,
             hidden_dropout=0.0,
-            gradient_checkpointing=True,
             bos_token_id=1,
             eos_token_id=2,
             pad_token_id=3,
@@ -167,6 +157,27 @@ class TestSMLModel:
             config.vocab_size,
         ) == output.logits.shape
 
+    def test_forward_rejects_out_of_vocabulary_input_ids(self):
+        from sml import SMLLanguageModel
+
+        config = self.tiny_config()
+        model = SMLLanguageModel(config)
+
+        with pytest.raises(ValueError, match="input_ids must be within"):
+            model(mx.array([[10, config.vocab_size]], dtype=mx.int32))
+        with pytest.raises(ValueError, match="input_ids must be within"):
+            model(mx.array([[-1, 10]], dtype=mx.int32))
+
+    def test_forward_rejects_out_of_vocabulary_labels(self):
+        from sml import SMLLanguageModel
+
+        config = self.tiny_config()
+        model = SMLLanguageModel(config)
+        input_ids = mx.array([[10, 20]], dtype=mx.int32)
+
+        with pytest.raises(ValueError, match="labels must be within"):
+            model(input_ids, labels=mx.array([[20, config.vocab_size]], dtype=mx.int32))
+
     def test_forward_rejects_tokens_beyond_scaled_context_length(self):
         from sml import SMLLanguageModel
 
@@ -207,13 +218,15 @@ class TestSMLModel:
         mx.random.seed(0)
         config = self.tiny_config()
         model = SMLLanguageModel(config)
+        # Token ids must stay below config.vocab_size; out-of-range ids make the
+        # GPU embedding lookup read undefined memory and the test nondeterministic.
         prompt = mx.array([[10, 20, 30]], dtype=mx.int32)
-        chunk = mx.array([[40, 50]], dtype=mx.int32)
+        chunk = mx.array([[25, 28]], dtype=mx.int32)
 
         kv_sequential = KVCache()
         model(prompt, kv_cache=kv_sequential)
-        logits_first = model(mx.array([[40]]), kv_cache=kv_sequential).logits[0, 0]
-        logits_second = model(mx.array([[50]]), kv_cache=kv_sequential).logits[0, 0]
+        logits_first = model(mx.array([[25]]), kv_cache=kv_sequential).logits[0, 0]
+        logits_second = model(mx.array([[28]]), kv_cache=kv_sequential).logits[0, 0]
 
         kv_chunk = KVCache()
         model(prompt, kv_cache=kv_chunk)

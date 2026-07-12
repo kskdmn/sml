@@ -7,15 +7,20 @@ from typing import Iterator, NamedTuple, Sequence
 
 import sentencepiece as spm
 
-from config import PROJECT_DIR, resolve_path
+from config import (
+    BOS_TOKEN_ID,
+    DEFAULT_TOKENIZER_MODEL_PATH,
+    EOS_TOKEN_ID,
+    INPUT_DIR,
+    INPUT_FILE_NAME_REGEX,
+    PAD_TOKEN_ID,
+    SUCCESS_RETURN_CODE,
+    UNK_TOKEN_ID,
+    resolve_path,
+)
 import tokenizer
-from utils import shuffle_input_files
+from utils import discover_input_files, shuffle_input_files
 
-SUCCESS_RETURN_CODE = 0
-INPUT_DIR = Path("~/Documents/data-common_pile/")
-TOKENIZER_SHARD_NAME_REGEX = r".*-00[0-9][0-9]\.jsonl\.zst\Z"
-OUTPUT_DIR = PROJECT_DIR / "output"
-DEFAULT_TOKENIZER_MODEL_PATH = OUTPUT_DIR / "bpe_tokenizer.model"
 MAX_ROWS_PER_FILE = 32_768
 SHUFFLE_INPUT_FILES = True
 RANDOM_SEED = 42
@@ -60,10 +65,7 @@ def train_tokenizer(
     output_dir = tokenizer_model_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    input_files = tokenizer.discover_input_files(
-        INPUT_DIR,
-        TOKENIZER_SHARD_NAME_REGEX,
-    )
+    input_files = discover_input_files(INPUT_DIR, INPUT_FILE_NAME_REGEX)
     if not input_files:
         raise FileNotFoundError(
             f"No supported input files found in {resolve_path(INPUT_DIR)}"
@@ -91,10 +93,10 @@ def train_tokenizer(
         self_test_sample_size=SELF_TEST_SAMPLE_SIZE,
         hard_vocab_limit=tokenizer.HARD_VOCAB_LIMIT,
         train_extremely_large_corpus=TRAIN_EXTREMELY_LARGE_CORPUS,
-        unk_id=tokenizer.UNK_ID,
-        bos_id=tokenizer.BOS_ID,
-        eos_id=tokenizer.EOS_ID,
-        pad_id=tokenizer.PAD_ID,
+        unk_id=UNK_TOKEN_ID,
+        bos_id=BOS_TOKEN_ID,
+        eos_id=EOS_TOKEN_ID,
+        pad_id=PAD_TOKEN_ID,
         user_defined_symbols=list(tokenizer.CONVERSATION_SPECIAL_TOKENS),
     )
     if tokenizer.MAX_SENTENCE_LENGTH is not None:

@@ -1,9 +1,12 @@
 """
-Shared lm-eval helpers for SML benchmark scripts.
+Benchmark evaluation for the local SML checkpoint and tokenizer.
+
+Select the lm-eval task with ``--benchmark hellaswag`` or ``--benchmark
+winogrande``. Results default to ``v2/output/<benchmark>.json``. Override
+paths with ``--model``, ``--tokenizer-model``, ``--limit``, and ``--output``.
 
 The adapter supports likelihood-based multiple-choice tasks and greedy
-generation tasks while keeping checkpoint loading, result writing, and common
-CLI arguments in one place.
+generation tasks.
 """
 
 from __future__ import annotations
@@ -17,11 +20,18 @@ import mlx.core as mx
 from lm_eval import simple_evaluate
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
-from lm_eval.utils import handle_non_serializable
+from lm_eval.utils import handle_non_serializable, make_table
 
-from config import DEFAULT_MODEL_PATH, DEFAULT_TOKENIZER_MODEL_PATH
+from config import (
+    DEFAULT_MODEL_PATH,
+    DEFAULT_TOKENIZER_MODEL_PATH,
+    OUTPUT_DIR,
+    SUCCESS_RETURN_CODE,
+)
 from infer_sml import InferenceTokenizer, decode_token_ids, encode_prompt, load_model
-from train_sml import load_tokenizer
+from utils import load_tokenizer
+
+BENCHMARKS = ("hellaswag", "winogrande")
 
 
 class SMLEvalLM(LM):
@@ -130,7 +140,7 @@ class SMLEvalLM(LM):
 
     def loglikelihood_rolling(self, requests: list[Instance]) -> list[float]:
         """
-        Perplexity-style rolling likelihood is not needed by these benchmark scripts.
+        Perplexity-style rolling likelihood is not needed by these benchmark tasks.
         """
         del requests
         raise NotImplementedError("SMLEvalLM does not support rolling likelihood")
@@ -235,15 +245,32 @@ def write_results(output_path: Path, results: dict[str, Any]) -> None:
         output_file.write("\n")
 
 
-def build_eval_parser(
-    description: str,
-    default_results_path: Path,
-    limit_help: str,
-) -> argparse.ArgumentParser:
+def require_results(results: dict[str, Any] | None) -> dict[str, Any]:
     """
-    Build the shared checkpoint/tokenizer/output parser.
+    lm-eval returns results only on the primary process.
     """
-    parser = argparse.ArgumentParser(description=description)
+    if results is None:
+        raise RuntimeError("lm_eval did not return results on this process")
+    return results
+
+
+def resolve_results_path(benchmark: str, output: Path | None) -> Path:
+    """
+    Default the results file to ``output/<benchmark>.json`` unless overridden.
+    """
+    return OUTPUT_DIR / f"{benchmark}.json" if output is None else output
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Evaluate the local SML checkpoint on an lm-eval benchmark."
+    )
+    parser.add_argument(
+        "--benchmark",
+        choices=BENCHMARKS,
+        required=True,
+        help="benchmark task to run",
+    )
     parser.add_argument(
         "--model",
         dest="checkpoint",
@@ -262,21 +289,47 @@ def build_eval_parser(
         "--limit",
         type=int,
         default=None,
-        help=limit_help,
+        help="evaluate only the first N examples",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=default_results_path,
-        help=f"JSON results path (default: {default_results_path})",
+        default=None,
+        help=f"JSON results path (default: {OUTPUT_DIR}/<benchmark>.json)",
     )
     return parser
 
 
-def require_results(results: dict[str, Any] | None) -> dict[str, Any]:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """
-    lm-eval returns results only on the primary process.
+    Accept an explicit argv for tests while keeping CLI defaults in one place.
     """
-    if results is None:
-        raise RuntimeError("lm_eval did not return results on this process")
-    return results
+    return build_parser().parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """
+    Load the checkpoint, run the selected benchmark with zero-shot scoring, save
+    JSON results, and print a table.
+    """
+    args = parse_args(argv)
+    lm = SMLEvalLM.from_checkpoint(
+        checkpoint_path=args.checkpoint,
+        tokenizer_model_path=args.tokenizer_model,
+    )
+    results = require_results(
+        evaluate_lm(
+            lm=lm,
+            checkpoint_path=args.checkpoint,
+            tasks=[args.benchmark],
+            limit=args.limit,
+        )
+    )
+
+    write_results(resolve_results_path(args.benchmark, args.output), results)
+    print(make_table(results))
+    return SUCCESS_RETURN_CODE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

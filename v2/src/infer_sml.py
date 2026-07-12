@@ -14,21 +14,20 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol, Sequence
-
-if TYPE_CHECKING:
-    from sml import SMLLanguageModel
+from typing import Any, Protocol, Sequence
 
 import mlx.core as mx
 
 from config import (
     DEFAULT_MODEL_PATH,
     DEFAULT_TOKENIZER_MODEL_PATH,
+    METADATA_NAME,
+    MODEL_WEIGHTS_NAME,
     SUCCESS_RETURN_CODE,
     resolve_path,
 )
-from sml import GenerationConfig
-from train_sml import load_tokenizer
+from sml import GenerationConfig, SMLConfig, SMLLanguageModel
+from utils import load_tokenizer
 
 
 class InferenceTokenizer(Protocol):
@@ -48,7 +47,7 @@ def load_checkpoint_metadata(checkpoint_path: Path) -> dict[str, Any]:
     """
     Load the JSON metadata saved next to MLX checkpoint weights.
     """
-    metadata_path = resolve_path(checkpoint_path) / "metadata.json"
+    metadata_path = resolve_path(checkpoint_path) / METADATA_NAME
     if not metadata_path.exists():
         raise FileNotFoundError(f"Checkpoint metadata does not exist: {metadata_path}")
 
@@ -60,35 +59,18 @@ def load_checkpoint_metadata(checkpoint_path: Path) -> dict[str, Any]:
     return metadata
 
 
-def normalize_model_config(model_config: dict[str, Any]) -> dict[str, Any]:
-    """
-    Older checkpoints used `max_position_embeddings` and may omit newer RoPE fields;
-    rename legacy keys and let dataclass defaults fill gaps.
-    """
-    normalized = dict(model_config)
-    if "max_position_embeddings" in normalized:
-        legacy_max_position_embeddings = normalized.pop("max_position_embeddings")
-        normalized.setdefault(
-            "original_max_position_embeddings",
-            legacy_max_position_embeddings,
-        )
-    return normalized
-
-
 def load_model(checkpoint_path: Path) -> SMLLanguageModel:
     """
     Checkpoint directories must contain shape config metadata and MLX weights.
     """
-    from sml import SMLConfig, SMLLanguageModel
-
     checkpoint_dir = resolve_path(checkpoint_path)
     metadata = load_checkpoint_metadata(checkpoint_dir)
     model_config = metadata.get("model_config")
     if not isinstance(model_config, dict):
         raise ValueError("Checkpoint is missing model_config")
 
-    model = SMLLanguageModel(SMLConfig(**normalize_model_config(model_config)))
-    model.load_weights(str(checkpoint_dir / "model.safetensors"))
+    model = SMLLanguageModel(SMLConfig(**model_config))
+    model.load_weights(str(checkpoint_dir / MODEL_WEIGHTS_NAME))
     model.eval()
     mx.eval(model.parameters())
     return model

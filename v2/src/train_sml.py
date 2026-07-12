@@ -2,37 +2,45 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import random
-import re
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol, Sequence, TypeVar
 
-import sentencepiece as spm
+import mlx.core as mx
+import mlx.nn as nn
+import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
-from config import PROJECT_DIR, resolve_path
-from tokenizer import (
-    HIDDEN_FILE_PREFIX,
-    TEXT_COLUMN,
-    filter_text,
-    iter_jsonl_records,
+from config import (
+    DEFAULT_MODEL_PATH,
+    DEFAULT_TOKENIZER_MODEL_PATH,
+    INPUT_DIR,
+    INPUT_FILE_NAME_REGEX,
+    METADATA_NAME,
+    MODEL_WEIGHTS_NAME,
+    OPTIMIZER_STATE_NAME,
+    OUTPUT_DIR,
+    SUCCESS_RETURN_CODE,
+    resolve_path,
 )
-from utils import shuffle_input_files
+from sml import SMLConfig, SMLLanguageModel, count_parameters
+from utils import (
+    TEXT_COLUMN,
+    build_loss_fn,
+    build_lr_schedule,
+    discover_input_files,
+    filter_text,
+    get_special_token_id,
+    iter_jsonl_records,
+    json_ready,
+    load_tokenizer,
+    set_seed,
+    shuffle_input_files,
+)
 
 
-ROW_INCREMENT = 1
-SUCCESS_RETURN_CODE = 0
-INPUT_DIR = Path("~/Documents/data-common_pile/")
-INPUT_FILE_NAME_REGEX = r".*-00[0-9][0-9]\.jsonl\.zst\Z"
-OUTPUT_DIR = PROJECT_DIR / "output"
-DEFAULT_MODEL_PATH = OUTPUT_DIR / "sml"
-DEFAULT_TOKENIZER_MODEL_PATH = OUTPUT_DIR / "bpe_tokenizer.model"
-MODEL_WEIGHTS_NAME = "model.safetensors"
-OPTIMIZER_STATE_NAME = "optimizer.npz"
-METADATA_NAME = "metadata.json"
 STOCHASTIC_RESUME_NOTE = (
     "Resume restores model weights, optimizer state, and data position; "
     "stochastic continuity is not guaranteed."
@@ -67,14 +75,20 @@ class TrainingConfig:
     weight_decay: float = 0.1
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
-    warmup_steps: int = int(
-        (lr_total_steps if lr_total_steps is not None else 10_000) * 0.01
-    )
+    warmup_steps: int | None = None  # None derives 1% of lr_total_steps.
     min_lr_ratio: float = 0.1
     log_every: int = 10
     save_every: int = 1_000
     seed: int = 42
     autocast_dtype: str = "bfloat16"
+
+    def __post_init__(self) -> None:
+        """
+        Derive warmup from the schedule horizon unless the caller sets it explicitly.
+        """
+        if self.warmup_steps is None:
+            horizon = 10_000 if self.lr_total_steps is None else self.lr_total_steps
+            self.warmup_steps = int(horizon * 0.01)
 
 
 def model_config_for_training(config):
@@ -122,29 +136,6 @@ class TextTokenizer(Protocol):
         ...
 
 
-def discover_input_files(
-    input_dir: Path,
-    file_name_regex: str,
-) -> tuple[Path, ...]:
-    """
-    Match the regex against file names rather than paths, and skip hidden files such as
-    local filesystem metadata.
-    """
-    root = resolve_path(input_dir)
-    if not root.exists():
-        raise FileNotFoundError(f"Input directory does not exist: {root}")
-
-    pattern = re.compile(file_name_regex)
-    files = [
-        path
-        for path in root.iterdir()
-        if path.is_file()
-        and not path.name.startswith(HIDDEN_FILE_PREFIX)
-        and pattern.fullmatch(path.name) is not None
-    ]
-    return tuple(sorted(files, key=lambda path: path.name))
-
-
 def iter_texts(
     input_files: Iterable[Path],
     max_rows_per_file: int | None,
@@ -178,33 +169,6 @@ def iter_texts(
             text = filter_text(row.get(TEXT_COLUMN))
             if text is not None:
                 yield text
-
-
-def get_special_token_id(
-    tokenizer: object,
-    name: str,
-    fallback: int | None,
-) -> int | None:
-    """
-    SentencePiece reports negative IDs for disabled special tokens, so config fallbacks
-    are used in that case.
-    """
-    value = getattr(tokenizer, name, None)
-    if callable(value):
-        value = value()
-    if value is None or value < 0:
-        return fallback
-    return int(value)
-
-
-def load_tokenizer(path: Path) -> spm.SentencePieceProcessor:
-    """
-    Fail before training starts if the configured SentencePiece model path is missing.
-    """
-    model_path = resolve_path(path)
-    if not model_path.exists():
-        raise FileNotFoundError(f"Tokenizer model does not exist: {model_path}")
-    return spm.SentencePieceProcessor(model_file=str(model_path))
 
 
 def parse_checkpoint_input_files(input_files: object) -> tuple[Path, ...]:
@@ -260,7 +224,7 @@ def iter_unseen_batches(
     """
     for batch in dataloader:
         if progress.batches_to_skip > 0:
-            progress.batches_to_skip -= ROW_INCREMENT
+            progress.batches_to_skip -= 1
             continue
         yield batch
 
@@ -317,68 +281,12 @@ def format_training_log(
     return " ".join(parts)
 
 
-def lr_lambda(
-    step: int,
-    total_steps: int | None,
-    warmup_steps: int,
-    min_lr_ratio: float,
-) -> float:
-    """
-    Warm up linearly, then either hold constant when no horizon is known or cosine-decay
-    to a configured floor.
-    """
-    if step < warmup_steps:
-        return float(step + 1) / float(max(1, warmup_steps))
-    if total_steps is None:
-        return 1.0
-    progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-    cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-    return max(min_lr_ratio, cosine)
-
-
-def _mlx_core():
-    import mlx.core as mx
-
-    return mx
-
-
-def _mlx_nn():
-    import mlx.nn as nn
-
-    return nn
-
-
-def _mlx_optimizers():
-    import mlx.optimizers as optim
-
-    return optim
-
-
-def _mlx_tree_utils():
-    from mlx.utils import tree_flatten, tree_map, tree_unflatten
-
-    return tree_flatten, tree_map, tree_unflatten
-
-
-def _model_modules():
-    from sml import SMLConfig, SMLLanguageModel, count_parameters
-
-    return SMLConfig, SMLLanguageModel, count_parameters
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    mx = _mlx_core()
-    mx.random.seed(seed)
-
-
 def resolve_compute_dtype(name: str):
     """
     Map training dtype names to MLX dtypes.
 
     ``none`` keeps float32 weights; otherwise parameters are cast before training.
     """
-    mx = _mlx_core()
     if name == "none":
         return None
     if name == "bfloat16":
@@ -400,9 +308,6 @@ def apply_model_dtype(model, autocast_dtype: str) -> None:
     dtype = resolve_compute_dtype(autocast_dtype)
     if dtype is None:
         return
-
-    mx = _mlx_core()
-    _, tree_map, _ = _mlx_tree_utils()
 
     def cast_array(value: object) -> object:
         if isinstance(value, mx.array):
@@ -482,7 +387,6 @@ def _as_token_list(value: object) -> list[int]:
 
 
 def _collate_mlx_batch(batch: list[dict[str, object]]) -> dict[str, object]:
-    mx = _mlx_core()
     input_ids = [_as_token_list(example["input_ids"]) for example in batch]
     labels = [_as_token_list(example["labels"]) for example in batch]
     return {
@@ -491,43 +395,15 @@ def _collate_mlx_batch(batch: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
-def build_lr_schedule(
-    learning_rate: float,
-    total_steps: int | None,
-    warmup_steps: int,
-    min_lr_ratio: float,
-):
-    mx = _mlx_core()
-
-    def schedule(step):
-        warmup_denominator = float(max(1, warmup_steps))
-        warmup_multiplier = (step + 1) / warmup_denominator
-        if total_steps is None:
-            decay_multiplier = mx.array(1.0)
-        else:
-            progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            progress = mx.minimum(mx.array(1.0), progress)
-            cosine = 0.5 * (1.0 + mx.cos(math.pi * progress))
-            decay_multiplier = mx.maximum(mx.array(min_lr_ratio), cosine)
-        multiplier = mx.where(step < warmup_steps, warmup_multiplier, decay_multiplier)
-        return learning_rate * multiplier
-
-    return schedule
-
-
 def tree_add(left: dict, right: dict) -> dict:
-    _, tree_map, _ = _mlx_tree_utils()
     return tree_map(lambda a, b: a + b, left, right)
 
 
 def tree_scale(tree: dict, scale: float | object) -> dict:
-    _, tree_map, _ = _mlx_tree_utils()
     return tree_map(lambda value: value * scale, tree)
 
 
 def global_grad_norm(grads: dict):
-    mx = _mlx_core()
-    tree_flatten, _, _ = _mlx_tree_utils()
     total = mx.array(0.0)
     for _, grad in tree_flatten(grads):
         total = total + mx.sum(grad.astype(mx.float32) * grad.astype(mx.float32))
@@ -538,7 +414,6 @@ def clip_gradients_by_global_norm(
     grads: dict,
     max_norm: float,
 ) -> tuple[dict, object]:
-    mx = _mlx_core()
     grad_norm = global_grad_norm(grads)
     scale = mx.where(
         grad_norm > max_norm,
@@ -567,7 +442,7 @@ def accumulate_gradients(
     loss: float,
     gradient_accumulation_steps: int,
 ) -> None:
-    window.micro_step += ROW_INCREMENT
+    window.micro_step += 1
     window.loss_sum += loss
     scaled_grads = tree_scale(grads, 1.0 / gradient_accumulation_steps)
     window.accumulated_grads = (
@@ -615,16 +490,6 @@ def resolve_mlx_checkpoint_path(training_config: TrainingConfig) -> Path:
     return resolve_path(checkpoint_path)
 
 
-def _json_ready(value: object) -> object:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, dict):
-        return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_ready(item) for item in value]
-    return value
-
-
 def save_checkpoint(
     checkpoint_path: Path,
     model,
@@ -635,18 +500,16 @@ def save_checkpoint(
     input_files: Iterable[Path] = (),
     data_state: TrainingDataState | None = None,
 ) -> None:
-    mx = _mlx_core()
-    tree_flatten, _, _ = _mlx_tree_utils()
     checkpoint_path.mkdir(parents=True, exist_ok=True)
     model.save_weights(str(checkpoint_path / MODEL_WEIGHTS_NAME))
     optimizer_state = tree_flatten(optimizer.state, destination={})
     mx.savez(str(checkpoint_path / OPTIMIZER_STATE_NAME), **optimizer_state)
     metadata = {
         "step": step,
-        "model_config": _json_ready(asdict(model_config)),
-        "training_config": _json_ready(asdict(training_config)),
+        "model_config": json_ready(asdict(model_config)),
+        "training_config": json_ready(asdict(training_config)),
         "input_files": [str(input_file) for input_file in input_files],
-        "data_state": None if data_state is None else _json_ready(asdict(data_state)),
+        "data_state": None if data_state is None else json_ready(asdict(data_state)),
         "stochastic_resume": "not_guaranteed",
         "resume_note": STOCHASTIC_RESUME_NOTE,
     }
@@ -663,8 +526,6 @@ def load_training_checkpoint(
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
 
-    mx = _mlx_core()
-    _, _, tree_unflatten = _mlx_tree_utils()
     weights_path = checkpoint_path / MODEL_WEIGHTS_NAME
     optimizer_path = checkpoint_path / OPTIMIZER_STATE_NAME
     metadata_path = checkpoint_path / METADATA_NAME
@@ -705,12 +566,7 @@ def train_model(
     resume_from_checkpoint: bool = False,
 ) -> Path:
     training_config = TrainingConfig() if training_config is None else training_config
-    SMLConfig, SMLLanguageModel, count_parameters = _model_modules()
     base_model_config = SMLConfig() if model_config is None else model_config
-
-    mx = _mlx_core()
-    nn = _mlx_nn()
-    optim = _mlx_optimizers()
 
     set_seed(training_config.seed)
     output_dir = resolve_path(training_config.output_dir)
@@ -773,7 +629,7 @@ def train_model(
     resume_progress = ResumeProgress(batches_to_skip=legacy_batches_to_skip)
     accumulation = GradientAccumulationWindow()
     reading_progress = ReadingProgress()
-    loss_and_grad = nn.value_and_grad(model, _loss_fn(model))
+    loss_and_grad = nn.value_and_grad(model, build_loss_fn(model))
 
     def complete_optimizer_step(
         grads_to_step: dict,
@@ -788,7 +644,7 @@ def train_model(
         optimizer.update(model, clipped_grads)
         _retie_embeddings_if_needed(model)
         mx.eval(model.parameters(), optimizer.state)
-        global_step += ROW_INCREMENT
+        global_step += 1
 
         if global_step % training_config.log_every == 0 or global_step == 1:
             lr = float(optimizer.learning_rate.item())
@@ -804,6 +660,19 @@ def train_model(
                 )
             )
 
+        if is_step_limit_reached(global_step, training_config.max_steps):
+            save_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                checkpoint_model_config,
+                training_config,
+                global_step,
+                input_files=input_files,
+                data_state=data_state,
+            )
+            return True
+
         if (
             training_config.save_every > 0
             and global_step % training_config.save_every == 0
@@ -818,19 +687,6 @@ def train_model(
                 input_files=input_files,
                 data_state=data_state,
             )
-
-        if is_step_limit_reached(global_step, training_config.max_steps):
-            save_checkpoint(
-                checkpoint_path,
-                model,
-                optimizer,
-                checkpoint_model_config,
-                training_config,
-                global_step,
-                input_files=input_files,
-                data_state=data_state,
-            )
-            return True
         return False
 
     print(f"Input files: {len(input_files)}")
@@ -896,16 +752,6 @@ def train_model(
         data_state=data_state,
     )
     return checkpoint_path
-
-
-def _loss_fn(model):
-    def loss_fn(input_ids, labels):
-        output = model(input_ids, labels=labels)
-        if output.loss is None:
-            raise RuntimeError("Model did not return a training loss")
-        return output.loss
-
-    return loss_fn
 
 
 def build_parser() -> argparse.ArgumentParser:

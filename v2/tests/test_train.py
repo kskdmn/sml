@@ -55,9 +55,7 @@ class PureModelConfig:
     intermediate_size: int = 16
     original_max_position_embeddings: int = 16
     rope_scaling_factor: float = 2.0
-    attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
-    gradient_checkpointing: bool = False
     bos_token_id: int = 1
     eos_token_id: int = 2
     pad_token_id: int = 3
@@ -76,9 +74,7 @@ def tiny_config():
             intermediate_size=16,
             original_max_position_embeddings=16,
             rope_scaling_factor=2.0,
-            attention_dropout=0.0,
             hidden_dropout=0.0,
-            gradient_checkpointing=False,
             bos_token_id=1,
             eos_token_id=2,
             pad_token_id=3,
@@ -196,6 +192,14 @@ class TestTrainData:
         training_config = TrainingConfig()
 
         assert "bfloat16" == training_config.autocast_dtype
+
+    def test_training_config_derives_warmup_steps_from_lr_total_steps(self):
+        from train_sml import TrainingConfig
+
+        assert 1_000 == TrainingConfig().warmup_steps
+        assert 500 == TrainingConfig(lr_total_steps=50_000).warmup_steps
+        assert 100 == TrainingConfig(lr_total_steps=None).warmup_steps
+        assert 7 == TrainingConfig(warmup_steps=7).warmup_steps
 
     def test_resolve_compute_dtype_maps_supported_names(self):
         import mlx.core as mx
@@ -602,10 +606,10 @@ class TestTrainData:
         assert 2.0 == config.rope_scaling_factor
 
     def test_lr_lambda_warms_up_then_cosine_decays_to_floor(self):
-        import train_sml
+        import utils
 
         assert 0.5 == pytest.approx(
-            train_sml.lr_lambda(
+            utils.lr_lambda(
                 step=0,
                 total_steps=10,
                 warmup_steps=2,
@@ -613,7 +617,7 @@ class TestTrainData:
             )
         )
         assert 1.0 == pytest.approx(
-            train_sml.lr_lambda(
+            utils.lr_lambda(
                 step=2,
                 total_steps=10,
                 warmup_steps=2,
@@ -621,7 +625,7 @@ class TestTrainData:
             )
         )
         assert 0.1 == pytest.approx(
-            train_sml.lr_lambda(
+            utils.lr_lambda(
                 step=10,
                 total_steps=10,
                 warmup_steps=2,
@@ -630,9 +634,9 @@ class TestTrainData:
         )
 
     def test_lr_lambda_keeps_constant_schedule_without_total_steps(self):
-        import train_sml
+        import utils
 
-        assert 1.0 == train_sml.lr_lambda(
+        assert 1.0 == utils.lr_lambda(
             step=10,
             total_steps=None,
             warmup_steps=2,
@@ -694,9 +698,9 @@ class TestCanonicalMlxTraining:
 
     def test_mlx_lr_schedule_matches_training_helper(self):
         mx = require_mlx()
-        import train_sml
+        import utils
 
-        schedule = train_sml.build_lr_schedule(
+        schedule = utils.build_lr_schedule(
             learning_rate=0.01,
             total_steps=10,
             warmup_steps=2,
@@ -704,7 +708,7 @@ class TestCanonicalMlxTraining:
         )
 
         for step in (0, 1, 5, 10):
-            expected = 0.01 * train_sml.lr_lambda(
+            expected = 0.01 * utils.lr_lambda(
                 step=step,
                 total_steps=10,
                 warmup_steps=2,

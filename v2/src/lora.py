@@ -13,16 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
-
-try:
-    import mlx.nn as nn
-except RuntimeError as exc:  # pragma: no cover - depends on host MLX access
-    nn = None
-    _MLX_IMPORT_ERROR = exc
-    _ModuleBase = object
-else:
-    _MLX_IMPORT_ERROR = None
-    _ModuleBase = nn.Module
+import mlx.nn as nn
 
 if TYPE_CHECKING:
     from sml import SMLLanguageModel
@@ -53,13 +44,7 @@ class LoRAConfig:
     )
 
 
-def _require_mlx_nn():
-    if nn is None:
-        raise RuntimeError(f"mlx.nn is not available: {_MLX_IMPORT_ERROR}")
-    return nn
-
-
-class LoRALinear(_ModuleBase):
+class LoRALinear(nn.Module):
     def __init__(
         self,
         linear,
@@ -70,7 +55,6 @@ class LoRALinear(_ModuleBase):
         """
         Compute ``linear(x) + scaling * (x @ A.T @ B.T)`` with base weights frozen.
         """
-        mlx_nn = _require_mlx_nn()
         super().__init__()
         if rank <= 0:
             raise ValueError("LoRA rank must be positive")
@@ -80,9 +64,7 @@ class LoRALinear(_ModuleBase):
         self.linear = linear
         self.rank = rank
         self.scaling = alpha / rank
-        self.lora_dropout = (
-            mlx_nn.Dropout(dropout) if dropout > 0.0 else mlx_nn.Identity()
-        )
+        self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         input_dims = linear.weight.shape[1]
         output_dims = linear.weight.shape[0]
         self.lora_A = mx.random.normal(shape=(rank, input_dims)) * 0.01
@@ -112,10 +94,9 @@ def apply_lora(model: "SMLLanguageModel", config: LoRAConfig) -> "SMLLanguageMod
     """
     Replace matching linear projections with ``LoRALinear`` wrappers in place.
     """
-    mlx_nn = _require_mlx_nn()
     target_modules: list[tuple[str, object]] = []
     for name, module in list(model.named_modules()):
-        if not isinstance(module, mlx_nn.Linear):
+        if not isinstance(module, nn.Linear):
             continue
 
         short_name = name.rsplit(".", 1)[-1]
