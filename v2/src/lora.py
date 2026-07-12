@@ -9,7 +9,7 @@ checkpoints load through the standard inference path.
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -92,6 +92,8 @@ class LoRALinear(nn.Module):
         rank: int,
         alpha: float,
         dropout: float = 0.0,
+        lora_a_initializer_range: float = 0.01,
+        lora_b_initializer_range: float = 0.0,
     ) -> None:
         """
         Compute ``linear(x) + scaling * (x @ A.T @ B.T)`` with base weights frozen.
@@ -101,6 +103,12 @@ class LoRALinear(nn.Module):
             raise ValueError("LoRA rank must be positive")
         if alpha <= 0.0:
             raise ValueError("LoRA alpha must be positive")
+        for field_name, value in (
+            ("lora_a_initializer_range", lora_a_initializer_range),
+            ("lora_b_initializer_range", lora_b_initializer_range),
+        ):
+            if value is None or not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{field_name} must be non-negative and finite")
 
         self.linear = linear
         self.rank = rank
@@ -108,8 +116,18 @@ class LoRALinear(nn.Module):
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         input_dims = linear.weight.shape[1]
         output_dims = linear.weight.shape[0]
-        self.lora_A = mx.random.normal(shape=(rank, input_dims)) * 0.01
-        self.lora_B = mx.zeros((output_dims, rank), dtype=linear.weight.dtype)
+        self.lora_A = mx.random.normal(
+            shape=(rank, input_dims),
+            scale=lora_a_initializer_range,
+        )
+        self.lora_B = (
+            mx.zeros((output_dims, rank), dtype=linear.weight.dtype)
+            if lora_b_initializer_range == 0.0
+            else mx.random.normal(
+                shape=(output_dims, rank),
+                scale=lora_b_initializer_range,
+            )
+        )
         self.linear.freeze()
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -131,10 +149,36 @@ class LoRALinear(nn.Module):
         return self.linear
 
 
-def apply_lora(model: "SMLLanguageModel", config: LoRAConfig) -> "SMLLanguageModel":
+def resolve_lora_initializer_range(
+    parameter_initializer_range,
+    field_name: str,
+    default: float,
+) -> float:
+    if parameter_initializer_range is None:
+        return default
+    if isinstance(parameter_initializer_range, Mapping):
+        return parameter_initializer_range.get(field_name, default)
+    return getattr(parameter_initializer_range, field_name, default)
+
+
+def apply_lora(
+    model: "SMLLanguageModel",
+    config: LoRAConfig,
+    parameter_initializer_range=None,
+) -> "SMLLanguageModel":
     """
     Replace matching linear projections with ``LoRALinear`` wrappers in place.
     """
+    lora_a_initializer_range = resolve_lora_initializer_range(
+        parameter_initializer_range,
+        "lora_a",
+        0.01,
+    )
+    lora_b_initializer_range = resolve_lora_initializer_range(
+        parameter_initializer_range,
+        "lora_b",
+        0.0,
+    )
     target_modules: list[tuple[str, object]] = []
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
@@ -157,6 +201,8 @@ def apply_lora(model: "SMLLanguageModel", config: LoRAConfig) -> "SMLLanguageMod
             rank=config.rank,
             alpha=config.alpha,
             dropout=config.dropout,
+            lora_a_initializer_range=lora_a_initializer_range,
+            lora_b_initializer_range=lora_b_initializer_range,
         )
         wrapper.unfreeze(keys=[LORA_A_SUFFIX, LORA_B_SUFFIX], recurse=False)
         setattr(parent, child_name, wrapper)

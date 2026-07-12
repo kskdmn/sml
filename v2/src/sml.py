@@ -11,6 +11,73 @@ from config import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, UNK_TOKEN_ID
 
 
 @dataclass(slots=True)
+class ParameterInitializerRangeConfig:
+    """
+    Per-parameter-type normal initializer standard deviations.
+
+    ``o_proj`` and ``down_proj`` are residual-output projections and should use a
+    depth-scaled value when the config is created from ``SMLConfig`` defaults.
+    """
+
+    embed_tokens: float = 0.02
+    lm_head: float = 0.02
+    q_proj: float = 0.02
+    k_proj: float = 0.02
+    v_proj: float = 0.02
+    o_proj: float = 0.02
+    gate_proj: float = 0.02
+    up_proj: float = 0.02
+    down_proj: float = 0.02
+    other: float = 0.02
+
+    def validate_initializer_range(self, value: float, field_name: str) -> None:
+        if value is None or not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{field_name} must be non-negative and finite")
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "embed_tokens",
+            "lm_head",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "other",
+        ):
+            self.validate_initializer_range(getattr(self, field_name), field_name)
+
+    @classmethod
+    def depth_scaled(
+        cls,
+        initializer_range: float,
+        num_layers: int,
+    ) -> "ParameterInitializerRangeConfig":
+        if initializer_range is None or not math.isfinite(initializer_range):
+            raise ValueError("initializer_range must be non-negative and finite")
+        if initializer_range < 0.0:
+            raise ValueError("initializer_range must be non-negative and finite")
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+
+        residual_initializer_range = initializer_range / math.sqrt(2 * num_layers)
+        return cls(
+            embed_tokens=initializer_range,
+            lm_head=initializer_range,
+            q_proj=initializer_range,
+            k_proj=initializer_range,
+            v_proj=initializer_range,
+            o_proj=residual_initializer_range,
+            gate_proj=initializer_range,
+            up_proj=initializer_range,
+            down_proj=residual_initializer_range,
+            other=initializer_range,
+        )
+
+
+@dataclass(slots=True)
 class SMLConfig:
     """
     Model hyperparameters.
@@ -52,6 +119,7 @@ class SMLConfig:
     rms_norm_eps: float = 1e-6
     hidden_dropout: float = 0.01  # If overfitting, try 0.1
     initializer_range: float = 0.02
+    parameter_initializer_range: ParameterInitializerRangeConfig | dict | None = None
     pad_token_id: int = PAD_TOKEN_ID
     bos_token_id: int = BOS_TOKEN_ID
     eos_token_id: int = EOS_TOKEN_ID
@@ -97,6 +165,30 @@ class SMLConfig:
             or self.hidden_dropout >= 1.0
         ):
             raise ValueError("hidden_dropout must be in [0, 1)")
+        if (
+            self.initializer_range is None
+            or not math.isfinite(self.initializer_range)
+            or self.initializer_range < 0.0
+        ):
+            raise ValueError("initializer_range must be non-negative and finite")
+        if self.parameter_initializer_range is None:
+            self.parameter_initializer_range = (
+                ParameterInitializerRangeConfig.depth_scaled(
+                    self.initializer_range,
+                    self.num_layers,
+                )
+            )
+        elif isinstance(self.parameter_initializer_range, dict):
+            self.parameter_initializer_range = ParameterInitializerRangeConfig(
+                **self.parameter_initializer_range
+            )
+        elif not isinstance(
+            self.parameter_initializer_range,
+            ParameterInitializerRangeConfig,
+        ):
+            raise ValueError(
+                "parameter_initializer_range must be a ParameterInitializerRangeConfig"
+            )
         if (
             not math.isfinite(self.yarn_beta_fast)
             or not math.isfinite(self.yarn_beta_slow)
@@ -618,8 +710,11 @@ class GroupedQueryAttention(nn.Module):
             config.hidden_size,
             bias=False,
         )
-        for linear in (self.q_proj, self.k_proj, self.v_proj, self.o_proj):
-            _init_linear(linear, config.initializer_range)
+        initializer_range = config.parameter_initializer_range
+        _init_linear(self.q_proj, initializer_range.q_proj)
+        _init_linear(self.k_proj, initializer_range.k_proj)
+        _init_linear(self.v_proj, initializer_range.v_proj)
+        _init_linear(self.o_proj, initializer_range.o_proj)
         self.rope = RotaryEmbedding(
             dim=self.head_dim,
             original_max_position_embeddings=config.original_max_position_embeddings,
@@ -693,8 +788,10 @@ class SwiGLUFeedForward(nn.Module):
             config.hidden_size,
             bias=False,
         )
-        for linear in (self.gate_proj, self.up_proj, self.down_proj):
-            _init_linear(linear, config.initializer_range)
+        initializer_range = config.parameter_initializer_range
+        _init_linear(self.gate_proj, initializer_range.gate_proj)
+        _init_linear(self.up_proj, initializer_range.up_proj)
+        _init_linear(self.down_proj, initializer_range.down_proj)
         self.dropout = nn.Dropout(config.hidden_dropout)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -727,7 +824,7 @@ class SMLLanguageModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         _init_embedding(
             self.embed_tokens,
-            config.initializer_range,
+            config.parameter_initializer_range.embed_tokens,
             config.pad_token_id,
         )
         self.layers = [
@@ -735,7 +832,7 @@ class SMLLanguageModel(nn.Module):
         ]
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        _init_linear(self.lm_head, config.initializer_range)
+        _init_linear(self.lm_head, config.parameter_initializer_range.lm_head)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
 

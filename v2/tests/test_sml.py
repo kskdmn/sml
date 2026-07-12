@@ -44,6 +44,45 @@ class TestSMLConfig:
         assert not hasattr(config, "attention_dropout")
         assert not hasattr(config, "gradient_checkpointing")
 
+    def test_default_initializer_ranges_depth_scale_residual_outputs(self):
+        import math
+
+        from sml import SMLConfig
+
+        config = SMLConfig(num_layers=8)
+        initializer_range = config.parameter_initializer_range
+        residual_initializer_range = config.initializer_range / math.sqrt(
+            2 * config.num_layers
+        )
+
+        assert initializer_range.embed_tokens == pytest.approx(0.02)
+        assert initializer_range.lm_head == pytest.approx(0.02)
+        assert initializer_range.q_proj == pytest.approx(0.02)
+        assert initializer_range.k_proj == pytest.approx(0.02)
+        assert initializer_range.v_proj == pytest.approx(0.02)
+        assert initializer_range.o_proj == pytest.approx(residual_initializer_range)
+        assert initializer_range.gate_proj == pytest.approx(0.02)
+        assert initializer_range.up_proj == pytest.approx(0.02)
+        assert initializer_range.down_proj == pytest.approx(residual_initializer_range)
+        assert initializer_range.other == pytest.approx(0.02)
+
+    def test_parameter_initializer_range_config_rejects_unset_values(self):
+        from sml import ParameterInitializerRangeConfig
+
+        with pytest.raises(ValueError, match="q_proj"):
+            ParameterInitializerRangeConfig(q_proj=None)
+
+    def test_parameter_initializer_range_config_validates_initializer_range_with_member_method(
+        self,
+    ):
+        from sml import ParameterInitializerRangeConfig
+
+        config = ParameterInitializerRangeConfig()
+
+        config.validate_initializer_range(0.0, "q_proj")
+        with pytest.raises(ValueError, match="q_proj"):
+            config.validate_initializer_range(float("inf"), "q_proj")
+
     def test_invalid_attention_shape_is_rejected(self):
         from sml import SMLConfig
 
@@ -130,6 +169,60 @@ class TestSMLModel:
             eos_token_id=2,
             pad_token_id=3,
         )
+
+    def test_model_uses_per_parameter_initializer_ranges(self, monkeypatch):
+        import sml
+        from sml import (
+            ParameterInitializerRangeConfig,
+            SMLConfig,
+            SMLLanguageModel,
+        )
+
+        def fake_normal(*, shape, scale):
+            return mx.full(shape, scale)
+
+        def assert_full(array, value):
+            assert bool(mx.allclose(array, mx.full(array.shape, value)).item())
+
+        monkeypatch.setattr(sml.mx.random, "normal", fake_normal)
+        config = SMLConfig(
+            vocab_size=16,
+            hidden_size=8,
+            num_layers=1,
+            num_q_heads=2,
+            num_kv_heads=1,
+            intermediate_size=16,
+            original_max_position_embeddings=16,
+            rope_scaling_factor=1.0,
+            hidden_dropout=0.0,
+            pad_token_id=None,
+            tie_word_embeddings=False,
+            parameter_initializer_range=ParameterInitializerRangeConfig(
+                embed_tokens=0.011,
+                lm_head=0.012,
+                q_proj=0.013,
+                k_proj=0.014,
+                v_proj=0.015,
+                o_proj=0.016,
+                gate_proj=0.017,
+                up_proj=0.018,
+                down_proj=0.019,
+            ),
+        )
+
+        model = SMLLanguageModel(config)
+        block = model.layers[0]
+
+        assert_full(model.embed_tokens.weight, 0.011)
+        assert_full(model.lm_head.weight, 0.012)
+        assert_full(block.self_attn.q_proj.weight, 0.013)
+        assert_full(block.self_attn.k_proj.weight, 0.014)
+        assert_full(block.self_attn.v_proj.weight, 0.015)
+        assert_full(block.self_attn.o_proj.weight, 0.016)
+        assert_full(block.mlp.gate_proj.weight, 0.017)
+        assert_full(block.mlp.up_proj.weight, 0.018)
+        assert_full(block.mlp.down_proj.weight, 0.019)
+        assert_full(block.input_norm.weight, 1.0)
 
     def test_forward_returns_logits_and_causal_lm_loss(self):
         from sml import SMLLanguageModel

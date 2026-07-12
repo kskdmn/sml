@@ -82,6 +82,34 @@ class TestFtSwag:
         assert config.lora_a == pytest.approx(0.0)
         assert config.lora_b == pytest.approx(0.0)
 
+    def test_swag_parameter_initializer_range_config_extends_base_defaults(self):
+        import ft_swag
+        from sml import ParameterInitializerRangeConfig
+
+        config = ft_swag.SwagParameterInitializerRangeConfig()
+
+        assert isinstance(config, ParameterInitializerRangeConfig)
+        assert config.q_proj == pytest.approx(0.02)
+        assert config.down_proj == pytest.approx(0.02)
+        assert config.lora_a == pytest.approx(0.01)
+        assert config.lora_b == pytest.approx(0.0)
+
+    def test_swag_fine_tune_config_uses_depth_scaled_initializer_defaults(self):
+        import ft_swag
+        from sml import SMLConfig
+
+        base_initializer_range = SMLConfig().parameter_initializer_range
+        config = ft_swag.SwagFineTuneConfig()
+
+        assert config.parameter_initializer_range.o_proj == pytest.approx(
+            base_initializer_range.o_proj
+        )
+        assert config.parameter_initializer_range.down_proj == pytest.approx(
+            base_initializer_range.down_proj
+        )
+        assert config.parameter_initializer_range.lora_a == pytest.approx(0.01)
+        assert config.parameter_initializer_range.lora_b == pytest.approx(0.0)
+
     def test_swag_parameter_weight_decay_config_classifies_lora_parameters(self):
         require_mlx_runtime()
         from mlx.utils import tree_flatten

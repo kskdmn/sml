@@ -46,7 +46,12 @@ from lora import (
     merge_lora,
     require_lora_modules,
 )
-from sml import SMLConfig, SMLLanguageModel, count_parameters
+from sml import (
+    ParameterInitializerRangeConfig,
+    SMLConfig,
+    SMLLanguageModel,
+    count_parameters,
+)
 from train_sml import (
     GradientAccumulationWindow,
     ParameterWeightDecayConfig,
@@ -104,6 +109,29 @@ class SwagParameterWeightDecayConfig(ParameterWeightDecayConfig):
 
 
 @dataclass(slots=True)
+class SwagParameterInitializerRangeConfig(ParameterInitializerRangeConfig):
+    """
+    SWAG fine-tuning initializer ranges, including LoRA adapter matrices.
+    """
+
+    lora_a: float = 0.01
+    lora_b: float = 0.0
+
+    def __post_init__(self) -> None:
+        ParameterInitializerRangeConfig.__post_init__(self)
+        self.validate_initializer_range(self.lora_a, "lora_a")
+        self.validate_initializer_range(self.lora_b, "lora_b")
+
+
+def default_swag_parameter_initializer_range() -> SwagParameterInitializerRangeConfig:
+    """
+    Match base-model depth-scaled defaults and add LoRA adapter ranges.
+    """
+    base_initializer_range = SMLConfig().parameter_initializer_range
+    return SwagParameterInitializerRangeConfig(**asdict(base_initializer_range))
+
+
+@dataclass(slots=True)
 class SwagFineTuneConfig:
     """
     LoRA fine-tuning hyperparameters for SWAG continuation training.
@@ -129,6 +157,9 @@ class SwagFineTuneConfig:
     max_examples: int | None = None
     shuffle_examples: bool = True
     lora: LoRAConfig = field(default_factory=LoRAConfig)
+    parameter_initializer_range: SwagParameterInitializerRangeConfig = field(
+        default_factory=default_swag_parameter_initializer_range
+    )
     learning_rate: float = 1e-4
     parameter_weight_decay: SwagParameterWeightDecayConfig = field(
         default_factory=SwagParameterWeightDecayConfig
@@ -500,7 +531,11 @@ def prepare_lora_model(
     """
     Attach LoRA adapters after base weights are loaded and freeze base parameters.
     """
-    apply_lora(model, fine_tune_config.lora)
+    apply_lora(
+        model,
+        fine_tune_config.lora,
+        parameter_initializer_range=fine_tune_config.parameter_initializer_range,
+    )
     require_lora_modules(model, fine_tune_config.lora.target_modules)
 
 
