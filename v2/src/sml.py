@@ -17,6 +17,8 @@ class ParameterInitializerRangeConfig:
 
     ``o_proj`` and ``down_proj`` are residual-output projections and should use a
     depth-scaled value when the config is created from ``SMLConfig`` defaults.
+
+    No parameter is defined for ``rms_norm`` because its weights are not random-normal initialized.
     """
 
     embed_tokens: float = 0.02
