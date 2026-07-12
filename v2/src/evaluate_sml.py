@@ -12,6 +12,8 @@ generation tasks.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any
@@ -32,6 +34,15 @@ from infer_sml import InferenceTokenizer, decode_token_ids, encode_prompt, load_
 from utils import load_tokenizer
 
 BENCHMARKS = ("hellaswag", "winogrande")
+DEFAULT_LOGLIKELIHOOD_BATCH_SIZE = 8
+
+
+@dataclass(frozen=True, slots=True)
+class EncodedLoglikelihoodRequest:
+    index: int
+    args: tuple[Any, ...]
+    token_ids: list[int]
+    continuation_start: int
 
 
 class SMLEvalLM(LM):
@@ -39,13 +50,17 @@ class SMLEvalLM(LM):
         self,
         model: Any,
         tokenizer: InferenceTokenizer,
+        loglikelihood_batch_size: int = DEFAULT_LOGLIKELIHOOD_BATCH_SIZE,
     ) -> None:
         """
         Keep the local model and tokenizer together for lm-eval.
         """
         super().__init__()
+        if loglikelihood_batch_size <= 0:
+            raise ValueError("loglikelihood_batch_size must be positive")
         self.model = model
         self.tokenizer = tokenizer
+        self.loglikelihood_batch_size = loglikelihood_batch_size
 
     @classmethod
     def from_checkpoint(
@@ -68,45 +83,109 @@ class SMLEvalLM(LM):
         """
         Score each continuation by summing next-token log-probabilities.
         """
-        results: list[tuple[float, bool]] = []
-        for request in requests:
+        encoded_requests = self._encode_loglikelihood_requests(requests)
+        results: list[tuple[float, bool] | None] = [None] * len(encoded_requests)
+        for batch in self._iter_loglikelihood_batches(encoded_requests):
+            self._score_loglikelihood_batch(batch, results)
+
+        return [self._require_loglikelihood_result(result) for result in results]
+
+    def _encode_loglikelihood_requests(
+        self,
+        requests: list[Instance],
+    ) -> list[EncodedLoglikelihoodRequest]:
+        encoded_requests = []
+        max_length = self.model.config.effective_max_position_embeddings
+        for index, request in enumerate(requests):
             context, continuation = request.args
             token_ids, continuation_start = self._encode_context_continuation(
                 context,
                 continuation,
             )
-            max_length = self.model.config.effective_max_position_embeddings
             if len(token_ids) > max_length:
                 raise ValueError(
                     "prompt plus continuation exceeds the checkpoint context window: "
                     f"{len(token_ids)} > {max_length}"
                 )
-
-            input_ids = mx.array(
-                [token_ids],
-                dtype=mx.int32,
-            )
-            output = self.model(input_ids)
-
-            logits = output.logits
-            log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-            continuation_positions = range(continuation_start, len(token_ids))
-            logprob = 0.0
-            is_greedy = True
-            for target_position in continuation_positions:
-                predictor_position = target_position - 1
-                target_token_id = token_ids[target_position]
-                logprob += float(
-                    log_probs[0, predictor_position, target_token_id].item()
+            encoded_requests.append(
+                EncodedLoglikelihoodRequest(
+                    index=index,
+                    args=request.args,
+                    token_ids=token_ids,
+                    continuation_start=continuation_start,
                 )
-                greedy_token_id = int(mx.argmax(logits[0, predictor_position]).item())
-                is_greedy = is_greedy and greedy_token_id == target_token_id
+            )
+        return encoded_requests
 
-            result = (logprob, is_greedy)
-            results.append(result)
+    def _iter_loglikelihood_batches(
+        self,
+        requests: list[EncodedLoglikelihoodRequest],
+    ) -> Iterator[list[EncodedLoglikelihoodRequest]]:
+        for start in range(0, len(requests), self.loglikelihood_batch_size):
+            yield requests[start : start + self.loglikelihood_batch_size]
+
+    def _score_loglikelihood_batch(
+        self,
+        batch: list[EncodedLoglikelihoodRequest],
+        results: list[tuple[float, bool] | None],
+    ) -> None:
+        max_length = max(len(request.token_ids) for request in batch)
+        pad_token_id = self.model.config.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
+        input_ids = mx.array(
+            [
+                request.token_ids
+                + [pad_token_id] * (max_length - len(request.token_ids))
+                for request in batch
+            ],
+            dtype=mx.int32,
+        )
+        output = self.model(input_ids)
+        logits = output.logits
+        log_probs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        mx.eval(logits, log_probs)
+
+        for row_index, request in enumerate(batch):
+            result = self._score_encoded_loglikelihood_request(
+                request,
+                row_index,
+                logits,
+                log_probs,
+            )
+            results[request.index] = result
             self.cache_hook.add_partial("loglikelihood", request.args, result)
 
-        return results
+    def _score_encoded_loglikelihood_request(
+        self,
+        request: EncodedLoglikelihoodRequest,
+        row_index: int,
+        logits: mx.array,
+        log_probs: mx.array,
+    ) -> tuple[float, bool]:
+        logprob = 0.0
+        is_greedy = True
+        for target_position in range(
+            request.continuation_start, len(request.token_ids)
+        ):
+            predictor_position = target_position - 1
+            target_token_id = request.token_ids[target_position]
+            logprob += float(
+                log_probs[row_index, predictor_position, target_token_id].item()
+            )
+            greedy_token_id = int(
+                mx.argmax(logits[row_index, predictor_position]).item()
+            )
+            is_greedy = is_greedy and greedy_token_id == target_token_id
+        return logprob, is_greedy
+
+    def _require_loglikelihood_result(
+        self,
+        result: tuple[float, bool] | None,
+    ) -> tuple[float, bool]:
+        if result is None:
+            raise RuntimeError("missing loglikelihood result")
+        return result
 
     def _encode_context_continuation(
         self,
@@ -222,7 +301,7 @@ def evaluate_lm(
         model_args={"path": str(checkpoint_path)},
         tasks=tasks,
         num_fewshot=0,
-        batch_size=1,
+        batch_size=DEFAULT_LOGLIKELIHOOD_BATCH_SIZE,
         limit=limit,
         log_samples=False,
         **extra_options,

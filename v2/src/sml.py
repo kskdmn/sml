@@ -653,14 +653,18 @@ def apply_rotary_pos_emb(
 
 
 class KVCache:
-    def __init__(self) -> None:
-        self.key_cache: list[mx.array] = []
-        self.value_cache: list[mx.array] = []
+    def __init__(self, max_seq_len: int | None = None) -> None:
+        if max_seq_len is not None and max_seq_len <= 0:
+            raise ValueError("max_seq_len must be positive when set")
+        self.max_seq_len = max_seq_len
+        self.key_cache: list[mx.array | None] = []
+        self.value_cache: list[mx.array | None] = []
+        self.seq_lens: list[int] = []
 
     def get_seq_len(self, layer_idx: int) -> int:
-        if layer_idx >= len(self.key_cache):
+        if layer_idx >= len(self.seq_lens):
             return 0
-        return self.key_cache[layer_idx].shape[2]
+        return self.seq_lens[layer_idx]
 
     def update(
         self,
@@ -668,20 +672,113 @@ class KVCache:
         key: mx.array,
         value: mx.array,
     ) -> tuple[mx.array, mx.array]:
-        if layer_idx >= len(self.key_cache):
-            self.key_cache.append(key)
-            self.value_cache.append(value)
-        else:
-            self.key_cache[layer_idx] = mx.concatenate(
-                [self.key_cache[layer_idx], key],
-                axis=2,
-            )
-            self.value_cache[layer_idx] = mx.concatenate(
-                [self.value_cache[layer_idx], value],
-                axis=2,
+        if key.shape != value.shape:
+            raise ValueError("key and value cache updates must have the same shape")
+        self._ensure_capacity(layer_idx, key)
+        start = self.seq_lens[layer_idx]
+        end = start + key.shape[2]
+
+        cached_key = self.key_cache[layer_idx]
+        cached_value = self.value_cache[layer_idx]
+        if cached_key is None or cached_value is None:
+            raise RuntimeError("KV cache layer was not initialized")
+
+        self.key_cache[layer_idx] = mx.slice_update(
+            cached_key,
+            key,
+            start_indices=mx.array(start),
+            axes=(2,),
+        )
+        self.value_cache[layer_idx] = mx.slice_update(
+            cached_value,
+            value,
+            start_indices=mx.array(start),
+            axes=(2,),
+        )
+        self.seq_lens[layer_idx] = end
+        return self._valid_prefix(layer_idx)
+
+    def _ensure_layer(self, layer_idx: int) -> None:
+        while layer_idx >= len(self.key_cache):
+            self.key_cache.append(None)
+            self.value_cache.append(None)
+            self.seq_lens.append(0)
+
+    def _ensure_capacity(self, layer_idx: int, update: mx.array) -> None:
+        self._ensure_layer(layer_idx)
+        current_len = self.seq_lens[layer_idx]
+        needed_len = current_len + update.shape[2]
+        if self.max_seq_len is not None and needed_len > self.max_seq_len:
+            raise ValueError(
+                f"KV cache update exceeds max_seq_len: {needed_len} > {self.max_seq_len}"
             )
 
-        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+        cached_key = self.key_cache[layer_idx]
+        cached_value = self.value_cache[layer_idx]
+        if cached_key is None or cached_value is None:
+            capacity = self.max_seq_len if self.max_seq_len is not None else needed_len
+            self.key_cache[layer_idx] = mx.zeros(
+                (*update.shape[:2], capacity, update.shape[3]),
+                dtype=update.dtype,
+            )
+            self.value_cache[layer_idx] = mx.zeros(
+                (*update.shape[:2], capacity, update.shape[3]),
+                dtype=update.dtype,
+            )
+            return
+
+        if (
+            cached_key.shape[:2] != update.shape[:2]
+            or cached_key.shape[3] != update.shape[3]
+        ):
+            raise ValueError("KV cache update shape does not match existing cache")
+        if cached_key.shape[2] >= needed_len:
+            return
+
+        capacity = max(needed_len, cached_key.shape[2] * 2)
+        self.key_cache[layer_idx] = self._resize_cache(
+            cached_key, capacity, current_len
+        )
+        self.value_cache[layer_idx] = self._resize_cache(
+            cached_value,
+            capacity,
+            current_len,
+        )
+
+    def _resize_cache(
+        self,
+        cache: mx.array,
+        capacity: int,
+        valid_len: int,
+    ) -> mx.array:
+        resized = mx.zeros(
+            (*cache.shape[:2], capacity, cache.shape[3]),
+            dtype=cache.dtype,
+        )
+        if valid_len == 0:
+            return resized
+        return mx.slice_update(
+            resized,
+            self._slice(cache, valid_len),
+            start_indices=mx.array(0),
+            axes=(2,),
+        )
+
+    def _valid_prefix(self, layer_idx: int) -> tuple[mx.array, mx.array]:
+        cached_key = self.key_cache[layer_idx]
+        cached_value = self.value_cache[layer_idx]
+        if cached_key is None or cached_value is None:
+            raise RuntimeError("KV cache layer was not initialized")
+        seq_len = self.seq_lens[layer_idx]
+        return self._slice(cached_key, seq_len), self._slice(cached_value, seq_len)
+
+    def _slice(self, cache: mx.array, seq_len: int) -> mx.array:
+        return mx.slice(
+            cache,
+            start_indices=mx.array(0),
+            axes=(2,),
+            slice_size=(*cache.shape[:2], seq_len, cache.shape[3]),
+        )
 
 
 class GroupedQueryAttention(nn.Module):
@@ -907,7 +1004,9 @@ class SMLLanguageModel(nn.Module):
             self.config.eos_token_id if eos_token_id is None else eos_token_id
         )
         generated = input_ids
-        kv_cache = KVCache() if self.config.use_cache else None
+        kv_cache = (
+            KVCache(max_seq_len=requested_seq_len) if self.config.use_cache else None
+        )
         key = mx.random.key(config.seed) if config.seed is not None else None
 
         for _ in range(max_new_tokens):

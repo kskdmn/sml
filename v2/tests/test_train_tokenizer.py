@@ -202,7 +202,7 @@ class TestTrainTokenizer:
         assert len(byte_min_text.encode(utils.TEXT_ENCODING)) >= utils.MIN_TEXT_LENGTH
         assert ["a" * utils.MIN_TEXT_LENGTH, byte_min_text] == texts
 
-    def test_filtered_text_iterable_keeps_long_utf8_text_when_max_is_unset(self):
+    def test_filtered_text_iterable_keeps_utf8_text_below_max_length(self):
         tokenizer = load_tokenizer_module()
         utils = load_utils_module()
 
@@ -214,8 +214,8 @@ class TestTrainTokenizer:
 
             texts = collect_filtered_texts(tokenizer, [path])
 
-        assert utils.MAX_TEXT_LENGTH is None
-        assert len(byte_long_text.encode(utils.TEXT_ENCODING)) > 2000
+        assert 16_384 == utils.MAX_TEXT_LENGTH
+        assert len(byte_long_text.encode(utils.TEXT_ENCODING)) < utils.MAX_TEXT_LENGTH
         assert [byte_long_text, valid_text] == texts
 
     def test_filtered_text_iterable_normalizes_multiline_text_to_one_line(self):
@@ -396,7 +396,7 @@ class TestTrainTokenizer:
             train.call_args.kwargs.get("user_defined_symbols")
         )
 
-    def test_train_tokenizer_omits_max_sentence_length_when_unset(self, monkeypatch):
+    def test_train_tokenizer_passes_max_sentence_length_when_set(self, monkeypatch):
         train_tokenizer = load_script()
         utils = load_utils_module()
 
@@ -417,5 +417,5 @@ class TestTrainTokenizer:
                 tokenizer_model_path=root / "output" / "tokenizer.model"
             )
 
-        assert train_tokenizer.tokenizer.MAX_SENTENCE_LENGTH is None
-        assert "max_sentence_length" not in train.call_args.kwargs
+        assert utils.MAX_TEXT_LENGTH == train_tokenizer.tokenizer.MAX_SENTENCE_LENGTH
+        assert utils.MAX_TEXT_LENGTH == train.call_args.kwargs["max_sentence_length"]

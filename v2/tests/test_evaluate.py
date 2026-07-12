@@ -145,6 +145,29 @@ class TestSMLEvalLM:
         assert result[0][1]
         assert [[[1, 10, 20]]] == model.calls
 
+    def test_loglikelihood_batches_padded_requests(self):
+        require_mlx_runtime()
+        import evaluate_sml
+
+        model = FakeModel()
+        lm = evaluate_sml.SMLEvalLM(
+            model=model,
+            tokenizer=FakeTokenizer(),
+        )
+        requests = [
+            SimpleNamespace(args=("4 5", " 6")),
+            SimpleNamespace(args=("7", " 8 9")),
+        ]
+
+        result = lm.loglikelihood(requests)
+
+        assert 2 == len(result)
+        assert result[0][0] > -0.001
+        assert result[0][1]
+        assert result[1][0] > -0.001
+        assert result[1][1]
+        assert [[[1, 4, 5, 6], [1, 7, 8, 9]]] == model.calls
+
     def test_loglikelihood_rejects_sequences_beyond_checkpoint_context(self):
         import evaluate_sml
 
@@ -204,7 +227,7 @@ class TestSMLEvalLM:
             model_args={"path": "v2/output/sml"},
             tasks=["hellaswag"],
             num_fewshot=0,
-            batch_size=1,
+            batch_size=evaluate_sml.DEFAULT_LOGLIKELIHOOD_BATCH_SIZE,
             limit=2,
             log_samples=False,
         )

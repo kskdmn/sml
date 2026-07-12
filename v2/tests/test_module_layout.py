@@ -61,7 +61,7 @@ class TestModuleLayout:
         assert train_tokenizer.INPUT_FILE_NAME_REGEX is config.INPUT_FILE_NAME_REGEX
         assert train_sml.INPUT_DIR is config.INPUT_DIR
         assert train_tokenizer.INPUT_DIR is config.INPUT_DIR
-        assert 32_768 == train_tokenizer.MAX_ROWS_PER_FILE
+        assert 8_192 == train_tokenizer.MAX_ROWS_PER_FILE
 
     def test_removed_modules_are_absent(self):
         assert not (SRC_DIR / "sml_config.py").exists()

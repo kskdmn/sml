@@ -32,6 +32,7 @@ MLP_TARGET_MODULES = (
     "up_proj",
     "down_proj",
 )
+LORA_SCALING_MODES = ("lora", "rslora")
 
 
 @dataclass(slots=True)
@@ -44,6 +45,7 @@ class LoRAConfig:
 
     rank: int = 16
     alpha: float = 32.0
+    scaling_mode: str = "rslora"
     dropout: float = 0.05
     target_modules: tuple[str, ...] | None = None
     target_q_proj: bool = True
@@ -59,6 +61,9 @@ class LoRAConfig:
             raise ValueError("LoRA rank must be positive")
         if not math.isfinite(self.alpha) or self.alpha <= 0.0:
             raise ValueError("LoRA alpha must be positive")
+        if self.scaling_mode not in LORA_SCALING_MODES:
+            valid_modes = ", ".join(LORA_SCALING_MODES)
+            raise ValueError(f"LoRA scaling_mode must be one of: {valid_modes}")
         if not math.isfinite(self.dropout) or self.dropout < 0.0 or self.dropout >= 1.0:
             raise ValueError("LoRA dropout must be in [0, 1)")
         if self.target_modules is None:
@@ -91,6 +96,7 @@ class LoRALinear(nn.Module):
         linear,
         rank: int,
         alpha: float,
+        scaling_mode: str = "rslora",
         dropout: float = 0.0,
         lora_a_initializer_range: float = 0.01,
         lora_b_initializer_range: float = 0.0,
@@ -103,6 +109,9 @@ class LoRALinear(nn.Module):
             raise ValueError("LoRA rank must be positive")
         if alpha <= 0.0:
             raise ValueError("LoRA alpha must be positive")
+        if scaling_mode not in LORA_SCALING_MODES:
+            valid_modes = ", ".join(LORA_SCALING_MODES)
+            raise ValueError(f"LoRA scaling_mode must be one of: {valid_modes}")
         for field_name, value in (
             ("lora_a_initializer_range", lora_a_initializer_range),
             ("lora_b_initializer_range", lora_b_initializer_range),
@@ -112,7 +121,10 @@ class LoRALinear(nn.Module):
 
         self.linear = linear
         self.rank = rank
-        self.scaling = alpha / rank
+        self.scaling_mode = scaling_mode
+        self.scaling = (
+            alpha / rank if scaling_mode == "lora" else alpha / math.sqrt(rank)
+        )
         self.lora_dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
         input_dims = linear.weight.shape[1]
         output_dims = linear.weight.shape[0]
@@ -200,6 +212,7 @@ def apply_lora(
             module,
             rank=config.rank,
             alpha=config.alpha,
+            scaling_mode=config.scaling_mode,
             dropout=config.dropout,
             lora_a_initializer_range=lora_a_initializer_range,
             lora_b_initializer_range=lora_b_initializer_range,

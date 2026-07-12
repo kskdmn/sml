@@ -323,6 +323,54 @@ class TestSMLModel:
         assert (1, 7) == generated.shape
         assert bool(mx.all(prompt == generated[:, : prompt.shape[1]]).item())
 
+    def test_generate_preallocates_kv_cache_to_requested_length(self, monkeypatch):
+        import sml
+        from sml import SMLLanguageModel
+
+        created_cache_lengths = []
+        original_kv_cache = sml.KVCache
+
+        class RecordingKVCache(original_kv_cache):
+            def __init__(self, max_seq_len=None):
+                created_cache_lengths.append(max_seq_len)
+                super().__init__(max_seq_len=max_seq_len)
+
+        monkeypatch.setattr(sml, "KVCache", RecordingKVCache)
+        config = self.tiny_config()
+        model = SMLLanguageModel(config)
+        prompt = mx.array([[config.bos_token_id, 5, 6]], dtype=mx.int32)
+
+        generated = model.generate(prompt, max_new_tokens=4)
+        mx.eval(generated)
+
+        assert [7] == created_cache_lengths
+
+    def test_kv_cache_preallocates_capacity_and_tracks_logical_length(self):
+        from sml import KVCache
+
+        cache = KVCache(max_seq_len=8)
+        key = mx.ones((1, 2, 3, 4))
+        value = mx.full((1, 2, 3, 4), 2.0)
+
+        cached_key, cached_value = cache.update(0, key, value)
+        mx.eval(cached_key, cached_value)
+
+        assert 3 == cache.get_seq_len(0)
+        assert 8 == cache.key_cache[0].shape[2]
+        assert (1, 2, 3, 4) == cached_key.shape
+        assert (1, 2, 3, 4) == cached_value.shape
+
+        next_key = mx.full((1, 2, 1, 4), 3.0)
+        next_value = mx.full((1, 2, 1, 4), 4.0)
+        cached_key, cached_value = cache.update(0, next_key, next_value)
+        mx.eval(cached_key, cached_value)
+
+        assert 4 == cache.get_seq_len(0)
+        assert 8 == cache.key_cache[0].shape[2]
+        assert (1, 2, 4, 4) == cached_key.shape
+        assert bool(mx.allclose(cached_key[:, :, :3, :], key).item())
+        assert bool(mx.allclose(cached_key[:, :, 3:, :], next_key).item())
+
     def test_cached_multi_token_chunk_matches_sequential_decode(self):
         from sml import KVCache, SMLLanguageModel
 

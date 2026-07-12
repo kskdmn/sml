@@ -49,6 +49,7 @@ class TestLoRA:
 
         assert 16 == config.rank
         assert 32.0 == config.alpha
+        assert "rslora" == config.scaling_mode
         assert ATTENTION_TARGET_MODULES == config.target_modules
         assert config.target_q_proj
         assert config.target_k_proj
@@ -109,6 +110,9 @@ class TestLoRA:
         with pytest.raises(ValueError, match="dropout"):
             LoRAConfig(dropout=1.0)
 
+        with pytest.raises(ValueError, match="scaling_mode"):
+            LoRAConfig(scaling_mode="unknown")
+
         with pytest.raises(ValueError, match="target_modules"):
             LoRAConfig(
                 target_q_proj=False,
@@ -134,6 +138,29 @@ class TestLoRA:
             LoRALinear(linear, rank=0, alpha=8.0)
         with pytest.raises(ValueError, match="alpha must be positive"):
             LoRALinear(linear, rank=4, alpha=0.0)
+
+    def test_lora_linear_uses_rank_stabilized_scaling_by_default(self):
+        require_mlx_runtime()
+        import mlx.nn as nn
+        from lora import LoRALinear
+
+        adapter = LoRALinear(nn.Linear(8, 4, bias=False), rank=4, alpha=8.0)
+
+        assert 4.0 == pytest.approx(adapter.scaling)
+
+    def test_lora_linear_can_use_legacy_rank_scaling(self):
+        require_mlx_runtime()
+        import mlx.nn as nn
+        from lora import LoRALinear
+
+        adapter = LoRALinear(
+            nn.Linear(8, 4, bias=False),
+            rank=4,
+            alpha=8.0,
+            scaling_mode="lora",
+        )
+
+        assert 2.0 == pytest.approx(adapter.scaling)
 
     def test_lora_linear_uses_adapter_initializer_ranges(self, monkeypatch):
         mx = require_mlx_runtime()
