@@ -163,14 +163,6 @@ def join_swag_parts(startphrase: str, ending: str) -> str:
     return f"{startphrase} {ending}"
 
 
-def format_swag_example(row: Mapping[str, object]) -> str:
-    """
-    Build a causal-LM target by appending the gold ending to the start phrase.
-    """
-    startphrase, ending = format_swag_parts(row)
-    return join_swag_parts(startphrase, ending)
-
-
 def load_swag_dataset(fine_tune_config: SwagFineTuneConfig):
     """
     Download or load the SWAG split from the Hugging Face datasets hub.
@@ -226,24 +218,6 @@ def iter_swag_parts(
             data_state.line_number = position
 
         yield format_swag_parts(row)
-
-
-def iter_swag_texts(
-    fine_tune_config: SwagFineTuneConfig,
-    epoch: int = 0,
-    progress: ReadingProgress | None = None,
-    data_state: TrainingDataState | None = None,
-) -> Iterator[str]:
-    """
-    Yield formatted SWAG examples, optionally shuffled and resumable by position.
-    """
-    for startphrase, ending in iter_swag_parts(
-        fine_tune_config,
-        epoch=epoch,
-        progress=progress,
-        data_state=data_state,
-    ):
-        yield join_swag_parts(startphrase, ending)
 
 
 class SwagExampleDataset:

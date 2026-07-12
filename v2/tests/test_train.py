@@ -423,21 +423,6 @@ class TestTrainData:
         with pytest.raises(FileNotFoundError, match="Tokenizer model does not exist"):
             train_sml.load_tokenizer(tmp_path / "missing.model")
 
-    def test_parse_checkpoint_input_files_accepts_none_and_lists(self, tmp_path):
-        import train_sml
-
-        assert () == train_sml.parse_checkpoint_input_files(None)
-        assert (
-            tmp_path / "a",
-            tmp_path / "b",
-        ) == train_sml.parse_checkpoint_input_files([tmp_path / "a", tmp_path / "b"])
-
-    def test_parse_checkpoint_input_files_rejects_non_lists(self):
-        import train_sml
-
-        with pytest.raises(ValueError, match="Checkpoint input_files must be a list"):
-            train_sml.parse_checkpoint_input_files("not-a-list")
-
     def test_parse_checkpoint_data_state_restores_fields(self):
         import train_sml
 

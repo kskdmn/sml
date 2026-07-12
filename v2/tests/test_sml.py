@@ -53,6 +53,24 @@ class TestSMLConfig:
         with pytest.raises(ValueError, match="num_q_heads"):
             SMLConfig(num_q_heads=6, num_kv_heads=4)
 
+    def test_invalid_positive_shape_fields_are_rejected(self):
+        from sml import SMLConfig
+
+        with pytest.raises(ValueError, match="num_layers"):
+            SMLConfig(num_layers=0)
+
+        with pytest.raises(ValueError, match="num_q_heads"):
+            SMLConfig(num_q_heads=0)
+
+        with pytest.raises(ValueError, match="num_kv_heads"):
+            SMLConfig(num_kv_heads=0)
+
+        with pytest.raises(ValueError, match="rope_theta"):
+            SMLConfig(rope_theta=0.0)
+
+        with pytest.raises(ValueError, match="hidden_dropout"):
+            SMLConfig(hidden_dropout=-0.1)
+
     def test_model_config_for_training_disables_yarn(self):
         from sml import SMLConfig
         from train_sml import model_config_for_training
@@ -276,6 +294,19 @@ class TestSMLModel:
 
         assert bool(mx.isinf(adjusted[0, 2]).item())
         assert 5.0 == pytest.approx(adjusted[0, 3].item())
+
+    def test_no_repeat_ngram_blocks_repeated_unigrams(self):
+        from sml import apply_no_repeat_ngram
+
+        logits = mx.array([[0.0, 1.0, 2.0, 3.0]])
+        generated = mx.array([[1, 3]])
+        adjusted = apply_no_repeat_ngram(logits, generated, ngram_size=1)
+        mx.eval(adjusted)
+
+        assert 0.0 == pytest.approx(adjusted[0, 0].item())
+        assert bool(mx.isinf(adjusted[0, 1]).item())
+        assert 2.0 == pytest.approx(adjusted[0, 2].item())
+        assert bool(mx.isinf(adjusted[0, 3]).item())
 
     def test_generate_uses_repetition_penalty_without_sampling(self):
         from sml import GenerationConfig

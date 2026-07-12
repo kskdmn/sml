@@ -58,43 +58,19 @@ class TestFtSwag:
             row
         )
 
-    def test_format_swag_example_concatenates_gold_ending(self):
+    def test_join_swag_parts_inserts_space_before_gold_ending(self):
         import ft_swag
 
-        row = {
-            "startphrase": "A man is sitting on a roof. he",
-            "ending0": " starts typing on a laptop.",
-            "ending1": " is using wrap to blend a container.",
-            "ending2": " is ripping level tiles off.",
-            "ending3": " is holding a rubik's cube.",
-            "label": 0,
-        }
-
-        assert (
-            "A man is sitting on a roof. he starts typing on a laptop."
-            == ft_swag.format_swag_example(row)
+        assert "The girl stops clutching her diary." == ft_swag.join_swag_parts(
+            "The girl", "stops clutching her diary."
         )
-
-    def test_format_swag_example_inserts_space_before_gold_ending(self):
-        import ft_swag
-
-        row = {
-            "startphrase": "The girl",
-            "ending0": "stops clutching her diary.",
-            "ending1": "runs away.",
-            "ending2": "looks around.",
-            "ending3": "opens the door.",
-            "label": 0,
-        }
-
-        assert "The girl stops clutching her diary." == ft_swag.format_swag_example(row)
 
     def test_resolve_swag_label_accepts_string_labels(self):
         import ft_swag
 
         assert 2 == ft_swag.resolve_swag_label("2")
 
-    def test_iter_swag_texts_resumes_after_saved_position(self, monkeypatch):
+    def test_iter_swag_parts_resumes_after_saved_position(self, monkeypatch):
         import ft_swag
         from ft_swag import SwagFineTuneConfig
         from train_sml import TrainingDataState
@@ -129,18 +105,18 @@ class TestFtSwag:
         data_state = TrainingDataState(line_number=0)
 
         monkeypatch.setattr(ft_swag, "load_swag_dataset", Spy(return_value=dataset))
-        texts = list(
-            ft_swag.iter_swag_texts(
+        parts = list(
+            ft_swag.iter_swag_parts(
                 SwagFineTuneConfig(shuffle_examples=False, seed=42),
                 epoch=0,
                 data_state=data_state,
             )
         )
 
-        assert ["second beta", "third z"] == texts
+        assert [("second", "beta"), ("third", "z")] == parts
         assert 2 == data_state.line_number
 
-    def test_iter_swag_texts_resumes_same_shuffled_order(self, monkeypatch):
+    def test_iter_swag_parts_resumes_same_shuffled_order(self, monkeypatch):
         import ft_swag
         from ft_swag import SwagFineTuneConfig
         from train_sml import TrainingDataState
@@ -160,17 +136,17 @@ class TestFtSwag:
         config = SwagFineTuneConfig(shuffle_examples=True, seed=7)
 
         monkeypatch.setattr(ft_swag, "load_swag_dataset", Spy(return_value=dataset))
-        full_epoch = list(ft_swag.iter_swag_texts(config, epoch=2))
+        full_epoch = list(ft_swag.iter_swag_parts(config, epoch=2))
 
         data_state = TrainingDataState(line_number=2)
         resumed_epoch = list(
-            ft_swag.iter_swag_texts(config, epoch=2, data_state=data_state)
+            ft_swag.iter_swag_parts(config, epoch=2, data_state=data_state)
         )
 
         assert full_epoch[3:] == resumed_epoch
         assert 7 == data_state.line_number
 
-    def test_iter_swag_texts_updates_reading_progress_example_index(self, monkeypatch):
+    def test_iter_swag_parts_updates_reading_progress_example_index(self, monkeypatch):
         import ft_swag
         from ft_swag import SwagFineTuneConfig
         from train_sml import ReadingProgress
@@ -197,15 +173,15 @@ class TestFtSwag:
         progress = ReadingProgress()
 
         monkeypatch.setattr(ft_swag, "load_swag_dataset", Spy(return_value=dataset))
-        texts = list(
-            ft_swag.iter_swag_texts(
+        parts = list(
+            ft_swag.iter_swag_parts(
                 SwagFineTuneConfig(shuffle_examples=False, seed=42),
                 epoch=0,
                 progress=progress,
             )
         )
 
-        assert ["first one", "second beta"] == texts
+        assert [("first", "one"), ("second", "beta")] == parts
         assert 1 == progress.line_number
         assert 1 == progress.example_index
 

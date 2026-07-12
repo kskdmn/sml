@@ -8,6 +8,7 @@ checkpoints load through the standard inference path.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -20,6 +21,17 @@ if TYPE_CHECKING:
 
 LORA_A_SUFFIX = "lora_A"
 LORA_B_SUFFIX = "lora_B"
+ATTENTION_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+)
+MLP_TARGET_MODULES = (
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+)
 
 
 @dataclass(slots=True)
@@ -33,15 +45,44 @@ class LoRAConfig:
     rank: int = 16
     alpha: float = 32.0
     dropout: float = 0.05
-    target_modules: tuple[str, ...] = (
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        # "gate_proj",
-        # "up_proj",
-        # "down_proj",
-    )
+    target_modules: tuple[str, ...] | None = None
+    target_q_proj: bool = True
+    target_k_proj: bool = True
+    target_v_proj: bool = True
+    target_o_proj: bool = True
+    target_gate_proj: bool = False
+    target_up_proj: bool = False
+    target_down_proj: bool = False
+
+    def __post_init__(self) -> None:
+        if self.rank <= 0:
+            raise ValueError("LoRA rank must be positive")
+        if not math.isfinite(self.alpha) or self.alpha <= 0.0:
+            raise ValueError("LoRA alpha must be positive")
+        if not math.isfinite(self.dropout) or self.dropout < 0.0 or self.dropout >= 1.0:
+            raise ValueError("LoRA dropout must be in [0, 1)")
+        if self.target_modules is None:
+            requested_targets = (
+                (self.target_q_proj, "q_proj"),
+                (self.target_k_proj, "k_proj"),
+                (self.target_v_proj, "v_proj"),
+                (self.target_o_proj, "o_proj"),
+                (self.target_gate_proj, "gate_proj"),
+                (self.target_up_proj, "up_proj"),
+                (self.target_down_proj, "down_proj"),
+            )
+            self.target_modules = tuple(
+                module_name
+                for should_target, module_name in requested_targets
+                if should_target
+            )
+        else:
+            self.target_modules = tuple(self.target_modules)
+        if not self.target_modules or any(
+            not isinstance(module_name, str) or not module_name
+            for module_name in self.target_modules
+        ):
+            raise ValueError("LoRA target_modules must contain module names")
 
 
 class LoRALinear(nn.Module):

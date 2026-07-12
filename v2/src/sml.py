@@ -68,6 +68,12 @@ class SMLConfig:
             raise ValueError("vocab_size must be positive")
         if self.hidden_size <= 0:
             raise ValueError("hidden_size must be positive")
+        if self.num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        if self.num_q_heads <= 0:
+            raise ValueError("num_q_heads must be positive")
+        if self.num_kv_heads <= 0:
+            raise ValueError("num_kv_heads must be positive")
         if self.hidden_size % self.num_q_heads != 0:
             raise ValueError("hidden_size must be divisible by num_q_heads")
         if self.num_q_heads % self.num_kv_heads != 0:
@@ -78,11 +84,19 @@ class SMLConfig:
             raise ValueError("intermediate_size must be positive")
         if self.original_max_position_embeddings <= 0:
             raise ValueError("original_max_position_embeddings must be positive")
+        if not math.isfinite(self.rope_theta) or self.rope_theta <= 0.0:
+            raise ValueError("rope_theta must be positive")
         if (
             not math.isfinite(self.rope_scaling_factor)
             or self.rope_scaling_factor < 1.0
         ):
             raise ValueError("rope_scaling_factor must be at least 1.0")
+        if (
+            not math.isfinite(self.hidden_dropout)
+            or self.hidden_dropout < 0.0
+            or self.hidden_dropout >= 1.0
+        ):
+            raise ValueError("hidden_dropout must be in [0, 1)")
         if (
             not math.isfinite(self.yarn_beta_fast)
             or not math.isfinite(self.yarn_beta_slow)
@@ -339,6 +353,17 @@ def apply_no_repeat_ngram(
     """
     if ngram_size <= 0:
         return logits
+    if ngram_size == 1:
+        return mx.where(
+            mx.put_along_axis(
+                mx.zeros(logits.shape, dtype=mx.bool_),
+                generated,
+                mx.ones(generated.shape, dtype=mx.bool_),
+                axis=-1,
+            ),
+            -math.inf,
+            logits,
+        )
 
     adjusted_rows = []
     for batch_idx in range(generated.shape[0]):

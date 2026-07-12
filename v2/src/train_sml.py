@@ -171,14 +171,6 @@ def iter_texts(
                 yield text
 
 
-def parse_checkpoint_input_files(input_files: object) -> tuple[Path, ...]:
-    if input_files is None:
-        return ()
-    if not isinstance(input_files, (list, tuple)):
-        raise ValueError("Checkpoint input_files must be a list")
-    return tuple(resolve_path(Path(str(input_file))) for input_file in input_files)
-
-
 def parse_checkpoint_data_state(data_state: object) -> TrainingDataState | None:
     if data_state is None:
         return None

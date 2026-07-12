@@ -43,13 +43,85 @@ class TestLoRA:
         )
 
     def test_lora_config_keeps_expected_defaults(self):
-        from lora import LoRAConfig
+        from lora import ATTENTION_TARGET_MODULES, LoRAConfig
 
         config = LoRAConfig()
 
         assert 16 == config.rank
         assert 32.0 == config.alpha
-        assert "q_proj" in config.target_modules
+        assert ATTENTION_TARGET_MODULES == config.target_modules
+        assert config.target_q_proj
+        assert config.target_k_proj
+        assert config.target_v_proj
+        assert config.target_o_proj
+        assert not config.target_gate_proj
+        assert not config.target_up_proj
+        assert not config.target_down_proj
+
+    def test_lora_config_can_include_mlp_targets_with_flags(self):
+        from lora import ATTENTION_TARGET_MODULES, LoRAConfig, MLP_TARGET_MODULES
+
+        config = LoRAConfig(
+            target_gate_proj=True,
+            target_up_proj=True,
+            target_down_proj=True,
+        )
+
+        assert (*ATTENTION_TARGET_MODULES, *MLP_TARGET_MODULES) == (
+            config.target_modules
+        )
+
+    def test_lora_config_can_target_only_one_mlp_module(self):
+        from lora import LoRAConfig
+
+        config = LoRAConfig(
+            target_q_proj=False,
+            target_k_proj=False,
+            target_v_proj=False,
+            target_o_proj=False,
+            target_gate_proj=True,
+        )
+
+        assert ("gate_proj",) == config.target_modules
+
+    def test_lora_config_accepts_explicit_target_modules(self):
+        from lora import LoRAConfig
+
+        config = LoRAConfig(
+            target_q_proj=False,
+            target_modules=("q_proj",),
+        )
+
+        assert ("q_proj",) == config.target_modules
+
+    def test_lora_config_rejects_invalid_values(self):
+        from lora import LoRAConfig
+
+        with pytest.raises(ValueError, match="rank"):
+            LoRAConfig(rank=0)
+
+        with pytest.raises(ValueError, match="alpha"):
+            LoRAConfig(alpha=0.0)
+
+        with pytest.raises(ValueError, match="dropout"):
+            LoRAConfig(dropout=-0.1)
+
+        with pytest.raises(ValueError, match="dropout"):
+            LoRAConfig(dropout=1.0)
+
+        with pytest.raises(ValueError, match="target_modules"):
+            LoRAConfig(
+                target_q_proj=False,
+                target_k_proj=False,
+                target_v_proj=False,
+                target_o_proj=False,
+                target_gate_proj=False,
+                target_up_proj=False,
+                target_down_proj=False,
+            )
+
+        with pytest.raises(ValueError, match="target_modules"):
+            LoRAConfig(target_modules=())
 
     def test_lora_linear_validates_rank_and_alpha(self):
         require_mlx_runtime()
