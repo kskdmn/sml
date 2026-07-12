@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
@@ -49,6 +50,48 @@ BatchT = TypeVar("BatchT")
 
 
 @dataclass(slots=True)
+class ParameterWeightDecayConfig:
+    """
+    Per-parameter-type weight decay values.
+
+    ``lm_head`` only matters when embeddings are untied; tied checkpoints retie
+    ``lm_head.weight`` to ``embed_tokens.weight`` after each optimizer step.
+    """
+
+    embed_tokens: float = 0.0
+    lm_head: float = 0.0
+    rms_norm: float = 0.0
+    q_proj: float = 0.1
+    k_proj: float = 0.1
+    v_proj: float = 0.1
+    o_proj: float = 0.1
+    gate_proj: float = 0.1
+    up_proj: float = 0.1
+    down_proj: float = 0.1
+    other: float = 0.1
+
+    def validate_weight_decay(self, value: float, field_name: str) -> None:
+        if value is None or not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{field_name} must be non-negative and finite")
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "embed_tokens",
+            "lm_head",
+            "rms_norm",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "other",
+        ):
+            self.validate_weight_decay(getattr(self, field_name), field_name)
+
+
+@dataclass(slots=True)
 class TrainingConfig:
     """
     Training hyperparameters and I/O paths.
@@ -72,7 +115,9 @@ class TrainingConfig:
     max_rows_per_file: int | None = 40_960
     shuffle_input_files: bool = True
     learning_rate: float = 3e-4
-    weight_decay: float = 0.1
+    parameter_weight_decay: ParameterWeightDecayConfig = field(
+        default_factory=ParameterWeightDecayConfig
+    )
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
     warmup_steps: int | None = None  # None derives 1% of lr_total_steps.
@@ -395,6 +440,108 @@ def tree_scale(tree: dict, scale: float | object) -> dict:
     return tree_map(lambda value: value * scale, tree)
 
 
+def map_named_tree(tree: object, fn, prefix: str = ""):
+    if isinstance(tree, dict):
+        return {
+            key: map_named_tree(
+                value,
+                fn,
+                f"{prefix}.{key}" if prefix else str(key),
+            )
+            for key, value in tree.items()
+        }
+    if isinstance(tree, list):
+        return [
+            map_named_tree(
+                value,
+                fn,
+                f"{prefix}.{index}" if prefix else str(index),
+            )
+            for index, value in enumerate(tree)
+        ]
+    if isinstance(tree, tuple):
+        return type(tree)(
+            map_named_tree(
+                value,
+                fn,
+                f"{prefix}.{index}" if prefix else str(index),
+            )
+            for index, value in enumerate(tree)
+        )
+    return fn(prefix, tree)
+
+
+def resolve_parameter_weight_decay(
+    parameter_name: str,
+    parameter_weight_decay: ParameterWeightDecayConfig,
+) -> float:
+    if parameter_name.endswith(".lora_A") and hasattr(parameter_weight_decay, "lora_a"):
+        return parameter_weight_decay.lora_a
+    if parameter_name.endswith(".lora_B") and hasattr(parameter_weight_decay, "lora_b"):
+        return parameter_weight_decay.lora_b
+    if parameter_name == "embed_tokens.weight":
+        return parameter_weight_decay.embed_tokens
+    if parameter_name == "lm_head.weight":
+        return parameter_weight_decay.lm_head
+    if (
+        parameter_name == "norm.weight"
+        or parameter_name.endswith(".input_norm.weight")
+        or parameter_name.endswith(".post_attn_norm.weight")
+    ):
+        return parameter_weight_decay.rms_norm
+    parameter_suffixes = (
+        (".self_attn.q_proj.weight", parameter_weight_decay.q_proj),
+        (".self_attn.k_proj.weight", parameter_weight_decay.k_proj),
+        (".self_attn.v_proj.weight", parameter_weight_decay.v_proj),
+        (".self_attn.o_proj.weight", parameter_weight_decay.o_proj),
+        (".mlp.gate_proj.weight", parameter_weight_decay.gate_proj),
+        (".mlp.up_proj.weight", parameter_weight_decay.up_proj),
+        (".mlp.down_proj.weight", parameter_weight_decay.down_proj),
+    )
+    for suffix, weight_decay in parameter_suffixes:
+        if parameter_name.endswith(suffix):
+            return weight_decay
+    return parameter_weight_decay.other
+
+
+def build_parameter_weight_decay_tree(
+    parameters: dict,
+    parameter_weight_decay: ParameterWeightDecayConfig,
+) -> dict:
+    return map_named_tree(
+        parameters,
+        lambda name, _value: resolve_parameter_weight_decay(
+            name,
+            parameter_weight_decay,
+        ),
+    )
+
+
+def apply_decoupled_weight_decay(
+    model,
+    weight_decay_tree: dict,
+    learning_rate,
+) -> None:
+    lr = (
+        learning_rate
+        if isinstance(learning_rate, mx.array)
+        else mx.array(learning_rate)
+    )
+
+    def decay_parameter(parameter, weight_decay: float):
+        if weight_decay == 0.0:
+            return parameter
+        return parameter * (1.0 - lr.astype(parameter.dtype) * weight_decay)
+
+    model.update(
+        tree_map(
+            decay_parameter,
+            model.trainable_parameters(),
+            weight_decay_tree,
+        )
+    )
+
+
 def global_grad_norm(grads: dict):
     total = mx.array(0.0)
     for _, grad in tree_flatten(grads):
@@ -599,9 +746,13 @@ def train_model(
     )
     optimizer = optim.AdamW(
         learning_rate=lr_schedule,
-        weight_decay=training_config.weight_decay,
+        weight_decay=0.0,
     )
     optimizer.init(model.trainable_parameters())
+    weight_decay_tree = build_parameter_weight_decay_tree(
+        model.trainable_parameters(),
+        parameter_weight_decay=training_config.parameter_weight_decay,
+    )
 
     checkpoint_path = resolve_mlx_checkpoint_path(training_config)
     resume_state = TrainingResumeState()
@@ -633,6 +784,12 @@ def train_model(
             grads_to_step,
             training_config.max_grad_norm,
         )
+        apply_decoupled_weight_decay(
+            model,
+            weight_decay_tree=weight_decay_tree,
+            learning_rate=lr_schedule(optimizer.step),
+        )
+        _retie_embeddings_if_needed(model)
         optimizer.update(model, clipped_grads)
         _retie_embeddings_if_needed(model)
         mx.eval(model.parameters(), optimizer.state)

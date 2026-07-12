@@ -193,6 +193,114 @@ class TestTrainData:
 
         assert "bfloat16" == training_config.autocast_dtype
 
+    def test_parameter_weight_decay_config_has_recommended_base_defaults(self):
+        import train_sml
+
+        config = train_sml.ParameterWeightDecayConfig()
+
+        assert config.embed_tokens == pytest.approx(0.0)
+        assert config.lm_head == pytest.approx(0.0)
+        assert config.rms_norm == pytest.approx(0.0)
+        assert config.q_proj == pytest.approx(0.1)
+        assert config.k_proj == pytest.approx(0.1)
+        assert config.v_proj == pytest.approx(0.1)
+        assert config.o_proj == pytest.approx(0.1)
+        assert config.gate_proj == pytest.approx(0.1)
+        assert config.up_proj == pytest.approx(0.1)
+        assert config.down_proj == pytest.approx(0.1)
+        assert config.other == pytest.approx(0.1)
+        assert not hasattr(config, "lora_a")
+        assert not hasattr(config, "lora_b")
+
+    def test_parameter_weight_decay_config_rejects_unset_values(self):
+        import train_sml
+
+        with pytest.raises(ValueError, match="rms_norm"):
+            train_sml.ParameterWeightDecayConfig(rms_norm=None)
+
+    def test_parameter_weight_decay_config_validates_weight_decay_with_member_method(
+        self,
+    ):
+        import train_sml
+
+        config = train_sml.ParameterWeightDecayConfig()
+
+        config.validate_weight_decay(0.0, "rms_norm")
+        with pytest.raises(ValueError, match="rms_norm"):
+            config.validate_weight_decay(float("inf"), "rms_norm")
+
+    def test_parameter_weight_decay_config_classifies_base_model_parameters(self):
+        require_mlx()
+        from mlx.utils import tree_flatten
+
+        import train_sml
+        from sml import SMLLanguageModel
+
+        model = SMLLanguageModel(tiny_config())
+        config = train_sml.ParameterWeightDecayConfig(
+            embed_tokens=0.01,
+            lm_head=0.02,
+            rms_norm=0.03,
+            q_proj=0.04,
+            k_proj=0.05,
+            v_proj=0.06,
+            o_proj=0.07,
+            gate_proj=0.08,
+            up_proj=0.09,
+            down_proj=0.10,
+        )
+
+        decays = dict(
+            tree_flatten(
+                train_sml.build_parameter_weight_decay_tree(
+                    model.trainable_parameters(),
+                    parameter_weight_decay=config,
+                )
+            )
+        )
+
+        assert decays["embed_tokens.weight"] == pytest.approx(0.01)
+        assert decays["lm_head.weight"] == pytest.approx(0.02)
+        assert decays["layers.0.input_norm.weight"] == pytest.approx(0.03)
+        assert decays["layers.0.post_attn_norm.weight"] == pytest.approx(0.03)
+        assert decays["norm.weight"] == pytest.approx(0.03)
+        assert decays["layers.0.self_attn.q_proj.weight"] == pytest.approx(0.04)
+        assert decays["layers.0.self_attn.k_proj.weight"] == pytest.approx(0.05)
+        assert decays["layers.0.self_attn.v_proj.weight"] == pytest.approx(0.06)
+        assert decays["layers.0.self_attn.o_proj.weight"] == pytest.approx(0.07)
+        assert decays["layers.0.mlp.gate_proj.weight"] == pytest.approx(0.08)
+        assert decays["layers.0.mlp.up_proj.weight"] == pytest.approx(0.09)
+        assert decays["layers.0.mlp.down_proj.weight"] == pytest.approx(0.10)
+
+    def test_decoupled_weight_decay_scales_trainable_parameters_by_decay_tree(self):
+        mx = require_mlx()
+        from mlx.utils import tree_flatten, tree_map
+
+        import train_sml
+        from sml import SMLLanguageModel
+
+        model = SMLLanguageModel(tiny_config())
+        model.update(tree_map(lambda value: mx.ones_like(value), model.parameters()))
+        trainable = model.trainable_parameters()
+        decay_tree = tree_map(lambda _: 0.0, trainable)
+        decay_tree["layers"][0]["self_attn"]["q_proj"]["weight"] = 0.5
+
+        train_sml.apply_decoupled_weight_decay(
+            model,
+            weight_decay_tree=decay_tree,
+            learning_rate=mx.array(0.1),
+        )
+        parameters = dict(tree_flatten(model.parameters()))
+        mx.eval(parameters["layers.0.self_attn.q_proj.weight"])
+        mx.eval(parameters["layers.0.self_attn.k_proj.weight"])
+
+        assert float(parameters["layers.0.self_attn.q_proj.weight"][0, 0].item()) == (
+            pytest.approx(0.95)
+        )
+        assert float(parameters["layers.0.self_attn.k_proj.weight"][0, 0].item()) == (
+            pytest.approx(1.0)
+        )
+
     def test_training_config_derives_warmup_steps_from_lr_total_steps(self):
         from train_sml import TrainingConfig
 

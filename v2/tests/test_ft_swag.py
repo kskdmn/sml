@@ -70,6 +70,56 @@ class TestFtSwag:
 
         assert 2 == ft_swag.resolve_swag_label("2")
 
+    def test_swag_parameter_weight_decay_config_extends_base_defaults(self):
+        import ft_swag
+        import train_sml
+
+        config = ft_swag.SwagParameterWeightDecayConfig()
+
+        assert isinstance(config, train_sml.ParameterWeightDecayConfig)
+        assert config.q_proj == pytest.approx(0.1)
+        assert config.down_proj == pytest.approx(0.1)
+        assert config.lora_a == pytest.approx(0.0)
+        assert config.lora_b == pytest.approx(0.0)
+
+    def test_swag_parameter_weight_decay_config_classifies_lora_parameters(self):
+        require_mlx_runtime()
+        from mlx.utils import tree_flatten
+
+        import ft_swag
+        from lora import LoRAConfig, apply_lora
+        from sml import SMLLanguageModel
+        from test_train import tiny_config
+        import train_sml
+
+        model = SMLLanguageModel(tiny_config())
+        apply_lora(
+            model,
+            LoRAConfig(
+                rank=2,
+                alpha=4.0,
+                dropout=0.0,
+                target_modules=("q_proj", "down_proj"),
+            ),
+        )
+
+        decays = dict(
+            tree_flatten(
+                train_sml.build_parameter_weight_decay_tree(
+                    model.trainable_parameters(),
+                    parameter_weight_decay=ft_swag.SwagParameterWeightDecayConfig(
+                        lora_a=0.001,
+                        lora_b=0.002,
+                    ),
+                )
+            )
+        )
+
+        assert decays["layers.0.self_attn.q_proj.lora_A"] == pytest.approx(0.001)
+        assert decays["layers.0.self_attn.q_proj.lora_B"] == pytest.approx(0.002)
+        assert decays["layers.0.mlp.down_proj.lora_A"] == pytest.approx(0.001)
+        assert decays["layers.0.mlp.down_proj.lora_B"] == pytest.approx(0.002)
+
     def test_iter_swag_parts_resumes_after_saved_position(self, monkeypatch):
         import ft_swag
         from ft_swag import SwagFineTuneConfig

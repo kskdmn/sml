@@ -49,12 +49,15 @@ from lora import (
 from sml import SMLConfig, SMLLanguageModel, count_parameters
 from train_sml import (
     GradientAccumulationWindow,
+    ParameterWeightDecayConfig,
     ReadingProgress,
     ResumeProgress,
     TrainingDataState,
     TrainingResumeState,
     accumulate_gradients,
+    apply_decoupled_weight_decay,
     apply_model_dtype,
+    build_parameter_weight_decay_tree,
     clip_gradients_by_global_norm,
     consume_accumulated_grads,
     count_resume_batches,
@@ -86,6 +89,21 @@ STOCHASTIC_RESUME_NOTE = (
 
 
 @dataclass(slots=True)
+class SwagParameterWeightDecayConfig(ParameterWeightDecayConfig):
+    """
+    SWAG fine-tuning decay values, including LoRA adapter matrices.
+    """
+
+    lora_a: float = 0.0
+    lora_b: float = 0.0
+
+    def __post_init__(self) -> None:
+        ParameterWeightDecayConfig.__post_init__(self)
+        self.validate_weight_decay(self.lora_a, "lora_a")
+        self.validate_weight_decay(self.lora_b, "lora_b")
+
+
+@dataclass(slots=True)
 class SwagFineTuneConfig:
     """
     LoRA fine-tuning hyperparameters for SWAG continuation training.
@@ -112,7 +130,9 @@ class SwagFineTuneConfig:
     shuffle_examples: bool = True
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     learning_rate: float = 1e-4
-    weight_decay: float = 0.0
+    parameter_weight_decay: SwagParameterWeightDecayConfig = field(
+        default_factory=SwagParameterWeightDecayConfig
+    )
     gradient_accumulation_steps: int = 8
     max_grad_norm: float = 1.0
     warmup_steps: int | None = None  # None derives 1% of lr_total_steps.
@@ -621,9 +641,13 @@ def fine_tune_swag(
     )
     optimizer = optim.AdamW(
         learning_rate=lr_schedule,
-        weight_decay=fine_tune_config.weight_decay,
+        weight_decay=0.0,
     )
     optimizer.init(model.trainable_parameters())
+    weight_decay_tree = build_parameter_weight_decay_tree(
+        model.trainable_parameters(),
+        parameter_weight_decay=fine_tune_config.parameter_weight_decay,
+    )
 
     resume_state = TrainingResumeState()
     if resume_from_checkpoint:
@@ -659,6 +683,11 @@ def fine_tune_swag(
         clipped_grads, grad_norm = clip_gradients_by_global_norm(
             grads_to_step,
             fine_tune_config.max_grad_norm,
+        )
+        apply_decoupled_weight_decay(
+            model,
+            weight_decay_tree=weight_decay_tree,
+            learning_rate=lr_schedule(optimizer.step),
         )
         optimizer.update(model, clipped_grads)
         mx.eval(model.parameters(), optimizer.state)
