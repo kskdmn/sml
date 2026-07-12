@@ -21,7 +21,7 @@ from config import (
 import tokenizer
 from utils import discover_input_files, shuffle_input_files
 
-MAX_ROWS_PER_FILE = 32_768
+MAX_ROWS_PER_FILE = 8_192
 SHUFFLE_INPUT_FILES = True
 RANDOM_SEED = 42
 NUM_THREADS = 8

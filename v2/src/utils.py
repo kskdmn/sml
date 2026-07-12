@@ -20,7 +20,7 @@ import zstandard as zstd
 from config import resolve_path
 
 MIN_TEXT_LENGTH = 100
-MAX_TEXT_LENGTH: int | None = None
+MAX_TEXT_LENGTH: int | None = 16_384
 TEXT_COLUMN = "text"
 TEXT_ENCODING = "utf-8"
 TEXT_DECODE_ERRORS = "replace"
