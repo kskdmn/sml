@@ -11,8 +11,8 @@ from config import (
     BOS_TOKEN_ID,
     DEFAULT_TOKENIZER_MODEL_PATH,
     EOS_TOKEN_ID,
-    INPUT_DIR,
-    INPUT_FILE_NAME_REGEX,
+    PRETRAINING_INPUT_DIR,
+    PRETRAINING_INPUT_FILE_NAME_REGEX,
     PAD_TOKEN_ID,
     SUCCESS_RETURN_CODE,
     UNK_TOKEN_ID,
@@ -65,10 +65,12 @@ def train_tokenizer(
     output_dir = tokenizer_model_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    input_files = discover_input_files(INPUT_DIR, INPUT_FILE_NAME_REGEX)
+    input_files = discover_input_files(
+        PRETRAINING_INPUT_DIR, PRETRAINING_INPUT_FILE_NAME_REGEX
+    )
     if not input_files:
         raise FileNotFoundError(
-            f"No supported input files found in {resolve_path(INPUT_DIR)}"
+            f"No supported input files found in {resolve_path(PRETRAINING_INPUT_DIR)}"
         )
     if SHUFFLE_INPUT_FILES:
         input_files = shuffle_input_files(input_files, seed=RANDOM_SEED)

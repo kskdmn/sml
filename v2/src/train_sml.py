@@ -17,8 +17,8 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from config import (
     DEFAULT_MODEL_PATH,
     DEFAULT_TOKENIZER_MODEL_PATH,
-    INPUT_DIR,
-    INPUT_FILE_NAME_REGEX,
+    PRETRAINING_INPUT_DIR,
+    PRETRAINING_INPUT_FILE_NAME_REGEX,
     METADATA_NAME,
     MODEL_WEIGHTS_NAME,
     OPTIMIZER_STATE_NAME,
@@ -101,8 +101,8 @@ class TrainingConfig:
     ``train_sml.train_model``, instead of adding CLI flags.
     """
 
-    input_dir: Path = INPUT_DIR
-    input_file_name_regex: str = INPUT_FILE_NAME_REGEX
+    input_dir: Path = PRETRAINING_INPUT_DIR
+    input_file_name_regex: str = PRETRAINING_INPUT_FILE_NAME_REGEX
     output_dir: Path = OUTPUT_DIR
     model_path: Path | None = None
     tokenizer_model_path: Path = DEFAULT_TOKENIZER_MODEL_PATH

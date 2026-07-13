@@ -56,11 +56,19 @@ class TestModuleLayout:
         train_sml = importlib.import_module("train_sml")
         train_tokenizer = importlib.import_module("train_tokenizer")
 
-        assert r".*-00[0-9][0-9]\.jsonl\.zst\Z" == config.INPUT_FILE_NAME_REGEX
-        assert train_sml.INPUT_FILE_NAME_REGEX is config.INPUT_FILE_NAME_REGEX
-        assert train_tokenizer.INPUT_FILE_NAME_REGEX is config.INPUT_FILE_NAME_REGEX
-        assert train_sml.INPUT_DIR is config.INPUT_DIR
-        assert train_tokenizer.INPUT_DIR is config.INPUT_DIR
+        assert (
+            r".*-00[0-9][0-9]\.jsonl\.zst\Z" == config.PRETRAINING_INPUT_FILE_NAME_REGEX
+        )
+        assert (
+            train_sml.PRETRAINING_INPUT_FILE_NAME_REGEX
+            is config.PRETRAINING_INPUT_FILE_NAME_REGEX
+        )
+        assert (
+            train_tokenizer.PRETRAINING_INPUT_FILE_NAME_REGEX
+            is config.PRETRAINING_INPUT_FILE_NAME_REGEX
+        )
+        assert train_sml.PRETRAINING_INPUT_DIR is config.PRETRAINING_INPUT_DIR
+        assert train_tokenizer.PRETRAINING_INPUT_DIR is config.PRETRAINING_INPUT_DIR
         assert 8_192 == train_tokenizer.MAX_ROWS_PER_FILE
 
     def test_removed_modules_are_absent(self):

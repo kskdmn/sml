@@ -39,6 +39,29 @@ Use `--tokenizer-model` to write the tokenizer somewhere other than
 uv run python v2/src/train_tokenizer.py --tokenizer-model v2/output/custom.model
 ```
 
+### Prepare pretraining data
+
+Tokenizes the configured JSONL Zstandard shards offline, packs fixed
+`sequence_length + 1` token blocks, shuffles blocks deterministically within
+each output shard, and writes compressed NumPy `.npz` files under
+`v2/output/pretraining_data/`. The shard array is named `tokens` and stored as
+`uint16`; preparation fails if the tokenizer vocabulary is larger than 65,536
+pieces.
+
+```sh
+uv run python v2/src/prepare_pretraining_data.py
+```
+
+Useful variants:
+
+```sh
+uv run python v2/src/prepare_pretraining_data.py --sequence-length 1024 --blocks-per-shard 8192
+uv run python v2/src/prepare_pretraining_data.py --max-rows-per-file none --tokenizer-model v2/output/bpe_tokenizer.model
+```
+
+The command writes `manifest.json` beside `train-000000.npz`,
+`train-000001.npz`, and so on.
+
 ### Train the base model
 
 Trains the MLX SML language model from the configured corpus. Run tokenizer

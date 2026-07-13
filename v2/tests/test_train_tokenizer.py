@@ -110,7 +110,7 @@ class TestTrainTokenizer:
 
             files = utils.discover_input_files(
                 root,
-                train_tokenizer.INPUT_FILE_NAME_REGEX,
+                train_tokenizer.PRETRAINING_INPUT_FILE_NAME_REGEX,
             )
 
         assert [
@@ -152,7 +152,7 @@ class TestTrainTokenizer:
             )
             discovered = (input_path,)
             shuffle_spy = Spy(return_value=discovered)
-            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer, "PRETRAINING_INPUT_DIR", root)
             monkeypatch.setattr(
                 train_tokenizer,
                 "discover_input_files",
@@ -257,7 +257,7 @@ class TestTrainTokenizer:
             write_zst_rows(input_path, [{"text": expected_text}])
             discover_input_files = Spy(return_value=(input_path,))
 
-            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer, "PRETRAINING_INPUT_DIR", root)
             monkeypatch.setattr(
                 train_tokenizer,
                 "discover_input_files",
@@ -272,7 +272,7 @@ class TestTrainTokenizer:
 
         discover_input_files.assert_called_once_with(
             root,
-            train_tokenizer.INPUT_FILE_NAME_REGEX,
+            train_tokenizer.PRETRAINING_INPUT_FILE_NAME_REGEX,
         )
 
     def test_iter_zstd_jsonl_lines_reads_zst_files_without_subprocess(
@@ -308,7 +308,7 @@ class TestTrainTokenizer:
             )
 
             train = Spy()
-            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer, "PRETRAINING_INPUT_DIR", root)
             monkeypatch.setattr(
                 train_tokenizer.spm.SentencePieceTrainer, "train", train
             )
@@ -332,7 +332,7 @@ class TestTrainTokenizer:
             )
 
             train = Spy()
-            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer, "PRETRAINING_INPUT_DIR", root)
             monkeypatch.setattr(
                 train_tokenizer.spm.SentencePieceTrainer, "train", train
             )
@@ -384,7 +384,7 @@ class TestTrainTokenizer:
             )
 
             train = Spy()
-            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer, "PRETRAINING_INPUT_DIR", root)
             monkeypatch.setattr(
                 train_tokenizer.spm.SentencePieceTrainer, "train", train
             )
@@ -409,7 +409,7 @@ class TestTrainTokenizer:
             )
 
             train = Spy()
-            monkeypatch.setattr(train_tokenizer, "INPUT_DIR", root)
+            monkeypatch.setattr(train_tokenizer, "PRETRAINING_INPUT_DIR", root)
             monkeypatch.setattr(
                 train_tokenizer.spm.SentencePieceTrainer, "train", train
             )

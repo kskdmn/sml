@@ -26,8 +26,13 @@ class TestConfig:
             config.OUTPUT_DIR / "bpe_tokenizer.model"
             == config.DEFAULT_TOKENIZER_MODEL_PATH
         )
-        assert Path("~/Documents/data-common_pile/") == config.INPUT_DIR
-        assert r".*-00[0-9][0-9]\.jsonl\.zst\Z" == config.INPUT_FILE_NAME_REGEX
+        assert (
+            Path("~/Documents/training_data-common_pile/")
+            == config.PRETRAINING_INPUT_DIR
+        )
+        assert (
+            r".*-00[0-9][0-9]\.jsonl\.zst\Z" == config.PRETRAINING_INPUT_FILE_NAME_REGEX
+        )
         assert "model.safetensors" == config.MODEL_WEIGHTS_NAME
         assert "optimizer.npz" == config.OPTIMIZER_STATE_NAME
         assert "metadata.json" == config.METADATA_NAME
