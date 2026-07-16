@@ -64,10 +64,13 @@ The command writes `manifest.json` beside `train-000000.npz`,
 
 ### Train the base model
 
-Trains the MLX SML language model from the configured corpus. Run tokenizer
-training first, or pass an existing tokenizer with `--tokenizer-model`.
+Trains the MLX SML language model from prepared pretraining shards under
+`v2/output/pretraining_data/` (`manifest.json` plus `train-*.npz`). Run data
+preparation first, and train the tokenizer unless you pass an existing model
+with `--tokenizer-model`.
 
 ```sh
+uv run python v2/src/prepare_pretraining_data.py
 uv run python v2/src/train_sml.py
 ```
 

@@ -12,6 +12,7 @@ from typing import Protocol, Sequence, TypeVar
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from config import (
@@ -25,6 +26,13 @@ from config import (
     OUTPUT_DIR,
     SUCCESS_RETURN_CODE,
     resolve_path,
+)
+from pretraining_format import (
+    DEFAULT_PRETRAINING_DATA_DIR,
+    MANIFEST_NAME,
+    TOKENS_ARRAY_NAME,
+    load_manifest,
+    validate_manifest_for_training,
 )
 from sml import SMLConfig, SMLLanguageModel, count_parameters
 from utils import (
@@ -47,6 +55,15 @@ STOCHASTIC_RESUME_NOTE = (
     "stochastic continuity is not guaranteed."
 )
 BatchT = TypeVar("BatchT")
+
+# Kept as compatibility exports for callers that use the shared JSONL utilities
+# through this module; base-model training no longer consumes them.
+__all__ = (
+    "PRETRAINING_INPUT_DIR",
+    "PRETRAINING_INPUT_FILE_NAME_REGEX",
+    "discover_input_files",
+    "shuffle_input_files",
+)
 
 
 @dataclass(slots=True)
@@ -101,8 +118,7 @@ class TrainingConfig:
     ``train_sml.train_model``, instead of adding CLI flags.
     """
 
-    input_dir: Path = PRETRAINING_INPUT_DIR
-    input_file_name_regex: str = PRETRAINING_INPUT_FILE_NAME_REGEX
+    input_dir: Path = DEFAULT_PRETRAINING_DATA_DIR
     output_dir: Path = OUTPUT_DIR
     model_path: Path | None = None
     tokenizer_model_path: Path = DEFAULT_TOKENIZER_MODEL_PATH
@@ -112,8 +128,6 @@ class TrainingConfig:
     max_steps: int | None = None
     lr_total_steps: int | None = 268_000
     epochs: int = 1
-    max_rows_per_file: int | None = 40_960
-    shuffle_input_files: bool = True
     learning_rate: float = 3e-4
     parameter_weight_decay: ParameterWeightDecayConfig = field(
         default_factory=ParameterWeightDecayConfig
@@ -166,10 +180,94 @@ class TrainingDataState:
 
 
 @dataclass(slots=True)
+class PretrainingDataState:
+    epoch: int = 0
+    shard_index: int = 0
+    block_index: int = 0
+
+
+@dataclass(slots=True)
 class TrainingResumeState:
     step: int = 0
     input_files: tuple[Path, ...] = ()
-    data_state: TrainingDataState | None = None
+    data_state: PretrainingDataState | None = None
+
+
+def parse_checkpoint_pretraining_data_state(
+    data_state: object,
+) -> PretrainingDataState | None:
+    if data_state is None:
+        return None
+    if not isinstance(data_state, dict):
+        raise ValueError("Checkpoint data_state must be a dictionary")
+    shard_index = data_state.get("shard_index", 0)
+    block_index = data_state.get("block_index", 0)
+    if not isinstance(shard_index, int):
+        raise ValueError("Checkpoint data_state shard_index must be an integer")
+    if not isinstance(block_index, int):
+        raise ValueError("Checkpoint data_state block_index must be an integer")
+    return PretrainingDataState(
+        epoch=int(data_state.get("epoch", 0)),
+        shard_index=shard_index,
+        block_index=block_index,
+    )
+
+
+def reset_pretraining_data_state(data_state: PretrainingDataState, epoch: int) -> None:
+    data_state.epoch = epoch
+    data_state.shard_index = 0
+    data_state.block_index = 0
+
+
+def iter_prepared_token_blocks(
+    shard_paths: Sequence[Path],
+    sequence_length: int,
+    data_state: PretrainingDataState | None = None,
+    progress: ReadingProgress | None = None,
+) -> Iterator[dict[str, list[int]]]:
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+    tokens_per_block = sequence_length + 1
+    start_shard = 0 if data_state is None else data_state.shard_index
+    start_block = 0 if data_state is None else data_state.block_index
+    if start_shard < 0 or start_shard > len(shard_paths):
+        raise ValueError(
+            f"shard_index must be in [0, {len(shard_paths)}]; got {start_shard}"
+        )
+    for shard_index, shard_path in enumerate(shard_paths):
+        if shard_index < start_shard:
+            continue
+        with np.load(shard_path) as archive:
+            if TOKENS_ARRAY_NAME not in archive:
+                raise ValueError(
+                    f"Expected array '{TOKENS_ARRAY_NAME}' in {shard_path}"
+                )
+            tokens = archive[TOKENS_ARRAY_NAME]
+            if tokens.ndim != 2 or tokens.shape[1] != tokens_per_block:
+                raise ValueError(
+                    f"Shard {shard_path} tokens_per_block must be {tokens_per_block}; "
+                    f"got shape {tokens.shape}"
+                )
+            if tokens.dtype != np.uint16:
+                raise ValueError(
+                    f"Shard {shard_path} tokens dtype must be uint16; got {tokens.dtype}"
+                )
+            block_start = start_block if shard_index == start_shard else 0
+            if block_start < 0 or block_start > tokens.shape[0]:
+                raise ValueError(
+                    f"block_index must be in [0, {tokens.shape[0]}]; got {block_start}"
+                )
+            for block_index in range(block_start, tokens.shape[0]):
+                block = [int(token_id) for token_id in tokens[block_index]]
+                if progress is not None:
+                    progress.input_file = shard_path.name
+                    progress.line_number = block_index
+                    progress.example_index = block_index
+                if data_state is not None:
+                    data_state.shard_index = shard_index
+                    data_state.block_index = block_index + 1
+                yield {"input_ids": block[:-1], "labels": block[1:]}
+        start_block = 0
 
 
 class TextTokenizer(Protocol):
@@ -637,7 +735,7 @@ def save_checkpoint(
     training_config: TrainingConfig,
     step: int,
     input_files: Iterable[Path] = (),
-    data_state: TrainingDataState | None = None,
+    data_state: PretrainingDataState | None = None,
 ) -> None:
     checkpoint_path.mkdir(parents=True, exist_ok=True)
     model.save_weights(str(checkpoint_path / MODEL_WEIGHTS_NAME))
@@ -689,7 +787,7 @@ def load_training_checkpoint(
     input_files = metadata.get("input_files", ())
     if not isinstance(input_files, list):
         raise ValueError("Checkpoint metadata input_files must be a list")
-    data_state = parse_checkpoint_data_state(metadata.get("data_state"))
+    data_state = parse_checkpoint_pretraining_data_state(metadata.get("data_state"))
     return TrainingResumeState(
         step=step,
         input_files=tuple(
@@ -711,21 +809,22 @@ def train_model(
     output_dir = resolve_path(training_config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    input_files = discover_input_files(
-        training_config.input_dir,
-        training_config.input_file_name_regex,
-    )
-    if not input_files:
-        raise FileNotFoundError(
-            f"No supported input files found in {resolve_path(training_config.input_dir)}"
-        )
-    if training_config.shuffle_input_files:
-        input_files = shuffle_input_files(input_files, seed=training_config.seed)
-
+    input_dir = resolve_path(training_config.input_dir)
+    manifest_path = input_dir / MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Pretraining manifest does not exist: {manifest_path}")
+    manifest = load_manifest(manifest_path)
     tokenizer = load_tokenizer(training_config.tokenizer_model_path)
+    vocab_size = int(tokenizer.get_piece_size())
+    input_files = validate_manifest_for_training(
+        manifest,
+        manifest_dir=input_dir,
+        sequence_length=training_config.sequence_length,
+        tokenizer_vocab_size=vocab_size,
+    )
     checkpoint_model_config = replace(
         base_model_config,
-        vocab_size=tokenizer.get_piece_size(),
+        vocab_size=vocab_size,
         original_max_position_embeddings=max(
             base_model_config.original_max_position_embeddings,
             training_config.sequence_length,
@@ -763,13 +862,7 @@ def train_model(
             input_files = resume_state.input_files
 
     global_step = resume_state.step
-    data_state = resume_state.data_state or TrainingDataState()
-    legacy_batches_to_skip = (
-        count_resume_batches(global_step, training_config)
-        if resume_from_checkpoint and resume_state.data_state is None
-        else 0
-    )
-    resume_progress = ResumeProgress(batches_to_skip=legacy_batches_to_skip)
+    data_state = resume_state.data_state or PretrainingDataState()
     accumulation = GradientAccumulationWindow()
     reading_progress = ReadingProgress()
     loss_and_grad = nn.value_and_grad(model, build_loss_fn(model))
@@ -838,7 +931,7 @@ def train_model(
             )
         return False
 
-    print(f"Input files: {len(input_files)}")
+    print(f"Input shards: {len(input_files)}")
     print(f"Tokenizer vocab: {checkpoint_model_config.vocab_size:,}")
     print("Backend: mlx")
     print(f"Compute dtype: {training_config.autocast_dtype}")
@@ -846,21 +939,16 @@ def train_model(
 
     for epoch in range(data_state.epoch, training_config.epochs):
         if epoch != data_state.epoch:
-            reset_training_data_state(data_state, epoch)
+            reset_pretraining_data_state(data_state, epoch)
         reset_gradient_accumulation_window(accumulation)
-        blocks = iter_mlx_token_blocks(
-            texts=iter_texts(
-                input_files,
-                max_rows_per_file=training_config.max_rows_per_file,
-                progress=reading_progress,
-                data_state=data_state,
-            ),
-            tokenizer=tokenizer,
+        blocks = iter_prepared_token_blocks(
+            shard_paths=input_files,
             sequence_length=training_config.sequence_length,
             data_state=data_state,
+            progress=reading_progress,
         )
         batches = iter_mlx_batches(blocks, batch_size=training_config.batch_size)
-        for batch in iter_unseen_batches(batches, resume_progress):
+        for batch in batches:
             loss, grads = loss_and_grad(batch["input_ids"], batch["labels"])
             mx.eval(loss, grads)
             accumulate_gradients(

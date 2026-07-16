@@ -10,7 +10,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -18,9 +17,17 @@ import numpy as np
 import sentencepiece as spm
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+V2_SRC = REPO_ROOT / "v2" / "src"
+if str(V2_SRC) not in sys.path:
+    sys.path.insert(0, str(V2_SRC))
+
+from pretraining_format import (  # noqa: E402
+    MANIFEST_NAME,
+    TOKENS_ARRAY_NAME,
+    load_manifest as load_manifest_file,
+)
+
 DEFAULT_TOKENIZER_MODEL_PATH = REPO_ROOT / "v2" / "output" / "bpe_tokenizer.model"
-MANIFEST_NAME = "manifest.json"
-TOKENS_ARRAY_NAME = "tokens"
 SUCCESS_RETURN_CODE = 0
 
 
@@ -57,10 +64,7 @@ def load_manifest(shard_path: Path) -> dict[str, object] | None:
     if not manifest_path.is_file():
         return None
 
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Manifest must be a JSON object: {manifest_path}")
-    return manifest
+    return load_manifest_file(manifest_path)
 
 
 def resolve_tokenizer_model_path(

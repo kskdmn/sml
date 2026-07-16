@@ -45,6 +45,27 @@ class FakeTokenizer:
         return 16
 
 
+def write_pretraining_fixture(root: Path, blocks: list[list[int]]) -> Path:
+    import numpy as np
+
+    root.mkdir(parents=True, exist_ok=True)
+    shard_name = "train-000000.npz"
+    np.savez_compressed(root / shard_name, tokens=np.asarray(blocks, dtype=np.uint16))
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "format": "sml-pretokenized-blocks-v1",
+                "sequence_length": 4,
+                "tokens_per_block": 5,
+                "tokenizer_vocab_size": 16,
+                "shards": [{"path": shard_name, "blocks": len(blocks)}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return root
+
+
 @dataclass(frozen=True, slots=True)
 class PureModelConfig:
     vocab_size: int = 16
@@ -927,7 +948,7 @@ class TestCanonicalMlxTraining:
         monkeypatch,
         tmp_path,
     ):
-        require_mlx()
+        pytest.skip("obsolete JSONL training-path test")
         import train_sml
         from train_sml import TrainingConfig
 
@@ -963,7 +984,7 @@ class TestCanonicalMlxTraining:
         monkeypatch,
         tmp_path,
     ):
-        require_mlx()
+        pytest.skip("obsolete JSONL training-path test")
         import train_sml
         from train_sml import TrainingConfig
 
@@ -1012,7 +1033,7 @@ class TestCanonicalMlxTraining:
         monkeypatch,
         tmp_path,
     ):
-        require_mlx()
+        pytest.skip("replaced by exact prepared-shard resume coverage")
         import train_sml
         from train_sml import TrainingConfig
 
@@ -1064,10 +1085,12 @@ class TestCanonicalMlxTraining:
         import train_sml
         from train_sml import TrainingConfig
 
-        data_file = tmp_path / "data.jsonl.zst"
+        data_dir = write_pretraining_fixture(
+            tmp_path / "data", [[1, 4, 5, 6, 2], [2, 7, 8, 9, 2]]
+        )
         tokenizer_path = tmp_path / "tokenizer.model"
         training_config = TrainingConfig(
-            input_dir=tmp_path,
+            input_dir=data_dir,
             output_dir=tmp_path / "out",
             tokenizer_model_path=tokenizer_path,
             sequence_length=4,
@@ -1075,7 +1098,6 @@ class TestCanonicalMlxTraining:
             max_steps=1,
             lr_total_steps=1,
             epochs=1,
-            max_rows_per_file=None,
             learning_rate=1e-4,
             gradient_accumulation_steps=1,
             log_every=1,
@@ -1083,15 +1105,7 @@ class TestCanonicalMlxTraining:
         )
 
         monkeypatch.setattr(
-            train_sml, "discover_input_files", Spy(return_value=(data_file,))
-        )
-        monkeypatch.setattr(
             train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
-        )
-        monkeypatch.setattr(
-            train_sml,
-            "iter_texts",
-            lambda *args, **kwargs: iter(["4 5 6 7 8 9 10 11"]),
         )
 
         checkpoint_path = train_sml.train_model(
@@ -1114,12 +1128,15 @@ class TestCanonicalMlxTraining:
         import train_sml
         from train_sml import TrainingConfig
 
-        data_file = tmp_path / "data.jsonl.zst"
+        data_dir = write_pretraining_fixture(
+            tmp_path / "data",
+            [[1, 4, 5, 6, 2], [2, 7, 8, 9, 2], [1, 10, 11, 12, 2]],
+        )
         tokenizer_path = tmp_path / "tokenizer.model"
 
         def make_config(max_steps: int):
             return TrainingConfig(
-                input_dir=tmp_path,
+                input_dir=data_dir,
                 output_dir=tmp_path / "out",
                 tokenizer_model_path=tokenizer_path,
                 sequence_length=4,
@@ -1127,7 +1144,6 @@ class TestCanonicalMlxTraining:
                 max_steps=max_steps,
                 lr_total_steps=max_steps,
                 epochs=1,
-                max_rows_per_file=None,
                 learning_rate=1e-4,
                 gradient_accumulation_steps=1,
                 log_every=1,
@@ -1135,15 +1151,7 @@ class TestCanonicalMlxTraining:
             )
 
         monkeypatch.setattr(
-            train_sml, "discover_input_files", Spy(return_value=(data_file,))
-        )
-        monkeypatch.setattr(
             train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
-        )
-        monkeypatch.setattr(
-            train_sml,
-            "iter_texts",
-            lambda *args, **kwargs: iter(["4 5 6 7 8 9 10 11 12 13 14"]),
         )
 
         checkpoint_path = train_sml.train_model(

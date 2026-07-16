@@ -15,9 +15,16 @@ from config import (
     EOS_TOKEN_ID,
     PRETRAINING_INPUT_DIR,
     PRETRAINING_INPUT_FILE_NAME_REGEX,
-    OUTPUT_DIR,
     SUCCESS_RETURN_CODE,
     resolve_path,
+)
+from pretraining_format import (
+    DEFAULT_PRETRAINING_DATA_DIR as DEFAULT_OUTPUT_DIR,
+    FORMAT_NAME,
+    MANIFEST_NAME,
+    TOKEN_DTYPE_NAME,
+    TOKENS_ARRAY_NAME,
+    shard_name,
 )
 from utils import (
     TEXT_COLUMN,
@@ -31,19 +38,12 @@ from utils import (
 )
 
 
-FORMAT_NAME = "sml-pretokenized-blocks-v1"
-TOKENS_ARRAY_NAME = "tokens"
-TOKEN_DTYPE_NAME = "uint16"
 UINT16_VOCAB_SIZE_LIMIT = 65_536
 UINT16_MAX_TOKEN_ID = UINT16_VOCAB_SIZE_LIMIT - 1
-DEFAULT_OUTPUT_DIR = OUTPUT_DIR / "pretraining_data"
 DEFAULT_SEQUENCE_LENGTH = 1_024
 DEFAULT_BLOCKS_PER_SHARD = 32_768
 DEFAULT_MAX_ROWS_PER_FILE = 40_960
 DEFAULT_SEED = 42
-MANIFEST_NAME = "manifest.json"
-SHARD_NAME_PREFIX = "train"
-SHARD_NAME_SUFFIX = ".npz"
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,10 +154,6 @@ def iter_filtered_texts(
                 continue
             counters.texts_used += 1
             yield text
-
-
-def shard_name(shard_index: int) -> str:
-    return f"{SHARD_NAME_PREFIX}-{shard_index:06d}{SHARD_NAME_SUFFIX}"
 
 
 def write_token_shard(
