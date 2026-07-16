@@ -547,6 +547,25 @@ class TestSMLModel:
         assert low >= 0
         assert high <= 7
 
+    def test_yarn_find_correction_range_preserves_fractional_bounds(self):
+        from sml import yarn_find_correction_dim, yarn_find_correction_range
+
+        expected_low = yarn_find_correction_dim(32.0, 64, 10_000.0, 1_024)
+        expected_high = yarn_find_correction_dim(1.0, 64, 10_000.0, 1_024)
+        low, high = yarn_find_correction_range(
+            low_rot=32.0,
+            high_rot=1.0,
+            rotary_dim=64,
+            base=10_000.0,
+            original_max_position_embeddings=1_024,
+            truncate=False,
+        )
+
+        assert low == pytest.approx(expected_low)
+        assert high == pytest.approx(expected_high)
+        assert not low.is_integer()
+        assert not high.is_integer()
+
     def test_causal_lm_loss_uses_aligned_next_token_labels(self):
         from sml import compute_causal_lm_loss
 

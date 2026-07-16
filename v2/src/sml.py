@@ -322,7 +322,7 @@ def yarn_find_correction_range(
     original_max_position_embeddings: int,
     *,
     truncate: bool = True,
-) -> tuple[int, int]:
+) -> tuple[float, float]:
     """
     Convert YaRN rotation thresholds into band-index cutoffs for blending.
 
@@ -344,7 +344,7 @@ def yarn_find_correction_range(
     if truncate:
         low = math.floor(low)
         high = math.ceil(high)
-    return max(0, min(int(low), max_band)), max(0, min(int(high), max_band))
+    return max(0.0, min(low, max_band)), max(0.0, min(high, max_band))
 
 
 def yarn_get_mscale(rope_scaling_factor: float, multiplier: float = 1.0) -> float:
@@ -525,8 +525,8 @@ class RMSNorm(nn.Module):
 
 
 def yarn_linear_ramp_mask(
-    low: int,
-    high: int,
+    low: float,
+    high: float,
     num_rotary_bands: int,
 ) -> mx.array:
     if num_rotary_bands == 0:
