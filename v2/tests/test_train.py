@@ -45,24 +45,36 @@ class FakeTokenizer:
         return 16
 
 
-def write_pretraining_fixture(root: Path, blocks: list[list[int]]) -> Path:
+def write_token_shard(path: Path, blocks: list[list[int]]) -> None:
     import numpy as np
 
+    tokens = np.asarray(blocks, dtype=np.uint16)
+    np.savez_compressed(path, tokens=tokens)
+
+
+def write_pretraining_fixture(
+    root: Path,
+    *,
+    sequence_length: int,
+    vocab_size: int,
+    shards: list[list[list[int]]],
+) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    shard_name = "train-000000.npz"
-    np.savez_compressed(root / shard_name, tokens=np.asarray(blocks, dtype=np.uint16))
-    (root / "manifest.json").write_text(
-        json.dumps(
-            {
-                "format": "sml-pretokenized-blocks-v1",
-                "sequence_length": 4,
-                "tokens_per_block": 5,
-                "tokenizer_vocab_size": 16,
-                "shards": [{"path": shard_name, "blocks": len(blocks)}],
-            }
-        ),
-        encoding="utf-8",
-    )
+    shard_entries = []
+    for index, blocks in enumerate(shards):
+        relative = f"train-{index:06d}.npz"
+        write_token_shard(root / relative, blocks)
+        shard_entries.append({"path": relative, "blocks": len(blocks)})
+    manifest = {
+        "format": "sml-pretokenized-blocks-v1",
+        "array_name": "tokens",
+        "dtype": "uint16",
+        "sequence_length": sequence_length,
+        "tokens_per_block": sequence_length + 1,
+        "tokenizer_vocab_size": vocab_size,
+        "shards": shard_entries,
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     return root
 
 
@@ -757,6 +769,113 @@ class TestTrainData:
         )
 
 
+class TestPreparedPretrainingBlocks:
+    def test_iter_prepared_token_blocks_splits_input_ids_and_labels(self, tmp_path):
+        import train_sml
+
+        root = write_pretraining_fixture(
+            tmp_path,
+            sequence_length=4,
+            vocab_size=128,
+            shards=[
+                [
+                    [1, 10, 11, 12, 2],
+                    [2, 1, 20, 21, 2],
+                ]
+            ],
+        )
+        data_state = train_sml.PretrainingDataState()
+        progress = train_sml.ReadingProgress()
+
+        blocks = list(
+            train_sml.iter_prepared_token_blocks(
+                shard_paths=(root / "train-000000.npz",),
+                sequence_length=4,
+                data_state=data_state,
+                progress=progress,
+            )
+        )
+
+        assert [
+            {"input_ids": [1, 10, 11, 12], "labels": [10, 11, 12, 2]},
+            {"input_ids": [2, 1, 20, 21], "labels": [1, 20, 21, 2]},
+        ] == blocks
+        assert data_state.shard_index == 0
+        assert data_state.block_index == 2
+        assert progress.input_file == "train-000000.npz"
+        assert progress.line_number == 1
+
+    def test_iter_prepared_token_blocks_resumes_from_shard_and_block(self, tmp_path):
+        import train_sml
+
+        root = write_pretraining_fixture(
+            tmp_path,
+            sequence_length=4,
+            vocab_size=128,
+            shards=[
+                [[1, 10, 11, 12, 2], [2, 1, 20, 21, 2]],
+                [[3, 30, 31, 32, 2]],
+            ],
+        )
+        data_state = train_sml.PretrainingDataState(shard_index=1, block_index=0)
+
+        blocks = list(
+            train_sml.iter_prepared_token_blocks(
+                shard_paths=(
+                    root / "train-000000.npz",
+                    root / "train-000001.npz",
+                ),
+                sequence_length=4,
+                data_state=data_state,
+            )
+        )
+
+        assert [{"input_ids": [3, 30, 31, 32], "labels": [30, 31, 32, 2]}] == blocks
+
+    def test_iter_prepared_token_blocks_rejects_wrong_block_width(self, tmp_path):
+        import train_sml
+        import numpy as np
+
+        path = tmp_path / "train-000000.npz"
+        np.savez_compressed(
+            path,
+            tokens=np.asarray([[1, 2, 3]], dtype=np.uint16),
+        )
+
+        with pytest.raises(ValueError, match="tokens_per_block"):
+            list(
+                train_sml.iter_prepared_token_blocks(
+                    shard_paths=(path,),
+                    sequence_length=4,
+                )
+            )
+
+    def test_parse_checkpoint_pretraining_data_state_restores_fields(self):
+        import train_sml
+
+        data_state = train_sml.parse_checkpoint_pretraining_data_state(
+            {"epoch": 2, "shard_index": 1, "block_index": 7}
+        )
+
+        assert data_state == train_sml.PretrainingDataState(
+            epoch=2,
+            shard_index=1,
+            block_index=7,
+        )
+
+    def test_reset_pretraining_data_state_starts_new_epoch(self):
+        import train_sml
+
+        data_state = train_sml.PretrainingDataState(
+            epoch=1,
+            shard_index=2,
+            block_index=9,
+        )
+        train_sml.reset_pretraining_data_state(data_state, epoch=3)
+
+        assert data_state == train_sml.PretrainingDataState(epoch=3)
+
+
 class TestCanonicalMlxTraining:
     def test_mlx_token_blocks_update_training_data_state_after_yield(self):
         import train_sml
@@ -1086,7 +1205,10 @@ class TestCanonicalMlxTraining:
         from train_sml import TrainingConfig
 
         data_dir = write_pretraining_fixture(
-            tmp_path / "data", [[1, 4, 5, 6, 2], [2, 7, 8, 9, 2]]
+            tmp_path / "data",
+            sequence_length=4,
+            vocab_size=16,
+            shards=[[[1, 4, 5, 6, 2], [2, 7, 8, 9, 2]]],
         )
         tokenizer_path = tmp_path / "tokenizer.model"
         training_config = TrainingConfig(
@@ -1130,7 +1252,11 @@ class TestCanonicalMlxTraining:
 
         data_dir = write_pretraining_fixture(
             tmp_path / "data",
-            [[1, 4, 5, 6, 2], [2, 7, 8, 9, 2], [1, 10, 11, 12, 2]],
+            sequence_length=4,
+            vocab_size=16,
+            shards=[
+                [[1, 4, 5, 6, 2], [2, 7, 8, 9, 2], [1, 10, 11, 12, 2]],
+            ],
         )
         tokenizer_path = tmp_path / "tokenizer.model"
 
