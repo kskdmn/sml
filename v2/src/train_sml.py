@@ -18,8 +18,6 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from config import (
     DEFAULT_MODEL_PATH,
     DEFAULT_TOKENIZER_MODEL_PATH,
-    PRETRAINING_INPUT_DIR,
-    PRETRAINING_INPUT_FILE_NAME_REGEX,
     METADATA_NAME,
     MODEL_WEIGHTS_NAME,
     OPTIMIZER_STATE_NAME,
@@ -49,13 +47,6 @@ STOCHASTIC_RESUME_NOTE = (
     "stochastic continuity is not guaranteed."
 )
 BatchT = TypeVar("BatchT")
-
-# Kept as compatibility exports for callers that read shared config constants
-# through this module; base-model training reads prepared shards instead.
-__all__ = (
-    "PRETRAINING_INPUT_DIR",
-    "PRETRAINING_INPUT_FILE_NAME_REGEX",
-)
 
 
 @dataclass(slots=True)
@@ -182,7 +173,7 @@ class PretrainingDataState:
 class TrainingResumeState:
     step: int = 0
     input_files: tuple[Path, ...] = ()
-    data_state: PretrainingDataState | None = None
+    data_state: PretrainingDataState | TrainingDataState | None = None
 
 
 def parse_checkpoint_pretraining_data_state(
@@ -250,7 +241,7 @@ def iter_prepared_token_blocks(
                     f"block_index must be in [0, {tokens.shape[0]}]; got {block_start}"
                 )
             for block_index in range(block_start, tokens.shape[0]):
-                block = [int(token_id) for token_id in tokens[block_index]]
+                block = tokens[block_index].tolist()
                 if progress is not None:
                     progress.input_file = shard_path.name
                     progress.line_number = block_index

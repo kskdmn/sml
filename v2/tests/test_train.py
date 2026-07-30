@@ -860,6 +860,116 @@ class TestCanonicalMlxTraining:
         with pytest.raises(FileNotFoundError, match="Checkpoint does not exist"):
             train_sml.load_training_checkpoint(tmp_path / "missing", object(), object())
 
+    def test_train_model_starts_fresh_without_resume_even_when_checkpoint_exists(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        require_mlx()
+        import train_sml
+        from train_sml import TrainingConfig
+
+        data_dir = write_pretraining_fixture(
+            tmp_path / "data",
+            sequence_length=4,
+            vocab_size=16,
+            shards=[[[1, 4, 5, 6, 2]]],
+        )
+        training_config = TrainingConfig(
+            input_dir=data_dir,
+            output_dir=tmp_path / "output",
+            tokenizer_model_path=tmp_path / "tokenizer.model",
+            sequence_length=4,
+            batch_size=1,
+            max_steps=1,
+            lr_total_steps=1,
+            epochs=1,
+            learning_rate=1e-4,
+            gradient_accumulation_steps=1,
+            log_every=1,
+            save_every=1,
+        )
+        checkpoint_path = tmp_path / "output" / "sml"
+        checkpoint_path.mkdir(parents=True)
+        (checkpoint_path / train_sml.METADATA_NAME).write_text("{}", encoding="utf-8")
+
+        monkeypatch.setattr(
+            train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
+        )
+        monkeypatch.setattr(
+            train_sml,
+            "load_training_checkpoint",
+            Spy(side_effect=AssertionError("checkpoint should not be loaded")),
+        )
+        monkeypatch.setattr(
+            train_sml,
+            "iter_mlx_batches",
+            Spy(side_effect=RuntimeError("stop after batches")),
+        )
+
+        with pytest.raises(RuntimeError, match="stop after batches"):
+            train_sml.train_model(training_config, model_config=tiny_config())
+
+    def test_train_model_restarts_from_checkpoint_name_when_resume_is_enabled(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        require_mlx()
+        import train_sml
+        from train_sml import TrainingConfig
+
+        data_dir = write_pretraining_fixture(
+            tmp_path / "data",
+            sequence_length=4,
+            vocab_size=16,
+            shards=[[[1, 4, 5, 6, 2]]],
+        )
+        training_config = TrainingConfig(
+            input_dir=data_dir,
+            output_dir=tmp_path / "output",
+            tokenizer_model_path=tmp_path / "tokenizer.model",
+            sequence_length=4,
+            batch_size=1,
+            max_steps=1,
+            lr_total_steps=1,
+            epochs=1,
+            learning_rate=1e-4,
+            gradient_accumulation_steps=1,
+            log_every=1,
+            save_every=1,
+            checkpoint_name="sml",
+            model_path=tmp_path / "output" / "sml",
+        )
+        load_training_checkpoint = Spy(return_value=train_sml.TrainingResumeState())
+
+        monkeypatch.setattr(
+            train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
+        )
+        monkeypatch.setattr(
+            train_sml,
+            "load_training_checkpoint",
+            load_training_checkpoint,
+        )
+        monkeypatch.setattr(
+            train_sml,
+            "iter_mlx_batches",
+            Spy(side_effect=RuntimeError("stop after batches")),
+        )
+
+        with pytest.raises(RuntimeError, match="stop after batches"):
+            train_sml.train_model(
+                training_config,
+                model_config=tiny_config(),
+                resume_from_checkpoint=True,
+            )
+
+        load_training_checkpoint.assert_called_once()
+        assert (
+            training_config.output_dir / "sml"
+            == load_training_checkpoint.call_args.args[0]
+        )
+
     def test_train_model_uses_checkpoint_input_file_order_when_resume_is_enabled(
         self,
         monkeypatch,
@@ -974,6 +1084,11 @@ class TestCanonicalMlxTraining:
         )
         assert "not_guaranteed" == metadata["stochastic_resume"]
         assert train_sml.STOCHASTIC_RESUME_NOTE == metadata["resume_note"]
+        assert metadata["data_state"] == {
+            "epoch": 0,
+            "shard_index": 0,
+            "block_index": 1,
+        }
 
     def test_tiny_mlx_training_run_can_resume_checkpoint(self, tmp_path, monkeypatch):
         require_mlx()
@@ -1025,3 +1140,8 @@ class TestCanonicalMlxTraining:
 
         assert resumed_path == checkpoint_path
         assert metadata["step"] == 2
+        assert metadata["data_state"] == {
+            "epoch": 0,
+            "shard_index": 0,
+            "block_index": 2,
+        }
