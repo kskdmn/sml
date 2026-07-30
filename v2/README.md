@@ -11,8 +11,9 @@
 Run commands from the repository root with `uv run`. The scripts use the shared
 defaults in `v2/src/config.py`:
 
-- Training data: `~/Documents/data-common_pile/`
-- Input shard pattern: `.*-00[0-9][0-9]\.jsonl\.zst\Z`
+- JSONL training data (tokenizer + prepare): `~/Documents/training_data-common_pile/`
+- Prepared pretraining shards (`train_sml`): `v2/output/pretraining_data/`
+- Input shard pattern (JSONL): `.*-00[0-9][0-9]\.jsonl\.zst\Z`
 - Default tokenizer: `v2/output/bpe_tokenizer.model`
 - Default model checkpoint: `v2/output/sml`
 - Default output directory: `v2/output`

@@ -7,7 +7,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol, Sequence, TypeVar
+from typing import Sequence, TypeVar
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -36,17 +36,11 @@ from pretraining_format import (
 )
 from sml import SMLConfig, SMLLanguageModel, count_parameters
 from utils import (
-    TEXT_COLUMN,
     build_loss_fn,
     build_lr_schedule,
-    discover_input_files,
-    filter_text,
-    get_special_token_id,
-    iter_jsonl_records,
     json_ready,
     load_tokenizer,
     set_seed,
-    shuffle_input_files,
 )
 
 
@@ -56,13 +50,11 @@ STOCHASTIC_RESUME_NOTE = (
 )
 BatchT = TypeVar("BatchT")
 
-# Kept as compatibility exports for callers that use the shared JSONL utilities
-# through this module; base-model training no longer consumes them.
+# Kept as compatibility exports for callers that read shared config constants
+# through this module; base-model training reads prepared shards instead.
 __all__ = (
     "PRETRAINING_INPUT_DIR",
     "PRETRAINING_INPUT_FILE_NAME_REGEX",
-    "discover_input_files",
-    "shuffle_input_files",
 )
 
 
@@ -270,50 +262,6 @@ def iter_prepared_token_blocks(
         start_block = 0
 
 
-class TextTokenizer(Protocol):
-    def encode(self, text: str, out_type: type = int) -> list[int]:
-        """
-        Training only needs SentencePiece-style integer encoding, which keeps the
-        protocol narrow enough for lightweight tests.
-        """
-        ...
-
-
-def iter_texts(
-    input_files: Iterable[Path],
-    max_rows_per_file: int | None,
-    progress: ReadingProgress | None = None,
-    data_state: TrainingDataState | None = None,
-) -> Iterator[str]:
-    """
-    Reuse tokenizer-training text filters so tokenizer and model training agree on which
-    rows are usable.
-    """
-    start_file_index = 0 if data_state is None else data_state.input_file_index
-    for input_file_index, input_file in enumerate(input_files):
-        if input_file_index < start_file_index:
-            continue
-        start_after_line = (
-            data_state.line_number
-            if data_state is not None and input_file_index == start_file_index
-            else None
-        )
-        for row, line_number in iter_jsonl_records(
-            input_file,
-            max_rows_per_file,
-            start_after_line=start_after_line,
-        ):
-            if progress is not None:
-                progress.input_file = input_file.name
-                progress.line_number = line_number
-            if data_state is not None:
-                data_state.input_file_index = input_file_index
-                data_state.line_number = line_number
-            text = filter_text(row.get(TEXT_COLUMN))
-            if text is not None:
-                yield text
-
-
 def parse_checkpoint_data_state(data_state: object) -> TrainingDataState | None:
     if data_state is None:
         return None
@@ -452,48 +400,6 @@ def apply_model_dtype(model, autocast_dtype: str) -> None:
     model.update(tree_map(cast_array, model.parameters()))
     _retie_embeddings_if_needed(model)
     mx.eval(model.parameters())
-
-
-def iter_mlx_token_blocks(
-    texts: Iterable[str],
-    tokenizer,
-    sequence_length: int,
-    stride: int | None = None,
-    bos_token_id: int | None = None,
-    eos_token_id: int | None = None,
-    data_state: TrainingDataState | None = None,
-) -> Iterator[dict[str, list[int]]]:
-    if sequence_length <= 0:
-        raise ValueError("sequence_length must be positive")
-
-    buffer = [] if data_state is None else list(data_state.token_buffer)
-    tokens_per_block = sequence_length + 1
-    stride = sequence_length if stride is None else stride
-    bos_token_id = get_special_token_id(tokenizer, "bos_id", bos_token_id)
-    eos_token_id = get_special_token_id(tokenizer, "eos_id", eos_token_id)
-
-    def iter_ready_blocks() -> Iterator[dict[str, list[int]]]:
-        while len(buffer) >= tokens_per_block:
-            block = buffer[:tokens_per_block]
-            del buffer[:stride]
-            if data_state is not None:
-                data_state.token_buffer = list(buffer)
-            yield {
-                "input_ids": [int(token_id) for token_id in block[:-1]],
-                "labels": [int(token_id) for token_id in block[1:]],
-            }
-
-    yield from iter_ready_blocks()
-    for text in texts:
-        token_ids = tokenizer.encode(text, out_type=int)
-        if bos_token_id is not None:
-            buffer.append(bos_token_id)
-        buffer.extend(int(token_id) for token_id in token_ids)
-        if eos_token_id is not None:
-            buffer.append(eos_token_id)
-        if data_state is not None:
-            data_state.token_buffer = list(buffer)
-        yield from iter_ready_blocks()
 
 
 def iter_mlx_batches(

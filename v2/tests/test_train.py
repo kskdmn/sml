@@ -1,14 +1,12 @@
 import inspect
 import json
 import sys
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from helpers import Spy
 import pytest
-import zstandard as zstd
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -24,13 +22,6 @@ def require_mlx():
     except (ImportError, RuntimeError) as exc:  # pragma: no cover - depends on host
         pytest.skip(f"mlx is not available: {exc}")
     return mx
-
-
-def write_zst_rows(path: Path, rows: list[dict[str, object]]) -> None:
-    encoder = json.JSONEncoder()
-    text = "\n".join(encoder.encode(row) for row in rows)
-    compressed = zstd.ZstdCompressor().compress(text.encode("utf-8"))
-    path.write_bytes(compressed)
 
 
 class FakeTokenizer:
@@ -381,181 +372,20 @@ class TestTrainData:
         for _, parameter in tree_flatten(model.parameters()):
             assert mx.float32 == parameter.dtype
 
-    def test_discover_input_files_uses_supplied_regex_and_sorts_matches(self):
-        import train_sml
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            root = Path(tmp_dir)
-            (root / "pile-0002.jsonl.zst").write_text("", encoding="utf-8")
-            (root / "pile-0000.jsonl.zst").write_text("", encoding="utf-8")
-            (root / "pile-0010.jsonl.zst").write_text("", encoding="utf-8")
-            (root / "pile-0001.jsonl").write_text("", encoding="utf-8")
-            (root / ".pile-0001.jsonl.zst").write_text("", encoding="utf-8")
-
-            files = train_sml.discover_input_files(root, r".*-000[0-9]\.jsonl\.zst\Z")
-
-        assert ["pile-0000.jsonl.zst", "pile-0002.jsonl.zst"] == [
-            path.name for path in files
-        ]
-
-    def test_shuffle_input_files_uses_seeded_deterministic_order(self):
-        import train_sml
-
-        files = tuple(
-            Path(name)
-            for name in (
-                "pile-0000.jsonl.zst",
-                "pile-0001.jsonl.zst",
-                "pile-0002.jsonl.zst",
-                "pile-0003.jsonl.zst",
-            )
-        )
-
-        first_shuffle = train_sml.shuffle_input_files(files, seed=42)
-        second_shuffle = train_sml.shuffle_input_files(files, seed=42)
-
-        assert [
-            "pile-0002.jsonl.zst",
-            "pile-0001.jsonl.zst",
-            "pile-0003.jsonl.zst",
-            "pile-0000.jsonl.zst",
-        ] == [path.name for path in first_shuffle]
-        assert first_shuffle == second_shuffle
-
-    def test_shuffle_input_files_uses_seed_to_change_order(self):
-        import train_sml
-
-        files = tuple(
-            Path(name)
-            for name in (
-                "pile-0000.jsonl.zst",
-                "pile-0001.jsonl.zst",
-                "pile-0002.jsonl.zst",
-                "pile-0003.jsonl.zst",
-            )
-        )
-
-        assert [
-            "pile-0002.jsonl.zst",
-            "pile-0000.jsonl.zst",
-            "pile-0001.jsonl.zst",
-            "pile-0003.jsonl.zst",
-        ] == [path.name for path in train_sml.shuffle_input_files(files, seed=99)]
-
-    def test_shuffle_input_files_returns_tuple_without_mutating_input(self):
-        import train_sml
-
-        files = [
-            Path("pile-0000.jsonl.zst"),
-            Path("pile-0001.jsonl.zst"),
-            Path("pile-0002.jsonl.zst"),
-            Path("pile-0003.jsonl.zst"),
-        ]
-        original_names = [path.name for path in files]
-
-        shuffled = train_sml.shuffle_input_files(files, seed=42)
-
-        assert isinstance(shuffled, tuple)
-        assert original_names == [path.name for path in files]
-
-    def test_iter_texts_resumes_after_training_data_state_line_number(self):
-        import train_sml
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "pile-0000.jsonl.zst"
-            write_zst_rows(
-                path,
-                [
-                    {"text": "a" * 100},
-                    {"text": "b" * 100},
-                    {"text": "c" * 100},
-                ],
-            )
-            data_state = train_sml.TrainingDataState(
-                input_file_index=0,
-                line_number=2,
-            )
-
-            texts = list(
-                train_sml.iter_texts(
-                    [path],
-                    max_rows_per_file=None,
-                    data_state=data_state,
-                )
-            )
-
-        assert ["c" * 100] == texts
-        assert 3 == data_state.line_number
-
-    def test_iter_texts_streams_zst_jsonl_rows_without_loading_all_files(self):
-        import train_sml
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            first = Path(tmp_dir) / "pile-0000.jsonl.zst"
-            second = Path(tmp_dir) / "pile-0001.jsonl.zst"
-            write_zst_rows(
-                first,
-                [{"text": "a" * 100}, {"text": "too short"}, {"other": "missing"}],
-            )
-            write_zst_rows(second, [{"text": "b" * 100}])
-
-            iterator = train_sml.iter_texts([first, second], max_rows_per_file=2)
-
-            assert "a" * 100 == next(iterator)
-            assert "b" * 100 == next(iterator)
-            with pytest.raises(StopIteration):
-                next(iterator)
-
-    def test_iter_texts_reads_all_rows_when_max_rows_per_file_is_none(self):
-        import train_sml
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "pile-0000.jsonl.zst"
-            write_zst_rows(
-                path,
-                [
-                    {"text": "a" * 100},
-                    {"text": "b" * 100},
-                    {"text": "c" * 100},
-                ],
-            )
-
-            texts = list(train_sml.iter_texts([path], max_rows_per_file=None))
-
-        assert ["a" * 100, "b" * 100, "c" * 100] == texts
-
-    def test_iter_texts_updates_reading_progress(self):
-        import train_sml
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            path = Path(tmp_dir) / "pile-0000.jsonl.zst"
-            write_zst_rows(
-                path,
-                [{"text": "a" * 100}, {"text": "too short"}, {"other": "missing"}],
-            )
-            progress = train_sml.ReadingProgress()
-            texts = list(
-                train_sml.iter_texts([path], max_rows_per_file=None, progress=progress)
-            )
-
-        assert ["a" * 100] == texts
-        assert "pile-0000.jsonl.zst" == progress.input_file
-        assert 3 == progress.line_number
-
     def test_get_special_token_id_uses_fallback_for_disabled_or_missing_token(self):
-        import train_sml
+        import utils
 
         class Tokenizer:
             def bos_id(self):
                 return -1
 
-        assert 1 == train_sml.get_special_token_id(Tokenizer(), "bos_id", 1)
-        assert 2 == train_sml.get_special_token_id(object(), "eos_id", 2)
+        assert 1 == utils.get_special_token_id(Tokenizer(), "bos_id", 1)
+        assert 2 == utils.get_special_token_id(object(), "eos_id", 2)
 
     def test_get_special_token_id_uses_tokenizer_value_when_enabled(self):
-        import train_sml
+        import utils
 
-        assert 1 == train_sml.get_special_token_id(FakeTokenizer(), "bos_id", 9)
+        assert 1 == utils.get_special_token_id(FakeTokenizer(), "bos_id", 9)
 
     def test_load_tokenizer_rejects_missing_model(self, tmp_path):
         import train_sml
@@ -877,38 +707,6 @@ class TestPreparedPretrainingBlocks:
 
 
 class TestCanonicalMlxTraining:
-    def test_mlx_token_blocks_update_training_data_state_after_yield(self):
-        import train_sml
-
-        data_state = train_sml.TrainingDataState()
-        blocks = train_sml.iter_mlx_token_blocks(
-            texts=iter(["4 5 6 7 8"]),
-            tokenizer=FakeTokenizer(),
-            sequence_length=3,
-            data_state=data_state,
-        )
-
-        first = next(blocks)
-
-        assert {"input_ids": [1, 4, 5], "labels": [4, 5, 6]} == first
-        assert [6, 7, 8, 2] == data_state.token_buffer
-
-    def test_mlx_token_blocks_resume_from_training_data_state_token_buffer(self):
-        import train_sml
-
-        data_state = train_sml.TrainingDataState(token_buffer=[6, 7, 8, 2])
-        blocks = train_sml.iter_mlx_token_blocks(
-            texts=iter([]),
-            tokenizer=FakeTokenizer(),
-            sequence_length=3,
-            data_state=data_state,
-        )
-
-        first = next(blocks)
-
-        assert {"input_ids": [6, 7, 8], "labels": [7, 8, 2]} == first
-        assert [2] == data_state.token_buffer
-
     def test_mlx_batch_iterator_emits_mx_arrays_with_next_token_labels(self):
         mx = require_mlx()
         import train_sml
@@ -1062,118 +860,45 @@ class TestCanonicalMlxTraining:
         with pytest.raises(FileNotFoundError, match="Checkpoint does not exist"):
             train_sml.load_training_checkpoint(tmp_path / "missing", object(), object())
 
-    def test_train_model_starts_fresh_without_resume_even_when_checkpoint_exists(
-        self,
-        monkeypatch,
-        tmp_path,
-    ):
-        pytest.skip("obsolete JSONL training-path test")
-        import train_sml
-        from train_sml import TrainingConfig
-
-        discovered = (Path("pile-0000.jsonl.zst"),)
-        training_config = TrainingConfig(
-            input_dir=tmp_path,
-            output_dir=tmp_path / "output",
-            tokenizer_model_path=tmp_path / "tokenizer.model",
-        )
-
-        monkeypatch.setattr(
-            train_sml, "discover_input_files", Spy(return_value=discovered)
-        )
-        monkeypatch.setattr(
-            train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
-        )
-        monkeypatch.setattr(
-            train_sml,
-            "load_training_checkpoint",
-            Spy(side_effect=AssertionError("checkpoint should not be loaded")),
-        )
-        monkeypatch.setattr(
-            train_sml,
-            "iter_mlx_batches",
-            Spy(side_effect=RuntimeError("stop after batches")),
-        )
-
-        with pytest.raises(RuntimeError, match="stop after batches"):
-            train_sml.train_model(training_config, model_config=tiny_config())
-
-    def test_train_model_restarts_from_checkpoint_name_when_resume_is_enabled(
-        self,
-        monkeypatch,
-        tmp_path,
-    ):
-        pytest.skip("obsolete JSONL training-path test")
-        import train_sml
-        from train_sml import TrainingConfig
-
-        discovered = (Path("pile-0000.jsonl.zst"),)
-        training_config = TrainingConfig(
-            input_dir=tmp_path,
-            output_dir=tmp_path / "output",
-            tokenizer_model_path=tmp_path / "tokenizer.model",
-            checkpoint_name="sml",
-            model_path=tmp_path / "output" / "sml",
-        )
-        load_training_checkpoint = Spy(return_value=train_sml.TrainingResumeState())
-
-        monkeypatch.setattr(
-            train_sml, "discover_input_files", Spy(return_value=discovered)
-        )
-        monkeypatch.setattr(
-            train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
-        )
-        monkeypatch.setattr(
-            train_sml,
-            "load_training_checkpoint",
-            load_training_checkpoint,
-        )
-        monkeypatch.setattr(
-            train_sml,
-            "iter_mlx_batches",
-            Spy(side_effect=RuntimeError("stop after batches")),
-        )
-
-        with pytest.raises(RuntimeError, match="stop after batches"):
-            train_sml.train_model(
-                training_config,
-                model_config=tiny_config(),
-                resume_from_checkpoint=True,
-            )
-
-        load_training_checkpoint.assert_called_once()
-        assert (
-            training_config.output_dir / "sml"
-            == load_training_checkpoint.call_args.args[0]
-        )
-
     def test_train_model_uses_checkpoint_input_file_order_when_resume_is_enabled(
         self,
         monkeypatch,
         tmp_path,
     ):
-        pytest.skip("replaced by exact prepared-shard resume coverage")
         import train_sml
         from train_sml import TrainingConfig
 
-        discovered = (
-            Path("pile-0000.jsonl.zst"),
-            Path("pile-0001.jsonl.zst"),
+        data_dir = write_pretraining_fixture(
+            tmp_path / "data",
+            sequence_length=4,
+            vocab_size=16,
+            shards=[
+                [[1, 4, 5, 6, 2]],
+                [[2, 7, 8, 9, 2]],
+            ],
         )
         checkpoint_order = (
-            Path("pile-0001.jsonl.zst"),
-            Path("pile-0000.jsonl.zst"),
+            data_dir / "train-000001.npz",
+            data_dir / "train-000000.npz",
         )
         training_config = TrainingConfig(
-            input_dir=tmp_path,
+            input_dir=data_dir,
             output_dir=tmp_path / "output",
             tokenizer_model_path=tmp_path / "tokenizer.model",
+            sequence_length=4,
+            batch_size=1,
+            max_steps=1,
+            lr_total_steps=1,
+            epochs=1,
+            learning_rate=1e-4,
+            gradient_accumulation_steps=1,
+            log_every=1,
+            save_every=1,
         )
-        iter_texts = Spy(side_effect=RuntimeError("stop after input order"))
+        iter_prepared_token_blocks = Spy(
+            side_effect=RuntimeError("stop after shard order")
+        )
 
-        monkeypatch.setattr(
-            train_sml, "discover_input_files", Spy(return_value=discovered)
-        )
         monkeypatch.setattr(
             train_sml, "load_tokenizer", Spy(return_value=FakeTokenizer())
         )
@@ -1184,20 +909,25 @@ class TestCanonicalMlxTraining:
                 return_value=train_sml.TrainingResumeState(
                     step=0,
                     input_files=checkpoint_order,
-                    data_state=train_sml.TrainingDataState(),
+                    data_state=train_sml.PretrainingDataState(),
                 )
             ),
         )
-        monkeypatch.setattr(train_sml, "iter_texts", iter_texts)
+        monkeypatch.setattr(
+            train_sml, "iter_prepared_token_blocks", iter_prepared_token_blocks
+        )
 
-        with pytest.raises(RuntimeError, match="stop after input order"):
+        with pytest.raises(RuntimeError, match="stop after shard order"):
             train_sml.train_model(
                 training_config,
                 model_config=tiny_config(),
                 resume_from_checkpoint=True,
             )
 
-        assert checkpoint_order == iter_texts.call_args.args[0]
+        assert (
+            checkpoint_order
+            == iter_prepared_token_blocks.call_args.kwargs["shard_paths"]
+        )
 
     def test_tiny_mlx_training_run_writes_checkpoint(self, tmp_path, monkeypatch):
         require_mlx()
