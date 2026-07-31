@@ -62,6 +62,13 @@ throughput and peak memory conflict, throughput wins provided the current
 default model and batch configuration still fit the target Apple-Silicon
 hardware.
 
+The acceptance hardware is an Apple M5 with 10 CPU cores (4 performance and 6
+efficiency cores), 10 GPU cores, and 24 GB of unified memory. Performance
+comparisons use the pre-refactor implementation at commit `3687f8b` as the
+source baseline. The benchmark protocol below pins the remaining workload and
+environment identity; results from other Apple-Silicon systems are informative
+but do not satisfy the acceptance gate.
+
 Correctness is a hard constraint, not a tradeoff. Performance changes must
 retain mathematical equivalence where specified and must be measured against a
 recorded baseline.
@@ -129,12 +136,22 @@ dependencies are imported lazily by the command that needs them.
 
 ## Artifact Model
 
-Every top-level consumable bundle is immutable, self-describing, and directory
-based. A run is the self-contained artifact; its step directories are immutable
-components that may reference files at the run root and are not independently
-portable. An export is independently self-contained and portable. Relative
-references and content identities are canonical; absolute source paths are
-diagnostic only.
+Tokenizer, prepared-data, and export bundles are immutable, self-describing,
+and directory based. A run is a mutable, self-contained container with narrowly
+defined mutable indexes: checkpoint directories may be appended, `latest.json`
+may be atomically replaced, and retention may delete non-latest checkpoint
+directories after a newer latest step has been published. Retention never
+deletes the checkpoint currently named by `latest.json` and always performs
+latest-index recovery before selecting deletion candidates. `run.json`, copied
+tokenizer and base snapshots, and every published checkpoint directory are
+immutable once written.
+
+A step directory may reference immutable files at its owning run root and is
+therefore not independently portable. A run directory and an export directory
+are independently self-contained and portable. Run identity is the identity of
+immutable `run.json` plus the selected checkpoint manifest, not a digest of the
+mutable directory as a whole. Relative references and content identities are
+canonical; absolute source paths are diagnostic only.
 
 ### Tokenizer bundle
 
@@ -146,8 +163,9 @@ tokenizer/
 ```
 
 The typed manifest records the schema kind/version, SentencePiece BPE settings,
-vocabulary size, BOS/EOS/PAD IDs, and model digest. Downstream commands accept
-the bundle directory, never a loose `.model` path.
+vocabulary size, BOS/EOS/PAD IDs, and content identities for both tokenizer
+files. Downstream commands accept the bundle directory, never a loose `.model`
+path.
 
 ### Prepared pretraining bundle
 
@@ -162,8 +180,9 @@ pretraining-data/
 ```
 
 The manifest records sequence length, row width, dtype, shard row counts,
-preparation seed and ordering policy, tokenizer identity, source summary, and
-file identities produced during writing.
+preparation seed and ordering policy, tokenizer identity, source summary, a
+canonical digest over the ordered `int32` rows independent of shard boundaries,
+and file identities produced during writing.
 
 ### Pretraining run
 
@@ -187,11 +206,41 @@ including the explicit PRNG key, uses safetensors. Checkpoints are committed at
 optimizer-step boundaries, so the saved accumulation state is canonical and
 empty; the microstep counter still proves exact boundary alignment.
 
+`latest.json` is a derived mutable index, not authoritative checkpoint state.
+It records the selected step number and checkpoint-manifest identity so readers
+can detect a stale, cross-run, or manually edited pointer.
+
 ### LoRA run and export
 
-A LoRA run copies the immutable base checkpoint once into the run. Periodic
-step directories contain adapters, optimizer state, trainer state, and cursor,
-but do not rewrite frozen base weights. A selected step can be exported as:
+A LoRA run has this self-contained layout:
+
+```text
+lora-run/
+├── run.json
+├── tokenizer/
+│   └── ... copied tokenizer bundle ...
+├── base/
+│   ├── manifest.json
+│   └── model.safetensors
+├── latest.json
+└── checkpoints/
+    └── step-000001000/
+        ├── checkpoint.json
+        ├── adapters.safetensors
+        ├── optimizer.safetensors
+        ├── trainer.safetensors
+        └── state.json
+```
+
+At run creation, `base/model.safetensors` is copied exactly once from the
+selected pretraining step. `base/manifest.json` contains the complete model and
+precision configuration, source run/step identity for diagnostics, and the
+copied file's content identity. The tokenizer bundle is copied from the owning
+pretraining run. No copied base or tokenizer file may be a symlink or external
+reference, and the LoRA run remains usable after the source pretraining run is
+removed. Periodic step directories contain adapters, optimizer state, trainer
+state, and cursor, but do not rewrite frozen base weights. A selected step can
+be exported as:
 
 ```text
 export/
@@ -208,13 +257,36 @@ inference parameter names. Export does not mutate or deep-copy the live model.
 Checkpoint writers:
 
 1. create a temporary sibling step directory
-2. write and evaluate all array files
+2. write and evaluate all array files and scalar state
 3. write the checkpoint manifest last
-4. atomically rename the step directory
-5. atomically replace `latest.json`
+4. `fsync` the files and temporary directory, or use the platform durability
+   equivalent
+5. atomically rename the step directory and `fsync` its parent directory
+6. write and `fsync` a temporary latest index, atomically replace `latest.json`,
+   and `fsync` its parent directory
 
 Readers ignore incomplete temporary directories. A completed checkpoint is
 never modified or repaired in place.
+
+The step-directory rename is the checkpoint commit point; `latest.json` is only
+a recoverable index. When opening a run with a valid pointer, the reader scans
+published `step-*` directories whose step number is greater than the pointed
+step. When the pointer is missing, malformed, or cross-run, the reader scans all
+published steps. In either case the highest valid completed step belonging to
+the run is selected, and a stale or invalid `latest.json` is atomically rebuilt.
+Temporary directories are ignored, while malformed published step directories
+raise an artifact error rather than being silently skipped.
+
+Recovery does not depend on write access. Resume and other writable workflows
+persist the repaired index before continuing; a read-only inference or
+evaluation workflow uses the recovered step in memory and reports that the
+stale index could not be persisted.
+
+If a writer finds an existing target step, it compares the completed manifest
+identity. An identical step is an idempotent success and only the latest index
+is refreshed; a different identity is a collision and fails without overwriting
+either checkpoint. Tests inject interruption after every publication stage,
+including the step rename immediately before the latest-index replacement.
 
 Typed manifest parsing rejects unknown fields, unknown schema kinds or
 versions, missing files, incorrect array keys/shapes/dtypes, inconsistent model
@@ -267,10 +339,24 @@ incomplete tail batch to keep compiled shapes stable. Resume stores epoch,
 deterministic shard-order position, and row offset, allowing constant-time
 continuation without replaying prior batches.
 
+The prefetch producer position is never checkpoint state. Every queued batch is
+an immutable envelope containing the NumPy slice and its cursor-after value.
+The training loop tracks a separate committed cursor. For an accumulation
+window, it retains the cursor-after value of the last consumed microbatch and
+publishes that value only after the optimizer update and its MLX state have
+successfully evaluated. A failure before that point replays the entire
+uncommitted accumulation window against unchanged weights. Checkpoints serialize
+only the committed cursor, so an arbitrarily full prefetch queue cannot skip
+data after resume.
+
 ### SWAG preparation and loading
 
-SWAG rows are encoded once and cached by dataset name, immutable revision,
-split, tokenizer digest, and maximum sequence length. Source loading and
+SWAG rows are encoded once. Cache identity includes the provider and dataset
+namespace/name, dataset configuration, immutable revision and provider
+fingerprint, split, preprocessing-schema version, context/ending join policy,
+truncation policy, BOS/EOS policy, tokenizer bundle identity, and maximum
+sequence length. Any change to one of those fields is a cache miss; caches are
+never reinterpreted under a newer preprocessing schema. Source loading and
 tokenization are batched. Cache construction validates four candidates, label
 range, EOS inclusion, and at least one scored continuation token.
 
@@ -375,6 +461,20 @@ The public runtime supports `generate()` and `generate_batch()`. Generation:
   conversion of device arrays
 - preserves greedy and seeded sampling behavior through explicit PRNG keys
 
+`generate_batch()` accepts unequal encoded prompt lengths. Internal length
+buckets may pad for stable compiled shapes, but every request carries its own
+valid-prefix length, attention mask, logical position, and KV-cache length.
+Prefill gathers the next-token logits from each request's last real token.
+Decode excludes padding cache slots and writes/rotates each token at that
+request's logical position; padding must not change any generated token or
+score. Results are restored to caller order after bucketing.
+
+Sampling assigns one explicit key to each request before bucketing and carries
+that key with the request, so bucket membership or internal reordering cannot
+change its random stream. Equivalence tests compare heterogeneous batched
+generation with the corresponding serial requests for greedy decoding, seeded
+sampling, EOS termination, repetition penalty, and no-repeat n-gram processing.
+
 Evaluation uses the same artifact resolution and model session. Log-likelihood
 requests are length-bucketed and dynamically padded, target logits are gathered
 on-device, and each batch synchronizes once. Generation requests use
@@ -441,11 +541,11 @@ codes. `argparse.Namespace` values never enter domain APIs.
 
 ### Resume configuration
 
-`train --resume RUN_DIR` and `finetune --resume RUN_DIR` resolve the atomic
-latest checkpoint. Saved model, optimizer, dataset identity, precision, and
-immutable run configuration are authoritative. Resume may override only
-termination and observability fields: maximum steps/epochs, logging interval,
-checkpoint interval, and retention.
+`train --resume RUN_DIR` and `finetune --resume RUN_DIR` recover and resolve the
+latest atomically published checkpoint. Saved model, optimizer, dataset
+identity, precision, and immutable run configuration are authoritative. Resume
+may override only termination and observability fields: maximum steps/epochs,
+logging interval, checkpoint interval, and retention.
 
 ## Error Handling
 
@@ -493,6 +593,7 @@ Before replacing the old implementation, deterministic fixtures capture:
 - GQA attention output
 - sequential and chunked KV-cache output
 - greedy and seeded sampled generation
+- serial and unequal-length batched generation
 - tied embedding gradient sum
 - LoRA forward and direct merged-weight output
 - SWAG continuation scores
@@ -513,11 +614,61 @@ state, and explicit PRNG state. Artifact tests simulate interrupted writes and
 cross-run state. The normal suite injects or caches external dataset/evaluation
 providers and never requires network access.
 
+The integration suite additionally proves:
+
+- a crash after step-directory publication but before `latest.json` replacement
+  resumes from the newly published step
+- a full prefetch queue cannot advance the checkpointed committed cursor
+- conflicting reuse of an existing step number is rejected without overwrite
+- deleting the source pretraining run does not affect LoRA resume, inference, or
+  export from the copied base snapshot
+- every SWAG cache-identity field produces a cache miss when changed
+- unequal-length batched generation matches serial generation and remains
+  invariant to internal bucket ordering
+
 ## Performance Measurement and Acceptance
 
 Performance claims require explicit Metal synchronization around timed regions
-and compiled-kernel warmup before measurement. Baseline records include
-hardware, OS, Python, MLX, configuration, and repeated-run medians.
+and compiled-kernel warmup before measurement. Before phase 1 begins, a
+machine-readable baseline manifest and its raw measurements are committed. The
+manifest records:
+
+- source commit, dirty-worktree state, benchmark command, and benchmark schema
+  version
+- Apple chip/core count and unified memory, macOS build, power mode, and whether
+  the machine was connected to power
+- Python, MLX, NumPy, SentencePiece, and relevant provider versions
+- complete model, optimizer, precision, loader, compilation, and generation
+  configurations
+- tokenizer, prepared-data representation, canonical training-row content, and
+  SWAG dataset/cache identities
+- warmup steps, measured steps or requests, synchronization points, trial count,
+  and raw per-trial values
+
+The acceptance baseline uses commit `3687f8b` on the Apple M5 10-core CPU,
+10-core GPU, 24 GB target. The fixed pretraining workload uses that commit's
+default model configuration with vocabulary size 28,672, hidden size 768, 12
+layers, 12 query heads, 3 KV heads, intermediate size 2,176, sequence length
+1,024, microbatch size 1, gradient accumulation 8, and BF16 compute.
+
+The prerequisite creates one canonical ordered `int32` row matrix from a fixed
+tokenizer and source-corpus sample, then serializes that matrix into paired
+legacy NPZ/`uint16` and replacement NPY/`int32` benchmark bundles without
+changing row order. The baseline manifest records the canonical row digest and
+each representation's own file identities; the replacement prepared-data
+manifest records the same canonical row digest. Benchmarks reject different
+canonical row identities while allowing the expected representation identities
+to differ. Other benchmark workloads likewise use identical serialized
+configurations and semantic input identities on both sides.
+
+Steady-state measurements use five fresh-process trials. Each trial performs one
+untimed compilation pass, 20 synchronized warmup work units, and 100
+synchronized measured work units. Each benchmark defines its work unit as a
+data batch, optimizer step, SWAG batch, prefill request batch, or decode chunk.
+Benchmarks that cannot supply 100 work units use the complete fixed request set
+and record its size. Reports include every raw result, the median, and median
+absolute deviation. Compile cold-start time is measured separately in a fresh
+process without warmup.
 
 Benchmarks cover:
 
@@ -530,16 +681,24 @@ Benchmarks cover:
 - peak Metal memory
 
 Performance benchmarks remain outside ordinary pytest. Each relevant phase
-records before/after results on identical model, batch, sequence length, dtype,
-and hardware.
+records before/after results using the pinned manifest. A result is invalid if
+the target enters critical memory pressure, thermal throttling is detected, the
+power mode changes, or the serialized configurations or content identities
+differ outside the explicitly paired legacy/new prepared-data representations.
+
+A benchmark is relevant to a phase when the phase changes code executed in its
+timed region. Every relevant training-throughput median must remain within 3
+percent of both the pinned baseline and the previous accepted phase; the final
+end-to-end pretraining gate below still requires an improvement over baseline.
+Acceptance measurements run from clean worktrees at the recorded commits.
 
 Acceptance gates:
 
-- no relevant phase may regress steady-state training throughput by more than
-  3 percent
-- the completed refactor must outperform the original end-to-end pretraining
-  throughput
-- the default workload must continue to fit target hardware
+- every relevant phase satisfies the per-phase throughput rule above
+- the completed refactor must improve median end-to-end pretraining throughput
+  by at least 3 percent over commit `3687f8b`
+- the fixed default workload must complete on the Apple M5 24 GB target without
+  out-of-memory failure or critical memory pressure
 - mathematical-equivalence and correctness tests must pass regardless of speed
 
 Compile cold-start time and peak memory are reported even when steady-state
@@ -562,6 +721,10 @@ The final phase additionally runs every performance comparison and all unified
 CLI workflow smoke tests.
 
 ## Delivery Sequence
+
+Creating and committing the pinned baseline manifest and raw baseline results is
+a prerequisite, not an implementation phase. No performance-sensitive source
+change begins before that record exists.
 
 One master plan index links six ordered implementation plans:
 
