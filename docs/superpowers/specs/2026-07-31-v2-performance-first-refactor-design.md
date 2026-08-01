@@ -58,10 +58,17 @@ Two mathematical corrections are explicitly authorized within this refactor:
 - SWAG candidate scores use mean continuation-token log likelihood instead of
   the current length-sensitive sum
 
+One additional precision-policy correction is explicitly authorized: base
+training keeps BF16 model parameters but replaces the legacy BF16 Adam moments
+with FP32 moments and performs accumulation, clipping, weight decay, and Adam
+arithmetic in FP32 before casting each updated parameter back to BF16. It does
+not introduce FP32 master weights. This changes the numerical training
+trajectory and is not a legacy-equivalence requirement.
+
 These corrections are part of the completed behavior and are tested against
 their stated formulas rather than required to reproduce the corresponding
-legacy training result. No other model-architecture, loss-objective, scoring, or
-generation-algorithm changes are authorized.
+legacy training result. No other model-architecture, loss-objective, scoring,
+generation-algorithm, or optimizer-algorithm changes are authorized.
 
 The user explicitly authorized the top-level `pyproject.toml` packaging/source
 mapping needed for `uv run python -m sml`. No unrelated top-level changes or
@@ -209,18 +216,42 @@ cannot change an identity; changing a semantic field, relative logical path,
 payload byte, dtype, shape, or order must change it.
 
 Readers always recompute a manifest or `run.json` structured identity from its
-parsed identity projection and compare it with the stored value. Normal startup
-may trust the file identities recorded by a valid immutable manifest and avoid
-rehashing large payloads; full verification recomputes every file identity.
+parsed identity projection and compare it with the stored value. Correctness-
+sensitive workflows that will mutate or derive model state -- fresh training,
+resume, fine-tuning, export, writable recovery, and retention -- fully rehash
+every referenced input payload before GPU initialization or destructive action.
+An immutable target that already exists must also pass full payload verification
+before a writer may accept it as an idempotent success. Payloads produced and
+hashed by the same live writer need not be reread immediately.
 
-Every logical payload path in a manifest uses `/`-separated relative form.
-Readers reject absolute paths, empty components, `.` or `..` components,
-platform-specific alternate separators, duplicate normalized paths, and any
-path whose resolved location escapes the artifact root. SML-produced bundles
-contain regular files and directories only. Readers reject symlinked payloads
-or symlinked path components before opening a payload. Absolute source paths may
-appear only in fields typed as diagnostic locators and are never followed as
-artifact payload references.
+Read-only inference and evaluation default to manifest-trusted validation and
+avoid rehashing large payloads; their APIs and CLI accept `full_verify=True` /
+`--full` to request payload rehashing. Every inference result and evaluation
+result records whether the selected model state was `full` verified or
+`manifest-trusted`. `sml verify --full` remains the standalone recursive
+payload-verification command.
+
+Every logical payload path in a manifest uses `/`-separated relative form. Each
+component must match the portable-ASCII grammar
+`[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?`, which also forbids a trailing
+dot. Readers normalize before validating that grammar and reject absolute paths,
+empty components, `.` or `..` components, platform-specific alternate
+separators, duplicate paths after Unicode normalization and case folding, and
+any path whose resolved location escapes the artifact root. After opening all
+payloads, readers also reject distinct logical paths that resolve to the same
+`(device, inode)` pair. Every regular payload file must also have link count one,
+so a hard link outside the bundle cannot provide a second mutation path.
+
+SML-produced bundles contain regular files and directories only. The artifact
+root itself is opened with `O_DIRECTORY | O_NOFOLLOW` and validated with `fstat`.
+Readers then walk payload paths with `openat`-style operations relative to that
+descriptor. Intermediate components are opened with
+`O_DIRECTORY | O_NOFOLLOW`; final payloads are opened with `O_NOFOLLOW`, and
+every opened object is validated with `fstat` before use. Readers never perform
+a symlink check followed by a separate ordinary path open. Writers, renames, and
+temporary-directory cleanup use the same descriptor-relative discipline.
+Absolute source paths may appear only in fields typed as diagnostic locators and
+are never followed as artifact payload references.
 
 Prepared data additionally has a semantic row-content identity independent of
 its storage representation. It hashes a domain tag, row and column counts as
@@ -352,7 +383,25 @@ The export manifest records its schema kind/version, complete model and
 precision configuration, tokenizer identity, source run/step identity for
 diagnostics, and content identities for the tokenizer files and merged model.
 The exported model contains directly merged base-plus-LoRA weights under plain
-inference parameter names. Export does not mutate or deep-copy the live model.
+inference parameter names. For each adapter, export deterministically computes
+
+```text
+delta_weight_fp32 = scale_fp32 * (B_fp32 @ A_fp32)
+merged_weight_bf16 =
+    cast_bf16(cast_fp32(base_weight_bf16) + delta_weight_fp32)
+```
+
+and stores the merged weight as BF16. Live adapters deterministically compute
+
+```text
+adapter_fp32 = scale_fp32 * ((input_fp32 @ A_fp32.T) @ B_fp32.T)
+output_bf16 = base_output_bf16 + cast_bf16(adapter_fp32)
+```
+
+The merged-weight formula is an exact array oracle; merged-model output is
+compared with live-adapter output using pinned BF16 tolerances because the two
+rounding locations are intentionally different. Export does not mutate or
+deep-copy the live model.
 
 ### Encoded SWAG bundle
 
@@ -384,6 +433,13 @@ The manifest records the complete preprocessing identity, bucket-boundary
 policy, per-bucket counts and shapes, array dtypes, dropped-row counts, and file
 identities. Bucket policy is part of the authoritative bundle identity, so a
 cache is never silently rebucketed or reinterpreted.
+
+Before creating or resuming a LoRA run, fine-tuning requires exact equality
+between the selected base snapshot and encoded-SWAG bundle for tokenizer bundle
+identity, vocabulary size, BOS/EOS/PAD/UNK IDs, and the preprocessing fields
+derived from those values. The cache maximum sequence length must not exceed the
+base model's effective context length. A mismatch fails before base weights,
+adapters, or optimizer state are allocated.
 
 ### Atomicity and validation
 
@@ -418,37 +474,47 @@ Readers ignore incomplete temporary directories. A completed checkpoint is
 never modified or repaired in place.
 
 The step-directory rename is the checkpoint commit point; `latest.json` is only
-a recoverable index. When opening a run with a valid pointer, the reader fully
-validates the pointed step and scans published `step-*` directories whose step
-number is greater than the pointed step. When the pointer is missing, malformed,
-or cross-run, the reader scans all published steps. In either case the highest
-valid completed step belonging to the run is selected, and a stale or invalid
-`latest.json` is atomically rebuilt. Temporary directories are ignored. A
-malformed published directory that the normal selection algorithm must examine
-raises an artifact error rather than being silently skipped; older steps below a
-valid pointer are checked only by an explicit full-artifact verification.
+a recoverable index. When opening a run through latest-step resolution with a
+valid pointer, the reader validates the pointed step and scans published
+`step-*` directories whose step number is greater than the pointed step. When
+the pointer is missing, malformed, or cross-run, the reader scans all published
+steps. In either case the highest valid completed step belonging to the run is
+selected. A writable workflow atomically rebuilds a stale or invalid
+`latest.json`; a read-only workflow keeps the recovered selection in memory.
+Temporary directories are ignored. A malformed published directory that latest-
+step resolution must examine raises an artifact error rather than being silently
+skipped; older steps below a valid pointer are checked only by an explicit full-
+artifact verification.
+
+Exact-step resolution is a separate algorithm. While holding the shared access
+lock, it validates only the owning `run.json` and requested checkpoint. It does
+not read, scan, repair, or depend on `latest.json`, and an unrelated malformed
+or newer step cannot prevent use of the requested valid step.
 
 Recovery does not depend on write access. Resume and other writable workflows
 persist the repaired index before continuing; a read-only inference or
-evaluation workflow uses the recovered step in memory and reports that the
-stale index could not be persisted.
+evaluation workflow never writes it, uses the recovered step in memory, and
+reports that the stale index was not persisted.
 
 If a writer finds an existing target step, it compares the completed manifest
-identity. An identical step is an idempotent success; a different identity is a
-collision and fails without overwriting either checkpoint. Before publishing an
-index, the writer performs recovery and advances `latest.json` only when the
-target is not older than the recovered latest step. The index is never moved
-backward. Tests inject interruption after every publication stage, including the
-step rename immediately before the latest-index replacement.
+identity and fully verifies the existing step's payloads. An identical, fully
+verified step is an idempotent success; a different identity or payload mismatch
+is a collision or corruption error and fails without overwriting either
+checkpoint. Before publishing an index, the writer performs recovery and
+advances `latest.json` only when the target is not older than the recovered
+latest step. The index is never moved backward. Tests inject interruption after
+every publication stage, including the step rename immediately before the
+latest-index replacement.
 
 Typed manifest parsing rejects unknown fields, unknown schema kinds or
 versions, missing files, incorrect array keys/shapes/dtypes, inconsistent model
 or tokenizer configuration, and cross-run state before GPU-heavy work begins.
-Large-file digests are computed while artifacts are produced. Normal local
-APFS startup trusts immutable manifests after schema, path, and array-metadata
-validation. `sml verify --full` rereads and hashes every file. Read-only use on
-another local filesystem has no concurrent writer or retention guarantee;
-writable recovery, publication, and retention reject it.
+Large-file digests are computed while artifacts are produced. Correctness-
+sensitive workflows perform the full input verification defined above; normal
+read-only local-APFS startup may trust immutable manifests after schema, path,
+and array-metadata validation. Read-only use on another local filesystem has no
+concurrent writer or retention guarantee; writable recovery, publication, and
+retention reject it.
 
 ### Concurrency and lifecycle
 
@@ -473,6 +539,13 @@ the exclusive access lock because readers validate immutable manifests and
 recover stale indexes. Immutable-bundle writers use the target publication lock
 and identity comparison, so concurrent production is either an idempotent
 success or a collision rather than a partial overwrite.
+
+Before retention deletes an older step, it proves that the step it will retain
+is payload-valid. A checkpoint produced and hashed by the same live writer
+already carries that proof. After resume or writable recovery, the workflow
+fully rehashes the preexisting retained step once before the first deletion.
+Retention never converts a manifest-trusted read-only result into deletion
+authority.
 
 Publication-lock files are durable sidecars and are not identities or payloads.
 After acquiring a target's publication lock, a later writer may delete abandoned
@@ -523,6 +596,12 @@ Preparation fails rather than publishing a bundle with no complete rows.
 
 ### Pretraining loading
 
+Before model or optimizer initialization, fresh training and resume fully hash
+the prepared-data manifest's tokenizer and shard payloads, recompute the
+manifest identities, and validate array metadata and bundle-wide token-range
+invariants. The later hot loop relies on that verified immutable byte set and
+does not repeat per-forward token-range synchronization.
+
 Training memory-maps each shard. Most batches are complete contiguous
 `(batch, sequence_length + 1)` slices that transfer to MLX once before adjacent
 input and label views are derived. At a shard boundary, the bounded prefetcher
@@ -551,6 +630,18 @@ uncommitted accumulation window against unchanged weights. Checkpoints serialize
 only the committed cursor, so an arbitrarily full prefetch queue cannot skip
 data after resume.
 
+A pretraining cursor is the canonical location of the next row that could enter
+a runtime batch: `(epoch, shard_order_position, row_offset)`. `row_offset` is
+strictly less than the current shard's row count; reaching a shard end
+normalizes immediately to offset zero in the next ordered shard. A batch that
+crosses a shard boundary records the normalized position after its final row.
+The intentionally dropped incomplete epoch tail does not advance the committed
+cursor because it produces no optimizer update. Resume deterministically
+encounters and drops that same tail again before moving in memory to the next
+epoch. The first optimizer update in the next epoch commits a cursor in that
+epoch. This avoids both data skips and a progress-only checkpoint with a
+different manifest at an already-published optimizer step.
+
 ### SWAG preparation and loading
 
 SWAG rows are encoded once. The authoritative bundle identity includes the
@@ -561,6 +652,11 @@ BOS/EOS policy, tokenizer bundle identity, maximum sequence length, and bucket-
 boundary policy. Any change to one of those fields is a cache miss; caches are
 never reinterpreted under a newer preprocessing schema. Source loading and
 tokenization are batched.
+
+Before base weights or adapters are allocated, fresh fine-tuning and resume
+fully hash the selected base snapshot, copied tokenizer, encoded-SWAG arrays,
+and any restored adapter/optimizer/trainer state, then apply the encoded-SWAG
+compatibility checks above. The hot loop performs no redundant payload hashing.
 
 To preserve the current preprocessing contract, context and each normalized
 ending are encoded separately and their token IDs are concatenated. EOS is
@@ -592,6 +688,13 @@ accumulation sums gradients of those loss sums and divides once by the total
 valid-example count at the optimizer step, so a small bucket tail cannot receive
 the weight of a full microbatch. Resume state records epoch, deterministic
 bucket-order position, and real-example row offset, never padded slots.
+
+A SWAG cursor likewise names the next real example. Reaching the end of a bucket
+normalizes to offset zero in the next deterministic bucket; the padded synthetic
+slots are never cursor positions. Consuming the final real example of the final
+bucket normalizes to `(next_epoch, first_bucket, 0)`. Because the padded tail
+still performs an optimizer update, that normalized epoch transition is
+committed atomically with updated model, optimizer, and PRNG state.
 
 ## Model Mathematics and Corrections
 
@@ -639,22 +742,61 @@ and no resumable workflow relies on an unrecorded process-global random state.
 
 ### Precision policy
 
-The default base-training policy uses:
+The default base-training and inference dtype contract is:
 
-- BF16 model weights and activations
-- FP32 causal-loss and metric reductions
-- FP32 gradient-accumulation buffers
-- FP32 Adam moments
+| State or computation | Required dtype |
+| --- | --- |
+| all persistent base-model parameters, including embeddings and norm scales | BF16 |
+| embeddings, linear outputs, residuals, MLP activations, Q/K/V, and model logits | BF16 |
+| KV-cache keys and values | BF16 |
+| YaRN/RoPE frequencies and cosine/sine caches | FP32, with rotated Q/K remaining BF16 |
+| RMSNorm reduction | FP32 internally, BF16 output |
+| attention softmax | FP32 internally, BF16 output |
+| causal loss, SWAG log-sum-exp/scores, and metric reductions | FP32 |
+| raw base-parameter gradient leaves | BF16 |
+| gradient-accumulation buffers, normalized gradients, clipping, and global norm | FP32 |
+| Adam first and second moments | FP32 |
+| learning-rate, weight-decay, and Adam update arithmetic | FP32 |
+| updated persistent base parameter | explicitly cast back to BF16 |
+| token IDs, labels, positions, and device lengths | int32 |
+| device optimizer-step and accumulation counters | int32, range-checked before overflow |
+| checkpoint steps, epochs, data cursors, and host counts | nonnegative signed 64-bit integers |
+| attention, score, valid-token, example, and finished masks | Boolean |
+| explicit MLX PRNG keys | native uint32 key representation |
 
-The default SWAG policy uses a frozen BF16 base and FP32 LoRA parameters,
-gradients, reductions, and Adam moments. Precision is an explicit validated
-configuration, and checkpoint state must match it exactly. LoRA casts its input
-to FP32 before the adapter matmuls rather than relying on implicit mixed-dtype
-promotion. Each adapter delta is then explicitly cast to the wrapped base
-projection's output dtype before residual addition. This keeps base attention
-and downstream activations BF16 while gradients and optimizer state for the FP32
-adapter parameters remain FP32. Precision tests assert these dtypes at every
-targeted projection.
+Base training has no FP32 master-weight copy. Autodiff may return BF16 gradient
+leaves for BF16 parameters even when the scalar loss is FP32; each leaf is cast
+to FP32 immediately before accumulation. A project-owned mixed-precision Adam
+update, rather than an unmodified stock `mlx.optimizers.Adam`/`AdamW` parameter
+update, computes for each parameter:
+
+```text
+g_fp32 = normalized_and_clipped_accumulator_fp32
+m_fp32 = beta1 * m_fp32 + (1 - beta1) * g_fp32
+v_fp32 = beta2 * v_fp32 + (1 - beta2) * square(g_fp32)
+updated_fp32 = adam_and_decoupled_weight_decay(
+    cast_fp32(parameter_bf16), m_fp32, v_fp32, step, config
+)
+parameter_bf16 = cast_bf16(updated_fp32)
+```
+
+The exact bias-correction, epsilon, schedule, and per-parameter weight-decay
+semantics remain those of the saved optimizer configuration. The optimizer must
+not rely on implicit mixed-dtype promotion, and every compiled update returns a
+BF16 parameter tree plus FP32 moment tree. BF16 training uses no dynamic loss
+scaler.
+
+The default SWAG policy uses a frozen BF16 base and FP32 LoRA parameters, raw
+gradients, accumulation, reductions, and Adam moments. LoRA casts its input to
+FP32 before adapter matmuls and applies the live-adapter formula specified in the
+export section. This keeps base attention, KV state, and downstream activations
+BF16 while adapter state remains FP32. Precision is explicit validated semantic
+configuration, and checkpoint state must match it exactly.
+
+Precision tests assert all listed dtypes after initialization, two consecutive
+eager and compiled updates, checkpoint save/load, and interrupted resume. They
+also prove that no base parameter becomes FP32 and that no uncheckpointed FP32
+master-weight state exists.
 
 ### Compiled execution
 
@@ -717,8 +859,17 @@ compiled gradients, or model training mode are constructed.
 
 `InferenceSession.from_checkpoint()` loads and validates a pretraining run, a
 step within its owning run, a LoRA run, or a self-contained merged export once.
-It owns the tokenizer, model, compiled prefill/decode functions, token storage,
-and KV cache.
+It owns the tokenizer, immutable loaded model state, compiled prefill/decode
+functions, and a reusable buffer pool. Token storage, logical lengths, finished
+state, per-request PRNG keys, and KV-cache contents belong to one generation
+call and are reset before use. A failed call discards or clears its leased state
+in `finally` before the session can be reused.
+
+An `InferenceSession` is explicitly non-reentrant. A non-blocking in-process
+call guard rejects overlapping `generate()` or `generate_batch()` calls with a
+focused runtime error; callers that need concurrency create independent
+sessions. Model arrays and compiled-function caches persist safely across
+sequential calls, but no request-specific array state does.
 
 The public runtime supports `generate()` and `generate_batch()`. Generation:
 
@@ -738,6 +889,12 @@ optional seed. Prefill gathers the next-token logits from each request's last
 real token. Decode excludes padding cache slots and writes/rotates each token at
 that request's logical position. Prompt overflow remains an error. Results are
 restored to caller order after bucketing.
+
+The request boundary applies configured BOS insertion before validation and
+rejects any prompt that still encodes to zero tokens. This includes empty or
+tokenizer-normalized-empty text when the selected tokenizer/model has no usable
+BOS token. Empty lm-eval contexts use the model's configured prefix token and
+fail before bucketing when none exists.
 
 For seeded sampling, each request key is created directly from that request's
 seed before bucketing and carried with the request. Calling `generate()` with
@@ -769,6 +926,14 @@ rather than a request-serial loop. Equivalence tests compare heterogeneous
 batched log-likelihood results with the corresponding serial requests for both
 left- and right-padding layouts used by the adapter.
 
+Artifact resolution completes once before the first evaluation request. The
+persisted evaluation result records artifact kind, run identity when applicable,
+resolved step, checkpoint-manifest identity, run-step identity, tokenizer
+identity, payload-verification level, task configuration, and relevant provider
+versions. A later `latest.json` update cannot change or obscure which model was
+evaluated. Inference result metadata records the same resolved model identity
+and verification level in addition to any allocated sampling seed.
+
 The completed v2 evaluation CLI supports the current HellaSwag and WinoGrande
 scope. Its lm-eval adapter implements `loglikelihood` and `generate_until`;
 unsupported request methods fail explicitly rather than returning partial or
@@ -782,6 +947,10 @@ Both inference and evaluation can consume:
 - a merged export directory
 
 An optional step selector chooses an exact step inside a run.
+
+Run-directory resolution uses the latest-step recovery algorithm. An exact step
+directory or `--step` selector uses exact-step resolution and therefore neither
+reads nor repairs `latest.json`.
 
 ## Unified CLI and Configuration
 
@@ -830,7 +999,10 @@ encoded-SWAG bundles respectively. `infer` and `evaluate` require
 is accepted only in the context of its owning run and is never treated as a
 standalone portable artifact. Evaluation accepts repeated `--task` arguments
 from the supported HellaSwag and WinoGrande set. `verify --full` performs the
-explicit payload-rehash operation described above.
+explicit payload-rehash operation described above. Read-only `infer` and
+`evaluate` use manifest-trusted validation by default; their optional `--full`
+flag rehashes every payload needed by the selected model before GPU
+initialization.
 
 Each command accepts an optional TOML configuration file plus explicit CLI
 overrides. Precedence is defaults, then TOML, then CLI. Frozen validated
@@ -859,6 +1031,12 @@ omitted, the original diagnostic locator is tried. A supplied location is not a
 semantic override and is accepted only after its authoritative bundle identity
 matches the dataset identity stored in `run.json`. Starting without `--resume`
 never reuses, truncates, or overwrites an existing run target.
+
+Before allocating model or optimizer arrays, resume fully verifies the resolved
+checkpoint payloads and matching data bundle, then validates every checkpoint
+array against the saved precision contract. A payload mismatch, BF16/FP32 dtype
+mismatch, missing optimizer leaf, or unrecorded master-weight leaf is corruption
+and cannot be coerced or regenerated.
 
 ## Error Handling
 
@@ -912,7 +1090,10 @@ correction suite covers:
 - serial and dynamically padded batched log-likelihood
 - tied embedding gradient sum
 - LoRA forward and direct merged-weight output
+- exact FP32 LoRA merge formula and BF16 export-weight dtype
 - FP32 LoRA-state and BF16 base-activation dtype boundaries
+- BF16 base parameters with BF16 raw gradients, FP32 accumulation/moments/update
+  arithmetic, and mandatory BF16 post-update cast-back
 - compiled consecutive-step state transitions against eager execution
 - SWAG per-token log likelihood and authorized mean-normalized candidate scores
 
@@ -949,6 +1130,9 @@ The integration suite additionally proves:
   payload references before opening them
 - normal validation detects schema and array-metadata corruption, while full
   verification detects a payload byte changed without a manifest update
+- every correctness-sensitive workflow rejects a payload byte changed without a
+  manifest update before GPU initialization or retention deletion; fast
+  read-only use reports `manifest-trusted` rather than claiming full verification
 - interruption at every immutable-bundle publication stage never exposes a
   partial bundle at its final path
 - concurrent production of the same immutable target is either an idempotent
@@ -961,6 +1145,9 @@ The integration suite additionally proves:
 - a full prefetch queue cannot advance the checkpointed committed cursor
 - a crash inside an accumulation window replays the complete uncommitted window
   with its original PRNG sequence
+- cursors normalize identically at shard, cross-shard-batch, bucket, padded-tail,
+  and epoch boundaries; a dropped pretraining tail cannot create a second state
+  for an already-published optimizer step
 - shard-boundary batching drops at most one tail for the complete epoch stream
 - conflicting reuse of an existing step number is rejected without overwrite
 - idempotent publication of an older step cannot move `latest.json` backward
@@ -971,6 +1158,8 @@ The integration suite additionally proves:
 - a second mutable workflow for the same run is rejected, concurrent readers
   can load published steps, and retention waits for an active step loader
 - every SWAG cache-identity field produces a cache miss when changed
+- fine-tuning rejects tokenizer identity, vocabulary, special-token, preprocessing,
+  and maximum-length mismatches between encoded SWAG and the selected base
 - SWAG cache fixtures pin separate context/ending encoding, mask alignment, EOS
   scoring, overlength-row drops, bucket placement, and stored array contracts
 - padded SWAG bucket tails consume every real example exactly once, ignore
@@ -980,6 +1169,15 @@ The integration suite additionally proves:
   aware equivalence rule and remains invariant to internal bucket ordering
 - dynamically padded batched log-likelihood matches serial scoring within the
   configured tolerance and remains invariant to padding layout
+- sequential session calls start from empty token/KV state, failed calls cannot
+  contaminate the next call, and overlapping calls fail before mutation
+- exact-step inference/export succeeds despite a malformed unrelated newer step
+  and does not read or repair `latest.json`
+- evaluation and inference results pin the resolved model identity and
+  verification level even if `latest.json` advances afterward
+- empty encoded prompts without a usable prefix token fail before bucketing
+- case-folded, Unicode-normalized, internal/external hard-link-alias, and
+  symlink-swap payload paths are rejected by descriptor-relative path traversal
 
 The benchmark-analysis tests use fixed synthetic raw measurements to pin paired
 ratio direction, bootstrap reproducibility, confidence-bound calculation, noise
@@ -1022,6 +1220,12 @@ forward, backward, gradient accumulation, clipping, and the update, while
 compilation, warmup, checkpointing, and unrelated logging are measured
 separately.
 
+Mandatory pre-GPU full input verification is startup work outside the steady-
+state training region and is measured and reported separately for each native
+artifact representation. A benchmark may not disable that verification in the
+candidate's end-to-end CLI smoke measurement, even though it is excluded from
+the steady-state optimizer-step ratio.
+
 The harness owns an implementation-independent benchmark-workload schema.
 Version-specific adapters map that semantic workload to the legacy and
 replacement configuration APIs outside timed regions. The manifest records the
@@ -1038,10 +1242,22 @@ boundary:
 - end-to-end loading and training metrics intentionally use each version's
   native prepared-data or encoded-dataset representation and include the work
   named by the timed-region contract
+- end-to-end pretraining compares each version's actual default optimizer-state
+  precision: legacy BF16 Adam moments against replacement FP32 moments with
+  BF16 parameter cast-back. This explicitly authorized precision-policy
+  difference is recorded in both native configurations and means the benchmark
+  compares product-default throughput, not identical numerical trajectories
 - every native representation must resolve to the same canonical token rows,
   examples, requests, and real-work counts for that metric
 - when work order can affect the executed kernels or state evolution, both
   adapters emit the same logical row, example, or request order
+
+All other optimizer hyperparameters, model-parameter and activation dtypes,
+initial BF16 parameter values, input rows, batch shapes, accumulation count,
+clipping, weight-decay classification, schedules, and synchronization boundaries
+match. Reports state the moment-precision difference next to every end-to-end
+pretraining ratio and never describe that metric as legacy trajectory
+equivalence.
 
 The acceptance baseline uses commit `3687f8b` on the Apple M5 10-core CPU,
 10-core GPU, 24 GB target. The fixed pretraining workload uses that commit's
@@ -1169,9 +1385,9 @@ documentation to describe only the new system.
 
 ## Out of Scope
 
-- changing the model architecture or mathematical algorithms beyond the
-  canonical tied-gradient and mean-normalized SWAG-score corrections authorized
-  above
+- changing the model architecture, mathematical algorithms, or optimizer
+  algorithm beyond the canonical tied-gradient, mean-normalized SWAG-score, and
+  BF16-parameter/FP32-moment precision corrections authorized above
 - replacing SentencePiece BPE
 - supporting non-MLX training/inference backends
 - compatibility with any existing v2 artifact or API
