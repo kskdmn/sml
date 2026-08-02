@@ -59,10 +59,11 @@ Two mathematical corrections are explicitly authorized within this refactor:
   the current length-sensitive sum
 
 One additional precision-policy correction is explicitly authorized: base
-training keeps BF16 model parameters but replaces the legacy BF16 Adam moments
-with FP32 moments and performs accumulation, clipping, weight decay, and Adam
-arithmetic in FP32 before casting each updated parameter back to BF16. It does
-not introduce FP32 master weights. This changes the numerical training
+training uses FP32 master parameters as the authoritative optimizer state,
+derives BF16 working parameters for forward/backward compute, keeps Adam moments
+in FP32, and performs accumulation, clipping, weight decay, and Adam arithmetic
+in FP32. After every optimizer update it deterministically derives a new BF16
+working tree from the updated FP32 masters. This changes the numerical training
 trajectory and is not a legacy-equivalence requirement.
 
 These corrections are part of the completed behavior and are tested against
@@ -89,9 +90,10 @@ source baseline. The benchmark protocol below pins the remaining workload and
 environment identity; results from other Apple-Silicon systems are informative
 but do not satisfy the acceptance gate.
 
-Correctness is a hard constraint, not a tradeoff. Performance changes must
-retain mathematical equivalence where specified and must be measured against a
-recorded baseline.
+Correctness and controlled training quality are hard constraints, not
+tradeoffs. Performance changes must retain mathematical equivalence where
+specified, pass the quality gates below, and be measured against a recorded
+baseline.
 
 ## Package Architecture
 
@@ -308,30 +310,38 @@ run/
     └── step-000010000/
         ├── checkpoint.json
         ├── model.safetensors
+        ├── master.safetensors
         ├── optimizer.safetensors
         ├── trainer.safetensors
         └── state.json
 ```
 
 `run.json` contains the immutable run configuration and dataset identity.
-`state.json` contains scalar progress and the data cursor. MLX array state,
-including the explicit PRNG key, uses safetensors. Checkpoints are committed at
-optimizer-step boundaries, so the saved accumulation state is canonical and
-empty; the microstep counter still proves exact boundary alignment.
+`model.safetensors` contains the BF16 working parameters used by inference and
+the next forward/backward call. `master.safetensors` contains the authoritative
+FP32 trainable parameters. `state.json` contains scalar progress and the data
+cursor. Remaining MLX array state, including the explicit PRNG key, uses
+safetensors. Checkpoints are committed at optimizer-step boundaries, so the
+saved accumulation state is canonical and empty; the microstep counter still
+proves exact boundary alignment.
 
-Every fresh run publishes a canonical step-zero checkpoint containing the
-initialized model or adapters, initialized optimizer state, initial cursor, and
-next unused PRNG key before training begins. Run creation builds `run.json`,
-copied immutable inputs, step zero, and `latest.json` in a temporary run
-directory and atomically publishes that directory under the run writer lock.
-A crash before the first optimizer step is therefore resumable; a crash before
-run-directory publication leaves no visible run target.
+Every fresh base run publishes a canonical step-zero checkpoint containing an
+FP32 master tree initialized from the exact BF16 working tree, that BF16 working
+tree, initialized optimizer state, initial cursor, and next unused PRNG key
+before training begins. LoRA step zero analogously contains its FP32 adapters
+and optimizer state. Run creation builds `run.json`, copied immutable inputs,
+step zero, and `latest.json` in a temporary run directory and atomically
+publishes that directory under the run writer lock. A crash before the first
+optimizer step is therefore resumable; a crash before run-directory publication
+leaves no visible run target.
 
 `checkpoint.json` binds the owning `run.json` identity, checkpoint kind, step
 number, `state.json` file identity, and every array file's identity, array keys,
 shapes, and dtypes. `state.json` repeats the owning run identity and step so a
 scalar-state file cannot be transplanted between checkpoints. Array readers
-reject missing and additional keys as well as mismatched metadata.
+reject missing and additional keys as well as mismatched metadata. A base
+checkpoint additionally proves that every BF16 working leaf equals the explicit
+BF16 cast of its corresponding FP32 master leaf; a mismatch is corruption.
 
 `latest.json` is a derived mutable index, not authoritative checkpoint state.
 It records the owning run identity, selected step number, and checkpoint-
@@ -746,7 +756,8 @@ The default base-training and inference dtype contract is:
 
 | State or computation | Required dtype |
 | --- | --- |
-| all persistent base-model parameters, including embeddings and norm scales | BF16 |
+| authoritative trainable base-model master parameters | FP32 |
+| base-model working parameters used by forward/backward and inference | BF16 |
 | embeddings, linear outputs, residuals, MLP activations, Q/K/V, and model logits | BF16 |
 | KV-cache keys and values | BF16 |
 | YaRN/RoPE frequencies and cosine/sine caches | FP32, with rotated Q/K remaining BF16 |
@@ -757,34 +768,37 @@ The default base-training and inference dtype contract is:
 | gradient-accumulation buffers, normalized gradients, clipping, and global norm | FP32 |
 | Adam first and second moments | FP32 |
 | learning-rate, weight-decay, and Adam update arithmetic | FP32 |
-| updated persistent base parameter | explicitly cast back to BF16 |
+| updated authoritative base master parameter | FP32 |
+| post-update base working parameter | explicit BF16 cast of the updated master |
 | token IDs, labels, positions, and device lengths | int32 |
 | device optimizer-step and accumulation counters | int32, range-checked before overflow |
 | checkpoint steps, epochs, data cursors, and host counts | nonnegative signed 64-bit integers |
 | attention, score, valid-token, example, and finished masks | Boolean |
 | explicit MLX PRNG keys | native uint32 key representation |
 
-Base training has no FP32 master-weight copy. Autodiff may return BF16 gradient
-leaves for BF16 parameters even when the scalar loss is FP32; each leaf is cast
-to FP32 immediately before accumulation. A project-owned mixed-precision Adam
-update, rather than an unmodified stock `mlx.optimizers.Adam`/`AdamW` parameter
-update, computes for each parameter:
+Autodiff may return BF16 gradient leaves for BF16 working parameters even when
+the scalar loss is FP32; each leaf is cast to FP32 immediately before
+accumulation. A project-owned mixed-precision Adam update, rather than an
+unmodified stock `mlx.optimizers.Adam`/`AdamW` parameter update, computes for
+each parameter:
 
 ```text
 g_fp32 = normalized_and_clipped_accumulator_fp32
 m_fp32 = beta1 * m_fp32 + (1 - beta1) * g_fp32
 v_fp32 = beta2 * v_fp32 + (1 - beta2) * square(g_fp32)
 updated_fp32 = adam_and_decoupled_weight_decay(
-    cast_fp32(parameter_bf16), m_fp32, v_fp32, step, config
+    master_parameter_fp32, m_fp32, v_fp32, step, config
 )
-parameter_bf16 = cast_bf16(updated_fp32)
+master_parameter_fp32 = updated_fp32
+working_parameter_bf16 = cast_bf16(master_parameter_fp32)
 ```
 
 The exact bias-correction, epsilon, schedule, and per-parameter weight-decay
 semantics remain those of the saved optimizer configuration. The optimizer must
-not rely on implicit mixed-dtype promotion, and every compiled update returns a
-BF16 parameter tree plus FP32 moment tree. BF16 training uses no dynamic loss
-scaler.
+not rely on implicit mixed-dtype promotion, and every compiled update returns
+an FP32 master tree, its derived BF16 working tree, and an FP32 moment tree.
+BF16 training uses no dynamic loss scaler. The master tree is checkpointed; it
+is never reconstructed from BF16 working weights during resume.
 
 The default SWAG policy uses a frozen BF16 base and FP32 LoRA parameters, raw
 gradients, accumulation, reductions, and Adam moments. LoRA casts its input to
@@ -795,8 +809,9 @@ configuration, and checkpoint state must match it exactly.
 
 Precision tests assert all listed dtypes after initialization, two consecutive
 eager and compiled updates, checkpoint save/load, and interrupted resume. They
-also prove that no base parameter becomes FP32 and that no uncheckpointed FP32
-master-weight state exists.
+prove that sub-BF16-ULP updates accumulate in the FP32 masters, that sensitive
+leaves such as RMSNorm scales eventually move, that every BF16 working leaf is
+the exact cast of its master, and that no uncheckpointed master state exists.
 
 ### Compiled execution
 
@@ -805,16 +820,20 @@ ranking/update functions are compiled with MLX. Immutable parameter
 classifications and weight-decay structures are built once.
 
 Every compiled function is explicit about the mutable array state it uses.
-Training functions declare model parameters, optimizer state, gradient-
-accumulation buffers and counters, and PRNG keys; generation functions declare
-token storage, KV-cache state, finished state, and per-request keys. State is
-passed and returned directly or declared as MLX compile inputs and outputs.
-Mutable arrays captured only through a Python closure are forbidden because MLX
-may treat them as compile-time constants. Static validated configuration and
-immutable parameter classifications may be captured. A synchronization barrier
-evaluates all mutually consistent updated state together. Multi-step tests
-compare eager and compiled execution and prove that a second compiled step
-observes the state returned by the first.
+Training functions declare FP32 master parameters, BF16 working parameters,
+optimizer state, gradient-accumulation buffers and counters, and PRNG keys;
+generation functions declare token storage, KV-cache state, finished state, and
+per-request keys. State is passed and returned directly as built-in array trees,
+or declared through MLX's documented compile `inputs`/`outputs` state capture.
+Compiled functions are pure with respect to uncaptured Python state: they never
+call `model.update(...)`, mutate a captured module shell, or install arrays into
+a host wrapper while MLX traces. Mutable arrays captured only through a Python
+closure are forbidden because MLX may treat them as compile-time constants.
+Static validated configuration and immutable parameter classifications may be
+captured. A synchronization barrier evaluates all mutually consistent updated
+state together. Multi-step tests compare eager and compiled execution, prove
+that a second compiled step observes the state returned by the first, and prove
+that tracing leaves no placeholder or stale array in an owning model/session.
 
 Microbatch loss and gradients remain on-device. Gradient accumulation is
 scheduled asynchronously, and the host synchronizes only at an optimizer-step
@@ -882,13 +901,19 @@ The public runtime supports `generate()` and `generate_batch()`. Generation:
 - preserves greedy and seeded sampling behavior through explicit PRNG keys
 
 `generate_batch()` accepts unequal encoded prompt lengths and a generation
-configuration for each request. Internal length buckets may pad for stable
-compiled shapes, but every request carries its own valid-prefix length,
-attention mask, logical position, KV-cache length, maximum-new-token limit, and
-optional seed. Prefill gathers the next-token logits from each request's last
-real token. Decode excludes padding cache slots and writes/rotates each token at
-that request's logical position. Prompt overflow remains an error. Results are
-restored to caller order after bucketing.
+configuration for each request. It selects two independent stable shapes. The
+prefill-length bucket is the smallest configured prompt bucket that fits the
+real encoded prompt and bounds only prefill token/mask/position work. The
+cache-capacity bucket is the smallest configured capacity that fits
+`prompt_token_count + max_new_tokens` and bounds token storage, KV storage, and
+decode state. A short prompt with a large generation allowance therefore does
+not execute prefill at the full cache-capacity length. Every request carries its
+own valid-prefix length, attention mask, logical position, KV-cache length,
+maximum-new-token limit, and optional seed. Prefill gathers the next-token
+logits from each request's last real token. Decode excludes padding cache slots
+and writes/rotates each token at that request's logical position. Prompt
+overflow remains an error. Results are restored to caller order after
+bucketing.
 
 The request boundary applies configured BOS insertion before validation and
 rejects any prompt that still encodes to zero tokens. This includes empty or
@@ -929,10 +954,18 @@ left- and right-padding layouts used by the adapter.
 Artifact resolution completes once before the first evaluation request. The
 persisted evaluation result records artifact kind, run identity when applicable,
 resolved step, checkpoint-manifest identity, run-step identity, tokenizer
-identity, payload-verification level, task configuration, and relevant provider
-versions. A later `latest.json` update cannot change or obscure which model was
-evaluated. Inference result metadata records the same resolved model identity
-and verification level in addition to any allocated sampling seed.
+identity, and payload-verification level. For each ordered task invocation it
+also records a structured task identity over the resolved task YAML and complete
+include/template closure, task metadata version, prompt/few-shot/generation and
+metric-normalization configuration, seeds, limit, ordered request identity,
+lm-eval package version and source commit when available, resolved dataset
+revision/fingerprint, and relevant provider versions. Evaluation fails rather
+than publishing a result when an authoritative task file, dataset revision, or
+request identity cannot be resolved. A later `latest.json`, task-package, or
+dataset-cache update cannot change or obscure which model and evaluation
+definition produced the result. Inference result metadata records the same
+resolved model identity and verification level in addition to any allocated
+sampling seed.
 
 The completed v2 evaluation CLI supports the current HellaSwag and WinoGrande
 scope. Its lm-eval adapter implements `loglikelihood` and `generate_until`;
@@ -1035,8 +1068,9 @@ never reuses, truncates, or overwrites an existing run target.
 Before allocating model or optimizer arrays, resume fully verifies the resolved
 checkpoint payloads and matching data bundle, then validates every checkpoint
 array against the saved precision contract. A payload mismatch, BF16/FP32 dtype
-mismatch, missing optimizer leaf, or unrecorded master-weight leaf is corruption
-and cannot be coerced or regenerated.
+mismatch, missing or additional working/master/optimizer leaf, or failed exact
+master-to-working cast relationship is corruption and cannot be coerced or
+regenerated.
 
 ## Error Handling
 
@@ -1092,8 +1126,9 @@ correction suite covers:
 - LoRA forward and direct merged-weight output
 - exact FP32 LoRA merge formula and BF16 export-weight dtype
 - FP32 LoRA-state and BF16 base-activation dtype boundaries
-- BF16 base parameters with BF16 raw gradients, FP32 accumulation/moments/update
-  arithmetic, and mandatory BF16 post-update cast-back
+- FP32 master parameters with BF16 working parameters/raw gradients, FP32
+  accumulation/moments/update arithmetic, exact BF16 derivation after each
+  update, and survival of sub-BF16-ULP updates in the masters
 - compiled consecutive-step state transitions against eager execution
 - SWAG per-token log likelihood and authorized mean-normalized candidate scores
 
@@ -1175,6 +1210,13 @@ The integration suite additionally proves:
   and does not read or repair `latest.json`
 - evaluation and inference results pin the resolved model identity and
   verification level even if `latest.json` advances afterward
+- evaluation results pin task YAML/include/template identities, prompt and
+  metric policy, provider code, resolved dataset fingerprints, seeds, limits,
+  and ordered request identities so provider/cache changes cannot masquerade as
+  the same evaluation
+- prefill compilation depends on prompt-length buckets independently of KV/token
+  cache-capacity buckets, and short-prompt/long-generation requests never run a
+  capacity-length prefill
 - empty encoded prompts without a usable prefix token fail before bucketing
 - case-folded, Unicode-normalized, internal/external hard-link-alias, and
   symlink-swap payload paths are rejected by descriptor-relative path traversal
@@ -1183,6 +1225,43 @@ The benchmark-analysis tests use fixed synthetic raw measurements to pin paired
 ratio direction, bootstrap reproducibility, confidence-bound calculation, noise
 rejection, and pass/fail/inconclusive decisions without running a performance
 benchmark inside pytest.
+
+## Training-Quality Acceptance
+
+Formula and resume tests do not by themselves prove that the revised numerical
+trajectory can train. A separately versioned deterministic quality harness owns
+a fixed source-disjoint training/validation row set, initial BF16 parameter
+identity, ordered batches, optimizer configuration, checkpoint steps, and
+evaluation request identities. Quality work is never included in a throughput
+timed region.
+
+The base-training quality workload uses the default model architecture and
+precision-independent semantic configuration for 1,000 optimizer steps. From
+the same initial BF16 working tree it runs:
+
+- the candidate FP32-master/BF16-compute runtime; and
+- a correctness oracle that keeps authoritative parameters and model compute in
+  FP32 while using the same corrected tied-embedding graph, optimizer formula,
+  batches, schedule, and seeds.
+
+The report records training loss, held-out FP32 validation negative log
+likelihood, finite-state checks, per-leaf update-to-BF16-ULP statistics, the
+fraction of changed BF16 working values, and RMSNorm-master movement at steps 0,
+10, 100, and 1,000. Acceptance requires no nonfinite state, nonzero RMSNorm
+master movement, survival of at least one update that was individually below a
+BF16 ULP, and candidate step-1,000 validation NLL no more than 1 percent above
+the FP32-compute oracle. The candidate and oracle reports, exact workload
+identity, and raw checkpoint metrics are committed before Part 1 is accepted.
+
+The SWAG quality workload fine-tunes the same frozen BF16 base and FP32 adapters
+for 256 optimizer steps on fixed source-train rows, then evaluates a disjoint
+fixed validation split with the authorized mean continuation-token score. Its
+compiled result must remain within 1 percent relative validation loss and one
+percentage point validation accuracy of the eager FP32-adapter oracle, with
+identical real-example counts and no nonfinite state. Final HellaSwag and
+WinoGrande results are recorded with the complete evaluation provenance defined
+above; they are diagnostic rather than substitutes for these controlled quality
+gates.
 
 ## Performance Measurement and Acceptance
 
@@ -1242,22 +1321,23 @@ boundary:
 - end-to-end loading and training metrics intentionally use each version's
   native prepared-data or encoded-dataset representation and include the work
   named by the timed-region contract
-- end-to-end pretraining compares each version's actual default optimizer-state
-  precision: legacy BF16 Adam moments against replacement FP32 moments with
-  BF16 parameter cast-back. This explicitly authorized precision-policy
-  difference is recorded in both native configurations and means the benchmark
-  compares product-default throughput, not identical numerical trajectories
+- end-to-end pretraining compares each version's actual default training-state
+  precision: legacy BF16 persistent parameters and Adam moments without masters
+  against replacement FP32 master parameters/moments with BF16 working
+  parameters. This explicitly authorized precision-policy difference is
+  recorded in both native configurations and means the benchmark compares
+  product-default throughput, not identical numerical trajectories
 - every native representation must resolve to the same canonical token rows,
   examples, requests, and real-work counts for that metric
 - when work order can affect the executed kernels or state evolution, both
   adapters emit the same logical row, example, or request order
 
-All other optimizer hyperparameters, model-parameter and activation dtypes,
-initial BF16 parameter values, input rows, batch shapes, accumulation count,
-clipping, weight-decay classification, schedules, and synchronization boundaries
-match. Reports state the moment-precision difference next to every end-to-end
-pretraining ratio and never describe that metric as legacy trajectory
-equivalence.
+All other optimizer hyperparameters, BF16 working-parameter and activation
+dtypes, initial BF16 parameter values, input rows, batch shapes, accumulation
+count, clipping, weight-decay classification, schedules, and synchronization
+boundaries match. Reports state both the master-parameter and moment-precision
+differences next to every end-to-end pretraining ratio and never describe that
+metric as legacy trajectory equivalence.
 
 The acceptance baseline uses commit `3687f8b` on the Apple M5 10-core CPU,
 10-core GPU, 24 GB target. The fixed pretraining workload uses that commit's
@@ -1322,13 +1402,26 @@ configurations or semantic content identities differ. Native configuration and
 representation identities may differ only within the metric-specific boundaries
 described above.
 
+The harness maintains an explicit per-metric lineage rather than assuming that
+the immediately preceding phase measured every metric. Each accepted metric
+record names its pinned-baseline result identity and either the identity of the
+most recent accepted measurement of that same metric or `null` when this is the
+replacement metric's first appearance. A validator rejects a missing, wrong-
+metric, incompatible-workload, or non-latest predecessor. The lineage begins:
+
+- prepared data: baseline -> Phase 2 -> Phase 3 -> final acceptance
+- end-to-end pretraining: baseline -> Phase 3 -> final acceptance
+- inference prefill/decode: baseline -> Phase 1 -> Phase 4 -> final acceptance
+- SWAG end to end: baseline -> Phase 5 -> final acceptance
+
 A benchmark is relevant to a phase when the phase changes code executed in its
 timed region. For every relevant steady-state throughput metric, the five-pair
-phase-screen median must be at least `0.97` in direct comparisons against both
-the pinned baseline and the previous accepted phase; improvements have no upper
-bound. Checkpoint pause and peak memory are report-only except for the explicit
-fit and memory-pressure gate. All measurements run from the clean checkouts at
-the recorded commits.
+phase-screen median must be at least `0.97` against the pinned baseline and, when
+one exists, in a direct comparison against the previous accepted measurement of
+that same metric. A metric's first replacement measurement compares only with
+the baseline. Improvements have no upper bound. Checkpoint pause and peak memory
+are report-only except for the explicit fit and memory-pressure gate. All
+measurements run from the clean checkouts at the recorded commits.
 
 Acceptance gates:
 
@@ -1342,6 +1435,8 @@ Acceptance gates:
 - the fixed default workload must complete on the Apple M5 24 GB target without
   out-of-memory failure or critical memory pressure
 - mathematical-equivalence and correctness tests must pass regardless of speed
+- the base and SWAG controlled quality reports pass their committed acceptance
+  rules
 
 Compile cold-start time and peak memory are reported even when steady-state
 throughput is the deciding metric.
@@ -1387,7 +1482,7 @@ documentation to describe only the new system.
 
 - changing the model architecture, mathematical algorithms, or optimizer
   algorithm beyond the canonical tied-gradient, mean-normalized SWAG-score, and
-  BF16-parameter/FP32-moment precision corrections authorized above
+  FP32-master/BF16-working-parameter precision corrections authorized above
 - replacing SentencePiece BPE
 - supporting non-MLX training/inference backends
 - compatibility with any existing v2 artifact or API
