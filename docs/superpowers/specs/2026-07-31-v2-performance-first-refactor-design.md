@@ -156,6 +156,24 @@ training/inference/evaluation
 One workflow never imports another workflow or a CLI module. Optional heavy
 dependencies are imported lazily by the command that needs them.
 
+Every implementation-plan interface is complete at the task that first owns
+it. A named dataclass or wrapper must list all fields and types; a named function
+must define its complete signature, verification behavior, and ownership
+semantics. This applies in particular to verified/published artifact wrappers,
+tokenizer and prepared-data bundle results, KV and token-selection results,
+compiled-kernel host results, resolved provider records, export results, and
+recursive verification results. A later task may extend a discriminated schema
+only by introducing a new schema kind/version; it may not invent optional fields
+inside an already frozen kind.
+
+Artifact schemas are discriminated rather than one optional-field container.
+`PretrainingRunManifest` and `LoRARunManifest` are distinct strict run kinds;
+`PretrainingCheckpointManifest` and `LoRACheckpointManifest` are distinct strict
+checkpoint kinds. Tokenizer, prepared-data, base-snapshot, SWAG-data, export,
+latest-index, and evaluation-result schemas likewise have exact field sets,
+payload references, identity projections, and versions before their first
+writer is implemented. Strict readers reject fields from another kind.
+
 During the phased migration, creating `v2/src/sml/` causes the package to take
 precedence over the legacy `v2/src/sml.py` module. Phase 1 therefore installs a
 temporary internal bridge in `sml.__init__` that exposes the model symbols still
@@ -167,26 +185,30 @@ flat modules; it is never part of the completed public API.
 
 Tokenizer, prepared-data, encoded-SWAG, and export bundles are immutable,
 self-describing, and directory based. A run is a mutable model-state container
-that is self-contained for model-consuming operations, with narrowly defined
-mutable indexes: checkpoint directories may be appended, `latest.json` may be
-atomically replaced, and retention may delete non-latest checkpoint directories
-after a newer latest step has been published. Retention never deletes the
-checkpoint currently named by `latest.json` and always performs latest-index
-recovery before selecting deletion candidates. `run.json`, copied tokenizer and
-base snapshots, and every published checkpoint directory are immutable once
-written.
+that is self-contained for model-consuming operations. Each pretraining or
+fine-tuning run retains exactly one latest committed checkpoint bundle in steady
+state. Checkpoint publication may temporarily retain the previous committed
+bundle until the replacement is durable and `latest.json` names it; the writer
+then waits for active readers under the exclusive access lock and deletes the
+previous bundle before the checkpoint operation completes. A crash may leave
+the latest bundle plus one obsolete predecessor, which the next writable open
+must verify and prune. Checkpoint history, configurable retention, historical
+step selection, and standalone step artifacts are not part of v2.
 
-A step directory may reference immutable files at its owning run root and is
-therefore not independently portable. A run directory and an export directory
-are independently portable for inference, evaluation, and export operations
-that use only model state. Training data is deliberately not copied into a run:
-pretraining resume requires a prepared-data bundle, and LoRA resume requires an
-encoded-SWAG bundle, whose authoritative bundle identity must match `run.json`.
-A moved run may be given a new data-bundle location without changing its
-semantic configuration. Run-step identity combines immutable `run.json` with
-the selected checkpoint manifest as defined below; it is not a digest of the
-mutable directory as a whole. Relative references and content identities are
-canonical; absolute source paths are diagnostic locators only.
+`run.json`, copied tokenizer and base snapshots, and a committed checkpoint
+directory are immutable once written. A checkpoint directory may reference
+immutable files at its owning run root and is therefore not independently
+portable. A run directory and an export directory are independently portable
+for inference, evaluation, and export operations that use only model state.
+Training data is deliberately not copied into a run: pretraining resume requires
+a prepared-data bundle, and LoRA resume requires an encoded-SWAG bundle, whose
+authoritative bundle identity must match `run.json`. A moved run may be given a
+new data-bundle location without changing its semantic configuration. The
+current run-state identity combines immutable `run.json` with the latest
+checkpoint manifest; it is not a digest of the mutable directory as a whole.
+Relative references and content identities are canonical; absolute source paths
+are diagnostic locators only. A future fine-tuning method creates its own run
+kind and owns one latest checkpoint under the same bounded-publication rule.
 
 ### Content identities and path safety
 
@@ -220,8 +242,9 @@ payload byte, dtype, shape, or order must change it.
 Readers always recompute a manifest or `run.json` structured identity from its
 parsed identity projection and compare it with the stored value. Correctness-
 sensitive workflows that will mutate or derive model state -- fresh training,
-resume, fine-tuning, export, writable recovery, and retention -- fully rehash
-every referenced input payload before GPU initialization or destructive action.
+resume, fine-tuning, export, writable recovery, and obsolete-checkpoint pruning
+-- fully rehash every referenced input payload before GPU initialization or
+destructive action.
 An immutable target that already exists must also pass full payload verification
 before a writer may accept it as an idempotent success. Payloads produced and
 hashed by the same live writer need not be reread immediately.
@@ -264,8 +287,8 @@ identities. Resume therefore accepts a relocated byte-identical bundle but
 rejects a differently sharded representation; performance comparisons may use
 different representations only when their semantic row-content identities
 match. Other bundles use their manifest identity as their authoritative bundle
-identity. A run-step identity is a domain-separated structured identity over
-the owning `run.json` identity and selected checkpoint-manifest identity.
+identity. A current run-state identity is a domain-separated structured identity
+over the owning `run.json` identity and latest checkpoint-manifest identity.
 
 ### Tokenizer bundle
 
@@ -307,7 +330,7 @@ run/
 ├── tokenizer/
 ├── latest.json
 └── checkpoints/
-    └── step-000010000/
+    └── step-000010000/        latest committed checkpoint only
         ├── checkpoint.json
         ├── model.safetensors
         ├── master.safetensors
@@ -323,7 +346,9 @@ FP32 trainable parameters. `state.json` contains scalar progress and the data
 cursor. Remaining MLX array state, including the explicit PRNG key, uses
 safetensors. Checkpoints are committed at optimizer-step boundaries, so the
 saved accumulation state is canonical and empty; the microstep counter still
-proves exact boundary alignment.
+proves exact boundary alignment. Only the latest committed checkpoint is kept;
+the directory's step number records progress but does not provide historical
+selection.
 
 Every fresh base run publishes a canonical step-zero checkpoint containing an
 FP32 master tree initialized from the exact BF16 working tree, that BF16 working
@@ -346,7 +371,8 @@ BF16 cast of its corresponding FP32 master leaf; a mismatch is corruption.
 `latest.json` is a derived mutable index, not authoritative checkpoint state.
 It records the owning run identity, selected step number, and checkpoint-
 manifest identity so readers can detect a stale, cross-run, or manually edited
-pointer.
+pointer. A healthy quiescent run contains the pointed checkpoint and no other
+published `step-*` directory.
 
 ### LoRA run and export
 
@@ -362,7 +388,7 @@ lora-run/
 │   └── model.safetensors
 ├── latest.json
 └── checkpoints/
-    └── step-000001000/
+    └── step-000001000/        latest committed checkpoint only
         ├── checkpoint.json
         ├── adapters.safetensors
         ├── optimizer.safetensors
@@ -371,16 +397,19 @@ lora-run/
 ```
 
 At run creation, `base/model.safetensors` is copied exactly once from the
-selected pretraining step. `base/manifest.json` contains the complete model and
-precision configuration, source run/step identity for diagnostics, and the
-copied file's content identity. The tokenizer bundle is copied from the owning
-pretraining run. `run.json` records the copied base identity and authoritative
+latest pretraining checkpoint. `base/manifest.json` contains the complete model
+and precision configuration, source current-run-state identity for diagnostics,
+and the copied file's content identity. The tokenizer bundle is copied from the
+owning pretraining run. The source run's shared access lock is held from latest
+resolution through full verification and completion of the exact BF16 file-byte
+copy; the target run writer lock does not substitute for that source lock.
+`run.json` records the copied base identity and authoritative
 encoded-SWAG bundle identity. No copied base or tokenizer file may be a symlink
 or external reference, and the LoRA run remains usable after the source
 pretraining run is removed, provided the matching encoded-SWAG bundle remains
-available when resuming training. Periodic step directories contain adapters,
-optimizer state, trainer state, and cursor, but do not rewrite frozen base
-weights. A selected step can be exported as:
+available when resuming training. Each replacement checkpoint contains
+adapters, optimizer state, trainer state, and cursor, but does not rewrite
+frozen base weights. The latest checkpoint can be exported as:
 
 ```text
 export/
@@ -390,8 +419,9 @@ export/
 ```
 
 The export manifest records its schema kind/version, complete model and
-precision configuration, tokenizer identity, source run/step identity for
-diagnostics, and content identities for the tokenizer files and merged model.
+precision configuration, tokenizer identity, source current-run-state identity
+for diagnostics, and content identities for the tokenizer files and merged
+model.
 The exported model contains directly merged base-plus-LoRA weights under plain
 inference parameter names. For each adapter, export deterministically computes
 
@@ -479,42 +509,38 @@ Checkpoint writers:
 5. atomically rename the step directory and `fsync` its parent directory
 6. write and `fsync` a temporary latest index, atomically replace `latest.json`,
    and `fsync` its parent directory
+7. acquire the exclusive access lock, revalidate the new latest checkpoint,
+   delete every older published step by descriptor, and `fsync` the checkpoint
+   parent before returning
 
 Readers ignore incomplete temporary directories. A completed checkpoint is
 never modified or repaired in place.
 
 The step-directory rename is the checkpoint commit point; `latest.json` is only
-a recoverable index. When opening a run through latest-step resolution with a
-valid pointer, the reader validates the pointed step and scans published
-`step-*` directories whose step number is greater than the pointed step. When
-the pointer is missing, malformed, or cross-run, the reader scans all published
-steps. In either case the highest valid completed step belonging to the run is
-selected. A writable workflow atomically rebuilds a stale or invalid
-`latest.json`; a read-only workflow keeps the recovered selection in memory.
-Temporary directories are ignored. A malformed published directory that latest-
-step resolution must examine raises an artifact error rather than being silently
-skipped; older steps below a valid pointer are checked only by an explicit full-
-artifact verification.
-
-Exact-step resolution is a separate algorithm. While holding the shared access
-lock, it validates only the owning `run.json` and requested checkpoint. It does
-not read, scan, repair, or depend on `latest.json`, and an unrelated malformed
-or newer step cannot prevent use of the requested valid step.
+a recoverable index. Latest resolution validates every published `step-*`
+directory needed to establish the highest valid completed step belonging to the
+run. A missing, malformed, stale, or cross-run pointer is recovered from those
+immutable manifests. A malformed published candidate raises an artifact error
+rather than being silently skipped. Temporary directories are ignored.
 
 Recovery does not depend on write access. Resume and other writable workflows
-persist the repaired index before continuing; a read-only inference or
-evaluation workflow never writes it, uses the recovered step in memory, and
-reports that the stale index was not persisted.
+persist the repaired index, take the exclusive access lock, and prune every
+obsolete published checkpoint before allocating training state. A read-only
+inference or evaluation workflow never writes or prunes; it uses the recovered
+latest checkpoint in memory and reports whether repair or pruning remains
+pending. Thus normal operation retains one checkpoint, while an interrupted
+publication can leave at most the previous and replacement checkpoints until
+the next writable recovery.
 
 If a writer finds an existing target step, it compares the completed manifest
 identity and fully verifies the existing step's payloads. An identical, fully
 verified step is an idempotent success; a different identity or payload mismatch
 is a collision or corruption error and fails without overwriting either
 checkpoint. Before publishing an index, the writer performs recovery and
-advances `latest.json` only when the target is not older than the recovered
-latest step. The index is never moved backward. Tests inject interruption after
-every publication stage, including the step rename immediately before the
-latest-index replacement.
+rejects a target older than the recovered latest step. The index is never moved
+backward. Tests inject interruption after every publication and pruning stage,
+including the step rename immediately before the latest-index replacement and
+the index replacement immediately before obsolete-checkpoint deletion.
 
 Typed manifest parsing rejects unknown fields, unknown schema kinds or
 versions, missing files, incorrect array keys/shapes/dtypes, inconsistent model
@@ -523,39 +549,41 @@ Large-file digests are computed while artifacts are produced. Correctness-
 sensitive workflows perform the full input verification defined above; normal
 read-only local-APFS startup may trust immutable manifests after schema, path,
 and array-metadata validation. Read-only use on another local filesystem has no
-concurrent writer or retention guarantee; writable recovery, publication, and
-retention reject it.
+concurrent writer or pruning guarantee; writable recovery, publication, and
+obsolete-checkpoint pruning reject it.
 
 ### Concurrency and lifecycle
 
 A run permits one mutable workflow at a time. Run creation, training, resume,
-writable latest-index recovery, checkpoint publication, and retention hold an
-exclusive advisory writer lock for their complete lifetime. The lock is a
-sidecar in the run's parent directory, derived from the resolved run-directory
-name, and is not part of the portable run or any identity. Lock acquisition is
-non-blocking and a conflicting writer fails before GPU initialization with the
-run path and available owner diagnostics. The macOS implementation uses a
-kernel-managed file lock whose ownership is released automatically when the
-process exits; lock-file contents are diagnostic and are never used for unsafe
-PID-based stale-lock deletion.
+writable latest-index recovery, checkpoint publication, and obsolete-checkpoint
+pruning hold an exclusive advisory writer lock for their complete lifetime. The
+lock is a sidecar in the run's parent directory, derived from the resolved
+run-directory name, and is not part of the portable run or any identity. Lock
+acquisition is non-blocking and a conflicting writer fails before GPU
+initialization with the run path and available owner diagnostics. The macOS
+implementation uses a kernel-managed file lock whose ownership is released
+automatically when the process exits; lock-file contents are diagnostic and are
+never used for unsafe PID-based stale-lock deletion.
 
-Readers do not take the writer lock and may consume completed immutable steps
-while training continues. They do take a shared sidecar access lock from step
-resolution until all required state has been validated and fully evaluated into
-owned arrays. Retention takes the corresponding exclusive access lock only while
-deleting eligible steps, so it cannot remove an exact step between resolution
-and loading. Latest-index replacement and checkpoint publication do not require
-the exclusive access lock because readers validate immutable manifests and
-recover stale indexes. Immutable-bundle writers use the target publication lock
-and identity comparison, so concurrent production is either an idempotent
-success or a collision rather than a partial overwrite.
+Readers do not take the writer lock and may consume a completed immutable latest
+checkpoint while training continues. They take a shared sidecar access lock
+from checkpoint resolution until all required state has been validated and
+fully evaluated into owned arrays. The writer takes the corresponding exclusive
+access lock before deleting the previous checkpoint, so it cannot remove a
+checkpoint that an active reader is still loading. Latest-index replacement and
+new-checkpoint publication do not require the exclusive access lock; pruning
+does. Immutable-bundle writers use the target publication lock and identity
+comparison, so concurrent production is either an idempotent success or a
+collision rather than a partial overwrite.
 
-Before retention deletes an older step, it proves that the step it will retain
-is payload-valid. A checkpoint produced and hashed by the same live writer
-already carries that proof. After resume or writable recovery, the workflow
-fully rehashes the preexisting retained step once before the first deletion.
-Retention never converts a manifest-trusted read-only result into deletion
-authority.
+Before pruning an older checkpoint, the writer proves that the new latest
+checkpoint is payload-valid. A checkpoint produced and hashed by the same live
+writer already carries that proof. After resume or writable recovery, the
+workflow fully rehashes the preexisting latest checkpoint before deleting an
+obsolete predecessor. Manifest-trusted read-only resolution never grants
+deletion authority. Lock ordering is always run-writer lock, source-run shared
+access lock when copying a base, then target-run exclusive access lock for
+pruning; no workflow acquires those locks in reverse order.
 
 Publication-lock files are durable sidecars and are not identities or payloads.
 After acquiring a target's publication lock, a later writer may delete abandoned
@@ -573,12 +601,12 @@ The primary flows are:
 raw corpus
   -> tokenizer bundle
   -> prepared pretraining bundle
-  -> pretraining run/checkpoints
+  -> pretraining run/latest checkpoint
   -> base inference/evaluation
 
-HF SWAG + base checkpoint
+HF SWAG + latest base checkpoint
   -> cached encoded SWAG bundle
-  -> LoRA run/checkpoints
+  -> LoRA run/latest checkpoint
   -> merged export
   -> fine-tuned inference/evaluation
 ```
@@ -870,14 +898,17 @@ length-bucket shape and configured batch size.
 
 ### Checkpoint timing
 
-Training checkpoint intervals count completed optimizer steps. A resume whose
-restored step already satisfies its limit returns before data iterators,
+Training checkpoint intervals count completed optimizer steps. Each successful
+checkpoint operation replaces and prunes the previous checkpoint before
+returning; checkpoint history and retention controls do not exist. A resume
+whose restored step already satisfies its limit returns before data iterators,
 compiled gradients, or model training mode are constructed.
 
 ## Inference and Evaluation Runtime
 
-`InferenceSession.from_checkpoint()` loads and validates a pretraining run, a
-step within its owning run, a LoRA run, or a self-contained merged export once.
+`InferenceSession.from_checkpoint()` loads and validates the latest checkpoint
+of a pretraining run, the latest checkpoint of a LoRA run, or a self-contained
+merged export once.
 It owns the tokenizer, immutable loaded model state, compiled prefill/decode
 functions, and a reusable buffer pool. Token storage, logical lengths, finished
 state, per-request PRNG keys, and KV-cache contents belong to one generation
@@ -953,7 +984,7 @@ left- and right-padding layouts used by the adapter.
 
 Artifact resolution completes once before the first evaluation request. The
 persisted evaluation result records artifact kind, run identity when applicable,
-resolved step, checkpoint-manifest identity, run-step identity, tokenizer
+resolved step, checkpoint-manifest identity, current run-state identity, tokenizer
 identity, and payload-verification level. For each ordered task invocation it
 also records a structured task identity over the resolved task YAML and complete
 include/template closure, task metadata version, prompt/few-shot/generation and
@@ -967,6 +998,19 @@ definition produced the result. Inference result metadata records the same
 resolved model identity and verification level in addition to any allocated
 sampling seed.
 
+The result contract is explicit rather than a provider-owned untyped mapping.
+`EvaluationTaskRecord` contains task name, resolved task-YAML identity, ordered
+include/template identities, task metadata version, prompt/few-shot/generation
+configuration, metric-normalization configuration, seeds, limit, ordered
+request identity, lm-eval package version/source commit, dataset
+revision/fingerprint, sorted provider versions, and the task's complete metric
+payload. `EvaluationResult` contains schema kind/version/identity, resolved
+model identity, the ordered tuple of task records, and the complete top-level
+provider result payload. Evaluation writes one immutable JSON result file by
+temporary-file write, file `fsync`, no-replace publication, and parent `fsync`.
+An identical fully validated target is idempotent; a different existing target
+is a collision and is never overwritten.
+
 The completed v2 evaluation CLI supports the current HellaSwag and WinoGrande
 scope. Its lm-eval adapter implements `loglikelihood` and `generate_until`;
 unsupported request methods fail explicitly rather than returning partial or
@@ -975,28 +1019,32 @@ invented results.
 Both inference and evaluation can consume:
 
 - a pretraining run directory, resolving `latest.json`
-- an exact pretraining step directory within its owning run
 - a LoRA run directory, resolving base plus latest adapters
 - a merged export directory
 
-An optional step selector chooses an exact step inside a run.
-
-Run-directory resolution uses the latest-step recovery algorithm. An exact step
-directory or `--step` selector uses exact-step resolution and therefore neither
-reads nor repairs `latest.json`.
+Run-directory resolution always uses latest-checkpoint recovery. Historical
+step paths and step selectors are rejected because runs intentionally retain no
+checkpoint history.
 
 ## Unified CLI and Configuration
 
 The top-level package mapping and `sml.__main__` support:
 
 ```sh
-uv run python -m sml tokenize
-uv run python -m sml prepare pretraining
+uv run python -m sml tokenize \
+  --corpus RAW_CORPUS \
+  --output TOKENIZER_BUNDLE
+uv run python -m sml prepare pretraining \
+  --corpus RAW_CORPUS \
+  --tokenizer TOKENIZER_BUNDLE \
+  --output PRETRAINING_BUNDLE
 uv run python -m sml prepare swag \
   --checkpoint BASE_RUN \
+  --revision IMMUTABLE_PROVIDER_COMMIT \
   --output SWAG_BUNDLE
 uv run python -m sml train \
-  --data PRETRAINING_BUNDLE
+  --data PRETRAINING_BUNDLE \
+  --output PRETRAINING_RUN
 
 uv run python -m sml infer \
   --checkpoint RUN_DIR \
@@ -1004,14 +1052,17 @@ uv run python -m sml infer \
 
 uv run python -m sml evaluate \
   --checkpoint RUN_DIR \
-  --task hellaswag
+  --task hellaswag \
+  --output BASE_EVALUATION.json
 
 uv run python -m sml finetune \
   --checkpoint RUN_DIR \
-  --data SWAG_BUNDLE
+  --data SWAG_BUNDLE \
+  --output FINETUNE_RUN
 
 uv run python -m sml export \
-  --checkpoint FINETUNE_RUN_DIR
+  --checkpoint FINETUNE_RUN_DIR \
+  --output MERGED_EXPORT
 
 uv run python -m sml infer \
   --checkpoint EXPORT_DIR \
@@ -1019,28 +1070,34 @@ uv run python -m sml infer \
 
 uv run python -m sml evaluate \
   --checkpoint EXPORT_DIR \
-  --task hellaswag
+  --task hellaswag \
+  --output EXPORT_EVALUATION.json
 
 uv run python -m sml verify \
   --full \
   ARTIFACT
 ```
 
-Initial `train` and `finetune` commands require explicit prepared-data and
-encoded-SWAG bundles respectively. `infer` and `evaluate` require
-`--checkpoint`; `--step` optionally selects an exact run step. A step directory
-is accepted only in the context of its owning run and is never treated as a
-standalone portable artifact. Evaluation accepts repeated `--task` arguments
-from the supported HellaSwag and WinoGrande set. `verify --full` performs the
-explicit payload-rehash operation described above. Read-only `infer` and
-`evaluate` use manifest-trusted validation by default; their optional `--full`
-flag rehashes every payload needed by the selected model before GPU
-initialization.
+Artifact-producing commands require explicit input and output paths; v2 never
+writes to an implicit project or home-directory location. Initial `train` and
+`finetune` commands require explicit prepared-data and encoded-SWAG bundles
+respectively. `infer` and `evaluate` require `--checkpoint`; historical step
+selectors and standalone step paths are invalid. Evaluation requires an
+explicit output file and accepts repeated `--task` arguments from the supported
+HellaSwag and WinoGrande set. `verify --full` performs the explicit
+payload-rehash operation described above. Read-only `infer` and `evaluate` use
+manifest-trusted validation by default; their optional `--full` flag rehashes
+every payload needed by the selected model before GPU initialization.
 
 Each command accepts an optional TOML configuration file plus explicit CLI
 overrides. Precedence is defaults, then TOML, then CLI. Frozen validated
 dataclasses own configuration; derived values are read-only properties rather
-than constructor mutations.
+than constructor mutations. Before a run identity is calculated, fresh-run
+orchestration materializes every semantic default and derivation into a fully
+resolved frozen configuration, including initializer mappings, warmup steps,
+finite schedule horizons, and nested precision/loader/checkpoint policies.
+`run.json` stores those resolved values rather than `None` sentinels that resume
+would need to reinterpret.
 
 Training configurations compose shared optimizer, precision, loader, and
 checkpoint policies. They do not inherit from one another. Throughput-critical
@@ -1058,12 +1115,21 @@ codes. `argparse.Namespace` values never enter domain APIs.
 latest atomically published checkpoint. Saved model, optimizer, dataset
 identity, precision, and immutable run configuration are authoritative. Resume
 may override only termination and observability fields: maximum steps/epochs,
-logging interval, checkpoint interval, and retention. A resume command may also
+logging interval and checkpoint interval. Overrides apply only to that resume
+invocation; they do not modify `run.json` or become implicit defaults for a
+later resume. A resume command may also
 supply a prepared-data or encoded-SWAG bundle location with `--data`; when it is
 omitted, the original diagnostic locator is tried. A supplied location is not a
 semantic override and is accepted only after its authoritative bundle identity
 matches the dataset identity stored in `run.json`. Starting without `--resume`
 never reuses, truncates, or overwrites an existing run target.
+
+The shared frozen `ResumeOverrides` type lives in `training/common.py` and has
+exact fields `maximum_steps`, `maximum_epochs`, `log_interval`, and
+`checkpoint_interval`, each `int | None`. Pretraining and fine-tuning workflows
+import it from `training.common`; they never import one another. There is no
+retention field because latest-only checkpoint pruning is mandatory rather than
+configurable.
 
 Before allocating model or optimizer arrays, resume fully verifies the resolved
 checkpoint payloads and matching data bundle, then validates every checkpoint
@@ -1166,7 +1232,7 @@ The integration suite additionally proves:
 - normal validation detects schema and array-metadata corruption, while full
   verification detects a payload byte changed without a manifest update
 - every correctness-sensitive workflow rejects a payload byte changed without a
-  manifest update before GPU initialization or retention deletion; fast
+  manifest update before GPU initialization or obsolete-checkpoint deletion; fast
   read-only use reports `manifest-trusted` rather than claiming full verification
 - interruption at every immutable-bundle publication stage never exposes a
   partial bundle at its final path
@@ -1176,7 +1242,7 @@ The integration suite additionally proves:
   target, and explicit resume before the first optimizer step restores the
   initialized state from that checkpoint
 - a crash after step-directory publication but before `latest.json` replacement
-  resumes from the newly published step
+  resumes from the newly published step and prunes the predecessor
 - a full prefetch queue cannot advance the checkpointed committed cursor
 - a crash inside an accumulation window replays the complete uncommitted window
   with its original PRNG sequence
@@ -1185,13 +1251,16 @@ The integration suite additionally proves:
   for an already-published optimizer step
 - shard-boundary batching drops at most one tail for the complete epoch stream
 - conflicting reuse of an existing step number is rejected without overwrite
-- idempotent publication of an older step cannot move `latest.json` backward
+- publication of a non-increasing step cannot move `latest.json` backward
 - deleting the source pretraining run does not affect LoRA resume, inference, or
   export from the copied base snapshot when the encoded-SWAG bundle is supplied
 - a moved run performs model-only operations without its training data, resumes
   with an identity-matching relocated bundle, and rejects a mismatched bundle
 - a second mutable workflow for the same run is rejected, concurrent readers
-  can load published steps, and retention waits for an active step loader
+  can load the published checkpoint, and pruning waits for an active loader
+- LoRA run creation holds the source run's shared access lock through full
+  verification and exact BF16 base-byte copying, so source pruning cannot race
+  the copy
 - every SWAG cache-identity field produces a cache miss when changed
 - fine-tuning rejects tokenizer identity, vocabulary, special-token, preprocessing,
   and maximum-length mismatches between encoded SWAG and the selected base
@@ -1206,14 +1275,24 @@ The integration suite additionally proves:
   configured tolerance and remains invariant to padding layout
 - sequential session calls start from empty token/KV state, failed calls cannot
   contaminate the next call, and overlapping calls fail before mutation
-- exact-step inference/export succeeds despite a malformed unrelated newer step
-  and does not read or repair `latest.json`
+- interrupted checkpoint replacement recovers the highest valid checkpoint and
+  the next writable open prunes every obsolete predecessor
+- a successful pretraining or fine-tuning checkpoint operation leaves exactly
+  one published `step-*` directory after active readers release their locks
 - evaluation and inference results pin the resolved model identity and
   verification level even if `latest.json` advances afterward
 - evaluation results pin task YAML/include/template identities, prompt and
   metric policy, provider code, resolved dataset fingerprints, seeds, limits,
   and ordered request identities so provider/cache changes cannot masquerade as
   the same evaluation
+- evaluation result publication is immutable and atomic: identical reuse is
+  idempotent and a different existing output is a collision
+- CLI and library entrypoints reject historical `--step` selection and direct
+  `step-*` paths
+- fresh run manifests contain fully resolved semantic configuration, and
+  invocation-scoped resume overrides do not alter later resume defaults
+- strict schema tests prove each run/checkpoint kind rejects fields belonging to
+  another kind, and every named public wrapper has a complete field contract
 - prefill compilation depends on prompt-length buckets independently of KV/token
   cache-capacity buckets, and short-prompt/long-generation requests never run a
   capacity-length prefill
@@ -1234,6 +1313,16 @@ a fixed source-disjoint training/validation row set, initial BF16 parameter
 identity, ordered batches, optimizer configuration, checkpoint steps, and
 evaluation request identities. Quality work is never included in a throughput
 timed region.
+
+Quality inputs are checked-in immutable fixtures rather than arrays hidden in
+Python source. Their logical paths, shapes, dtypes, byte identities, semantic
+row/example identities, and exact ordered reuse schedule are part of each
+quality-workload manifest and harness identity. The pretraining fixture contains
+fixed `int32` training and source-disjoint validation rows; the SWAG fixture
+contains fixed encoded train and source-disjoint validation candidate arrays
+with masks and labels. All quality fixtures and committed raw/report evidence
+together must remain at or below 64 MiB; model/optimizer states are temporary
+run outputs and are not committed as quality fixtures.
 
 The base-training quality workload uses the default model architecture and
 precision-independent semantic configuration for 1,000 optimizer steps. From
@@ -1256,12 +1345,36 @@ identity, and raw checkpoint metrics are committed before Part 1 is accepted.
 The SWAG quality workload fine-tunes the same frozen BF16 base and FP32 adapters
 for 256 optimizer steps on fixed source-train rows, then evaluates a disjoint
 fixed validation split with the authorized mean continuation-token score. Its
-compiled result must remain within 1 percent relative validation loss and one
-percentage point validation accuracy of the eager FP32-adapter oracle, with
+compiled result must have absolute relative validation-loss difference
+`abs(candidate - oracle) / max(abs(oracle), 1e-12) <= 0.01` and absolute
+validation-accuracy difference `abs(candidate - oracle) <= 0.01`, with
 identical real-example counts and no nonfinite state. Final HellaSwag and
 WinoGrande results are recorded with the complete evaluation provenance defined
 above; they are diagnostic rather than substitutes for these controlled quality
 gates.
+
+On the acceptance M5, the pretraining quality command has a 12-hour wall-time
+budget and the SWAG quality command has a 4-hour wall-time budget. Each manifest
+records measured wall time, peak Metal memory, temporary disk usage, fixture
+cardinality, validation cardinality, and ordered work count. Exceeding a budget
+fails the quality-production task and requires an explicit workload/design
+revision; it never silently reduces validation work or steps. Interrupted
+quality evidence is discarded and rerun from the committed harness and fixtures
+so a partial record can never be accepted.
+
+## Implementation-Quality Acceptance
+
+Completion guarantees implementation discipline, not a promise about downstream
+model capability. The release must pass formula oracles, legacy-equivalence
+tests where mathematics is preserved, dtype and explicit-PRNG contracts,
+multi-step eager/compiled state tests, uninterrupted/resumed equality, artifact
+schema and adversarial path tests, crash-stage checkpoint replacement tests,
+source-lock concurrency tests, offline end-to-end CLI workflows, controlled
+training-quality gates, and the performance protocol below. Production code may
+contain no hidden global randomness, unverified state coercion, legacy fallback,
+test-only switch, mutable compiled closure state, or per-token host conversion.
+HellaSwag/WinoGrande results remain diagnostic; acceptance never substitutes a
+benchmark score for these implementation checks.
 
 ## Performance Measurement and Acceptance
 
@@ -1290,7 +1403,21 @@ harness or analysis changes, every affected baseline and retained phase result
 is rerun; reports never compare measurements produced by different harness
 identities. Its schema defines the exact start and end synchronization points,
 included data movement and host work, state-reset policy, numerator, and work
-unit for every metric.
+unit for every metric. The harness content identity covers the ordered bytes of
+the schema, workload, runner, analysis, legacy adapter, replacement adapter, and
+fixed benchmark-analysis test-vector module. Changing any one invalidates every
+dependent result.
+
+Both adapters implement one frozen phase-independent ABI:
+`resolve_native_workload(metric, canonical_workload, source_root)`,
+`run_warmup(metric, native_workload, units)`, and
+`run_measured(metric, native_workload, units)`. The replacement adapter is
+committed before baseline capture with lazy string-based imports for every
+planned owner module. A metric whose owner module is not yet present reports
+`unavailable` and is not measured in that phase; the adapter itself is never
+edited to enable a later phase. Unit tests pin every metric name, owner import,
+canonical round trip, synchronization boundary, and unavailable/available
+transition without importing absent modules.
 
 In particular, each end-to-end pretraining work unit starts before requesting
 the first microbatch in a measured accumulation window and ends after that
@@ -1378,11 +1505,15 @@ measured separately in a fresh process without warmup and is report-only.
 
 A phase screen is too noisy when `MAD / median` exceeds 2 percent for either
 side or for the paired ratios. Final acceptance uses a 1.5-percent threshold.
-After cooldown the complete comparison is repeated once; persistent excess
-dispersion blocks the phase or final acceptance. A final point estimate that
-satisfies a gate while its required lower confidence bound does not is reported
-as inconclusive and blocks acceptance rather than being rounded to a pass or
-resolved by selecting favorable trials.
+After a noisy comparison, terminate both benchmark checkouts/processes, keep the
+machine connected to power in the recorded power mode, and cool down for at
+least 15 minutes; the last 5 minutes must report nominal thermal state, normal
+memory pressure, and no competing GPU workload. The complete alternating-order
+comparison is then repeated exactly once and both attempts are retained in the
+raw report. Persistent excess dispersion blocks the phase or final acceptance.
+A final point estimate that satisfies a gate while its required lower confidence
+bound does not is reported as inconclusive and blocks acceptance rather than
+being rounded to a pass or resolved by selecting favorable trials.
 
 Benchmarks cover:
 
@@ -1413,6 +1544,11 @@ metric, incompatible-workload, or non-latest predecessor. The lineage begins:
 - end-to-end pretraining: baseline -> Phase 3 -> final acceptance
 - inference prefill/decode: baseline -> Phase 1 -> Phase 4 -> final acceptance
 - SWAG end to end: baseline -> Phase 5 -> final acceptance
+
+Runner and validator commands pass predecessors as an explicit mapping from
+metric name to result identity/path (or `null`), never as one phase-wide
+`--previous` value. A phase report that contains several metrics therefore may
+name different predecessors for each metric.
 
 A benchmark is relevant to a phase when the phase changes code executed in its
 timed region. For every relevant steady-state throughput metric, the five-pair
@@ -1486,5 +1622,7 @@ documentation to describe only the new system.
 - replacing SentencePiece BPE
 - supporting non-MLX training/inference backends
 - compatibility with any existing v2 artifact or API
+- checkpoint history, historical step selection, or configurable retention;
+  every run owns one latest checkpoint in steady state
 - adding a generic training framework or plugin system
 - unrelated top-level repository or dependency changes
