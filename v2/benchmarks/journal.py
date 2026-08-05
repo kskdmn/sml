@@ -25,6 +25,7 @@ SESSION_FIELDS = {
     "manifest_path",
     "raw_output_path",
 }
+INITIALIZATION_MARKER = ".baseline-session-initializing"
 
 
 def _fsync_directory(path: Path) -> None:
@@ -134,15 +135,10 @@ def _validate_session_document(session: dict) -> None:
         raise ValueError("session does not match expected session")
 
 
-def _remove_created_session(path: Path, created: os.stat_result) -> None:
-    try:
-        current = path.stat()
-    except FileNotFoundError:
-        return
-    if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
-        return
-    path.unlink()
-    _fsync_directory(path.parent)
+def _state_entries(state: Path) -> tuple[Path, ...]:
+    if not state.exists():
+        return ()
+    return tuple(state.iterdir())
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,20 +151,35 @@ class BaselineJournal:
         _validate_session_document(expected_session)
         state = root.resolve()
         session_path = state / "session.json"
-        if session_path.exists():
+        marker_path = state / INITIALIZATION_MARKER
+        entries = _state_entries(state)
+        if session_path in entries:
+            if any(path != session_path for path in entries):
+                raise ValueError("state directory contains unexpected content")
             session = read_json_object(session_path, label="baseline journal session")
         else:
-            if state.exists() and any(state.iterdir()):
+            if entries:
+                if marker_path in entries:
+                    raise ValueError("state directory contains unexpected content")
                 raise ValueError("non-empty state directory has no session")
             try:
+                atomic_write_text(marker_path, "", create_only=True)
+            except FileExistsError as error:
+                raise ValueError(
+                    "state directory contains unexpected content"
+                ) from error
+            if _state_entries(state) != (marker_path,):
+                raise ValueError("state directory contains unexpected content")
+            try:
                 atomic_write_json(session_path, expected_session, create_only=True)
-            except FileExistsError:
-                pass
-            else:
-                created = session_path.stat()
-                if any(path != session_path for path in state.iterdir()):
-                    _remove_created_session(session_path, created)
-                    raise ValueError("non-empty state directory has no session")
+            except FileExistsError as error:
+                raise ValueError(
+                    "state directory contains unexpected content"
+                ) from error
+            if set(_state_entries(state)) != {marker_path, session_path}:
+                raise ValueError("state directory contains unexpected content")
+            marker_path.unlink()
+            _fsync_directory(state)
             session = read_json_object(session_path, label="baseline journal session")
         _validate_session_document(session)
         if session != expected_session:

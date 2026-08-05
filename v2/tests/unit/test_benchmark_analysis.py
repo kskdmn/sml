@@ -1737,12 +1737,40 @@ def test_journal_rejects_an_orphan_written_during_session_initialization(
         baseline_journal, "atomic_write_json", write_session_after_orphan
     )
 
-    with pytest.raises(ValueError, match="non-empty state directory has no session"):
+    with pytest.raises(ValueError, match="unexpected content"):
         BaselineJournal.open(state, expected)
 
     assert (state / "orphan.json").is_file()
-    assert not (state / "session.json").exists()
-    with pytest.raises(ValueError, match="non-empty state directory has no session"):
+    assert (state / "session.json").is_file()
+    assert {path.name for path in state.iterdir()} == {
+        ".baseline-session-initializing",
+        "orphan.json",
+        "session.json",
+    }
+    with pytest.raises(ValueError, match="unexpected content"):
+        BaselineJournal.open(state, expected)
+
+
+def test_journal_rejects_later_resume_after_orphan_follows_publication_scan(
+    tmp_path, monkeypatch
+):
+    state = tmp_path / "state"
+    expected = _session_document(tmp_path)
+    original_iterdir = Path.iterdir
+
+    def entries_before_late_orphan(path):
+        entries = tuple(original_iterdir(path))
+        if path == state and (state / "session.json") in entries:
+            (state / "orphan.json").write_text("{}\n", encoding="utf-8")
+        return iter(entries)
+
+    monkeypatch.setattr(Path, "iterdir", entries_before_late_orphan)
+
+    first = BaselineJournal.open(state, expected)
+
+    assert first.session == expected
+    assert (state / "orphan.json").is_file()
+    with pytest.raises(ValueError, match="unexpected content"):
         BaselineJournal.open(state, expected)
 
 
