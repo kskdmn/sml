@@ -22,7 +22,9 @@ from v2.benchmarks.adapters.replacement import (
 from v2.benchmarks.adapters import legacy
 from v2.benchmarks.analysis import analyze_pairs
 from v2.benchmarks.journal import (
+    BaselineSlot,
     BaselineJournal,
+    JournalAttempt,
     atomic_write_json,
     atomic_write_text,
     build_session_document,
@@ -1813,3 +1815,80 @@ def test_atomic_write_json_create_only_never_overwrites_and_cleans_up(tmp_path):
 
     assert read_json_object(path, label="record") == {"generation": 1}
     assert not list(tmp_path.glob(".record.json.*"))
+
+
+def test_journal_promotes_an_inflight_trial_and_resumes_the_slot(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    trial = _valid_raw_trial(workload)
+    atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+
+    journal.accept_inflight(attempt, trial)
+
+    assert journal.load_accepted((slot,)) == {slot: trial}
+    assert not attempt.path.exists()
+    with pytest.raises(ValueError, match="accepted slot is immutable"):
+        journal.accept_inflight(
+            JournalAttempt(slot, 1, journal.inflight_path(slot, 1)),
+            replace(trial, value=trial.value + 1.0),
+        )
+
+
+def test_journal_preserves_rejected_trial_and_uses_a_new_attempt_number(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    trial = replace(
+        _valid_raw_trial(workload),
+        environment_status={
+            **_valid_raw_trial(workload).environment_status,
+            "thermal_state": "fair",
+            "thermal_state_raw_value": 1,
+        },
+    )
+    atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+
+    journal.reject_inflight(attempt, trial, reason="non-nominal-thermal")
+
+    rejected = read_json_object(journal.rejected_path(slot, 0), label="rejected trial")
+    assert rejected["journal_attempt_index"] == 0
+    assert rejected["reason"] == "non-nominal-thermal"
+    assert rejected["trial"]["environment_status"]["thermal_state_raw_value"] == 1
+    assert journal.next_attempt(slot).journal_attempt_index == 1
+
+
+def test_journal_records_every_preflight_observation(tmp_path):
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    observation = {
+        "observed_at_utc": "2026-08-05T00:00:00+00:00",
+        "hardware": trial.hardware,
+        "environment_status": trial.environment_status,
+        "software_versions": trial.software_versions,
+    }
+
+    document = journal.record_preflight(slot, 0, observation)
+
+    assert document["identity"].startswith("sha256:")
+    assert (
+        read_json_object(journal.preflight_path(slot, 0), label="preflight") == document
+    )
+
+
+def test_journal_rejects_malformed_and_unexpected_accepted_state(tmp_path):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    atomic_write_json(journal.accepted_path(slot), {}, create_only=True)
+    with pytest.raises(ValueError, match="raw trial has an invalid field set"):
+        journal.load_accepted((slot,))
+
+    journal.accepted_path(slot).unlink()
+    unexpected = BaselineSlot("prepared-data", 1)
+    atomic_write_json(journal.accepted_path(unexpected), {}, create_only=True)
+    with pytest.raises(ValueError, match="unexpected accepted slot"):
+        journal.load_accepted((slot,))
