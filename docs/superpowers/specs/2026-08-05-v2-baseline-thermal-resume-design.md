@@ -50,6 +50,8 @@ The state directory is durable, non-authoritative resume and diagnostic state:
 │   └── <metric>/<pair-index>/<attempt-index>.json
 ├── inflight/
 │   └── <metric>/<pair-index>/<attempt-index>.json
+├── preflight/
+│   └── <metric>/<pair-index>/<preflight-index>.json
 ├── thermal-waits/
 │   └── <metric>/<pair-index>/<recovery-index>/
 │       ├── <sample-index>.json
@@ -103,6 +105,8 @@ Foundation result:
 Start and end observations remain embedded in each raw trial. The merged trial
 environment retains the worse thermal state and its matching raw value. Thermal
 wait samples record both values, wall-clock time, and elapsed recovery time.
+Every parent pre-trial check is atomically recorded under `preflight/` before
+the runner decides to launch, wait, or stop.
 
 Hardware, software, AC power, power mode, Low Power Mode, memory pressure, and
 competing GPU workload remain part of the environment record. A non-thermal
