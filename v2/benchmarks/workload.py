@@ -20,6 +20,7 @@ HARNESS_COMPONENTS = (
     Path("v2/benchmarks/schema.py"),
     Path("v2/benchmarks/workload.py"),
     Path("v2/benchmarks/runner.py"),
+    Path("v2/benchmarks/journal.py"),
     Path("v2/benchmarks/analysis.py"),
     Path("v2/benchmarks/adapters/legacy.py"),
     Path("v2/benchmarks/adapters/replacement.py"),

@@ -20,6 +20,11 @@ from v2.benchmarks.adapters.replacement import (
 )
 from v2.benchmarks.adapters import legacy
 from v2.benchmarks.analysis import analyze_pairs
+from v2.benchmarks.journal import (
+    BaselineJournal,
+    build_session_document,
+    require_external_state_directory,
+)
 from v2.benchmarks.runner import (
     _resolve_predecessor_mapping,
     _resolve_comparison_mode,
@@ -1633,3 +1638,80 @@ def test_final_validation_requires_complete_raw_input_and_passing_gates(monkeypa
             {metric: None for metric in benchmark_runner.FINAL_METRICS},
             (),
         )
+
+
+def _session_document(
+    tmp_path,
+    *,
+    harness_commit="a" * 40,
+    protocol=None,
+    hardware=None,
+    software_versions=None,
+    paired_representations=None,
+    manifest_name="baseline.json",
+    raw_output_name="baseline.jsonl",
+):
+    workload = build_canonical_workload()
+    return build_session_document(
+        harness_commit=harness_commit,
+        harness_identity="sha256:" + "b" * 64,
+        source_commit="3687f8b3214a44c675ae67af52e4997762f6c634",
+        canonical_workload=workload,
+        canonical_workload_identity=canonical_workload_identity(workload),
+        protocol=protocol or {"pairs": 5, "warmup_units": 20, "measured_units": 100},
+        hardware=hardware or {"chip": "Apple M5"},
+        software_versions=software_versions or {"python": "3.12.13", "mlx": "0.32.0"},
+        paired_representations=paired_representations
+        or {"canonical_row_identity": "sha256:" + "c" * 64},
+        manifest_path=tmp_path / manifest_name,
+        raw_output_path=tmp_path / raw_output_name,
+    )
+
+
+def test_baseline_journal_resumes_only_an_identical_session(tmp_path):
+    state = tmp_path / "state"
+    expected = _session_document(tmp_path)
+
+    first = BaselineJournal.open(state, expected)
+    resumed = BaselineJournal.open(state, expected)
+
+    assert first.session == expected
+    assert resumed.session == expected
+    changed = _session_document(tmp_path, harness_commit="d" * 40)
+    with pytest.raises(ValueError, match="session does not match"):
+        BaselineJournal.open(state, changed)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"protocol": {"pairs": 4, "warmup_units": 20, "measured_units": 100}},
+        {"hardware": {"chip": "Apple M4"}},
+        {"software_versions": {"python": "3.12.12", "mlx": "0.32.0"}},
+        {"manifest_name": "other.json"},
+        {"raw_output_name": "other.jsonl"},
+    ],
+)
+def test_baseline_journal_rejects_every_session_compatibility_change(tmp_path, changed):
+    state = tmp_path / "state"
+    BaselineJournal.open(state, _session_document(tmp_path))
+    with pytest.raises(ValueError, match="session does not match"):
+        BaselineJournal.open(state, _session_document(tmp_path, **changed))
+
+
+def test_state_directory_must_be_outside_measured_checkouts(tmp_path):
+    harness = tmp_path / "harness"
+    harness.mkdir()
+    with pytest.raises(ValueError, match="outside measured checkouts"):
+        require_external_state_directory(harness / "state", (harness,))
+
+    external = tmp_path / "external"
+    assert require_external_state_directory(external, (harness,)) == external.resolve()
+
+
+def test_journal_never_adopts_a_nonempty_directory_without_a_session(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "orphan.json").write_text("{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="non-empty state directory has no session"):
+        BaselineJournal.open(state, _session_document(tmp_path))
