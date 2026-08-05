@@ -443,6 +443,7 @@ def _validate_acceptance_environment(
     workload: CanonicalWorkload,
     trial: RawTrial,
 ) -> None:
+    validate_thermal_observation(trial.environment_status)
     required = workload.required_environment
     for key in ("chip", "cpu_cores", "gpu_cores", "unified_memory_bytes"):
         if trial.hardware.get(key) != required[key]:
@@ -1388,12 +1389,41 @@ def _system_profiler(data_type: str) -> dict:
     return records[0]
 
 
-def _thermal_state() -> str:
+THERMAL_STATES = {0: "nominal", 1: "fair", 2: "serious", 3: "critical"}
+
+
+def decode_thermal_state(raw_value: int) -> str:
+    if type(raw_value) is not int or raw_value not in THERMAL_STATES:
+        raise RuntimeError(f"unsupported ProcessInfo thermal state: {raw_value!r}")
+    return THERMAL_STATES[raw_value]
+
+
+def validate_thermal_observation(status: dict[str, object]) -> None:
+    raw_value = status.get("thermal_state_raw_value")
+    state = status.get("thermal_state")
+    if type(raw_value) is not int or state != decode_thermal_state(raw_value):
+        raise ValueError("thermal state and raw value disagree")
+    for nested_name in ("start", "end"):
+        nested = status.get(nested_name)
+        if nested is not None:
+            if not isinstance(nested, dict):
+                raise ValueError(f"thermal {nested_name} observation must be an object")
+            validate_thermal_observation(nested)
+    if isinstance(status.get("start"), dict) and isinstance(status.get("end"), dict):
+        expected_raw = max(
+            status["start"]["thermal_state_raw_value"],
+            status["end"]["thermal_state_raw_value"],
+        )
+        if raw_value != expected_raw:
+            raise ValueError("merged thermal state is not the worse endpoint")
+
+
+def _thermal_state() -> tuple[str, int]:
     environment = os.environ.copy()
     cache_root = Path(tempfile.gettempdir()) / "sml-v2-swift-module-cache"
     environment["CLANG_MODULE_CACHE_PATH"] = str(cache_root / "clang")
     environment["SWIFT_MODULECACHE_PATH"] = str(cache_root / "swift")
-    result = subprocess.run(
+    raw_text = subprocess.run(
         (
             "swift",
             "-e",
@@ -1405,10 +1435,13 @@ def _thermal_state() -> str:
         text=True,
         env=environment,
     ).stdout.strip()
-    states = {"0": "nominal", "1": "fair", "2": "serious", "3": "critical"}
-    if result not in states:
-        raise RuntimeError(f"unsupported ProcessInfo thermal state: {result!r}")
-    return states[result]
+    try:
+        raw_value = int(raw_text)
+    except ValueError as error:
+        raise RuntimeError(
+            f"unsupported ProcessInfo thermal state: {raw_text!r}"
+        ) from error
+    return decode_thermal_state(raw_value), raw_value
 
 
 def decode_memory_pressure_level(level: int) -> str:
@@ -1579,11 +1612,13 @@ def collect_environment() -> tuple[
     }
     connected, power_mode, low_power = _power_status()
     pressure, free_percentage = _memory_pressure()
+    thermal_state, thermal_state_raw_value = _thermal_state()
     environment_status = {
         "power_connected": connected,
         "power_mode": power_mode,
         "low_power_mode": low_power,
-        "thermal_state": _thermal_state(),
+        "thermal_state": thermal_state,
+        "thermal_state_raw_value": thermal_state_raw_value,
         "memory_pressure": pressure,
         "memory_free_percentage": free_percentage,
         "competing_gpu_workload": _has_competing_gpu_workload(),
@@ -1599,11 +1634,10 @@ def collect_environment() -> tuple[
 
 
 def merge_environment_status(start: dict, end: dict) -> dict:
-    thermal_order = {"nominal": 0, "fair": 1, "serious": 2, "critical": 3}
     pressure_order = {"normal": 0, "warning": 1, "critical": 2}
-    thermal_state = max(
-        (start["thermal_state"], end["thermal_state"]),
-        key=lambda value: thermal_order[value],
+    thermal_state_raw_value = max(
+        start["thermal_state_raw_value"],
+        end["thermal_state_raw_value"],
     )
     memory_pressure = max(
         (start["memory_pressure"], end["memory_pressure"]),
@@ -1618,7 +1652,8 @@ def merge_environment_status(start: dict, end: dict) -> dict:
             else "changed"
         ),
         "low_power_mode": bool(start["low_power_mode"]) or bool(end["low_power_mode"]),
-        "thermal_state": thermal_state,
+        "thermal_state": decode_thermal_state(thermal_state_raw_value),
+        "thermal_state_raw_value": thermal_state_raw_value,
         "memory_pressure": memory_pressure,
         "memory_free_percentage": min(
             int(start["memory_free_percentage"]),

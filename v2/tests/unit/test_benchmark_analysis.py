@@ -28,6 +28,7 @@ from v2.benchmarks.runner import (
     build_parser,
     comparison_has_noise,
     detect_competing_gpu_workload,
+    decode_thermal_state,
     decode_memory_pressure_level,
     measure_native_process,
     merge_environment_status,
@@ -39,6 +40,7 @@ from v2.benchmarks.runner import (
     validate_comparison_report,
     validate_cooldown_evidence,
     validate_final_report,
+    validate_thermal_observation,
     validate_throughput_gates,
 )
 from v2.benchmarks.schema import METRIC_NAMES, CanonicalWorkload, RawTrial
@@ -479,6 +481,7 @@ def test_environment_status_fails_closed_when_run_degrades():
         "power_mode": "automatic",
         "low_power_mode": False,
         "thermal_state": "nominal",
+        "thermal_state_raw_value": 0,
         "memory_pressure": "normal",
         "memory_free_percentage": 50,
         "competing_gpu_workload": False,
@@ -487,6 +490,7 @@ def test_environment_status_fails_closed_when_run_degrades():
         **start,
         "power_connected": False,
         "thermal_state": "serious",
+        "thermal_state_raw_value": 2,
         "memory_pressure": "warning",
         "memory_free_percentage": 7,
     }
@@ -499,6 +503,58 @@ def test_environment_status_fails_closed_when_run_degrades():
     assert merged["memory_free_percentage"] == 7
     assert merged["start"] == start
     assert merged["end"] == end
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "state"),
+    [(0, "nominal"), (1, "fair"), (2, "serious"), (3, "critical")],
+)
+def test_thermal_state_retains_foundation_raw_value(raw_value, state):
+    assert decode_thermal_state(raw_value) == state
+    validate_thermal_observation(
+        {"thermal_state": state, "thermal_state_raw_value": raw_value}
+    )
+
+
+def test_thermal_merge_retains_the_worse_matching_raw_value():
+    start = {
+        "power_connected": True,
+        "power_mode": "automatic",
+        "low_power_mode": False,
+        "thermal_state": "nominal",
+        "thermal_state_raw_value": 0,
+        "memory_pressure": "normal",
+        "memory_free_percentage": 60,
+        "competing_gpu_workload": False,
+    }
+    end = {**start, "thermal_state": "serious", "thermal_state_raw_value": 2}
+
+    merged = merge_environment_status(start, end)
+
+    assert merged["thermal_state"] == "serious"
+    assert merged["thermal_state_raw_value"] == 2
+    validate_thermal_observation(merged)
+
+
+def test_thermal_observation_rejects_a_mismatched_string_and_raw_value():
+    with pytest.raises(ValueError, match="thermal state and raw value disagree"):
+        validate_thermal_observation(
+            {"thermal_state": "nominal", "thermal_state_raw_value": 1}
+        )
+
+
+def test_thermal_observation_rejects_a_merged_value_that_is_not_the_worst_endpoint():
+    nominal = {"thermal_state": "nominal", "thermal_state_raw_value": 0}
+    fair = {"thermal_state": "fair", "thermal_state_raw_value": 1}
+    with pytest.raises(ValueError, match="merged thermal state"):
+        validate_thermal_observation(
+            {
+                "thermal_state": "nominal",
+                "thermal_state_raw_value": 0,
+                "start": nominal,
+                "end": fair,
+            }
+        )
 
 
 def test_gpu_workload_detection_ignores_system_metal_and_unrelated_python():
@@ -838,8 +894,17 @@ def _valid_raw_trial(workload, metric="prepared-data", pair_index=0):
             "power_mode": "automatic",
             "low_power_mode": False,
             "thermal_state": "nominal",
+            "thermal_state_raw_value": 0,
             "memory_pressure": "normal",
             "competing_gpu_workload": False,
+            "start": {
+                "thermal_state": "nominal",
+                "thermal_state_raw_value": 0,
+            },
+            "end": {
+                "thermal_state": "nominal",
+                "thermal_state_raw_value": 0,
+            },
         },
     )
 
