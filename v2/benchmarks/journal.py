@@ -134,6 +134,17 @@ def _validate_session_document(session: dict) -> None:
         raise ValueError("session does not match expected session")
 
 
+def _remove_created_session(path: Path, created: os.stat_result) -> None:
+    try:
+        current = path.stat()
+    except FileNotFoundError:
+        return
+    if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino):
+        return
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
 @dataclass(frozen=True, slots=True)
 class BaselineJournal:
     root: Path
@@ -153,6 +164,11 @@ class BaselineJournal:
                 atomic_write_json(session_path, expected_session, create_only=True)
             except FileExistsError:
                 pass
+            else:
+                created = session_path.stat()
+                if any(path != session_path for path in state.iterdir()):
+                    _remove_created_session(session_path, created)
+                    raise ValueError("non-empty state directory has no session")
             session = read_json_object(session_path, label="baseline journal session")
         _validate_session_document(session)
         if session != expected_session:

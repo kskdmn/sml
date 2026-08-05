@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 import v2.benchmarks.runner as benchmark_runner
+import v2.benchmarks.journal as baseline_journal
 from v2.benchmarks.adapters.replacement import (
     METRIC_OWNER_IMPORTS,
     ReplacementNativeWorkload,
@@ -22,7 +23,10 @@ from v2.benchmarks.adapters import legacy
 from v2.benchmarks.analysis import analyze_pairs
 from v2.benchmarks.journal import (
     BaselineJournal,
+    atomic_write_json,
+    atomic_write_text,
     build_session_document,
+    read_json_object,
     require_external_state_directory,
 )
 from v2.benchmarks.runner import (
@@ -1715,3 +1719,69 @@ def test_journal_never_adopts_a_nonempty_directory_without_a_session(tmp_path):
     (state / "orphan.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="non-empty state directory has no session"):
         BaselineJournal.open(state, _session_document(tmp_path))
+
+
+def test_journal_rejects_an_orphan_written_during_session_initialization(
+    tmp_path, monkeypatch
+):
+    state = tmp_path / "state"
+    expected = _session_document(tmp_path)
+    original_write = baseline_journal.atomic_write_json
+
+    def write_session_after_orphan(path, value, *, create_only=False):
+        (state / "orphan.json").parent.mkdir(parents=True, exist_ok=True)
+        (state / "orphan.json").write_text("{}\n", encoding="utf-8")
+        return original_write(path, value, create_only=create_only)
+
+    monkeypatch.setattr(
+        baseline_journal, "atomic_write_json", write_session_after_orphan
+    )
+
+    with pytest.raises(ValueError, match="non-empty state directory has no session"):
+        BaselineJournal.open(state, expected)
+
+    assert (state / "orphan.json").is_file()
+    assert not (state / "session.json").exists()
+    with pytest.raises(ValueError, match="non-empty state directory has no session"):
+        BaselineJournal.open(state, expected)
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        lambda session: session.__setitem__("unexpected", True),
+        lambda session: session.pop("protocol"),
+        lambda session: session.__setitem__("identity", "sha256:" + "0" * 64),
+    ],
+)
+def test_journal_rejects_corrupt_persisted_session_documents(tmp_path, corrupt):
+    state = tmp_path / "state"
+    expected = _session_document(tmp_path)
+    BaselineJournal.open(state, expected)
+    persisted = read_json_object(state / "session.json", label="test session")
+    corrupt(persisted)
+    (state / "session.json").write_text(json.dumps(persisted), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="session does not match"):
+        BaselineJournal.open(state, expected)
+
+
+def test_atomic_write_text_replaces_content_and_cleans_up_temporary_files(tmp_path):
+    path = tmp_path / "record.txt"
+    path.write_text("old\n", encoding="utf-8")
+
+    atomic_write_text(path, "new\n")
+
+    assert path.read_text(encoding="utf-8") == "new\n"
+    assert not list(tmp_path.glob(".record.txt.*"))
+
+
+def test_atomic_write_json_create_only_never_overwrites_and_cleans_up(tmp_path):
+    path = tmp_path / "record.json"
+    atomic_write_json(path, {"generation": 1}, create_only=True)
+
+    with pytest.raises(FileExistsError):
+        atomic_write_json(path, {"generation": 2}, create_only=True)
+
+    assert read_json_object(path, label="record") == {"generation": 1}
+    assert not list(tmp_path.glob(".record.json.*"))
