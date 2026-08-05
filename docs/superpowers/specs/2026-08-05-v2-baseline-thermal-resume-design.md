@@ -1,6 +1,6 @@
 # V2 Baseline Thermal Recovery and Resume Design
 
-**Status:** Awaiting written review
+**Status:** Approved
 
 **Date:** 2026-08-05
 
