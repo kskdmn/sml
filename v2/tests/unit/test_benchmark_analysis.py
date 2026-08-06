@@ -32,6 +32,10 @@ from v2.benchmarks.journal import (
     read_json_object,
     require_external_state_directory,
 )
+from v2.benchmarks.recovery import (
+    ThermalRecoveryTimeout,
+    wait_for_nominal_thermal_window,
+)
 from v2.benchmarks.runner import (
     _resolve_predecessor_mapping,
     _resolve_comparison_mode,
@@ -74,6 +78,46 @@ from v2.benchmarks.workload import (
     structured_identity,
     write_paired_pretraining_representations,
 )
+
+
+class _RecoveryClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+def _recovery_collect(states):
+    remaining = iter(states)
+    last = [states[-1]]
+
+    def collect():
+        try:
+            last[0] = next(remaining)
+        except StopIteration:
+            pass
+        status = {
+            "power_connected": True,
+            "power_mode": "automatic",
+            "low_power_mode": False,
+            "thermal_state": last[0],
+            "thermal_state_raw_value": {
+                "nominal": 0,
+                "fair": 1,
+                "serious": 2,
+                "critical": 3,
+            }[last[0]],
+            "memory_pressure": "normal",
+            "memory_free_percentage": 60,
+            "competing_gpu_workload": False,
+        }
+        return {"chip": "Apple M5"}, status, {"python": "3.12.13"}
+
+    return collect
 
 
 def test_throughput_ratio_and_bound_are_direction_normalized():
@@ -2246,3 +2290,104 @@ def test_journal_rejects_a_stale_persisted_rejected_trigger_before_summary(tmp_p
         )
 
     assert not (trigger_path.parent / "summary.json").exists()
+
+
+def test_thermal_recovery_requires_five_continuous_nominal_minutes():
+    clock = _RecoveryClock()
+    samples = []
+    result = wait_for_nominal_thermal_window(
+        collect=_recovery_collect(["nominal"] * 4 + ["fair"] + ["nominal"] * 20),
+        expected_hardware={"chip": "Apple M5"},
+        expected_software_versions={"python": "3.12.13"},
+        required_environment=build_canonical_workload().required_environment,
+        record_sample=lambda index, sample: samples.append((index, sample)),
+        deadline=clock() + 7_200,
+        clock=clock,
+        sleep=clock.sleep,
+        utc_now=lambda: "2026-08-05T00:00:00+00:00",
+    )
+
+    nominal_times = [
+        sample["elapsed_seconds"]
+        for _index, sample in samples
+        if sample["environment_status"]["thermal_state"] == "nominal"
+    ]
+    assert result.duration_seconds >= 300
+    assert nominal_times[-1] - nominal_times[4] >= 300
+
+
+def test_thermal_recovery_times_out_without_losing_samples():
+    clock = _RecoveryClock()
+    samples = []
+    with pytest.raises(ThermalRecoveryTimeout, match="two-hour deadline"):
+        wait_for_nominal_thermal_window(
+            collect=_recovery_collect(["fair"]),
+            expected_hardware={"chip": "Apple M5"},
+            expected_software_versions={"python": "3.12.13"},
+            required_environment=build_canonical_workload().required_environment,
+            record_sample=lambda index, sample: samples.append((index, sample)),
+            deadline=120.0,
+            clock=clock,
+            sleep=clock.sleep,
+            utc_now=lambda: "2026-08-05T00:00:00+00:00",
+        )
+    assert samples[-1][1]["environment_status"]["thermal_state"] == "fair"
+    assert samples[-1][1]["elapsed_seconds"] >= 120
+
+
+def test_thermal_recovery_enforces_a_deadline_at_a_nominal_window_boundary():
+    clock = _RecoveryClock()
+    samples = []
+
+    with pytest.raises(ThermalRecoveryTimeout, match="two-hour deadline") as raised:
+        wait_for_nominal_thermal_window(
+            collect=_recovery_collect(["nominal"]),
+            expected_hardware={"chip": "Apple M5"},
+            expected_software_versions={"python": "3.12.13"},
+            required_environment=build_canonical_workload().required_environment,
+            record_sample=lambda index, sample: samples.append((index, sample)),
+            deadline=324.0,
+            clock=clock,
+            sleep=clock.sleep,
+            utc_now=lambda: "2026-08-05T00:00:00+00:00",
+        )
+
+    assert raised.value.result.duration_seconds == 324.0
+    assert samples[-1][1]["elapsed_seconds"] == 324.0
+
+
+@pytest.mark.parametrize(
+    ("target", "field", "value"),
+    [
+        ("status", "power_connected", False),
+        ("status", "low_power_mode", True),
+        ("status", "memory_pressure", "warning"),
+        ("status", "competing_gpu_workload", True),
+        ("hardware", "chip", "Apple M4"),
+        ("software", "python", "3.12.12"),
+    ],
+)
+def test_thermal_recovery_stops_on_nonthermal_changes(target, field, value):
+    clock = _RecoveryClock()
+    hardware = {"chip": "Apple M5"}
+    status = _recovery_collect(["fair"])()[1]
+    software = {"python": "3.12.13"}
+    if target == "hardware":
+        hardware[field] = value
+    elif target == "software":
+        software[field] = value
+    else:
+        status[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        wait_for_nominal_thermal_window(
+            collect=lambda: (hardware, status, software),
+            expected_hardware={"chip": "Apple M5"},
+            expected_software_versions={"python": "3.12.13"},
+            required_environment=build_canonical_workload().required_environment,
+            record_sample=lambda index, sample: None,
+            deadline=120.0,
+            clock=clock,
+            sleep=clock.sleep,
+            utc_now=lambda: "2026-08-05T00:00:00+00:00",
+        )
