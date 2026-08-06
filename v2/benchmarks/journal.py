@@ -212,6 +212,13 @@ def _require_file(path: Path, *, label: str) -> None:
         raise ValueError(f"{label} must be a file")
 
 
+def _regular_file_identity(path: Path, *, label: str) -> tuple[int, int]:
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"{label} must be a regular file")
+    return metadata.st_dev, metadata.st_ino
+
+
 def _require_object_fields(raw: dict, fields: set[str], *, label: str) -> None:
     if not isinstance(raw, dict) or set(raw) != fields:
         raise ValueError(f"{label} has an invalid field set")
@@ -791,22 +798,16 @@ class BaselineJournal:
                 raw,
                 _parse_trial_for_slot(raw, slot=attempt.slot, label="inflight trial"),
             )
-        accepted: dict[BaselineSlot, dict] = {}
+        accepted: dict[BaselineSlot, tuple[Path, dict, RawTrial]] = {}
         for slot, path in self._accepted_records():
             raw = read_json_object(path, label="accepted trial")
-            _parse_trial_for_slot(raw, slot=slot, label="accepted trial")
-            accepted[slot] = raw
-        for key, (attempt, raw, _trial) in tuple(inflight.items()):
-            accepted_trial = accepted.get(attempt.slot)
-            if accepted_trial is None:
-                continue
-            if raw != accepted_trial:
-                raise ValueError(
-                    "inflight trial does not match its accepted transition"
-                )
-            attempt.path.unlink()
-            _fsync_directory(attempt.path.parent)
-            del inflight[key]
+            accepted[slot] = (
+                path,
+                raw,
+                _parse_trial_for_slot(raw, slot=slot, label="accepted trial"),
+            )
+
+        rejected_splits: list[JournalAttempt] = []
         for key in rejected.keys() & inflight.keys():
             rejected_document, rejected_trial = rejected[key]
             attempt, raw, inflight_trial = inflight[key]
@@ -814,13 +815,14 @@ class BaselineJournal:
                 raise ValueError(
                     "inflight trial does not match its rejected transition"
                 )
-            attempt.path.unlink()
-            _fsync_directory(attempt.path.parent)
-            del inflight[key]
+            rejected_splits.append(attempt)
 
         histories: dict[BaselineSlot, list[int]] = {}
-        for slot, index in (*rejected, *inflight):
+        for slot, index in rejected:
             histories.setdefault(slot, []).append(index)
+        for (slot, index), (_attempt, _raw, _trial) in inflight.items():
+            if (slot, index) not in rejected:
+                histories.setdefault(slot, []).append(index)
         for slot, indices in histories.items():
             if len(set(indices)) != len(indices):
                 raise ValueError(
@@ -830,8 +832,46 @@ class BaselineJournal:
                 raise ValueError(
                     f"journal attempt indices have a gap for {slot.metric}"
                 )
+
+        accepted_splits: list[JournalAttempt] = []
+        for slot, (accepted_path, accepted_raw, accepted_trial) in accepted.items():
+            candidates = [
+                record
+                for key, record in inflight.items()
+                if key not in rejected and key[0] == slot
+            ]
+            if not candidates:
+                continue
+            if len(candidates) != 1:
+                raise ValueError("multiple accepted transition candidates")
+            attempt, raw, inflight_trial = candidates[0]
+            if raw != accepted_raw or inflight_trial != accepted_trial:
+                raise ValueError(
+                    "inflight trial does not match its accepted transition"
+                )
+            if _regular_file_identity(
+                accepted_path, label="accepted slot"
+            ) != _regular_file_identity(attempt.path, label="inflight trial"):
+                raise ValueError(
+                    "inflight trial does not match its accepted transition"
+                )
+            accepted_splits.append(attempt)
+
+        for attempt in (*rejected_splits, *accepted_splits):
+            attempt.path.unlink()
+            _fsync_directory(attempt.path.parent)
+            del inflight[(attempt.slot, attempt.journal_attempt_index)]
+
+        remaining_histories: dict[BaselineSlot, list[int]] = {}
+        for slot, index in rejected:
+            remaining_histories.setdefault(slot, []).append(index)
+        for slot, index in inflight:
+            remaining_histories.setdefault(slot, []).append(index)
         return (
-            {slot: tuple(sorted(indices)) for slot, indices in histories.items()},
+            {
+                slot: tuple(sorted(indices))
+                for slot, indices in remaining_histories.items()
+            },
             tuple(record[0] for record in inflight.values()),
         )
 
@@ -898,8 +938,11 @@ class BaselineJournal:
                         raise ValueError("thermal recovery has a non-canonical path")
                     trigger_path = path / "trigger.json"
                     _require_file(trigger_path, label="thermal recovery trigger")
-                    _validate_trigger_document(
-                        read_json_object(trigger_path, label="thermal recovery trigger")
+                    self._validate_trigger_source(
+                        slot,
+                        read_json_object(
+                            trigger_path, label="thermal recovery trigger"
+                        ),
                     )
                     samples = self._recovery_sample_paths(path)
                     summary_path = path / "summary.json"
@@ -913,6 +956,35 @@ class BaselineJournal:
                         )
                     records.append((slot, index, path))
         return tuple(records)
+
+    def _validate_trigger_source(self, slot: BaselineSlot, trigger: dict) -> None:
+        body = _validate_trigger_document(trigger)
+        if body["source"] == "preflight":
+            persisted = {
+                _json_text(document)
+                for _index, document in self._validate_preflight_history().get(slot, ())
+            }
+            if _json_text(body["preflight"]) not in persisted:
+                raise ValueError(
+                    "thermal recovery trigger does not match a persisted preflight"
+                )
+            return
+
+        identities: set[str] = set()
+        for attempt, path in self._attempt_records("rejected"):
+            if attempt.slot != slot:
+                continue
+            rejected = read_json_object(path, label="rejected trial")
+            _validate_rejected_document(
+                rejected,
+                slot=attempt.slot,
+                journal_attempt_index=attempt.journal_attempt_index,
+            )
+            identities.add(rejected["identity"])
+        if body["rejected_trial_identity"] not in identities:
+            raise ValueError(
+                "thermal recovery trigger does not match a persisted rejected trial"
+            )
 
     def _validate_thermal_recovery_history(
         self,
@@ -931,12 +1003,18 @@ class BaselineJournal:
         self, expected_slots: Sequence[BaselineSlot]
     ) -> dict[BaselineSlot, RawTrial]:
         expected = self._expected_slot_set(expected_slots)
-        accepted: dict[BaselineSlot, RawTrial] = {}
-        for slot, path in self._accepted_records():
+        records = self._accepted_records()
+        recorded_slots: set[BaselineSlot] = set()
+        for slot, _path in records:
             if slot not in expected:
                 raise ValueError("unexpected accepted slot")
-            if slot in accepted:
+            if slot in recorded_slots:
                 raise ValueError("accepted slot is duplicated")
+            recorded_slots.add(slot)
+
+        self._validate_attempt_history()
+        accepted: dict[BaselineSlot, RawTrial] = {}
+        for slot, path in records:
             accepted[slot] = _parse_trial_for_slot(
                 read_json_object(path, label="accepted trial"),
                 slot=slot,
@@ -1118,7 +1196,7 @@ class BaselineJournal:
         if not isinstance(trigger, dict):
             raise ValueError("thermal recovery trigger must be an object")
         self._validate_attempt_history()
-        preflight_histories = self._validate_preflight_history()
+        self._validate_preflight_history()
         recovery_histories = self._validate_thermal_recovery_history()
         recovery_indices = recovery_histories.get(slot, ())
         if recovery_index > len(recovery_indices):
@@ -1134,32 +1212,7 @@ class BaselineJournal:
                 "sml-baseline-thermal-recovery-trigger-v1", body
             ),
         }
-        _validate_trigger_document(document)
-        if trigger["source"] == "preflight":
-            persisted = {
-                _json_text(current)
-                for _index, current in preflight_histories.get(slot, ())
-            }
-            if _json_text(trigger["preflight"]) not in persisted:
-                raise ValueError(
-                    "thermal recovery trigger does not match a persisted preflight"
-                )
-        else:
-            identities: set[str] = set()
-            for attempt, path in self._attempt_records("rejected"):
-                if attempt.slot != slot:
-                    continue
-                rejected = read_json_object(path, label="rejected trial")
-                _validate_rejected_document(
-                    rejected,
-                    slot=attempt.slot,
-                    journal_attempt_index=attempt.journal_attempt_index,
-                )
-                identities.add(rejected["identity"])
-            if trigger["rejected_trial_identity"] not in identities:
-                raise ValueError(
-                    "thermal recovery trigger does not match a persisted rejected trial"
-                )
+        self._validate_trigger_source(slot, document)
         trigger_path = recovery_path / "trigger.json"
         if _entry_exists(recovery_path) and not _entry_exists(trigger_path):
             _require_directory(recovery_path, label="thermal recovery state")
@@ -1186,8 +1239,9 @@ class BaselineJournal:
         )
         trigger_path = recovery_path / "trigger.json"
         _require_file(trigger_path, label="thermal recovery trigger")
-        _validate_trigger_document(
-            read_json_object(trigger_path, label="thermal recovery trigger")
+        self._validate_trigger_source(
+            slot,
+            read_json_object(trigger_path, label="thermal recovery trigger"),
         )
         samples = self._recovery_sample_paths(recovery_path)
         if sample_index != len(samples):
@@ -1227,8 +1281,9 @@ class BaselineJournal:
             raise ValueError("thermal recovery index does not exist")
         trigger_path = recovery_path / "trigger.json"
         _require_file(trigger_path, label="thermal recovery trigger")
-        _validate_trigger_document(
-            read_json_object(trigger_path, label="thermal recovery trigger")
+        self._validate_trigger_source(
+            slot,
+            read_json_object(trigger_path, label="thermal recovery trigger"),
         )
         samples = self._recovery_sample_paths(recovery_path)
         body = {

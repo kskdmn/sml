@@ -1,6 +1,7 @@
 import hashlib
 import inspect
 import json
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -1924,7 +1925,9 @@ def test_journal_replays_an_accepted_inflight_crash_split(tmp_path):
     attempt = journal.next_attempt(slot)
     trial = _valid_raw_trial(workload)
     atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
-    atomic_write_json(journal.accepted_path(slot), trial.to_dict(), create_only=True)
+    accepted_path = journal.accepted_path(slot)
+    accepted_path.parent.mkdir(parents=True)
+    os.link(attempt.path, accepted_path)
 
     journal.accept_inflight(attempt, trial)
 
@@ -1939,7 +1942,9 @@ def test_journal_load_inflight_replays_an_accepted_crash_split(tmp_path):
     attempt = journal.next_attempt(slot)
     trial = _valid_raw_trial(workload)
     atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
-    atomic_write_json(journal.accepted_path(slot), trial.to_dict(), create_only=True)
+    accepted_path = journal.accepted_path(slot)
+    accepted_path.parent.mkdir(parents=True)
+    os.link(attempt.path, accepted_path)
 
     assert journal.load_inflight((slot,)) == ()
     assert not attempt.path.exists()
@@ -2089,3 +2094,155 @@ def test_journal_rejects_boolean_rejected_attempt_index(tmp_path):
 
     with pytest.raises(ValueError, match="journal attempt index must be non-negative"):
         journal.next_attempt(slot)
+
+
+def test_journal_load_accepted_replays_only_a_hard_linked_crash_split(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    trial = _valid_raw_trial(workload)
+    atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+    accepted_path = journal.accepted_path(slot)
+    accepted_path.parent.mkdir(parents=True)
+    os.link(attempt.path, accepted_path)
+
+    assert journal.load_accepted((slot,)) == {slot: trial}
+    assert not attempt.path.exists()
+
+
+def test_journal_does_not_replay_independently_serialized_accepted_content(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    trial = _valid_raw_trial(workload)
+    atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+    accepted_path = journal.accepted_path(slot)
+    accepted_path.parent.mkdir(parents=True)
+    accepted_path.write_text(
+        json.dumps(trial.to_dict(), separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="accepted transition"):
+        journal.load_accepted((slot,))
+
+    assert attempt.path.exists()
+
+
+def test_journal_preserves_a_gapped_inflight_split_before_reconciliation(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    forged = JournalAttempt(slot, 1, journal.inflight_path(slot, 1))
+    trial = _valid_raw_trial(workload)
+    atomic_write_json(forged.path, trial.to_dict(), create_only=True)
+    accepted_path = journal.accepted_path(slot)
+    accepted_path.parent.mkdir(parents=True)
+    os.link(forged.path, accepted_path)
+
+    with pytest.raises(ValueError, match="attempt indices have a gap"):
+        journal.load_inflight((slot,))
+
+    assert forged.path.exists()
+
+
+def test_journal_preserves_multiple_inflight_split_candidates(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    first = JournalAttempt(slot, 0, journal.inflight_path(slot, 0))
+    second = JournalAttempt(slot, 1, journal.inflight_path(slot, 1))
+    trial = _valid_raw_trial(workload)
+    atomic_write_json(first.path, trial.to_dict(), create_only=True)
+    atomic_write_json(second.path, trial.to_dict(), create_only=True)
+    accepted_path = journal.accepted_path(slot)
+    accepted_path.parent.mkdir(parents=True)
+    os.link(first.path, accepted_path)
+
+    with pytest.raises(ValueError, match="multiple accepted transition candidates"):
+        journal.load_inflight((slot,))
+
+    assert first.path.exists()
+    assert second.path.exists()
+
+
+def test_journal_rejects_a_foreign_persisted_preflight_trigger_before_sampling(
+    tmp_path,
+):
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    other_slot = BaselineSlot("prepared-data", 1)
+    observation = {
+        "observed_at_utc": "2026-08-05T00:00:00+00:00",
+        "hardware": trial.hardware,
+        "environment_status": trial.environment_status,
+        "software_versions": trial.software_versions,
+    }
+    other_preflight = journal.record_preflight(other_slot, 0, observation)
+    body = {
+        "kind": "sml-baseline-thermal-recovery-trigger",
+        "version": 1,
+        "source": "preflight",
+        "preflight": other_preflight,
+    }
+    trigger = {
+        **body,
+        "identity": structured_identity(
+            "sml-baseline-thermal-recovery-trigger-v1", body
+        ),
+    }
+    trigger_path = (
+        journal.root / "thermal-waits" / slot.metric / "0" / "0" / "trigger.json"
+    )
+    atomic_write_json(trigger_path, trigger, create_only=True)
+
+    with pytest.raises(ValueError, match="does not match a persisted preflight"):
+        journal.record_thermal_sample(
+            slot,
+            0,
+            0,
+            {
+                "schema_version": 1,
+                "observed_at_utc": "2026-08-05T00:00:01+00:00",
+                "elapsed_seconds": 0.0,
+                "hardware": trial.hardware,
+                "environment_status": trial.environment_status,
+                "software_versions": trial.software_versions,
+            },
+        )
+
+    assert not (trigger_path.parent / "0.json").exists()
+
+
+def test_journal_rejects_a_stale_persisted_rejected_trigger_before_summary(tmp_path):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    body = {
+        "kind": "sml-baseline-thermal-recovery-trigger",
+        "version": 1,
+        "source": "rejected-trial",
+        "rejected_trial_identity": "sha256:" + "0" * 64,
+    }
+    trigger = {
+        **body,
+        "identity": structured_identity(
+            "sml-baseline-thermal-recovery-trigger-v1", body
+        ),
+    }
+    trigger_path = (
+        journal.root / "thermal-waits" / slot.metric / "0" / "0" / "trigger.json"
+    )
+    atomic_write_json(trigger_path, trigger, create_only=True)
+
+    with pytest.raises(ValueError, match="does not match a persisted rejected trial"):
+        journal.record_recovery_summary(
+            slot,
+            0,
+            {"outcome": "timeout", "duration_seconds": 0.0, "sample_count": 0},
+        )
+
+    assert not (trigger_path.parent / "summary.json").exists()
