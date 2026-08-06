@@ -28,6 +28,7 @@ from v2.benchmarks.journal import (
     JournalAttempt,
     atomic_write_json,
     atomic_write_text,
+    baseline_output_lock,
     baseline_session_lock,
     build_session_document,
     cleanup_orphaned_atomic_temporaries,
@@ -2521,16 +2522,17 @@ def _record_baseline(args: argparse.Namespace) -> int:
         manifest_path=args.manifest,
         raw_output_path=args.raw_output,
     )
-    with baseline_session_lock(state_root):
-        cleanup_orphaned_journal_temporaries(state_root)
-        cleanup_orphaned_atomic_temporaries((manifest_path, raw_output_path))
-        return _record_baseline_locked(
-            args,
-            harness_root=harness_root,
-            state_root=state_root,
-            manifest_path=manifest_path,
-            raw_output_path=raw_output_path,
-        )
+    with baseline_output_lock(manifest_path, raw_output_path):
+        with baseline_session_lock(state_root):
+            cleanup_orphaned_journal_temporaries(state_root)
+            cleanup_orphaned_atomic_temporaries((manifest_path, raw_output_path))
+            return _record_baseline_locked(
+                args,
+                harness_root=harness_root,
+                state_root=state_root,
+                manifest_path=manifest_path,
+                raw_output_path=raw_output_path,
+            )
 
 
 def _record_baseline_locked(

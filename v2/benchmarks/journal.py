@@ -39,6 +39,7 @@ SESSION_FIELDS = {
 }
 INITIALIZATION_MARKER = ".baseline-session-initializing"
 LOCK_FILE_NAME = ".baseline-session.lock"
+OUTPUT_LOCK_DIRECTORY_NAME = "sml-v2-baseline-output-locks"
 STATE_DIRECTORY_NAMES = frozenset(
     {"accepted", "rejected", "inflight", "preflight", "thermal-waits"}
 )
@@ -154,20 +155,20 @@ def require_external_state_directory(
 
 
 @contextmanager
-def baseline_session_lock(root: Path):
-    state = root.resolve()
-    _create_durable_directory(state)
+def _exclusive_file_lock(
+    lock_path: Path, *, conflict_message: str, invalid_message: str
+):
+    _create_durable_directory(lock_path.parent)
     owner = threading.get_ident()
     descriptor: int | None = None
     with _PROCESS_LOCK_GUARD:
-        held = _PROCESS_LOCKS.get(state)
+        held = _PROCESS_LOCKS.get(lock_path)
         if held is not None:
             held_descriptor, held_owner, depth = held
             if held_owner != owner:
-                raise RuntimeError("baseline session is already locked")
-            _PROCESS_LOCKS[state] = (held_descriptor, held_owner, depth + 1)
+                raise RuntimeError(conflict_message)
+            _PROCESS_LOCKS[lock_path] = (held_descriptor, held_owner, depth + 1)
         else:
-            lock_path = state / LOCK_FILE_NAME
             descriptor = os.open(
                 lock_path,
                 os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
@@ -176,35 +177,65 @@ def baseline_session_lock(root: Path):
             try:
                 metadata = os.fstat(descriptor)
                 if not stat.S_ISREG(metadata.st_mode):
-                    raise ValueError("baseline session lock must be a regular file")
+                    raise ValueError(invalid_message)
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError as error:
-                    raise RuntimeError("baseline session is already locked") from error
+                    raise RuntimeError(conflict_message) from error
                 os.fsync(descriptor)
-                _fsync_directory(state)
+                _fsync_directory(lock_path.parent)
             except BaseException:
                 os.close(descriptor)
                 raise
-            _PROCESS_LOCKS[state] = (descriptor, owner, 1)
+            _PROCESS_LOCKS[lock_path] = (descriptor, owner, 1)
     try:
-        yield state
+        yield
     finally:
         descriptor_to_close: int | None = None
         with _PROCESS_LOCK_GUARD:
-            held_descriptor, held_owner, depth = _PROCESS_LOCKS[state]
+            held_descriptor, held_owner, depth = _PROCESS_LOCKS[lock_path]
             if held_owner != owner:
-                raise RuntimeError("baseline session lock owner changed")
+                raise RuntimeError("baseline lock owner changed")
             if depth == 1:
-                del _PROCESS_LOCKS[state]
+                del _PROCESS_LOCKS[lock_path]
                 descriptor_to_close = held_descriptor
             else:
-                _PROCESS_LOCKS[state] = (held_descriptor, held_owner, depth - 1)
+                _PROCESS_LOCKS[lock_path] = (held_descriptor, held_owner, depth - 1)
         if descriptor_to_close is not None:
             try:
                 fcntl.flock(descriptor_to_close, fcntl.LOCK_UN)
             finally:
                 os.close(descriptor_to_close)
+
+
+@contextmanager
+def baseline_session_lock(root: Path):
+    state = root.resolve()
+    with _exclusive_file_lock(
+        state / LOCK_FILE_NAME,
+        conflict_message="baseline session is already locked",
+        invalid_message="baseline session lock must be a regular file",
+    ):
+        yield state
+
+
+@contextmanager
+def baseline_output_lock(manifest_path: Path, raw_output_path: Path):
+    destinations = sorted(
+        (str(manifest_path.resolve()), str(raw_output_path.resolve()))
+    )
+    if destinations[0] == destinations[1]:
+        raise ValueError("baseline final output paths must be distinct")
+    identity = structured_identity(
+        "sml-baseline-final-output-lock-v1", destinations
+    ).removeprefix("sha256:")
+    lock_root = Path("/tmp").resolve() / f"{OUTPUT_LOCK_DIRECTORY_NAME}-{os.getuid()}"
+    with _exclusive_file_lock(
+        lock_root / f"{identity}.lock",
+        conflict_message="baseline final outputs are already locked",
+        invalid_message="baseline final output lock must be a regular file",
+    ):
+        yield
 
 
 def _atomic_temporary_destination(path: Path) -> Path | None:

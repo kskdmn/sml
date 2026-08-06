@@ -46,8 +46,11 @@ journal that remains after success or failure:
 ```
 
 One crash-released advisory lock serializes initialization, resume, capture, and
-final publication for the state directory. The lock inode remains in place for
-the life of the journal. Atomic writes use the exact
+final publication for the state directory. A second advisory lock, keyed by the
+resolved manifest/raw-output pair and stored under the system temporary
+directory, serializes final-output cleanup and publication across different
+state directories that target the same outputs. Lock inodes remain in place.
+Atomic writes use the exact
 `.DESTINATION.sml-atomic-<32-lowercase-hex>.tmp` namespace. At locked resume,
 only regular orphan files in that namespace whose destination is valid for its
 exact journal location are removed; the initialization marker is recovered in

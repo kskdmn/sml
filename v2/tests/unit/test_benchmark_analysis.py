@@ -3057,6 +3057,41 @@ def test_session_lock_is_released_when_an_owner_process_crashes(tmp_path):
         pass
 
 
+def test_output_lock_excludes_a_process_with_a_different_temporary_directory(
+    tmp_path,
+):
+    manifest = tmp_path / "outputs" / "baseline.json"
+    raw_output = tmp_path / "outputs" / "baseline.jsonl"
+    alternate_temporary_directory = tmp_path / "alternate-tmp"
+    alternate_temporary_directory.mkdir()
+    script = f"""
+from pathlib import Path
+
+from v2.benchmarks.journal import baseline_output_lock
+
+manifest = Path({str(manifest)!r})
+raw_output = Path({str(raw_output)!r})
+try:
+    with baseline_output_lock(manifest, raw_output):
+        raise SystemExit("entered")
+except RuntimeError as error:
+    print(error)
+"""
+
+    with baseline_journal.baseline_output_lock(manifest, raw_output):
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[3],
+            env={**os.environ, "TMPDIR": str(alternate_temporary_directory)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "baseline final outputs are already locked"
+
+
 def test_journal_never_treats_a_symlink_as_the_persistent_lock_inode(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -3249,6 +3284,60 @@ def test_record_baseline_holds_the_session_lock_across_cleanup_and_capture_entry
     assert not thread.is_alive()
     assert failures == []
     assert len(calls) == 1
+
+
+def test_different_state_roots_cannot_clean_a_live_shared_output_temporary(
+    tmp_path, monkeypatch
+):
+    harness = tmp_path / "harness"
+    harness.mkdir()
+    manifest = tmp_path / "outputs" / "baseline.json"
+    raw_output = tmp_path / "outputs" / "baseline.jsonl"
+    first_args = SimpleNamespace(
+        state_directory=tmp_path / "first-state",
+        manifest=manifest,
+        raw_output=raw_output,
+    )
+    second_args = SimpleNamespace(
+        state_directory=tmp_path / "second-state",
+        manifest=manifest,
+        raw_output=raw_output,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    failures = []
+    live_temporary = []
+
+    monkeypatch.setattr(benchmark_runner, "_git_root", lambda path: harness)
+
+    def capture(current_args, **paths):
+        if paths["state_root"] == first_args.state_directory.resolve():
+            live_temporary.append(_orphan_atomic_temporary(manifest))
+            entered.set()
+            assert release.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(benchmark_runner, "_record_baseline_locked", capture)
+
+    def first_invocation():
+        try:
+            benchmark_runner._record_baseline(first_args)
+        except BaseException as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=first_invocation)
+    thread.start()
+    assert entered.wait(timeout=5)
+    try:
+        with pytest.raises(RuntimeError, match="final outputs are already locked"):
+            benchmark_runner._record_baseline(second_args)
+        assert live_temporary[0].is_file()
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert failures == []
 
 
 def test_journal_rejects_an_orphan_written_during_session_initialization(
