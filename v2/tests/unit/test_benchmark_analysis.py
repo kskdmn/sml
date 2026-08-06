@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import os
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -2356,13 +2357,33 @@ def test_thermal_recovery_enforces_a_deadline_at_a_nominal_window_boundary():
     assert samples[-1][1]["elapsed_seconds"] == 324.0
 
 
+def test_recovery_import_does_not_eagerly_import_runner():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import v2.benchmarks.recovery; "
+            "assert 'v2.benchmarks.runner' not in sys.modules",
+        ],
+        cwd=Path(__file__).resolve().parents[3],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     ("target", "field", "value"),
     [
         ("status", "power_connected", False),
+        ("status", "power_connected", 1),
         ("status", "low_power_mode", True),
+        ("status", "low_power_mode", 0),
         ("status", "memory_pressure", "warning"),
         ("status", "competing_gpu_workload", True),
+        ("status", "competing_gpu_workload", 0),
         ("hardware", "chip", "Apple M4"),
         ("software", "python", "3.12.12"),
     ],

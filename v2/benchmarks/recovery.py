@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from v2.benchmarks.runner import validate_thermal_observation
-
 _SAMPLE_INTERVAL_SECONDS = 27.0
 _REQUIRED_NOMINAL_SECONDS = 300.0
 
@@ -33,12 +31,18 @@ def _require_exact_match(actual: dict, expected: dict, *, label: str) -> None:
 def _validate_nonthermal_environment(
     status: dict[str, object], required_environment: dict[str, object]
 ) -> None:
-    expected = {
+    expected_booleans = {
         "power_connected": True,
-        "power_mode": required_environment["power_mode"],
         "low_power_mode": False,
-        "memory_pressure": "normal",
         "competing_gpu_workload": False,
+    }
+    for field, value in expected_booleans.items():
+        observed = status.get(field)
+        if type(observed) is not bool or observed is not value:
+            raise ValueError(f"environment status does not match required {field}")
+    expected = {
+        "power_mode": required_environment["power_mode"],
+        "memory_pressure": "normal",
     }
     for field, value in expected.items():
         if status.get(field) != value:
@@ -57,6 +61,8 @@ def wait_for_nominal_thermal_window(
     sleep: Callable[[float], None],
     utc_now: Callable[[], str],
 ) -> ThermalRecoveryResult:
+    from v2.benchmarks.runner import validate_thermal_observation
+
     started = clock()
     scheduled = started
     sample_count = 0
