@@ -25,7 +25,9 @@ software mismatches.
 
 Baseline capture also requires `--state-directory PATH`. The path is resolved
 before use and must be outside both the harness checkout and the detached pinned
-source checkout. It is a durable journal that remains after success or failure:
+source checkout. The final manifest and raw JSONL paths must be distinct from
+each other and both must be outside the state directory. The state directory is
+a durable journal that remains after success or failure:
 
 ```text
 <state-directory>/
@@ -55,12 +57,15 @@ Resume requires the exact same harness commit and content identity, pinned
 source commit, canonical workload, immutable protocol, hardware, software,
 paired representations, and resolved final output paths. Compatible accepted
 slots are validated and reused; a complete in-flight trial is classified before
-any replacement is launched, and only the same thermally rejected slot is
-retried. The final raw JSONL and manifest remain absent until all 45 canonical
-slots validate. Publication creates the raw JSONL first, the manifest second,
-and `completed.json` last; existing identical bytes are accepted for crash
-resume, while different final content is never overwritten. The external
-journal is retained for auditability.
+any replacement is launched. Persisted non-nominal preflights, thermally
+rejected trials, unfinished recovery episodes, and timed-out recovery episodes
+resume with a fresh five-continuous-minute nominal window before a new preflight
+or trial can run. Only the same thermally rejected slot is retried. The final raw
+JSONL and manifest remain absent until all 45 canonical slots validate.
+Publication creates the raw JSONL first, the manifest second, and
+`completed.json` last; existing identical bytes are accepted for crash resume,
+while different final content is never overwritten. The external journal is
+retained for auditability.
 
 Comparisons have two strict profiles. Screen mode uses five pairs, a 0.97 median
 gate, 2% maximum dispersion, and a report-only confidence bound. Final mode uses

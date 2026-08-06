@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from numbers import Real
 from pathlib import Path
 from typing import Literal
 
@@ -209,10 +210,10 @@ def validate_baseline_trial(
 ) -> None:
     if trial.side != "reference":
         raise ValueError("baseline raw trials must be reference-side records")
-    if trial.attempt_index != 0:
-        raise ValueError("baseline raw trials cannot be retry attempts")
-    if trial.pair_index not in range(SCREEN_PAIRS):
-        raise ValueError("baseline raw trial has an invalid pair index")
+    if type(trial.attempt_index) is not int or trial.attempt_index != 0:
+        raise ValueError("baseline raw trial attempt_index must be integer zero")
+    if type(trial.pair_index) is not int or trial.pair_index not in range(SCREEN_PAIRS):
+        raise ValueError("baseline raw trial pair_index is invalid")
     if trial.source_commit != source_commit:
         raise ValueError("raw source commit does not match baseline")
     if trial.harness_commit != harness_commit:
@@ -248,16 +249,26 @@ def validate_baseline_trial(
         if unit.metric == trial.metric
     )
     expected_warmup = 0 if trial.metric == "compile-cold-start" else WARMUP_UNITS
-    if trial.measured_units != expected_units or trial.warmup_units != expected_warmup:
-        raise ValueError("raw trial uses the wrong warmup or measured units")
+    if type(trial.warmup_units) is not int or trial.warmup_units != expected_warmup:
+        raise ValueError("raw trial has invalid warmup or measured units: warmup_units")
+    if type(trial.measured_units) is not int or trial.measured_units != expected_units:
+        raise ValueError(
+            "raw trial has invalid warmup or measured units: measured_units"
+        )
     if trial.startup_verification_seconds is None:
         raise ValueError("raw trial omitted mandatory startup verification")
     if trial.synchronization_boundaries != workload.synchronization_boundaries:
         raise ValueError("raw synchronization boundaries do not match workload")
-    if trial.native_configuration.get("rope_scaling_factor") != 1.0:
-        raise ValueError("raw native configuration must pin rope_scaling_factor=1.0")
-    if not math.isfinite(trial.value) or trial.value <= 0:
-        raise ValueError("raw benchmark value must be finite and positive")
+    rope_scaling_factor = trial.native_configuration.get("rope_scaling_factor")
+    if type(rope_scaling_factor) is not float or rope_scaling_factor != 1.0:
+        raise ValueError("raw rope_scaling_factor must be exact float 1.0")
+    if (
+        isinstance(trial.value, bool)
+        or not isinstance(trial.value, Real)
+        or not math.isfinite(trial.value)
+        or trial.value <= 0
+    ):
+        raise ValueError("raw benchmark value must be finite, positive, and non-bool")
     _validate_acceptance_environment(
         workload,
         trial,
@@ -478,6 +489,21 @@ def validate_baseline_manifest(
         raise ValueError("baseline software summary does not match raw trials")
 
 
+def _validate_nonthermal_environment_status(
+    status: dict,
+    required: dict,
+    *,
+    label: str,
+) -> None:
+    for key in ("power_connected", "low_power_mode", "competing_gpu_workload"):
+        observed = status.get(key)
+        if type(observed) is not bool or observed is not required[key]:
+            raise ValueError(f"{label} does not match required {key}")
+    for key in ("power_mode", "memory_pressure"):
+        if status.get(key) != required[key]:
+            raise ValueError(f"{label} does not match required {key}")
+
+
 def _validate_acceptance_environment(
     workload: CanonicalWorkload,
     trial: RawTrial,
@@ -489,15 +515,11 @@ def _validate_acceptance_environment(
     for key in ("chip", "cpu_cores", "gpu_cores", "unified_memory_bytes"):
         if trial.hardware.get(key) != required[key]:
             raise ValueError(f"raw hardware does not match required {key}")
-    for key in (
-        "power_connected",
-        "power_mode",
-        "low_power_mode",
-        "memory_pressure",
-        "competing_gpu_workload",
-    ):
-        if trial.environment_status.get(key) != required[key]:
-            raise ValueError(f"raw environment does not match required {key}")
+    _validate_nonthermal_environment_status(
+        trial.environment_status,
+        required,
+        label="raw environment",
+    )
     if (
         not allow_non_nominal_thermal
         and trial.environment_status.get("thermal_state") != required["thermal_state"]
@@ -1857,9 +1879,13 @@ def _create_detached_worktree(repository: Path, commit: str, destination: Path) 
         cwd=repository,
         check=True,
     )
-    _require_clean_checkout(destination, label="source")
-    if _git_commit(destination) != commit:
-        raise RuntimeError("detached source worktree resolved the wrong commit")
+    try:
+        _require_clean_checkout(destination, label="source")
+        if _git_commit(destination) != commit:
+            raise RuntimeError("detached source worktree resolved the wrong commit")
+    except BaseException:
+        _remove_worktree(repository, destination)
+        raise
 
 
 def _remove_worktree(repository: Path, destination: Path) -> None:
@@ -1939,6 +1965,110 @@ def _next_capture_indices(
     return len(preflight_history.get(slot, ())), len(recovery_history.get(slot, ()))
 
 
+def _thermal_trigger_payload(document: dict) -> tuple[tuple[str, str], dict]:
+    if document["source"] == "preflight":
+        preflight = document["preflight"]
+        return (
+            ("preflight", preflight["identity"]),
+            {"source": "preflight", "preflight": preflight},
+        )
+    identity = document["rejected_trial_identity"]
+    return (
+        ("rejected-trial", identity),
+        {"source": "rejected-trial", "rejected_trial_identity": identity},
+    )
+
+
+def _persisted_pending_thermal_triggers(
+    journal: BaselineJournal, slots: Sequence[BaselineSlot]
+) -> dict[BaselineSlot, dict]:
+    expected = set(slots)
+    preflight_order: dict[BaselineSlot, list[tuple[tuple[str, str], dict]]] = {}
+    for slot, _index, _path, document in journal._preflight_records():
+        if slot not in expected:
+            raise ValueError("unexpected preflight slot")
+        validate_thermal_observation(document["environment_status"])
+        if document["environment_status"]["thermal_state"] == "nominal":
+            continue
+        key = ("preflight", document["identity"])
+        trigger = {"source": "preflight", "preflight": document}
+        preflight_order.setdefault(slot, []).append((key, trigger))
+
+    rejected_order: dict[BaselineSlot, list[tuple[tuple[str, str], dict]]] = {}
+    for attempt, path in journal._attempt_records("rejected"):
+        if attempt.slot not in expected:
+            raise ValueError("unexpected rejected slot")
+        document = read_json_object(path, label="rejected trial")
+        trial = RawTrial.from_dict(document["trial"])
+        validate_thermal_observation(trial.environment_status)
+        if document["reason"] != "non-nominal-thermal":
+            continue
+        if trial.environment_status["thermal_state"] == "nominal":
+            raise ValueError("thermal rejection contains a nominal trial")
+        key = ("rejected-trial", document["identity"])
+        trigger = {
+            "source": "rejected-trial",
+            "rejected_trial_identity": document["identity"],
+        }
+        rejected_order.setdefault(attempt.slot, []).append((key, trigger))
+
+    recovery_by_slot: dict[
+        BaselineSlot, list[tuple[int, Path, tuple[str, str], dict]]
+    ] = {}
+    used_sources: dict[BaselineSlot, set[tuple[str, str]]] = {}
+    for slot, recovery_index, path in journal._thermal_recovery_records():
+        if slot not in expected:
+            raise ValueError("unexpected thermal recovery slot")
+        trigger_document = read_json_object(
+            path / "trigger.json", label="thermal recovery trigger"
+        )
+        key, trigger = _thermal_trigger_payload(trigger_document)
+        recovery_by_slot.setdefault(slot, []).append(
+            (recovery_index, path, key, trigger)
+        )
+        used_sources.setdefault(slot, set()).add(key)
+
+    pending: dict[BaselineSlot, dict] = {}
+    for slot in slots:
+        recoveries = sorted(recovery_by_slot.get(slot, ()))
+        last_success = -1
+        for recovery_index, path, _key, _trigger in recoveries:
+            summary_path = path / "summary.json"
+            if summary_path.exists():
+                summary = read_json_object(
+                    summary_path, label="thermal recovery summary"
+                )
+                if summary["outcome"] == "nominal-window":
+                    last_success = recovery_index
+        trailing = [record for record in recoveries if record[0] > last_success]
+        if trailing:
+            pending[slot] = trailing[-1][3]
+            continue
+
+        used = used_sources.get(slot, set())
+        unresolved_rejected = [
+            trigger for key, trigger in rejected_order.get(slot, ()) if key not in used
+        ]
+        if unresolved_rejected:
+            pending[slot] = unresolved_rejected[-1]
+            continue
+        unresolved_preflight = [
+            trigger for key, trigger in preflight_order.get(slot, ()) if key not in used
+        ]
+        if unresolved_preflight:
+            pending[slot] = unresolved_preflight[-1]
+    return pending
+
+
+def _start_recovery_deadline(
+    deadlines: dict[BaselineSlot, float],
+    slot: BaselineSlot,
+    clock: Callable[[], float],
+) -> None:
+    if slot not in deadlines:
+        deadlines[slot] = clock() + 7_200.0
+
+
 def capture_baseline_trials(
     *,
     journal: BaselineJournal,
@@ -1954,6 +2084,11 @@ def capture_baseline_trials(
 ) -> tuple[RawTrial, ...]:
     ordered_slots = tuple(slots)
     accepted = journal.load_accepted(ordered_slots)
+    pending_triggers = _persisted_pending_thermal_triggers(journal, ordered_slots)
+    recovery_deadlines: dict[BaselineSlot, float] = {}
+    for slot in ordered_slots:
+        if slot not in accepted and slot in pending_triggers:
+            _start_recovery_deadline(recovery_deadlines, slot, clock)
     for slot in ordered_slots:
         if slot not in accepted:
             continue
@@ -1961,7 +2096,6 @@ def capture_baseline_trials(
         validate_trial(trial, allow_non_nominal_thermal=False)
         progress(f"resumed accepted {slot.metric} pair {slot.pair_index}")
 
-    pending_triggers: dict[BaselineSlot, dict] = {}
     for attempt in journal.load_inflight(ordered_slots):
         raw = read_json_object(attempt.path, label="inflight trial")
         trial = RawTrial.from_dict(raw)
@@ -1974,6 +2108,7 @@ def capture_baseline_trials(
                 f"{attempt.slot.pair_index} ({len(accepted)}/{len(ordered_slots)})"
             )
             continue
+        _start_recovery_deadline(recovery_deadlines, attempt.slot, clock)
         journal.reject_inflight(attempt, trial, reason="non-nominal-thermal")
         rejected = read_json_object(
             journal.rejected_path(attempt.slot, attempt.journal_attempt_index),
@@ -1994,13 +2129,13 @@ def capture_baseline_trials(
         if slot in accepted:
             continue
         preflight_index, recovery_index = _next_capture_indices(journal, slot)
-        recovery_deadline: float | None = None
+        recovery_deadline = recovery_deadlines.get(slot)
         pending_trigger = pending_triggers.get(slot)
 
         while slot not in accepted:
             if pending_trigger is not None:
                 if recovery_deadline is None:
-                    recovery_deadline = clock() + 7_200.0
+                    raise AssertionError("thermal recovery is missing its deadline")
                 progress(
                     f"thermal recovery {slot.metric} pair {slot.pair_index} "
                     f"episode {recovery_index}"
@@ -2014,6 +2149,9 @@ def capture_baseline_trials(
                 pending_trigger = None
 
             hardware, status, software_versions = preflight()
+            if status.get("thermal_state") != "nominal" and recovery_deadline is None:
+                recovery_deadline = clock() + 7_200.0
+                recovery_deadlines[slot] = recovery_deadline
             preflight_document = journal.record_preflight(
                 slot,
                 preflight_index,
@@ -2062,6 +2200,9 @@ def capture_baseline_trials(
                 )
                 continue
 
+            if recovery_deadline is None:
+                recovery_deadline = clock() + 7_200.0
+                recovery_deadlines[slot] = recovery_deadline
             journal.reject_inflight(attempt, persisted, reason="non-nominal-thermal")
             rejected = read_json_object(
                 journal.rejected_path(slot, attempt.journal_attempt_index),
@@ -2100,15 +2241,11 @@ def _validate_baseline_preflight(
     for key in ("chip", "cpu_cores", "gpu_cores", "unified_memory_bytes"):
         if hardware.get(key) != required[key]:
             raise ValueError(f"preflight hardware does not match required {key}")
-    for key in (
-        "power_connected",
-        "power_mode",
-        "low_power_mode",
-        "memory_pressure",
-        "competing_gpu_workload",
-    ):
-        if status.get(key) != required[key]:
-            raise ValueError(f"preflight environment does not match required {key}")
+    _validate_nonthermal_environment_status(
+        status,
+        required,
+        label="preflight environment",
+    )
     _validate_software_versions(workload, software_versions)
 
 
@@ -2122,6 +2259,28 @@ def _allowed_checkout_output_paths(
         except ValueError:
             continue
     return frozenset(allowed)
+
+
+def _resolve_baseline_output_paths(
+    *,
+    state_root: Path,
+    manifest_path: Path,
+    raw_output_path: Path,
+) -> tuple[Path, Path]:
+    state = state_root.resolve()
+    manifest = manifest_path.resolve()
+    raw_output = raw_output_path.resolve()
+    if (
+        manifest == raw_output
+        or manifest == state
+        or raw_output == state
+        or manifest.is_relative_to(state)
+        or raw_output.is_relative_to(state)
+    ):
+        raise ValueError(
+            "final output paths must be distinct and outside the state directory"
+        )
+    return manifest, raw_output
 
 
 def _publish_final_artifact(path: Path, text: str) -> None:
@@ -2153,6 +2312,11 @@ def publish_baseline_from_journal(
     manifest_path: Path,
     raw_output_path: Path,
 ) -> dict:
+    manifest_path, raw_output_path = _resolve_baseline_output_paths(
+        state_root=journal.root,
+        manifest_path=manifest_path,
+        raw_output_path=raw_output_path,
+    )
     if journal.session["paired_representations"] != paired_representations:
         raise ValueError("publication paired representations do not match the session")
     if journal.session["manifest_path"] != str(manifest_path.resolve()):
@@ -2218,6 +2382,11 @@ def publish_baseline_from_journal(
 def _record_baseline(args: argparse.Namespace) -> int:
     harness_root = _git_root(Path.cwd())
     state_root = require_external_state_directory(args.state_directory, (harness_root,))
+    manifest_path, raw_output_path = _resolve_baseline_output_paths(
+        state_root=state_root,
+        manifest_path=args.manifest,
+        raw_output_path=args.raw_output,
+    )
     allowed_outputs = frozenset()
     session_path = state_root / "session.json"
     if session_path.is_file():
@@ -2225,11 +2394,11 @@ def _record_baseline(args: argparse.Namespace) -> int:
             session_path, label="baseline journal session"
         )
         BaselineJournal.open(state_root, existing_session)
-        if existing_session["manifest_path"] == str(
-            args.manifest.resolve()
-        ) and existing_session["raw_output_path"] == str(args.raw_output.resolve()):
+        if existing_session["manifest_path"] == str(manifest_path) and existing_session[
+            "raw_output_path"
+        ] == str(raw_output_path):
             allowed_outputs = _allowed_checkout_output_paths(
-                harness_root, (args.manifest, args.raw_output)
+                harness_root, (manifest_path, raw_output_path)
             )
     harness_status = _run_command(
         ("git", "status", "--porcelain", "--untracked-files=all"),
@@ -2276,8 +2445,8 @@ def _record_baseline(args: argparse.Namespace) -> int:
             hardware=initial_hardware,
             software_versions=initial_software_versions,
             paired_representations=paired_representations,
-            manifest_path=args.manifest,
-            raw_output_path=args.raw_output,
+            manifest_path=manifest_path,
+            raw_output_path=raw_output_path,
         )
         journal = BaselineJournal.open(state_root, session)
         slots = BaselineJournal.expected_slots(args.metrics, args.pairs)
@@ -2401,8 +2570,8 @@ def _record_baseline(args: argparse.Namespace) -> int:
         harness_identity=harness_identity,
         command=command,
         paired_representations=paired_representations,
-        manifest_path=args.manifest,
-        raw_output_path=args.raw_output,
+        manifest_path=manifest_path,
+        raw_output_path=raw_output_path,
     )
     return 0
 

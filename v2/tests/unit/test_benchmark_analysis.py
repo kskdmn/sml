@@ -987,6 +987,22 @@ def _valid_raw_trial(workload, metric="prepared-data", pair_index=0):
     )
 
 
+def _with_thermal_state(trial, state, raw_value):
+    status = {
+        **trial.environment_status,
+        "thermal_state": state,
+        "thermal_state_raw_value": raw_value,
+    }
+    for endpoint in ("start", "end"):
+        if endpoint in status:
+            status[endpoint] = {
+                **status[endpoint],
+                "thermal_state": state,
+                "thermal_state_raw_value": raw_value,
+            }
+    return replace(trial, environment_status=status)
+
+
 def _valid_baseline_trials(workload):
     return tuple(
         _valid_raw_trial(workload, metric=metric, pair_index=pair_index)
@@ -1141,6 +1157,100 @@ def test_baseline_rejects_invalid_environment_or_software(
 
     with pytest.raises(ValueError, match=message):
         validate_baseline_manifest(manifest, (changed, *trials[1:]))
+
+
+@pytest.mark.parametrize(
+    ("field", "build_invalid"),
+    (
+        ("pair_index", lambda trial: replace(trial, pair_index=False)),
+        ("attempt_index", lambda trial: replace(trial, attempt_index=False)),
+        ("warmup_units", lambda trial: replace(trial, warmup_units=False)),
+        ("measured_units", lambda trial: replace(trial, measured_units=True)),
+        (
+            "rope_scaling_factor",
+            lambda trial: replace(
+                trial,
+                native_configuration={
+                    **trial.native_configuration,
+                    "rope_scaling_factor": 1,
+                },
+            ),
+        ),
+        ("value", lambda trial: replace(trial, value=True)),
+        (
+            "power_connected",
+            lambda trial: replace(
+                trial,
+                environment_status={
+                    **trial.environment_status,
+                    "power_connected": 1,
+                },
+            ),
+        ),
+        (
+            "low_power_mode",
+            lambda trial: replace(
+                trial,
+                environment_status={
+                    **trial.environment_status,
+                    "low_power_mode": 0,
+                },
+            ),
+        ),
+        (
+            "competing_gpu_workload",
+            lambda trial: replace(
+                trial,
+                environment_status={
+                    **trial.environment_status,
+                    "competing_gpu_workload": 0,
+                },
+            ),
+        ),
+    ),
+)
+def test_single_baseline_trial_validation_rejects_boolean_numeric_substitutes(
+    field, build_invalid
+):
+    workload = build_canonical_workload()
+    valid = _valid_raw_trial(workload, metric="compile-cold-start")
+    invalid = build_invalid(valid)
+
+    with pytest.raises(ValueError, match=field):
+        benchmark_runner.validate_baseline_trial(
+            invalid,
+            workload=workload,
+            source_commit=valid.source_commit,
+            harness_commit=valid.harness_commit,
+            harness_identity=valid.harness_identity,
+            expected_hardware=valid.hardware,
+            expected_software_versions=valid.software_versions,
+            allow_non_nominal_thermal=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("power_connected", 1),
+        ("low_power_mode", 0),
+        ("competing_gpu_workload", 0),
+    ),
+)
+def test_baseline_preflight_rejects_boolean_integer_substitutes(field, value):
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    status = {**trial.environment_status, field: value}
+
+    with pytest.raises(ValueError, match=field):
+        benchmark_runner._validate_baseline_preflight(
+            workload=workload,
+            hardware=trial.hardware,
+            status=status,
+            software_versions=trial.software_versions,
+            expected_hardware=trial.hardware,
+            expected_software_versions=trial.software_versions,
+        )
 
 
 def test_comparison_report_pins_pairs_decisions_and_metric_lineage():
@@ -1975,6 +2085,239 @@ def test_capture_timeout_preserves_prior_acceptance_and_rejected_attempt(tmp_pat
     assert journal.rejected_path(second, 0).is_file()
 
 
+@pytest.mark.parametrize(
+    "persisted_state",
+    (
+        "untriggered-preflight",
+        "unrecovered-rejected",
+        "unfinished-recovery",
+        "timeout-recovery",
+    ),
+)
+def test_capture_replays_persisted_thermal_state_before_preflight(
+    tmp_path, persisted_state
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    nominal = _valid_raw_trial(workload)
+    fair = _with_thermal_state(nominal, "fair", 1)
+    observation = {
+        "observed_at_utc": "2026-08-05T00:00:00+00:00",
+        "hardware": fair.hardware,
+        "environment_status": fair.environment_status,
+        "software_versions": fair.software_versions,
+    }
+
+    if persisted_state == "unrecovered-rejected":
+        attempt = journal.next_attempt(slot)
+        atomic_write_json(attempt.path, fair.to_dict(), create_only=True)
+        journal.reject_inflight(attempt, fair, reason="non-nominal-thermal")
+        rejected = read_json_object(
+            journal.rejected_path(slot, 0), label="rejected trial"
+        )
+        expected_trigger = {
+            "source": "rejected-trial",
+            "rejected_trial_identity": rejected["identity"],
+        }
+        expected_recovery_index = 0
+    else:
+        preflight_document = journal.record_preflight(slot, 0, observation)
+        expected_trigger = {
+            "source": "preflight",
+            "preflight": preflight_document,
+        }
+        expected_recovery_index = 0
+        if persisted_state in ("unfinished-recovery", "timeout-recovery"):
+            journal.record_recovery_trigger(slot, 0, expected_trigger)
+            expected_recovery_index = 1
+        if persisted_state == "timeout-recovery":
+            journal.record_recovery_summary(
+                slot,
+                0,
+                {
+                    "outcome": "timeout",
+                    "duration_seconds": 7_200.0,
+                    "sample_count": 0,
+                },
+            )
+
+    events = []
+    recovered = []
+    clock = SimpleNamespace(now=0.0)
+
+    def progress(message):
+        clock.now += 100.0
+
+    capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, attempt: events.append("launch") or nominal,
+        preflight=lambda: (
+            events.append("preflight")
+            or (nominal.hardware, nominal.environment_status, nominal.software_versions)
+        ),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda current_slot, recovery_index, deadline, trigger: (
+            events.append("recover"),
+            recovered.append((recovery_index, deadline, trigger)),
+        ),
+        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        clock=lambda: clock.now,
+        utc_now=lambda: "2026-08-05T00:01:00+00:00",
+        progress=progress,
+    )
+
+    assert events == ["recover", "preflight", "launch"]
+    assert recovered == [(expected_recovery_index, 7_200.0, expected_trigger)]
+
+
+def test_capture_does_not_replay_thermal_state_closed_by_nominal_window(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    nominal = _valid_raw_trial(workload)
+    fair = _with_thermal_state(nominal, "fair", 1)
+    preflight_document = journal.record_preflight(
+        slot,
+        0,
+        {
+            "observed_at_utc": "2026-08-05T00:00:00+00:00",
+            "hardware": fair.hardware,
+            "environment_status": fair.environment_status,
+            "software_versions": fair.software_versions,
+        },
+    )
+    journal.record_recovery_trigger(
+        slot, 0, {"source": "preflight", "preflight": preflight_document}
+    )
+    journal.record_thermal_sample(
+        slot,
+        0,
+        0,
+        {
+            "schema_version": 1,
+            "observed_at_utc": "2026-08-05T00:05:00+00:00",
+            "elapsed_seconds": 300.0,
+            "hardware": nominal.hardware,
+            "environment_status": nominal.environment_status,
+            "software_versions": nominal.software_versions,
+        },
+    )
+    journal.record_recovery_summary(
+        slot,
+        0,
+        {
+            "outcome": "nominal-window",
+            "duration_seconds": 300.0,
+            "sample_count": 1,
+        },
+    )
+
+    capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, attempt: nominal,
+        preflight=lambda: (
+            nominal.hardware,
+            nominal.environment_status,
+            nominal.software_versions,
+        ),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda current_slot, recovery_index, deadline, trigger: pytest.fail(
+            "completed nominal recovery was replayed"
+        ),
+        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        progress=lambda message: None,
+    )
+
+
+@pytest.mark.parametrize("violation_source", ("preflight", "rejected-trial"))
+def test_capture_deadline_starts_before_slow_thermal_transition(
+    tmp_path, monkeypatch, violation_source
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    nominal = _valid_raw_trial(workload)
+    fair = _with_thermal_state(nominal, "fair", 1)
+    clock = SimpleNamespace(now=0.0)
+    deadlines = []
+
+    if violation_source == "preflight":
+        preflights = iter(
+            (
+                (fair.hardware, fair.environment_status, fair.software_versions),
+                (
+                    nominal.hardware,
+                    nominal.environment_status,
+                    nominal.software_versions,
+                ),
+            )
+        )
+        original = BaselineJournal.record_preflight
+
+        def slow_record_preflight(self, current_slot, preflight_index, observation):
+            clock.now += 100.0
+            return original(self, current_slot, preflight_index, observation)
+
+        monkeypatch.setattr(BaselineJournal, "record_preflight", slow_record_preflight)
+
+        def launch(current_slot, attempt):
+            return nominal
+
+    else:
+        preflights = iter(
+            (
+                (
+                    nominal.hardware,
+                    nominal.environment_status,
+                    nominal.software_versions,
+                ),
+                (
+                    nominal.hardware,
+                    nominal.environment_status,
+                    nominal.software_versions,
+                ),
+            )
+        )
+        launches = []
+        original = BaselineJournal.reject_inflight
+
+        def slow_reject(self, attempt, trial, *, reason):
+            clock.now += 100.0
+            return original(self, attempt, trial, reason=reason)
+
+        monkeypatch.setattr(BaselineJournal, "reject_inflight", slow_reject)
+
+        def launch(current_slot, attempt):
+            launches.append(current_slot)
+            if len(launches) == 1:
+                clock.now = 0.0
+                return fair
+            return nominal
+
+    def progress(message):
+        clock.now += 100.0
+
+    capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=launch,
+        preflight=lambda: next(preflights),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda current_slot, recovery_index, deadline, trigger: (
+            deadlines.append(deadline)
+        ),
+        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        clock=lambda: clock.now,
+        utc_now=lambda: "2026-08-05T00:00:00+00:00",
+        progress=progress,
+    )
+
+    assert deadlines == [7_200.0]
+
+
 def test_checkout_status_allows_only_bound_untracked_final_outputs():
     allowed = frozenset(
         {
@@ -1999,10 +2342,20 @@ def test_checkout_status_allows_only_bound_untracked_final_outputs():
         )
 
 
-def _accepted_complete_journal(tmp_path):
+def _accepted_complete_journal(
+    tmp_path,
+    *,
+    manifest_name="baseline.json",
+    raw_output_name="baseline.jsonl",
+):
     workload = build_canonical_workload()
     paired = _valid_paired_representations(workload)
-    session = _session_document(tmp_path, paired_representations=paired)
+    session = _session_document(
+        tmp_path,
+        paired_representations=paired,
+        manifest_name=manifest_name,
+        raw_output_name=raw_output_name,
+    )
     journal = BaselineJournal.open(tmp_path / "state", session)
     trials = _valid_baseline_trials(workload)
     for trial in trials:
@@ -2072,6 +2425,83 @@ def test_final_publication_never_overwrites_different_existing_output(tmp_path):
 
     assert raw_path.read_text(encoding="utf-8") == "different existing content\n"
     assert not journal.completed_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("manifest_name", "raw_output_name"),
+    (
+        ("same.json", "same.json"),
+        ("baseline.json", "state/completed.json"),
+        ("state/final-manifest.json", "baseline.jsonl"),
+    ),
+)
+def test_final_publication_rejects_colliding_or_journal_contained_outputs(
+    tmp_path, manifest_name, raw_output_name
+):
+    workload, paired, journal, trials = _accepted_complete_journal(
+        tmp_path,
+        manifest_name=manifest_name,
+        raw_output_name=raw_output_name,
+    )
+    manifest_path = tmp_path / manifest_name
+    raw_path = tmp_path / raw_output_name
+
+    with pytest.raises(ValueError, match="final output paths"):
+        publish_baseline_from_journal(
+            journal=journal,
+            trials=trials,
+            workload=workload,
+            workload_identity=canonical_workload_identity(workload),
+            source_commit=trials[0].source_commit,
+            harness_commit=trials[0].harness_commit,
+            harness_identity=trials[0].harness_identity,
+            command="record-baseline --state-directory state",
+            paired_representations=paired,
+            manifest_path=manifest_path,
+            raw_output_path=raw_path,
+        )
+
+    assert not journal.completed_path.exists()
+    for path in (manifest_path, raw_path):
+        if not path.is_relative_to(journal.root):
+            assert not path.exists()
+    assert (
+        BaselineJournal.open(journal.root, journal.session).session == journal.session
+    )
+
+
+def test_detached_worktree_cleans_registration_after_verification_error(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    destination = tmp_path / "source"
+    commit = "a" * 40
+    registered = set()
+    commands = []
+
+    def run(command, *, cwd, check):
+        commands.append(command)
+        if command[:3] == ("git", "worktree", "add"):
+            registered.add(Path(command[-2]))
+        elif command[:3] == ("git", "worktree", "remove"):
+            registered.remove(Path(command[-1]))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(benchmark_runner.subprocess, "run", run)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_require_clean_checkout",
+        lambda path, label: (_ for _ in ()).throw(RuntimeError("verification failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="verification failed"):
+        benchmark_runner._create_detached_worktree(repository, commit, destination)
+
+    assert registered == set()
+    assert [command[:3] for command in commands] == [
+        ("git", "worktree", "add"),
+        ("git", "worktree", "remove"),
+    ]
 
 
 def test_baseline_journal_resumes_only_an_identical_session(tmp_path):
