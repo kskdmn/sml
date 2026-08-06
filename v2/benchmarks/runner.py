@@ -12,12 +12,27 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 from v2.benchmarks.analysis import analyze_pairs
+from v2.benchmarks.journal import (
+    BaselineJournal,
+    BaselineSlot,
+    JournalAttempt,
+    atomic_write_json,
+    atomic_write_text,
+    build_session_document,
+    read_json_object,
+    require_external_state_directory,
+)
+from v2.benchmarks.recovery import (
+    ThermalRecoveryTimeout,
+    wait_for_nominal_thermal_window,
+)
 from v2.benchmarks.schema import METRIC_NAMES, CanonicalWorkload, MetricName, RawTrial
 from v2.benchmarks.workload import (
     LEGACY_PRECISION_POLICY,
@@ -100,6 +115,10 @@ def _raw_trial_identity(trial: RawTrial) -> str:
     return structured_identity("sml-raw-benchmark-trial-v1", trial.to_dict())
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _metric_report_dict(report) -> dict:
     return json.loads(json.dumps(asdict(report)))
 
@@ -175,6 +194,80 @@ def build_baseline_manifest(
         **body,
         "identity": structured_identity("sml-performance-baseline-v1", body),
     }
+
+
+def validate_baseline_trial(
+    trial: RawTrial,
+    *,
+    workload: CanonicalWorkload,
+    source_commit: str,
+    harness_commit: str,
+    harness_identity: str,
+    expected_hardware: dict,
+    expected_software_versions: dict[str, str],
+    allow_non_nominal_thermal: bool = False,
+) -> None:
+    if trial.side != "reference":
+        raise ValueError("baseline raw trials must be reference-side records")
+    if trial.attempt_index != 0:
+        raise ValueError("baseline raw trials cannot be retry attempts")
+    if trial.pair_index not in range(SCREEN_PAIRS):
+        raise ValueError("baseline raw trial has an invalid pair index")
+    if trial.source_commit != source_commit:
+        raise ValueError("raw source commit does not match baseline")
+    if trial.harness_commit != harness_commit:
+        raise ValueError("raw harness commit does not match baseline")
+    if trial.harness_identity != harness_identity:
+        raise ValueError("raw harness identity does not match baseline")
+    workload_identity = canonical_workload_identity(workload)
+    if trial.canonical_workload_identity != workload_identity:
+        raise ValueError("raw canonical workload identity does not match baseline")
+    if (
+        trial.canonical_row_identity
+        != workload.semantic_identities["canonical_training_rows"]
+    ):
+        raise ValueError("raw canonical row identity does not match baseline")
+    if trial.canonical_input_identity != canonical_input_identity(
+        trial.metric, workload
+    ):
+        raise ValueError("raw canonical input identity does not match baseline")
+    expected_projection = canonical_metric_projection(trial.metric, workload)
+    if trial.canonical_projection != expected_projection:
+        raise ValueError("raw adapter failed canonical workload round trip")
+    if trial.execution_order_identity != canonical_execution_order_identity(
+        trial.metric, workload
+    ):
+        raise ValueError("raw adapter used the wrong logical work order")
+    if trial.native_configuration.get(
+        "canonical_projection_identity"
+    ) != structured_identity("sml-benchmark-metric-projection-v1", expected_projection):
+        raise ValueError("raw native projection identity is invalid")
+    expected_units = next(
+        unit.measured_units
+        for unit in workload.work_units
+        if unit.metric == trial.metric
+    )
+    expected_warmup = 0 if trial.metric == "compile-cold-start" else WARMUP_UNITS
+    if trial.measured_units != expected_units or trial.warmup_units != expected_warmup:
+        raise ValueError("raw trial uses the wrong warmup or measured units")
+    if trial.startup_verification_seconds is None:
+        raise ValueError("raw trial omitted mandatory startup verification")
+    if trial.synchronization_boundaries != workload.synchronization_boundaries:
+        raise ValueError("raw synchronization boundaries do not match workload")
+    if trial.native_configuration.get("rope_scaling_factor") != 1.0:
+        raise ValueError("raw native configuration must pin rope_scaling_factor=1.0")
+    if not math.isfinite(trial.value) or trial.value <= 0:
+        raise ValueError("raw benchmark value must be finite and positive")
+    _validate_acceptance_environment(
+        workload,
+        trial,
+        allow_non_nominal_thermal=allow_non_nominal_thermal,
+    )
+    if trial.hardware != expected_hardware:
+        raise ValueError("raw hardware records are inconsistent")
+    if trial.software_versions != expected_software_versions:
+        raise ValueError("raw software-version records are inconsistent")
+    _validate_software_versions(workload, trial.software_versions)
 
 
 def validate_baseline_manifest(
@@ -318,69 +411,15 @@ def validate_baseline_manifest(
         if [trial.pair_index for trial in metric_trials] != list(range(pairs)):
             raise ValueError(f"baseline metric {metric} has invalid pair indices")
         for trial in metric_trials:
-            if trial.side != "reference":
-                raise ValueError("baseline raw trials must be reference-side records")
-            if trial.attempt_index != 0:
-                raise ValueError("baseline raw trials cannot be retry attempts")
-            if trial.source_commit != source.get("commit"):
-                raise ValueError("raw source commit does not match baseline")
-            if trial.harness_commit != harness.get("commit"):
-                raise ValueError("raw harness commit does not match baseline")
-            if trial.harness_identity != harness.get("content_identity"):
-                raise ValueError("raw harness identity does not match baseline")
-            if trial.canonical_workload_identity != workload_identity:
-                raise ValueError(
-                    "raw canonical workload identity does not match baseline"
-                )
-            if (
-                trial.canonical_row_identity
-                != workload.semantic_identities["canonical_training_rows"]
-            ):
-                raise ValueError("raw canonical row identity does not match baseline")
-            if trial.canonical_input_identity != canonical_input_identity(
-                metric, workload
-            ):
-                raise ValueError("raw canonical input identity does not match baseline")
-            expected_projection = canonical_metric_projection(metric, workload)
-            if trial.canonical_projection != expected_projection:
-                raise ValueError("raw adapter failed canonical workload round trip")
-            if trial.execution_order_identity != canonical_execution_order_identity(
-                metric, workload
-            ):
-                raise ValueError("raw adapter used the wrong logical work order")
-            if trial.native_configuration.get(
-                "canonical_projection_identity"
-            ) != structured_identity(
-                "sml-benchmark-metric-projection-v1", expected_projection
-            ):
-                raise ValueError("raw native projection identity is invalid")
-            expected_units = next(
-                unit.measured_units
-                for unit in workload.work_units
-                if unit.metric == metric
+            validate_baseline_trial(
+                trial,
+                workload=workload,
+                source_commit=source["commit"],
+                harness_commit=harness["commit"],
+                harness_identity=harness["content_identity"],
+                expected_hardware=manifest["hardware"],
+                expected_software_versions=manifest["software_versions"],
             )
-            expected_warmup = 0 if metric == "compile-cold-start" else WARMUP_UNITS
-            if (
-                trial.measured_units != expected_units
-                or trial.warmup_units != expected_warmup
-            ):
-                raise ValueError("raw trial uses the wrong warmup or measured units")
-            if trial.startup_verification_seconds is None:
-                raise ValueError("raw trial omitted mandatory startup verification")
-            if trial.synchronization_boundaries != workload.synchronization_boundaries:
-                raise ValueError("raw synchronization boundaries do not match workload")
-            if trial.native_configuration.get("rope_scaling_factor") != 1.0:
-                raise ValueError(
-                    "raw native configuration must pin rope_scaling_factor=1.0"
-                )
-            if not math.isfinite(trial.value) or trial.value <= 0:
-                raise ValueError("raw benchmark value must be finite and positive")
-            _validate_acceptance_environment(workload, trial)
-            if trial.hardware != manifest["hardware"]:
-                raise ValueError("raw hardware records are inconsistent")
-            if trial.software_versions != manifest["software_versions"]:
-                raise ValueError("raw software-version records are inconsistent")
-            _validate_software_versions(workload, trial.software_versions)
         expected_trial_identities = [
             _raw_trial_identity(trial) for trial in metric_trials
         ]
@@ -442,6 +481,8 @@ def validate_baseline_manifest(
 def _validate_acceptance_environment(
     workload: CanonicalWorkload,
     trial: RawTrial,
+    *,
+    allow_non_nominal_thermal: bool = False,
 ) -> None:
     validate_thermal_observation(trial.environment_status)
     required = workload.required_environment
@@ -452,12 +493,16 @@ def _validate_acceptance_environment(
         "power_connected",
         "power_mode",
         "low_power_mode",
-        "thermal_state",
         "memory_pressure",
         "competing_gpu_workload",
     ):
         if trial.environment_status.get(key) != required[key]:
             raise ValueError(f"raw environment does not match required {key}")
+    if (
+        not allow_non_nominal_thermal
+        and trial.environment_status.get("thermal_state") != required["thermal_state"]
+    ):
+        raise ValueError("raw environment does not match required thermal_state")
 
 
 def _validate_software_versions(
@@ -1374,6 +1419,16 @@ def _require_clean_checkout(path: Path, *, label: str) -> None:
         raise RuntimeError(f"{label} checkout must be clean before measurement")
 
 
+def validate_checkout_status(
+    status: str, *, allowed_untracked_paths: frozenset[str]
+) -> None:
+    for line in status.splitlines():
+        if not line:
+            continue
+        if not line.startswith("?? ") or line[3:] not in allowed_untracked_paths:
+            raise ValueError("checkout must be clean before measurement")
+
+
 def _system_profiler(data_type: str) -> dict:
     output = subprocess.run(
         ("system_profiler", data_type, "-json"),
@@ -1876,9 +1931,311 @@ def _launch_trial(
     return RawTrial.from_dict(raw)
 
 
+def _next_capture_indices(
+    journal: BaselineJournal, slot: BaselineSlot
+) -> tuple[int, int]:
+    preflight_history = journal._validate_preflight_history()
+    recovery_history = journal._validate_thermal_recovery_history()
+    return len(preflight_history.get(slot, ())), len(recovery_history.get(slot, ()))
+
+
+def capture_baseline_trials(
+    *,
+    journal: BaselineJournal,
+    slots: Sequence[BaselineSlot],
+    launch_trial: Callable[[BaselineSlot, JournalAttempt], RawTrial],
+    preflight: Callable[[], tuple[dict, dict, dict]],
+    validate_preflight: Callable[[dict, dict, dict], None],
+    recover: Callable[[BaselineSlot, int, float, dict], None],
+    validate_trial: Callable[[RawTrial, bool], None],
+    clock: Callable[[], float] = time.monotonic,
+    utc_now: Callable[[], str] = _utc_now_iso,
+    progress: Callable[[str], None] = print,
+) -> tuple[RawTrial, ...]:
+    ordered_slots = tuple(slots)
+    accepted = journal.load_accepted(ordered_slots)
+    for slot in ordered_slots:
+        if slot not in accepted:
+            continue
+        trial = accepted[slot]
+        validate_trial(trial, allow_non_nominal_thermal=False)
+        progress(f"resumed accepted {slot.metric} pair {slot.pair_index}")
+
+    pending_triggers: dict[BaselineSlot, dict] = {}
+    for attempt in journal.load_inflight(ordered_slots):
+        raw = read_json_object(attempt.path, label="inflight trial")
+        trial = RawTrial.from_dict(raw)
+        validate_trial(trial, allow_non_nominal_thermal=True)
+        if trial.environment_status["thermal_state"] == "nominal":
+            journal.accept_inflight(attempt, trial)
+            accepted[attempt.slot] = trial
+            progress(
+                f"accepted in-flight {attempt.slot.metric} pair "
+                f"{attempt.slot.pair_index} ({len(accepted)}/{len(ordered_slots)})"
+            )
+            continue
+        journal.reject_inflight(attempt, trial, reason="non-nominal-thermal")
+        rejected = read_json_object(
+            journal.rejected_path(attempt.slot, attempt.journal_attempt_index),
+            label="rejected trial",
+        )
+        pending_triggers[attempt.slot] = {
+            "source": "rejected-trial",
+            "rejected_trial_identity": rejected["identity"],
+        }
+        progress(
+            f"rejected in-flight {attempt.slot.metric} pair "
+            f"{attempt.slot.pair_index}: thermal="
+            f"{trial.environment_status['thermal_state']} "
+            f"raw={trial.environment_status['thermal_state_raw_value']}"
+        )
+
+    for slot in ordered_slots:
+        if slot in accepted:
+            continue
+        preflight_index, recovery_index = _next_capture_indices(journal, slot)
+        recovery_deadline: float | None = None
+        pending_trigger = pending_triggers.get(slot)
+
+        while slot not in accepted:
+            if pending_trigger is not None:
+                if recovery_deadline is None:
+                    recovery_deadline = clock() + 7_200.0
+                progress(
+                    f"thermal recovery {slot.metric} pair {slot.pair_index} "
+                    f"episode {recovery_index}"
+                )
+                recover(slot, recovery_index, recovery_deadline, pending_trigger)
+                progress(
+                    f"thermal recovery complete {slot.metric} pair {slot.pair_index} "
+                    f"episode {recovery_index}"
+                )
+                recovery_index += 1
+                pending_trigger = None
+
+            hardware, status, software_versions = preflight()
+            preflight_document = journal.record_preflight(
+                slot,
+                preflight_index,
+                {
+                    "observed_at_utc": utc_now(),
+                    "hardware": hardware,
+                    "environment_status": status,
+                    "software_versions": software_versions,
+                },
+            )
+            progress(
+                f"recorded preflight {slot.metric} pair {slot.pair_index} "
+                f"check {preflight_index}"
+            )
+            preflight_index += 1
+            validate_preflight(hardware, status, software_versions)
+            if status["thermal_state"] != "nominal":
+                pending_trigger = {
+                    "source": "preflight",
+                    "preflight": preflight_document,
+                }
+                continue
+
+            attempt = journal.next_attempt(slot)
+            progress(
+                f"launching {slot.metric} pair {slot.pair_index} "
+                f"journal attempt {attempt.journal_attempt_index}"
+            )
+            launched_trial = launch_trial(slot, attempt)
+            if not attempt.path.exists():
+                atomic_write_json(
+                    attempt.path, launched_trial.to_dict(), create_only=True
+                )
+            persisted = RawTrial.from_dict(
+                read_json_object(attempt.path, label="inflight trial")
+            )
+            if persisted != launched_trial:
+                raise ValueError("launched trial does not match in-flight output")
+            validate_trial(persisted, allow_non_nominal_thermal=True)
+            if persisted.environment_status["thermal_state"] == "nominal":
+                journal.accept_inflight(attempt, persisted)
+                accepted[slot] = persisted
+                progress(
+                    f"accepted {slot.metric} pair {slot.pair_index} "
+                    f"({len(accepted)}/{len(ordered_slots)})"
+                )
+                continue
+
+            journal.reject_inflight(attempt, persisted, reason="non-nominal-thermal")
+            rejected = read_json_object(
+                journal.rejected_path(slot, attempt.journal_attempt_index),
+                label="rejected trial",
+            )
+            pending_trigger = {
+                "source": "rejected-trial",
+                "rejected_trial_identity": rejected["identity"],
+            }
+            progress(
+                f"rejected {slot.metric} pair {slot.pair_index}: thermal="
+                f"{persisted.environment_status['thermal_state']} "
+                f"raw={persisted.environment_status['thermal_state_raw_value']}"
+            )
+
+    return tuple(accepted[slot] for slot in ordered_slots)
+
+
+def _validate_baseline_preflight(
+    *,
+    workload: CanonicalWorkload,
+    hardware: dict,
+    status: dict,
+    software_versions: dict,
+    expected_hardware: dict,
+    expected_software_versions: dict[str, str],
+) -> None:
+    if hardware != expected_hardware:
+        raise ValueError("preflight hardware does not match the baseline session")
+    if software_versions != expected_software_versions:
+        raise ValueError(
+            "preflight software versions do not match the baseline session"
+        )
+    validate_thermal_observation(status)
+    required = workload.required_environment
+    for key in ("chip", "cpu_cores", "gpu_cores", "unified_memory_bytes"):
+        if hardware.get(key) != required[key]:
+            raise ValueError(f"preflight hardware does not match required {key}")
+    for key in (
+        "power_connected",
+        "power_mode",
+        "low_power_mode",
+        "memory_pressure",
+        "competing_gpu_workload",
+    ):
+        if status.get(key) != required[key]:
+            raise ValueError(f"preflight environment does not match required {key}")
+    _validate_software_versions(workload, software_versions)
+
+
+def _allowed_checkout_output_paths(
+    harness_root: Path, paths: Sequence[Path]
+) -> frozenset[str]:
+    allowed = set()
+    for path in paths:
+        try:
+            allowed.add(path.resolve().relative_to(harness_root).as_posix())
+        except ValueError:
+            continue
+    return frozenset(allowed)
+
+
+def _publish_final_artifact(path: Path, text: str) -> None:
+    expected = text.encode("utf-8")
+    try:
+        atomic_write_text(path, text, create_only=True)
+    except FileExistsError:
+        try:
+            existing = path.read_bytes()
+        except OSError as error:
+            raise ValueError(
+                "final artifact already exists with different content"
+            ) from error
+        if existing != expected:
+            raise ValueError("final artifact already exists with different content")
+
+
+def publish_baseline_from_journal(
+    *,
+    journal: BaselineJournal,
+    trials: Sequence[RawTrial],
+    workload: CanonicalWorkload,
+    workload_identity: str,
+    source_commit: str,
+    harness_commit: str,
+    harness_identity: str,
+    command: str,
+    paired_representations: dict,
+    manifest_path: Path,
+    raw_output_path: Path,
+) -> dict:
+    if journal.session["paired_representations"] != paired_representations:
+        raise ValueError("publication paired representations do not match the session")
+    if journal.session["manifest_path"] != str(manifest_path.resolve()):
+        raise ValueError("publication manifest path does not match the session")
+    if journal.session["raw_output_path"] != str(raw_output_path.resolve()):
+        raise ValueError("publication raw output path does not match the session")
+
+    slots = BaselineJournal.expected_slots(METRIC_NAMES, SCREEN_PAIRS)
+    accepted = journal.load_accepted(slots)
+    if len(accepted) != len(slots):
+        raise ValueError("baseline journal does not contain every accepted slot")
+    ordered_trials = tuple(accepted[slot] for slot in slots)
+    if tuple(trials) != ordered_trials:
+        raise ValueError("publication trials do not exactly match accepted slots")
+
+    manifest = build_baseline_manifest(
+        trials=ordered_trials,
+        workload=workload,
+        workload_identity=workload_identity,
+        source_commit=source_commit,
+        harness_commit=harness_commit,
+        harness_identity=harness_identity,
+        command=command,
+        pairs=SCREEN_PAIRS,
+        warmup_units=WARMUP_UNITS,
+        measured_units=DEFAULT_MEASURED_UNITS,
+        paired_representations=paired_representations,
+    )
+    validate_baseline_manifest(manifest, ordered_trials)
+
+    raw_text = "".join(
+        json.dumps(trial.to_dict(), sort_keys=True, ensure_ascii=False) + "\n"
+        for trial in ordered_trials
+    )
+    manifest_text = (
+        json.dumps(manifest, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    )
+    _publish_final_artifact(raw_output_path, raw_text)
+    _publish_final_artifact(manifest_path, manifest_text)
+
+    completion_body = {
+        "kind": "sml-baseline-journal-completion",
+        "version": 1,
+        "session_identity": journal.session["identity"],
+        "baseline_identity": manifest["identity"],
+        "manifest_path": str(manifest_path.resolve()),
+        "raw_output_path": str(raw_output_path.resolve()),
+        "raw_trial_identities": [
+            _raw_trial_identity(trial) for trial in ordered_trials
+        ],
+    }
+    journal.publish_completed(
+        {
+            **completion_body,
+            "identity": structured_identity(
+                "sml-baseline-journal-completion-v1", completion_body
+            ),
+        }
+    )
+    return manifest
+
+
 def _record_baseline(args: argparse.Namespace) -> int:
     harness_root = _git_root(Path.cwd())
-    _require_clean_checkout(harness_root, label="harness")
+    state_root = require_external_state_directory(args.state_directory, (harness_root,))
+    allowed_outputs = frozenset()
+    session_path = state_root / "session.json"
+    if session_path.is_file():
+        existing_session = read_json_object(
+            session_path, label="baseline journal session"
+        )
+        BaselineJournal.open(state_root, existing_session)
+        if existing_session["manifest_path"] == str(
+            args.manifest.resolve()
+        ) and existing_session["raw_output_path"] == str(args.raw_output.resolve()):
+            allowed_outputs = _allowed_checkout_output_paths(
+                harness_root, (args.manifest, args.raw_output)
+            )
+    harness_status = _run_command(
+        ("git", "status", "--porcelain", "--untracked-files=all"),
+        cwd=harness_root,
+    )
+    validate_checkout_status(harness_status, allowed_untracked_paths=allowed_outputs)
     harness_commit = _git_commit(harness_root)
     harness_identity = harness_content_identity(harness_root)
     source_commit = _git_commit(harness_root, args.source_commit)
@@ -1893,40 +2250,149 @@ def _record_baseline(args: argparse.Namespace) -> int:
         raise ValueError("record-baseline protocol is immutable")
     workload = build_canonical_workload()
     workload_identity = canonical_workload_identity(workload)
+    initial_environment = collect_environment()
+    initial_hardware, _initial_status, initial_software_versions = initial_environment
+    protocol = {
+        "pairs": args.pairs,
+        "compilation_passes": 1,
+        "warmup_units": args.warmup,
+        "measured_units": args.measure,
+        "bootstrap_seed": 1729,
+        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
+        "synchronization_boundaries": list(workload.synchronization_boundaries),
+    }
     with tempfile.TemporaryDirectory(prefix="sml-v2-baseline-") as temporary_name:
         temporary = Path(temporary_name)
         paired_representations = write_paired_pretraining_representations(
             fixed_canonical_rows(), temporary / "paired-representations"
         )
+        session = build_session_document(
+            harness_commit=harness_commit,
+            harness_identity=harness_identity,
+            source_commit=source_commit,
+            canonical_workload=workload,
+            canonical_workload_identity=workload_identity,
+            protocol=protocol,
+            hardware=initial_hardware,
+            software_versions=initial_software_versions,
+            paired_representations=paired_representations,
+            manifest_path=args.manifest,
+            raw_output_path=args.raw_output,
+        )
+        journal = BaselineJournal.open(state_root, session)
+        slots = BaselineJournal.expected_slots(args.metrics, args.pairs)
         source_root = temporary / "source"
         _create_detached_worktree(harness_root, source_commit, source_root)
         try:
-            trials = []
-            for metric in args.metrics:
-                for pair_index in range(args.pairs):
-                    trials.append(
-                        _launch_trial(
-                            harness_root=harness_root,
-                            source_root=source_root,
-                            source_commit=source_commit,
-                            harness_commit=harness_commit,
-                            harness_identity=harness_identity,
-                            adapter="legacy",
-                            metric=metric,
-                            side="reference",
-                            attempt_index=0,
-                            pair_index=pair_index,
-                            order=0,
-                            warmup=args.warmup,
-                            measure=args.measure,
-                            comparison_target="baseline",
-                            output=temporary / f"{metric}-{pair_index}.json",
-                        )
+            require_external_state_directory(state_root, (harness_root, source_root))
+            cached_preflight = [initial_environment]
+
+            def collect_preflight():
+                if cached_preflight:
+                    return cached_preflight.pop()
+                return collect_environment()
+
+            def recover_thermal(
+                slot: BaselineSlot,
+                recovery_index: int,
+                deadline: float,
+                trigger: dict,
+            ) -> None:
+                journal.record_recovery_trigger(slot, recovery_index, trigger)
+
+                def record_sample(sample_index: int, sample: dict) -> None:
+                    journal.record_thermal_sample(
+                        slot, recovery_index, sample_index, sample
                     )
+                    print(
+                        f"thermal sample {slot.metric} pair {slot.pair_index} "
+                        f"episode {recovery_index}: elapsed="
+                        f"{sample['elapsed_seconds']:.1f}s"
+                    )
+
+                try:
+                    result = wait_for_nominal_thermal_window(
+                        collect=collect_environment,
+                        expected_hardware=initial_hardware,
+                        expected_software_versions=initial_software_versions,
+                        required_environment=workload.required_environment,
+                        record_sample=record_sample,
+                        deadline=deadline,
+                        clock=time.monotonic,
+                        sleep=time.sleep,
+                        utc_now=_utc_now_iso,
+                    )
+                except ThermalRecoveryTimeout as error:
+                    journal.record_recovery_summary(
+                        slot,
+                        recovery_index,
+                        {
+                            "outcome": "timeout",
+                            "duration_seconds": error.result.duration_seconds,
+                            "sample_count": error.result.sample_count,
+                        },
+                    )
+                    raise
+                journal.record_recovery_summary(
+                    slot,
+                    recovery_index,
+                    {
+                        "outcome": "nominal-window",
+                        "duration_seconds": result.duration_seconds,
+                        "sample_count": result.sample_count,
+                    },
+                )
+
+            trials = capture_baseline_trials(
+                journal=journal,
+                slots=slots,
+                launch_trial=lambda slot, attempt: _launch_trial(
+                    harness_root=harness_root,
+                    source_root=source_root,
+                    source_commit=source_commit,
+                    harness_commit=harness_commit,
+                    harness_identity=harness_identity,
+                    adapter="legacy",
+                    metric=slot.metric,
+                    side="reference",
+                    attempt_index=0,
+                    pair_index=slot.pair_index,
+                    order=0,
+                    warmup=args.warmup,
+                    measure=args.measure,
+                    comparison_target="baseline",
+                    output=attempt.path,
+                ),
+                preflight=collect_preflight,
+                validate_preflight=lambda hardware, status, software: (
+                    _validate_baseline_preflight(
+                        workload=workload,
+                        hardware=hardware,
+                        status=status,
+                        software_versions=software,
+                        expected_hardware=initial_hardware,
+                        expected_software_versions=initial_software_versions,
+                    )
+                ),
+                recover=recover_thermal,
+                validate_trial=lambda trial, allow_non_nominal_thermal: (
+                    validate_baseline_trial(
+                        trial,
+                        workload=workload,
+                        source_commit=source_commit,
+                        harness_commit=harness_commit,
+                        harness_identity=harness_identity,
+                        expected_hardware=initial_hardware,
+                        expected_software_versions=initial_software_versions,
+                        allow_non_nominal_thermal=allow_non_nominal_thermal,
+                    )
+                ),
+            )
         finally:
             _remove_worktree(harness_root, source_root)
     command = shlex.join((sys.executable, "-m", "v2.benchmarks.runner", *sys.argv[1:]))
-    manifest = build_baseline_manifest(
+    publish_baseline_from_journal(
+        journal=journal,
         trials=trials,
         workload=workload,
         workload_identity=workload_identity,
@@ -1934,14 +2400,10 @@ def _record_baseline(args: argparse.Namespace) -> int:
         harness_commit=harness_commit,
         harness_identity=harness_identity,
         command=command,
-        pairs=args.pairs,
-        warmup_units=args.warmup,
-        measured_units=args.measure,
         paired_representations=paired_representations,
+        manifest_path=args.manifest,
+        raw_output_path=args.raw_output,
     )
-    validate_baseline_manifest(manifest, trials)
-    _write_jsonl(args.raw_output, trials)
-    _write_json(args.manifest, manifest)
     return 0
 
 
@@ -2668,6 +3130,12 @@ def build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("--source-commit", required=True)
     baseline.add_argument("--manifest", type=Path, required=True)
     baseline.add_argument("--raw-output", type=Path, required=True)
+    baseline.add_argument(
+        "--state-directory",
+        type=Path,
+        required=True,
+        help="external durable journal directory for baseline resume and diagnostics",
+    )
     baseline.add_argument("--metrics", type=parse_metrics, default=METRIC_NAMES)
     baseline.add_argument("--pairs", type=int, default=5)
     baseline.add_argument("--warmup", type=int, default=20)

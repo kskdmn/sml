@@ -23,6 +23,45 @@ rejects metric subsets, changed protocol values, duplicate raw records, a
 different canonical projection or logical work order, and environment or
 software mismatches.
 
+Baseline capture also requires `--state-directory PATH`. The path is resolved
+before use and must be outside both the harness checkout and the detached pinned
+source checkout. It is a durable journal that remains after success or failure:
+
+```text
+<state-directory>/
+├── session.json
+├── accepted/<metric>/<pair-index>.json
+├── rejected/<metric>/<pair-index>/<attempt-index>.json
+├── inflight/<metric>/<pair-index>/<attempt-index>.json
+├── preflight/<metric>/<pair-index>/<preflight-index>.json
+├── thermal-waits/<metric>/<pair-index>/<recovery-index>/
+│   ├── trigger.json
+│   ├── <sample-index>.json
+│   └── summary.json
+└── completed.json
+```
+
+Every preflight is persisted before validation. A non-thermal hardware,
+software, power, memory-pressure, competing-workload, protocol, identity,
+subprocess, or schema failure stops the invocation and leaves the journal for
+diagnosis. Only a consistent non-nominal thermal observation enters recovery.
+Recovery samples at intervals no longer than 30 seconds and permits another
+trial only after five continuous minutes of nominal thermals. The first thermal
+violation for a missing slot starts one two-hour deadline for that slot during
+the invocation; rejected retries do not reset it. Rejected trials and recovery
+samples remain diagnostic evidence and never enter the baseline.
+
+Resume requires the exact same harness commit and content identity, pinned
+source commit, canonical workload, immutable protocol, hardware, software,
+paired representations, and resolved final output paths. Compatible accepted
+slots are validated and reused; a complete in-flight trial is classified before
+any replacement is launched, and only the same thermally rejected slot is
+retried. The final raw JSONL and manifest remain absent until all 45 canonical
+slots validate. Publication creates the raw JSONL first, the manifest second,
+and `completed.json` last; existing identical bytes are accepted for crash
+resume, while different final content is never overwritten. The external
+journal is retained for auditability.
+
 Comparisons have two strict profiles. Screen mode uses five pairs, a 0.97 median
 gate, 2% maximum dispersion, and a report-only confidence bound. Final mode uses
 ten pairs, 1.5% maximum dispersion, required lower bounds, and a 1.03 baseline

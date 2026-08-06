@@ -34,6 +34,7 @@ from v2.benchmarks.journal import (
     require_external_state_directory,
 )
 from v2.benchmarks.recovery import (
+    ThermalRecoveryResult,
     ThermalRecoveryTimeout,
     wait_for_nominal_thermal_window,
 )
@@ -43,6 +44,7 @@ from v2.benchmarks.runner import (
     build_baseline_manifest,
     build_comparison_report,
     build_parser,
+    capture_baseline_trials,
     comparison_has_noise,
     detect_competing_gpu_workload,
     decode_thermal_state,
@@ -53,7 +55,9 @@ from v2.benchmarks.runner import (
     parse_power_status,
     perform_cooldown,
     process_order,
+    publish_baseline_from_journal,
     validate_baseline_manifest,
+    validate_checkout_status,
     validate_comparison_report,
     validate_cooldown_evidence,
     validate_final_report,
@@ -680,6 +684,8 @@ def test_metric_parser_rejects_unknown_or_duplicate_names():
             "manifest.json",
             "--raw-output",
             "raw.jsonl",
+            "--state-directory",
+            "state",
         ],
         [
             "compare",
@@ -705,6 +711,21 @@ def test_metric_parser_rejects_unknown_or_duplicate_names():
 )
 def test_runner_parser_accepts_the_planned_operations(argv):
     assert build_parser().parse_args(argv).operation == argv[0]
+
+
+def test_record_baseline_parser_requires_state_directory():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "record-baseline",
+                "--source-commit",
+                "3687f8b",
+                "--manifest",
+                "manifest.json",
+                "--raw-output",
+                "raw.jsonl",
+            ]
+        )
 
 
 def test_final_mode_is_inferred_only_for_the_strict_ten_pair_protocol():
@@ -1718,6 +1739,339 @@ def _session_document(
         manifest_path=tmp_path / manifest_name,
         raw_output_path=tmp_path / raw_output_name,
     )
+
+
+def test_capture_retries_only_the_thermal_slot_and_resumes_accepted_slots(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slots = (
+        BaselineSlot("prepared-data", 0),
+        BaselineSlot("prepared-data", 1),
+    )
+    accepted_first = _valid_raw_trial(workload, pair_index=0)
+    first_attempt = journal.next_attempt(slots[0])
+    atomic_write_json(first_attempt.path, accepted_first.to_dict(), create_only=True)
+    journal.accept_inflight(first_attempt, accepted_first)
+    launches = []
+
+    def launch(slot, attempt):
+        launches.append(slot)
+        base = _valid_raw_trial(workload, pair_index=slot.pair_index)
+        if len(launches) == 1:
+            return replace(
+                base,
+                environment_status={
+                    **base.environment_status,
+                    "thermal_state": "fair",
+                    "thermal_state_raw_value": 1,
+                },
+            )
+        return base
+
+    recovered = []
+    trials = capture_baseline_trials(
+        journal=journal,
+        slots=slots,
+        launch_trial=launch,
+        preflight=lambda: (
+            accepted_first.hardware,
+            accepted_first.environment_status,
+            accepted_first.software_versions,
+        ),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda slot, recovery_index, deadline, trigger: recovered.append(slot),
+        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        clock=lambda: 0.0,
+        utc_now=lambda: "2026-08-05T00:00:00+00:00",
+        progress=lambda message: None,
+    )
+
+    assert launches == [slots[1], slots[1]]
+    assert recovered == [slots[1]]
+    assert [(trial.metric, trial.pair_index) for trial in trials] == [
+        ("prepared-data", 0),
+        ("prepared-data", 1),
+    ]
+    rejected = read_json_object(
+        journal.rejected_path(slots[1], 0), label="rejected trial"
+    )
+    assert rejected["trial"]["environment_status"]["thermal_state"] == "fair"
+
+
+def test_capture_reports_resumed_slots_in_supplied_order(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slots = (
+        BaselineSlot("prepared-data", 1),
+        BaselineSlot("prepared-data", 0),
+    )
+    for slot in reversed(slots):
+        trial = _valid_raw_trial(workload, pair_index=slot.pair_index)
+        attempt = journal.next_attempt(slot)
+        atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+        journal.accept_inflight(attempt, trial)
+    messages = []
+
+    capture_baseline_trials(
+        journal=journal,
+        slots=slots,
+        launch_trial=lambda slot, attempt: pytest.fail("accepted slot was launched"),
+        preflight=lambda: pytest.fail("accepted slot reached preflight"),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda slot, recovery_index, deadline, trigger: None,
+        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        progress=messages.append,
+    )
+
+    assert messages == [
+        "resumed accepted prepared-data pair 1",
+        "resumed accepted prepared-data pair 0",
+    ]
+
+
+def test_capture_passes_the_thermal_policy_to_trial_validation_by_keyword(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    trial = _valid_raw_trial(workload)
+    attempt = journal.next_attempt(slot)
+    atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+    policies = []
+
+    def validate(current_trial, *, allow_non_nominal_thermal):
+        policies.append(allow_non_nominal_thermal)
+
+    capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, current_attempt: pytest.fail(
+            "complete in-flight trial was relaunched"
+        ),
+        preflight=lambda: pytest.fail("accepted in-flight slot reached preflight"),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda current_slot, recovery_index, deadline, trigger: None,
+        validate_trial=validate,
+        progress=lambda message: None,
+    )
+
+    assert policies == [True]
+
+
+def test_capture_records_preflight_thermal_trigger_before_launch(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    nominal_trial = _valid_raw_trial(workload)
+    fair = {
+        **nominal_trial.environment_status,
+        "thermal_state": "fair",
+        "thermal_state_raw_value": 1,
+    }
+    preflights = iter(
+        [
+            (nominal_trial.hardware, fair, nominal_trial.software_versions),
+            (
+                nominal_trial.hardware,
+                nominal_trial.environment_status,
+                nominal_trial.software_versions,
+            ),
+        ]
+    )
+    triggers = []
+    launches = []
+
+    capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, attempt: (
+            launches.append(current_slot) or nominal_trial
+        ),
+        preflight=lambda: next(preflights),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda current_slot, recovery_index, deadline, trigger: triggers.append(
+            trigger
+        ),
+        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        clock=lambda: 0.0,
+        utc_now=lambda: "2026-08-05T00:00:00+00:00",
+        progress=lambda message: None,
+    )
+
+    assert launches == [slot]
+    assert triggers[0]["source"] == "preflight"
+    assert (
+        triggers[0]["preflight"]["environment_status"]["thermal_state_raw_value"] == 1
+    )
+    assert journal.preflight_path(slot, 0).is_file()
+
+
+def test_capture_classifies_complete_inflight_before_launching(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    trial = _valid_raw_trial(workload)
+    atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+
+    trials = capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, current_attempt: pytest.fail(
+            "resume launched a replacement for a complete in-flight trial"
+        ),
+        preflight=lambda: pytest.fail("accepted in-flight slot reached preflight"),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda current_slot, recovery_index, deadline, trigger: None,
+        validate_trial=lambda current_trial, allow_non_nominal_thermal: None,
+        clock=lambda: 0.0,
+        utc_now=lambda: "2026-08-05T00:00:00+00:00",
+        progress=lambda message: None,
+    )
+
+    assert trials == (trial,)
+    assert journal.load_accepted((slot,)) == {slot: trial}
+
+
+def test_capture_timeout_preserves_prior_acceptance_and_rejected_attempt(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    first = BaselineSlot("prepared-data", 0)
+    second = BaselineSlot("prepared-data", 1)
+    accepted = _valid_raw_trial(workload, pair_index=0)
+    attempt = journal.next_attempt(first)
+    atomic_write_json(attempt.path, accepted.to_dict(), create_only=True)
+    journal.accept_inflight(attempt, accepted)
+    fair_trial = replace(
+        _valid_raw_trial(workload, pair_index=1),
+        environment_status={
+            **_valid_raw_trial(workload, pair_index=1).environment_status,
+            "thermal_state": "fair",
+            "thermal_state_raw_value": 1,
+        },
+    )
+
+    def timeout_recovery(current_slot, recovery_index, deadline, trigger):
+        raise ThermalRecoveryTimeout(ThermalRecoveryResult(7_200.0, 241))
+
+    with pytest.raises(ThermalRecoveryTimeout):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(first, second),
+            launch_trial=lambda current_slot, current_attempt: fair_trial,
+            preflight=lambda: (
+                accepted.hardware,
+                accepted.environment_status,
+                accepted.software_versions,
+            ),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=timeout_recovery,
+            validate_trial=lambda current_trial, allow_non_nominal_thermal: None,
+            clock=lambda: 0.0,
+            utc_now=lambda: "2026-08-05T00:00:00+00:00",
+            progress=lambda message: None,
+        )
+
+    assert journal.load_accepted((first, second)) == {first: accepted}
+    assert journal.rejected_path(second, 0).is_file()
+
+
+def test_checkout_status_allows_only_bound_untracked_final_outputs():
+    allowed = frozenset(
+        {
+            "v2/benchmarks/manifests/baseline-3687f8b.json",
+            "v2/benchmarks/results/baseline-3687f8b.jsonl",
+        }
+    )
+    validate_checkout_status(
+        "?? v2/benchmarks/manifests/baseline-3687f8b.json\n"
+        "?? v2/benchmarks/results/baseline-3687f8b.jsonl\n",
+        allowed_untracked_paths=allowed,
+    )
+    with pytest.raises(ValueError, match="checkout must be clean"):
+        validate_checkout_status(
+            "?? v2/benchmarks/manifests/baseline-3687f8b.json\n?? unexpected.txt\n",
+            allowed_untracked_paths=allowed,
+        )
+    with pytest.raises(ValueError, match="checkout must be clean"):
+        validate_checkout_status(
+            " M v2/benchmarks/runner.py\n",
+            allowed_untracked_paths=allowed,
+        )
+
+
+def _accepted_complete_journal(tmp_path):
+    workload = build_canonical_workload()
+    paired = _valid_paired_representations(workload)
+    session = _session_document(tmp_path, paired_representations=paired)
+    journal = BaselineJournal.open(tmp_path / "state", session)
+    trials = _valid_baseline_trials(workload)
+    for trial in trials:
+        slot = BaselineSlot(trial.metric, trial.pair_index)
+        attempt = journal.next_attempt(slot)
+        atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+        journal.accept_inflight(attempt, trial)
+    return workload, paired, journal, trials
+
+
+def test_final_publication_uses_exactly_the_45_accepted_trials(tmp_path):
+    workload, paired, journal, trials = _accepted_complete_journal(tmp_path)
+    manifest_path = tmp_path / "baseline.json"
+    raw_path = tmp_path / "baseline.jsonl"
+
+    manifest = publish_baseline_from_journal(
+        journal=journal,
+        trials=trials,
+        workload=workload,
+        workload_identity=canonical_workload_identity(workload),
+        source_commit=trials[0].source_commit,
+        harness_commit=trials[0].harness_commit,
+        harness_identity=trials[0].harness_identity,
+        command="record-baseline --state-directory state",
+        paired_representations=paired,
+        manifest_path=manifest_path,
+        raw_output_path=raw_path,
+    )
+
+    raw_trials = tuple(
+        RawTrial.from_dict(json.loads(line))
+        for line in raw_path.read_text(encoding="utf-8").splitlines()
+    )
+    validate_baseline_manifest(manifest, raw_trials)
+    assert len(raw_trials) == 45
+    assert [(trial.metric, trial.pair_index) for trial in raw_trials] == [
+        (metric, pair_index) for metric in METRIC_NAMES for pair_index in range(5)
+    ]
+    completed = read_json_object(journal.completed_path, label="completion")
+    assert completed["baseline_identity"] == manifest["identity"]
+    assert completed["raw_trial_identities"] == [
+        benchmark_runner._raw_trial_identity(trial) for trial in raw_trials
+    ]
+
+
+def test_final_publication_never_overwrites_different_existing_output(tmp_path):
+    workload, paired, journal, trials = _accepted_complete_journal(tmp_path)
+    raw_path = tmp_path / "baseline.jsonl"
+    raw_path.write_text("different existing content\n", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError, match="final artifact already exists with different content"
+    ):
+        publish_baseline_from_journal(
+            journal=journal,
+            trials=trials,
+            workload=workload,
+            workload_identity=canonical_workload_identity(workload),
+            source_commit=trials[0].source_commit,
+            harness_commit=trials[0].harness_commit,
+            harness_identity=trials[0].harness_identity,
+            command="record-baseline --state-directory state",
+            paired_representations=paired,
+            manifest_path=tmp_path / "baseline.json",
+            raw_output_path=raw_path,
+        )
+
+    assert raw_path.read_text(encoding="utf-8") == "different existing content\n"
+    assert not journal.completed_path.exists()
 
 
 def test_baseline_journal_resumes_only_an_identical_session(tmp_path):
