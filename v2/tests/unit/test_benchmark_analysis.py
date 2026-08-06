@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -2219,13 +2220,126 @@ def test_capture_replays_persisted_thermal_state_before_preflight(
     assert recovered == [(expected_recovery_index, 7_200.0, expected_trigger)]
 
 
+def _session_bound_preflight_validator(workload, trial):
+    return lambda hardware, status, software: (
+        benchmark_runner._validate_baseline_preflight(
+            workload=workload,
+            hardware=hardware,
+            status=status,
+            software_versions=software,
+            expected_hardware=trial.hardware,
+            expected_software_versions=trial.software_versions,
+        )
+    )
+
+
+def test_capture_rejects_an_invalid_persisted_preflight_before_any_action(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    trial = _valid_raw_trial(workload)
+    journal.record_preflight(
+        slot,
+        0,
+        {
+            "observed_at_utc": "2026-08-05T00:00:00+00:00",
+            "hardware": trial.hardware,
+            "environment_status": {
+                **trial.environment_status,
+                "power_connected": False,
+            },
+            "software_versions": trial.software_versions,
+        },
+    )
+
+    with pytest.raises(ValueError, match="power_connected"):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=lambda current_slot, attempt: pytest.fail(
+                "launch ran before persisted preflight validation"
+            ),
+            preflight=lambda: pytest.fail(
+                "new preflight ran before persisted preflight validation"
+            ),
+            validate_preflight=_session_bound_preflight_validator(workload, trial),
+            recover=lambda current_slot, recovery_index, deadline, trigger: pytest.fail(
+                "recovery ran before persisted preflight validation"
+            ),
+            validate_trial=lambda current_trial, allow_non_nominal_thermal: None,
+            progress=lambda message: None,
+        )
+
+
+def test_capture_rejects_every_persisted_recovery_sample_before_any_action(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    nominal = _valid_raw_trial(workload)
+    fair = _with_thermal_state(nominal, "fair", 1)
+    preflight = journal.record_preflight(
+        slot,
+        0,
+        {
+            "observed_at_utc": "2026-08-05T00:00:00+00:00",
+            "hardware": fair.hardware,
+            "environment_status": fair.environment_status,
+            "software_versions": fair.software_versions,
+        },
+    )
+    journal.record_recovery_trigger(
+        slot, 0, {"source": "preflight", "preflight": preflight}
+    )
+    journal.record_thermal_sample(
+        slot,
+        0,
+        0,
+        {
+            "schema_version": 1,
+            "observed_at_utc": "2026-08-05T00:00:01+00:00",
+            "elapsed_seconds": 300.0,
+            "hardware": nominal.hardware,
+            "environment_status": nominal.environment_status,
+            "software_versions": {
+                **nominal.software_versions,
+                "python": "3.12.12",
+            },
+        },
+    )
+    journal.record_recovery_summary(
+        slot,
+        0,
+        {"outcome": "nominal-window", "duration_seconds": 300.0, "sample_count": 1},
+    )
+
+    with pytest.raises(ValueError, match="software versions"):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=lambda current_slot, attempt: pytest.fail(
+                "launch ran before persisted recovery validation"
+            ),
+            preflight=lambda: pytest.fail(
+                "new preflight ran before persisted recovery validation"
+            ),
+            validate_preflight=_session_bound_preflight_validator(workload, nominal),
+            recover=lambda current_slot, recovery_index, deadline, trigger: pytest.fail(
+                "recovery ran before persisted recovery validation"
+            ),
+            validate_trial=lambda current_trial, allow_non_nominal_thermal: None,
+            progress=lambda message: None,
+        )
+
+
 def test_capture_anchors_persisted_deadline_before_later_history_reads():
     workload = build_canonical_workload()
     slot = BaselineSlot("prepared-data", 0)
     fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
     preflight_document = {
         "identity": "sha256:" + "a" * 64,
+        "hardware": fair.hardware,
         "environment_status": fair.environment_status,
+        "software_versions": fair.software_versions,
     }
     clock = SimpleNamespace(now=0.0)
 
@@ -2285,11 +2399,15 @@ def test_persisted_recovery_reuses_first_recognition_deadline_for_slot():
     fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
     first = {
         "identity": "sha256:" + "a" * 64,
+        "hardware": fair.hardware,
         "environment_status": fair.environment_status,
+        "software_versions": fair.software_versions,
     }
     second = {
         "identity": "sha256:" + "b" * 64,
+        "hardware": fair.hardware,
         "environment_status": fair.environment_status,
+        "software_versions": fair.software_versions,
     }
 
     class MultiplePreflightJournal:
@@ -2313,7 +2431,10 @@ def test_persisted_recovery_reuses_first_recognition_deadline_for_slot():
         return observed
 
     persisted = benchmark_runner._persisted_pending_thermal_triggers(
-        MultiplePreflightJournal(), (slot,), advancing_clock
+        MultiplePreflightJournal(),
+        (slot,),
+        advancing_clock,
+        lambda hardware, status, software: None,
     )
 
     assert persisted[slot] == (
@@ -2529,7 +2650,6 @@ def test_final_publication_uses_exactly_the_45_accepted_trials(tmp_path):
         source_commit=trials[0].source_commit,
         harness_commit=trials[0].harness_commit,
         harness_identity=trials[0].harness_identity,
-        command="record-baseline --state-directory state",
         paired_representations=paired,
         manifest_path=manifest_path,
         raw_output_path=raw_path,
@@ -2567,7 +2687,6 @@ def test_final_publication_never_overwrites_different_existing_output(tmp_path):
             source_commit=trials[0].source_commit,
             harness_commit=trials[0].harness_commit,
             harness_identity=trials[0].harness_identity,
-            command="record-baseline --state-directory state",
             paired_representations=paired,
             manifest_path=tmp_path / "baseline.json",
             raw_output_path=raw_path,
@@ -2575,6 +2694,89 @@ def test_final_publication_never_overwrites_different_existing_output(tmp_path):
 
     assert raw_path.read_text(encoding="utf-8") == "different existing content\n"
     assert not journal.completed_path.exists()
+
+
+def test_interrupted_manifest_publication_resumes_byte_identically_across_cli_spellings(
+    tmp_path, monkeypatch
+):
+    workload, paired, journal, trials = _accepted_complete_journal(tmp_path)
+    manifest_path = tmp_path / "baseline.json"
+    raw_path = tmp_path / "baseline.jsonl"
+    original_publish_completed = BaselineJournal.publish_completed
+
+    monkeypatch.setattr(sys, "executable", "python-relative")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "v2/benchmarks/runner.py",
+            "record-baseline",
+            "--manifest",
+            "baseline.json",
+            "--raw-output",
+            "baseline.jsonl",
+        ],
+    )
+    first_command = benchmark_runner.canonical_baseline_command(journal)
+    relocated = BaselineJournal(tmp_path / "equivalent-state", journal.session)
+    assert benchmark_runner.canonical_baseline_command(relocated) == first_command
+    monkeypatch.setattr(
+        BaselineJournal,
+        "publish_completed",
+        lambda self, document: (_ for _ in ()).throw(
+            RuntimeError("interrupted before completion")
+        ),
+    )
+    with pytest.raises(RuntimeError, match="interrupted before completion"):
+        publish_baseline_from_journal(
+            journal=journal,
+            trials=trials,
+            workload=workload,
+            workload_identity=canonical_workload_identity(workload),
+            source_commit=trials[0].source_commit,
+            harness_commit=trials[0].harness_commit,
+            harness_identity=trials[0].harness_identity,
+            paired_representations=paired,
+            manifest_path=manifest_path,
+            raw_output_path=raw_path,
+        )
+    first_manifest_bytes = manifest_path.read_bytes()
+
+    monkeypatch.setattr(sys, "executable", "/absolute/venv/bin/python3")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "/absolute/checkout/v2/benchmarks/runner.py",
+            "record-baseline",
+            "--raw-output",
+            str(raw_path),
+            "--manifest",
+            str(manifest_path),
+        ],
+    )
+    monkeypatch.setattr(
+        BaselineJournal, "publish_completed", original_publish_completed
+    )
+    resumed = BaselineJournal.open(journal.root, journal.session)
+    second_command = benchmark_runner.canonical_baseline_command(resumed)
+    manifest = publish_baseline_from_journal(
+        journal=resumed,
+        trials=trials,
+        workload=workload,
+        workload_identity=canonical_workload_identity(workload),
+        source_commit=trials[0].source_commit,
+        harness_commit=trials[0].harness_commit,
+        harness_identity=trials[0].harness_identity,
+        paired_representations=paired,
+        manifest_path=manifest_path,
+        raw_output_path=raw_path,
+    )
+
+    assert second_command == first_command
+    assert manifest["command"] == first_command
+    assert manifest_path.read_bytes() == first_manifest_bytes
+    assert resumed.completed_path.is_file()
 
 
 @pytest.mark.parametrize(
@@ -2617,7 +2819,6 @@ def test_final_publication_rejects_colliding_or_journal_contained_outputs(
             source_commit=trials[0].source_commit,
             harness_commit=trials[0].harness_commit,
             harness_identity=trials[0].harness_identity,
-            command="record-baseline --state-directory state",
             paired_representations=paired,
             manifest_path=manifest_path,
             raw_output_path=raw_path,
@@ -2711,6 +2912,47 @@ def test_detached_worktree_preserves_verification_error_when_cleanup_fails(
     assert any("primary cleanup failure" in note for note in caught.value.__notes__)
 
 
+def test_managed_worktree_preserves_capture_error_when_final_cleanup_fails(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    destination = tmp_path / "source"
+    destination.mkdir()
+    (destination / "tracked.py").write_text("content\n", encoding="utf-8")
+    original_error = RuntimeError("outer capture failure")
+    commands = []
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_create_detached_worktree",
+        lambda current_repository, commit, current_destination: None,
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_remove_worktree",
+        lambda current_repository, current_destination: (_ for _ in ()).throw(
+            RuntimeError("final cleanup failure")
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_runner.subprocess,
+        "run",
+        lambda command, *, cwd, check: commands.append(command) or SimpleNamespace(),
+    )
+
+    with pytest.raises(RuntimeError, match="outer capture failure") as caught:
+        with benchmark_runner._managed_detached_worktree(
+            repository, "a" * 40, destination
+        ):
+            raise original_error
+
+    assert caught.value is original_error
+    assert not destination.exists()
+    assert ("git", "worktree", "prune") in commands
+    assert any("final cleanup failure" in note for note in caught.value.__notes__)
+
+
 def test_baseline_journal_resumes_only_an_identical_session(tmp_path):
     state = tmp_path / "state"
     expected = _session_document(tmp_path)
@@ -2758,6 +3000,255 @@ def test_journal_never_adopts_a_nonempty_directory_without_a_session(tmp_path):
     (state / "orphan.json").write_text("{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="non-empty state directory has no session"):
         BaselineJournal.open(state, _session_document(tmp_path))
+
+
+def _orphan_atomic_temporary(destination, token="a" * 32):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.parent / (f".{destination.name}.sml-atomic-{token}.tmp")
+    temporary.write_text("orphan\n", encoding="utf-8")
+    return temporary
+
+
+def test_session_lock_is_same_thread_reentrant_and_excludes_a_concurrent_invocation(
+    tmp_path,
+):
+    state = tmp_path / "state"
+    outcomes = []
+
+    with baseline_journal.baseline_session_lock(state):
+        with baseline_journal.baseline_session_lock(state):
+            pass
+
+        def contend():
+            try:
+                with baseline_journal.baseline_session_lock(state):
+                    outcomes.append("entered")
+            except RuntimeError as error:
+                outcomes.append(str(error))
+
+        thread = threading.Thread(target=contend)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert outcomes == ["baseline session is already locked"]
+    assert (state / ".baseline-session.lock").is_file()
+
+
+def test_session_lock_is_released_when_an_owner_process_crashes(tmp_path):
+    state = tmp_path / "state"
+    script = (
+        "import os, pathlib; "
+        "from v2.benchmarks.journal import baseline_session_lock; "
+        f"state = pathlib.Path({str(state)!r}); "
+        "lock = baseline_session_lock(state); lock.__enter__(); os._exit(0)"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[3],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    with baseline_journal.baseline_session_lock(state):
+        pass
+
+
+def test_journal_never_treats_a_symlink_as_the_persistent_lock_inode(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    outside = tmp_path / "outside-lock"
+    outside.write_text("outside\n", encoding="utf-8")
+    (state / ".baseline-session.lock").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="lock"):
+        BaselineJournal.open(state, _session_document(tmp_path))
+
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_locked_resume_removes_every_recognized_journal_orphan_and_fsyncs_parents(
+    tmp_path, monkeypatch
+):
+    state = tmp_path / "state"
+    expected_session = _session_document(tmp_path)
+    BaselineJournal.open(state, expected_session)
+    destinations = (
+        state / ".baseline-session-initializing",
+        state / "session.json",
+        state / "completed.json",
+        state / "accepted" / "prepared-data" / "0.json",
+        state / "inflight" / "prepared-data" / "0" / "0.json",
+        state / "rejected" / "prepared-data" / "0" / "0.json",
+        state / "preflight" / "prepared-data" / "0" / "0.json",
+        state / "thermal-waits" / "prepared-data" / "0" / "0" / "trigger.json",
+        state / "thermal-waits" / "prepared-data" / "0" / "0" / "0.json",
+        state / "thermal-waits" / "prepared-data" / "0" / "0" / "summary.json",
+    )
+    temporaries = tuple(_orphan_atomic_temporary(path) for path in destinations)
+    marker = state / ".baseline-session-initializing"
+    marker.write_text("", encoding="utf-8")
+    synced = []
+    original_fsync = baseline_journal._fsync_directory
+
+    with baseline_journal.baseline_session_lock(state):
+        monkeypatch.setattr(
+            baseline_journal,
+            "_fsync_directory",
+            lambda path: synced.append(path.resolve()),
+        )
+        baseline_journal.cleanup_orphaned_journal_temporaries(state)
+        monkeypatch.setattr(baseline_journal, "_fsync_directory", original_fsync)
+
+    assert not marker.exists()
+    assert not any(path.exists() for path in temporaries)
+    assert {path.parent.resolve() for path in temporaries} <= set(synced)
+    BaselineJournal.open(state, expected_session)
+
+
+def test_locked_resume_recovers_an_interrupted_root_initialization(tmp_path):
+    state = tmp_path / "state"
+    marker = state / ".baseline-session-initializing"
+    marker_temp = _orphan_atomic_temporary(marker)
+    session_temp = _orphan_atomic_temporary(state / "session.json", "b" * 32)
+    marker.write_text("", encoding="utf-8")
+
+    with baseline_journal.baseline_session_lock(state):
+        baseline_journal.cleanup_orphaned_journal_temporaries(state)
+
+    assert not marker.exists()
+    assert not marker_temp.exists()
+    assert not session_temp.exists()
+    BaselineJournal.open(state, _session_document(tmp_path))
+
+
+def test_orphan_cleanup_preserves_hidden_wrong_pattern_and_symlink_nodes(tmp_path):
+    state = tmp_path / "state"
+    arbitrary = state / ".arbitrary-hidden"
+    wrong_pattern = state / ".session.json.sml-atomic-not-a-token.tmp"
+    wrong_destination = state / f".foreign.json.sml-atomic-{'b' * 32}.tmp"
+    arbitrary.parent.mkdir(parents=True)
+    arbitrary.write_text("keep\n", encoding="utf-8")
+    wrong_pattern.write_text("keep\n", encoding="utf-8")
+    wrong_destination.write_text("keep\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.write_text("outside\n", encoding="utf-8")
+    symlink = state / f".session.json.sml-atomic-{'c' * 32}.tmp"
+    symlink.symlink_to(outside)
+
+    with baseline_journal.baseline_session_lock(state):
+        baseline_journal.cleanup_orphaned_journal_temporaries(state)
+
+    assert arbitrary.read_text(encoding="utf-8") == "keep\n"
+    assert wrong_pattern.read_text(encoding="utf-8") == "keep\n"
+    assert wrong_destination.read_text(encoding="utf-8") == "keep\n"
+    assert symlink.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+    with pytest.raises(ValueError, match="unexpected content|non-empty"):
+        BaselineJournal.open(state, _session_document(tmp_path))
+
+
+def test_a_live_atomic_temporary_cannot_be_cleaned_by_a_concurrent_invocation(
+    tmp_path,
+):
+    state = tmp_path / "state"
+    destination = state / "session.json"
+    outcomes = []
+
+    with baseline_journal.baseline_session_lock(state):
+        live = _orphan_atomic_temporary(destination)
+
+        def contend():
+            try:
+                with baseline_journal.baseline_session_lock(state):
+                    baseline_journal.cleanup_orphaned_journal_temporaries(state)
+            except RuntimeError as error:
+                outcomes.append(str(error))
+
+        thread = threading.Thread(target=contend)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+        assert live.is_file()
+
+    assert outcomes == ["baseline session is already locked"]
+    with baseline_journal.baseline_session_lock(state):
+        baseline_journal.cleanup_orphaned_journal_temporaries(state)
+    assert not live.exists()
+
+
+def test_locked_final_output_cleanup_removes_only_exact_regular_temporaries(tmp_path):
+    state = tmp_path / "state"
+    manifest = tmp_path / "checkout" / "baseline.json"
+    raw = tmp_path / "results" / "baseline.jsonl"
+    manifest_temp = _orphan_atomic_temporary(manifest, "d" * 32)
+    raw_temp = _orphan_atomic_temporary(raw, "e" * 32)
+    wrong = manifest.parent / f".other.json.sml-atomic-{'f' * 32}.tmp"
+    wrong.write_text("keep\n", encoding="utf-8")
+    outside = tmp_path / "outside-final"
+    outside.write_text("outside\n", encoding="utf-8")
+    linked = raw.parent / f".{raw.name}.sml-atomic-{'0' * 32}.tmp"
+    linked.symlink_to(outside)
+
+    with baseline_journal.baseline_session_lock(state):
+        baseline_journal.cleanup_orphaned_atomic_temporaries((manifest, raw))
+
+    assert not manifest_temp.exists()
+    assert not raw_temp.exists()
+    assert wrong.read_text(encoding="utf-8") == "keep\n"
+    assert linked.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "outside\n"
+
+
+def test_record_baseline_holds_the_session_lock_across_cleanup_and_capture_entry(
+    tmp_path, monkeypatch
+):
+    harness = tmp_path / "harness"
+    harness.mkdir()
+    args = SimpleNamespace(
+        state_directory=tmp_path / "state",
+        manifest=tmp_path / "outputs" / "baseline.json",
+        raw_output=tmp_path / "outputs" / "baseline.jsonl",
+    )
+    manifest_temp = _orphan_atomic_temporary(args.manifest)
+    raw_temp = _orphan_atomic_temporary(args.raw_output, "b" * 32)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+    failures = []
+
+    monkeypatch.setattr(benchmark_runner, "_git_root", lambda path: harness)
+
+    def capture(current_args, **paths):
+        calls.append(paths)
+        assert not manifest_temp.exists()
+        assert not raw_temp.exists()
+        entered.set()
+        assert release.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(benchmark_runner, "_record_baseline_locked", capture)
+
+    def first_invocation():
+        try:
+            benchmark_runner._record_baseline(args)
+        except BaseException as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=first_invocation)
+    thread.start()
+    assert entered.wait(timeout=5)
+    with pytest.raises(RuntimeError, match="already locked"):
+        benchmark_runner._record_baseline(args)
+    release.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert failures == []
+    assert len(calls) == 1
 
 
 def test_journal_rejects_an_orphan_written_during_session_initialization(
@@ -2852,6 +3343,125 @@ def test_atomic_write_json_create_only_never_overwrites_and_cleans_up(tmp_path):
 
     assert read_json_object(path, label="record") == {"generation": 1}
     assert not list(tmp_path.glob(".record.json.*"))
+
+
+def _single_process_arguments(tmp_path):
+    return SimpleNamespace(
+        harness_root=tmp_path / "harness",
+        source_root=tmp_path / "source",
+        source_commit="3687f8b3214a44c675ae67af52e4997762f6c634",
+        harness_commit="a" * 40,
+        harness_identity="sha256:" + "b" * 64,
+        adapter="legacy",
+        metric="prepared-data",
+        side="reference",
+        attempt_index=0,
+        pair_index=0,
+        process_order=0,
+        warmup=20,
+        measure=100,
+        comparison_target="baseline",
+        output=tmp_path / "state" / "inflight" / "prepared-data" / "0" / "0.json",
+    )
+
+
+def _stub_single_process_measurement(monkeypatch, args):
+    args.harness_root.mkdir()
+    args.source_root.mkdir()
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    status = {
+        "power_connected": True,
+        "power_mode": "automatic",
+        "low_power_mode": False,
+        "thermal_state": "nominal",
+        "thermal_state_raw_value": 0,
+        "memory_pressure": "normal",
+        "memory_free_percentage": 60,
+        "competing_gpu_workload": False,
+    }
+    native = SimpleNamespace(
+        native_configuration=trial.native_configuration,
+        native_representation_identity=trial.native_representation_identity,
+        canonical_row_identity=trial.canonical_row_identity,
+        canonical_input_identity=trial.canonical_input_identity,
+        canonical_projection=trial.canonical_projection,
+        execution_order_identity=trial.execution_order_identity,
+        initial_parameter_identity=trial.initial_parameter_identity,
+        startup_verification_seconds=trial.startup_verification_seconds,
+    )
+    monkeypatch.setattr(benchmark_runner, "_git_root", lambda path: path.resolve())
+    monkeypatch.setattr(
+        benchmark_runner, "_require_clean_checkout", lambda path, *, label: None
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_git_commit",
+        lambda path: (
+            args.harness_commit
+            if path.resolve() == args.harness_root.resolve()
+            else args.source_commit
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "harness_content_identity",
+        lambda path: args.harness_identity,
+    )
+    monkeypatch.setattr(legacy, "resolve_native_workload", lambda *unused: native)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "collect_environment",
+        lambda: (trial.hardware, status, trial.software_versions),
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "measure_native_process",
+        lambda **unused: benchmark_runner.ProcessMeasurement(
+            elapsed_seconds=trial.elapsed_seconds,
+            value=trial.value,
+            work_count=100.0,
+            compilation_seconds=trial.compilation_seconds,
+            peak_memory_bytes=trial.peak_memory_bytes,
+        ),
+    )
+
+
+def test_completed_child_output_never_overwrites_an_existing_attempt(
+    tmp_path, monkeypatch
+):
+    args = _single_process_arguments(tmp_path)
+    _stub_single_process_measurement(monkeypatch, args)
+    args.output.parent.mkdir(parents=True)
+    args.output.write_bytes(b"existing immutable attempt\n")
+
+    with pytest.raises(FileExistsError):
+        benchmark_runner._run_single_process(args)
+
+    assert args.output.read_bytes() == b"existing immutable attempt\n"
+
+
+def test_completed_child_output_crosses_the_parent_fsync_boundary(
+    tmp_path, monkeypatch
+):
+    args = _single_process_arguments(tmp_path)
+    _stub_single_process_measurement(monkeypatch, args)
+    synced_directories = []
+    monkeypatch.setattr(
+        baseline_journal,
+        "_fsync_directory",
+        lambda path: synced_directories.append(path.resolve()),
+    )
+
+    benchmark_runner._run_single_process(args)
+
+    assert args.output.parent.resolve() in synced_directories
+    assert (
+        RawTrial.from_dict(
+            read_json_object(args.output, label="completed child output")
+        ).attempt_index
+        == 0
+    )
 
 
 def test_journal_promotes_an_inflight_trial_and_resumes_the_slot(tmp_path):

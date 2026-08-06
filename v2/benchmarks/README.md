@@ -32,6 +32,7 @@ journal that remains after success or failure:
 
 ```text
 <state-directory>/
+├── .baseline-session.lock
 ├── session.json
 ├── accepted/<metric>/<pair-index>.json
 ├── rejected/<metric>/<pair-index>/<attempt-index>.json
@@ -44,6 +45,17 @@ journal that remains after success or failure:
 └── completed.json
 ```
 
+One crash-released advisory lock serializes initialization, resume, capture, and
+final publication for the state directory. The lock inode remains in place for
+the life of the journal. Atomic writes use the exact
+`.DESTINATION.sml-atomic-<32-lowercase-hex>.tmp` namespace. At locked resume,
+only regular orphan files in that namespace whose destination is valid for its
+exact journal location are removed; the initialization marker is recovered in
+the same locked pass. Exact manifest/raw-output temporaries are also removed
+before clean-checkout validation. Other hidden files, malformed names,
+unsupported locations, directories, and symlinks are retained and continue to
+fail the strict topology or checkout checks.
+
 Every preflight is persisted before validation. A non-thermal hardware,
 software, power, memory-pressure, competing-workload, protocol, identity,
 subprocess, or schema failure stops the invocation and leaves the journal for
@@ -53,6 +65,13 @@ trial only after five continuous minutes of nominal thermals. The first thermal
 violation for a missing slot starts one two-hour deadline for that slot during
 the invocation; rejected retries do not reset it. Rejected trials and recovery
 samples remain diagnostic evidence and never enter the baseline.
+
+On resume, every persisted preflight and every persisted thermal-recovery
+sample is replayed through the same complete session-bound hardware, software,
+raw/string thermal, and non-thermal environment validator used for live
+observations. This replay happens before recovery classification, a new
+preflight, or a process launch, including when a later recovery summary records
+a nominal window.
 
 Resume requires the exact same harness commit and content identity, pinned
 source commit, canonical workload, immutable protocol, hardware, software,
@@ -66,7 +85,10 @@ JSONL and manifest remain absent until all 45 canonical slots validate.
 Publication creates the raw JSONL first, the manifest second, and
 `completed.json` last; existing identical bytes are accepted for crash resume,
 while different final content is never overwritten. The external journal is
-retained for auditability.
+retained for auditability. The manifest command is a canonical session-derived
+command template with `SESSION_STATE_DIRECTORY` as its only operator-supplied
+placeholder; it does not depend on the invoking Python executable, working
+directory, argument ordering, or relative path spelling.
 
 Comparisons have two strict profiles. Screen mode uses five pairs, a 0.97 median
 gate, 2% maximum dispersion, and a report-only confidence bound. Final mode uses

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
 import re
+import secrets
 import stat
-import tempfile
+import threading
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,12 +38,18 @@ SESSION_FIELDS = {
     "raw_output_path",
 }
 INITIALIZATION_MARKER = ".baseline-session-initializing"
+LOCK_FILE_NAME = ".baseline-session.lock"
 STATE_DIRECTORY_NAMES = frozenset(
     {"accepted", "rejected", "inflight", "preflight", "thermal-waits"}
 )
 STATE_FILE_NAMES = frozenset({"session.json", "completed.json"})
 DECIMAL_INDEX = re.compile(r"(?:0|[1-9][0-9]*)")
 IDENTITY = re.compile(r"sha256:[0-9a-f]{64}")
+ATOMIC_TEMPORARY = re.compile(
+    r"^\.(?P<destination>.+)\.sml-atomic-(?P<token>[0-9a-f]{32})\.tmp$"
+)
+_PROCESS_LOCK_GUARD = threading.Lock()
+_PROCESS_LOCKS: dict[Path, tuple[int, int, int]] = {}
 
 
 def _fsync_directory(path: Path) -> None:
@@ -77,10 +86,19 @@ def _create_durable_directory(path: Path) -> None:
 def atomic_write_text(path: Path, text: str, *, create_only: bool = False) -> None:
     _create_durable_directory(path.parent)
     _fsync_directory(path.parent)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
-    temporary = Path(temporary_name)
+    while True:
+        temporary = path.parent / (
+            f".{path.name}.sml-atomic-{secrets.token_hex(16)}.tmp"
+        )
+        try:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        break
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             output.write(text)
@@ -95,6 +113,7 @@ def atomic_write_text(path: Path, text: str, *, create_only: bool = False) -> No
     finally:
         if temporary.exists():
             temporary.unlink()
+            _fsync_directory(path.parent)
 
 
 def atomic_write_json(path: Path, value: dict, *, create_only: bool = False) -> None:
@@ -132,6 +151,149 @@ def require_external_state_directory(
         if state == checkout or state.is_relative_to(checkout):
             raise ValueError("state directory must be outside measured checkouts")
     return state
+
+
+@contextmanager
+def baseline_session_lock(root: Path):
+    state = root.resolve()
+    _create_durable_directory(state)
+    owner = threading.get_ident()
+    descriptor: int | None = None
+    with _PROCESS_LOCK_GUARD:
+        held = _PROCESS_LOCKS.get(state)
+        if held is not None:
+            held_descriptor, held_owner, depth = held
+            if held_owner != owner:
+                raise RuntimeError("baseline session is already locked")
+            _PROCESS_LOCKS[state] = (held_descriptor, held_owner, depth + 1)
+        else:
+            lock_path = state / LOCK_FILE_NAME
+            descriptor = os.open(
+                lock_path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            try:
+                metadata = os.fstat(descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError("baseline session lock must be a regular file")
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise RuntimeError("baseline session is already locked") from error
+                os.fsync(descriptor)
+                _fsync_directory(state)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            _PROCESS_LOCKS[state] = (descriptor, owner, 1)
+    try:
+        yield state
+    finally:
+        descriptor_to_close: int | None = None
+        with _PROCESS_LOCK_GUARD:
+            held_descriptor, held_owner, depth = _PROCESS_LOCKS[state]
+            if held_owner != owner:
+                raise RuntimeError("baseline session lock owner changed")
+            if depth == 1:
+                del _PROCESS_LOCKS[state]
+                descriptor_to_close = held_descriptor
+            else:
+                _PROCESS_LOCKS[state] = (held_descriptor, held_owner, depth - 1)
+        if descriptor_to_close is not None:
+            try:
+                fcntl.flock(descriptor_to_close, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor_to_close)
+
+
+def _atomic_temporary_destination(path: Path) -> Path | None:
+    match = ATOMIC_TEMPORARY.fullmatch(path.name)
+    if match is None:
+        return None
+    return path.parent / match.group("destination")
+
+
+def _is_journal_destination(root: Path, destination: Path) -> bool:
+    try:
+        parts = destination.relative_to(root).parts
+    except ValueError:
+        return False
+    if len(parts) == 1:
+        return parts[0] in {INITIALIZATION_MARKER, "session.json", "completed.json"}
+    if len(parts) == 3 and parts[0] == "accepted":
+        return (
+            parts[1] in METRIC_NAMES
+            and parts[2].endswith(".json")
+            and DECIMAL_INDEX.fullmatch(parts[2][:-5]) is not None
+        )
+    if len(parts) == 4 and parts[0] in {"inflight", "rejected", "preflight"}:
+        return (
+            parts[1] in METRIC_NAMES
+            and DECIMAL_INDEX.fullmatch(parts[2]) is not None
+            and parts[3].endswith(".json")
+            and DECIMAL_INDEX.fullmatch(parts[3][:-5]) is not None
+        )
+    if len(parts) == 5 and parts[0] == "thermal-waits":
+        final_name = parts[4]
+        return (
+            parts[1] in METRIC_NAMES
+            and DECIMAL_INDEX.fullmatch(parts[2]) is not None
+            and DECIMAL_INDEX.fullmatch(parts[3]) is not None
+            and (
+                final_name in {"trigger.json", "summary.json"}
+                or (
+                    final_name.endswith(".json")
+                    and DECIMAL_INDEX.fullmatch(final_name[:-5]) is not None
+                )
+            )
+        )
+    return False
+
+
+def _unlink_regular_orphan(path: Path, modified: set[Path]) -> None:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(metadata.st_mode):
+        return
+    path.unlink()
+    modified.add(path.parent)
+
+
+def cleanup_orphaned_atomic_temporaries(destinations: Sequence[Path]) -> None:
+    modified: set[Path] = set()
+    for destination in destinations:
+        expected = destination.parent / (f".{destination.name}.sml-atomic-")
+        if not destination.parent.exists():
+            continue
+        _require_directory(destination.parent, label="atomic output parent")
+        for entry in destination.parent.iterdir():
+            recovered = _atomic_temporary_destination(entry)
+            if recovered == destination and entry.name.startswith(expected.name):
+                _unlink_regular_orphan(entry, modified)
+    for directory in modified:
+        _fsync_directory(directory)
+
+
+def cleanup_orphaned_journal_temporaries(root: Path) -> None:
+    state = root.resolve()
+    if not state.exists():
+        return
+    _require_directory(state, label="state directory")
+    modified: set[Path] = set()
+    for directory_name, _subdirectories, filenames in os.walk(state, followlinks=False):
+        directory = Path(directory_name)
+        for filename in filenames:
+            path = directory / filename
+            destination = _atomic_temporary_destination(path)
+            if destination is not None and _is_journal_destination(state, destination):
+                _unlink_regular_orphan(path, modified)
+    marker = state / INITIALIZATION_MARKER
+    _unlink_regular_orphan(marker, modified)
+    for directory in modified:
+        _fsync_directory(directory)
 
 
 def build_session_document(
@@ -547,7 +709,7 @@ def _validate_root_layout(state: Path) -> tuple[Path, ...]:
             raise ValueError("state directory contains unexpected content")
         if entry.name in STATE_DIRECTORY_NAMES:
             _require_directory(entry, label=f"state {entry.name}")
-        elif entry.name in STATE_FILE_NAMES:
+        elif entry.name in STATE_FILE_NAMES or entry.name == LOCK_FILE_NAME:
             _require_file(entry, label=f"state {entry.name}")
         else:
             raise ValueError("state directory contains unexpected content")
@@ -584,13 +746,19 @@ class BaselineJournal:
         session_path = state / "session.json"
         marker_path = state / INITIALIZATION_MARKER
         entries = _state_entries(state)
+        for entry in entries:
+            if entry.name == LOCK_FILE_NAME:
+                _require_file(entry, label="baseline session lock")
         resumed = session_path in entries
         if resumed:
             entries = _validate_root_layout(state)
             session = read_json_object(session_path, label="baseline journal session")
         else:
-            if entries:
-                if marker_path in entries:
+            non_lock_entries = tuple(
+                entry for entry in entries if entry.name != LOCK_FILE_NAME
+            )
+            if non_lock_entries:
+                if marker_path in non_lock_entries:
                     raise ValueError("state directory contains unexpected content")
                 raise ValueError("non-empty state directory has no session")
             try:
@@ -599,7 +767,12 @@ class BaselineJournal:
                 raise ValueError(
                     "state directory contains unexpected content"
                 ) from error
-            if _state_entries(state) != (marker_path,):
+            lock_path = state / LOCK_FILE_NAME
+            initialization_snapshot = set(_state_entries(state))
+            initialization_entries = {marker_path}
+            if lock_path in initialization_snapshot:
+                initialization_entries.add(lock_path)
+            if initialization_snapshot != initialization_entries:
                 raise ValueError("state directory contains unexpected content")
             try:
                 atomic_write_json(session_path, expected_session, create_only=True)
@@ -607,7 +780,11 @@ class BaselineJournal:
                 raise ValueError(
                     "state directory contains unexpected content"
                 ) from error
-            if set(_state_entries(state)) != {marker_path, session_path}:
+            initialized_snapshot = set(_state_entries(state))
+            initialized_entries = {marker_path, session_path}
+            if lock_path in initialized_snapshot:
+                initialized_entries.add(lock_path)
+            if initialized_snapshot != initialized_entries:
                 raise ValueError("state directory contains unexpected content")
             marker_path.unlink()
             _fsync_directory(state)

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from numbers import Real
@@ -27,7 +28,10 @@ from v2.benchmarks.journal import (
     JournalAttempt,
     atomic_write_json,
     atomic_write_text,
+    baseline_session_lock,
     build_session_document,
+    cleanup_orphaned_atomic_temporaries,
+    cleanup_orphaned_journal_temporaries,
     read_json_object,
     require_external_state_directory,
 )
@@ -1870,7 +1874,7 @@ def _run_single_process(args: argparse.Namespace) -> int:
         hardware=hardware,
         environment_status=environment_status,
     )
-    _write_json(args.output, trial.to_dict())
+    atomic_write_json(args.output, trial.to_dict(), create_only=True)
     return 0
 
 
@@ -1885,18 +1889,7 @@ def _create_detached_worktree(repository: Path, commit: str, destination: Path) 
         if _git_commit(destination) != commit:
             raise RuntimeError("detached source worktree resolved the wrong commit")
     except BaseException as error:
-        try:
-            _remove_worktree(repository, destination)
-        except BaseException as cleanup_error:
-            cleanup_failures = (
-                cleanup_error,
-                *_fallback_cleanup_failed_worktree(repository, destination),
-            )
-            for failure in cleanup_failures:
-                error.add_note(
-                    "detached worktree cleanup failed: "
-                    f"{type(failure).__name__}: {failure}"
-                )
+        _cleanup_detached_worktree(repository, destination, primary_error=error)
         raise
 
 
@@ -1941,6 +1934,43 @@ def _fallback_cleanup_failed_worktree(
     except BaseException as error:
         failures.append(error)
     return tuple(failures)
+
+
+def _cleanup_detached_worktree(
+    repository: Path,
+    destination: Path,
+    *,
+    primary_error: BaseException | None = None,
+) -> None:
+    try:
+        _remove_worktree(repository, destination)
+    except BaseException as cleanup_error:
+        fallback_failures = _fallback_cleanup_failed_worktree(repository, destination)
+        if primary_error is not None:
+            for failure in (cleanup_error, *fallback_failures):
+                primary_error.add_note(
+                    "detached worktree cleanup failed: "
+                    f"{type(failure).__name__}: {failure}"
+                )
+            return
+        for failure in fallback_failures:
+            cleanup_error.add_note(
+                "detached worktree fallback cleanup failed: "
+                f"{type(failure).__name__}: {failure}"
+            )
+        raise
+
+
+@contextmanager
+def _managed_detached_worktree(repository: Path, commit: str, destination: Path):
+    _create_detached_worktree(repository, commit, destination)
+    try:
+        yield destination
+    except BaseException as error:
+        _cleanup_detached_worktree(repository, destination, primary_error=error)
+        raise
+    else:
+        _cleanup_detached_worktree(repository, destination)
 
 
 def _launch_trial(
@@ -2030,6 +2060,7 @@ def _persisted_pending_thermal_triggers(
     journal: BaselineJournal,
     slots: Sequence[BaselineSlot],
     clock: Callable[[], float],
+    validate_observation: Callable[[dict, dict, dict], None],
 ) -> dict[BaselineSlot, tuple[dict, float]]:
     expected = set(slots)
     recovery_deadlines: dict[BaselineSlot, float] = {}
@@ -2037,6 +2068,11 @@ def _persisted_pending_thermal_triggers(
     for slot, _index, _path, document in journal._preflight_records():
         if slot not in expected:
             raise ValueError("unexpected preflight slot")
+        validate_observation(
+            document["hardware"],
+            document["environment_status"],
+            document["software_versions"],
+        )
         validate_thermal_observation(document["environment_status"])
         if document["environment_status"]["thermal_state"] == "nominal":
             continue
@@ -2071,6 +2107,13 @@ def _persisted_pending_thermal_triggers(
     for slot, recovery_index, path in journal._thermal_recovery_records():
         if slot not in expected:
             raise ValueError("unexpected thermal recovery slot")
+        for sample_path in journal._recovery_sample_paths(path):
+            sample = read_json_object(sample_path, label="thermal sample")
+            validate_observation(
+                sample["hardware"],
+                sample["environment_status"],
+                sample["software_versions"],
+            )
         trigger_document = read_json_object(
             path / "trigger.json", label="thermal recovery trigger"
         )
@@ -2138,7 +2181,7 @@ def capture_baseline_trials(
     ordered_slots = tuple(slots)
     accepted = journal.load_accepted(ordered_slots)
     persisted_recoveries = _persisted_pending_thermal_triggers(
-        journal, ordered_slots, clock
+        journal, ordered_slots, clock, validate_preflight
     )
     pending_triggers = {
         slot: trigger for slot, (trigger, _deadline) in persisted_recoveries.items()
@@ -2359,6 +2402,37 @@ def _publish_final_artifact(path: Path, text: str) -> None:
             raise ValueError("final artifact already exists with different content")
 
 
+def canonical_baseline_command(journal: BaselineJournal) -> str:
+    session = journal.session
+    protocol = session["protocol"]
+    return shlex.join(
+        (
+            "uv",
+            "run",
+            "python",
+            "-m",
+            "v2.benchmarks.runner",
+            "record-baseline",
+            "--source-commit",
+            session["source"]["commit"],
+            "--manifest",
+            session["manifest_path"],
+            "--raw-output",
+            session["raw_output_path"],
+            "--state-directory",
+            "SESSION_STATE_DIRECTORY",
+            "--metrics",
+            ",".join(METRIC_NAMES),
+            "--pairs",
+            str(protocol["pairs"]),
+            "--warmup",
+            str(protocol["warmup_units"]),
+            "--measure",
+            str(protocol["measured_units"]),
+        )
+    )
+
+
 def publish_baseline_from_journal(
     *,
     journal: BaselineJournal,
@@ -2368,7 +2442,6 @@ def publish_baseline_from_journal(
     source_commit: str,
     harness_commit: str,
     harness_identity: str,
-    command: str,
     paired_representations: dict,
     manifest_path: Path,
     raw_output_path: Path,
@@ -2400,7 +2473,7 @@ def publish_baseline_from_journal(
         source_commit=source_commit,
         harness_commit=harness_commit,
         harness_identity=harness_identity,
-        command=command,
+        command=canonical_baseline_command(journal),
         pairs=SCREEN_PAIRS,
         warmup_units=WARMUP_UNITS,
         measured_units=DEFAULT_MEASURED_UNITS,
@@ -2448,6 +2521,26 @@ def _record_baseline(args: argparse.Namespace) -> int:
         manifest_path=args.manifest,
         raw_output_path=args.raw_output,
     )
+    with baseline_session_lock(state_root):
+        cleanup_orphaned_journal_temporaries(state_root)
+        cleanup_orphaned_atomic_temporaries((manifest_path, raw_output_path))
+        return _record_baseline_locked(
+            args,
+            harness_root=harness_root,
+            state_root=state_root,
+            manifest_path=manifest_path,
+            raw_output_path=raw_output_path,
+        )
+
+
+def _record_baseline_locked(
+    args: argparse.Namespace,
+    *,
+    harness_root: Path,
+    state_root: Path,
+    manifest_path: Path,
+    raw_output_path: Path,
+) -> int:
     allowed_outputs = frozenset()
     session_path = state_root / "session.json"
     if session_path.is_file():
@@ -2512,8 +2605,7 @@ def _record_baseline(args: argparse.Namespace) -> int:
         journal = BaselineJournal.open(state_root, session)
         slots = BaselineJournal.expected_slots(args.metrics, args.pairs)
         source_root = temporary / "source"
-        _create_detached_worktree(harness_root, source_commit, source_root)
-        try:
+        with _managed_detached_worktree(harness_root, source_commit, source_root):
             require_external_state_directory(state_root, (harness_root, source_root))
             cached_preflight = [initial_environment]
 
@@ -2618,9 +2710,6 @@ def _record_baseline(args: argparse.Namespace) -> int:
                     )
                 ),
             )
-        finally:
-            _remove_worktree(harness_root, source_root)
-    command = shlex.join((sys.executable, "-m", "v2.benchmarks.runner", *sys.argv[1:]))
     publish_baseline_from_journal(
         journal=journal,
         trials=trials,
@@ -2629,7 +2718,6 @@ def _record_baseline(args: argparse.Namespace) -> int:
         source_commit=source_commit,
         harness_commit=harness_commit,
         harness_identity=harness_identity,
-        command=command,
         paired_representations=paired_representations,
         manifest_path=manifest_path,
         raw_output_path=raw_output_path,
