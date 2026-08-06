@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -3092,6 +3093,95 @@ except RuntimeError as error:
     assert result.stdout.strip() == "baseline final outputs are already locked"
 
 
+@pytest.mark.parametrize(
+    ("first_name", "alias_name"),
+    [
+        ("Case/Manifest.json", "case/manifest.JSON"),
+        (
+            "caf\N{LATIN SMALL LETTER E WITH ACUTE}.json",
+            "cafe\N{COMBINING ACUTE ACCENT}.json",
+        ),
+    ],
+)
+def test_output_lock_conservatively_serializes_case_and_unicode_aliases(
+    tmp_path, first_name, alias_name
+):
+    outcomes = []
+    first_manifest = tmp_path / first_name
+    alias_manifest = tmp_path / alias_name
+
+    with baseline_journal.baseline_output_lock(
+        first_manifest, tmp_path / "first.jsonl"
+    ):
+
+        def contend():
+            try:
+                with baseline_journal.baseline_output_lock(
+                    alias_manifest, tmp_path / "second.jsonl"
+                ):
+                    outcomes.append("entered")
+            except RuntimeError as error:
+                outcomes.append(str(error))
+
+        thread = threading.Thread(target=contend)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert outcomes == ["baseline final outputs are already locked"]
+
+
+def test_output_lock_root_is_private_and_rejects_unsafe_permissions(
+    tmp_path, monkeypatch
+):
+    secure_root = tmp_path / "secure-locks"
+    monkeypatch.setattr(
+        baseline_journal, "_baseline_output_lock_root", lambda: secure_root
+    )
+
+    with baseline_journal.baseline_output_lock(
+        tmp_path / "manifest.json", tmp_path / "raw.jsonl"
+    ):
+        pass
+
+    assert stat.S_IMODE(secure_root.stat().st_mode) == 0o700
+
+    unsafe_root = tmp_path / "unsafe-locks"
+    unsafe_root.mkdir(mode=0o700)
+    unsafe_root.chmod(0o777)
+    monkeypatch.setattr(
+        baseline_journal, "_baseline_output_lock_root", lambda: unsafe_root
+    )
+
+    with pytest.raises(ValueError, match="lock directory permissions"):
+        with baseline_journal.baseline_output_lock(
+            tmp_path / "other-manifest.json", tmp_path / "other-raw.jsonl"
+        ):
+            pass
+
+
+def test_durable_directory_creation_tolerates_a_concurrent_creator(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "parent" / "child"
+    original_mkdir = baseline_journal.os.mkdir
+    raced = False
+
+    def mkdir_after_competitor(path, mode=0o777):
+        nonlocal raced
+        if Path(path) == target and not raced:
+            raced = True
+            original_mkdir(path, mode)
+            raise FileExistsError
+        return original_mkdir(path, mode)
+
+    monkeypatch.setattr(baseline_journal.os, "mkdir", mkdir_after_competitor)
+
+    baseline_journal._create_durable_directory(target)
+
+    assert target.is_dir()
+
+
 def test_journal_never_treats_a_symlink_as_the_persistent_lock_inode(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
@@ -3286,8 +3376,9 @@ def test_record_baseline_holds_the_session_lock_across_cleanup_and_capture_entry
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("second_raw_name", ["baseline.jsonl", "other.jsonl"])
 def test_different_state_roots_cannot_clean_a_live_shared_output_temporary(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, second_raw_name
 ):
     harness = tmp_path / "harness"
     harness.mkdir()
@@ -3301,7 +3392,7 @@ def test_different_state_roots_cannot_clean_a_live_shared_output_temporary(
     second_args = SimpleNamespace(
         state_directory=tmp_path / "second-state",
         manifest=manifest,
-        raw_output=raw_output,
+        raw_output=tmp_path / "outputs" / second_raw_name,
     )
     entered = threading.Event()
     release = threading.Event()

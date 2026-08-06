@@ -8,8 +8,9 @@ import re
 import secrets
 import stat
 import threading
+import unicodedata
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,9 +80,13 @@ def _create_durable_directory(path: Path) -> None:
         try:
             _lstat_directory(current)
         except FileNotFoundError:
-            os.mkdir(current)
-            _fsync_directory(current.parent)
-            _fsync_directory(current)
+            try:
+                os.mkdir(current)
+            except FileExistsError:
+                _lstat_directory(current)
+            else:
+                _fsync_directory(current.parent)
+                _fsync_directory(current)
 
 
 def atomic_write_text(path: Path, text: str, *, create_only: bool = False) -> None:
@@ -156,7 +161,11 @@ def require_external_state_directory(
 
 @contextmanager
 def _exclusive_file_lock(
-    lock_path: Path, *, conflict_message: str, invalid_message: str
+    lock_path: Path,
+    *,
+    conflict_message: str,
+    invalid_message: str,
+    required_owner: int | None = None,
 ):
     _create_durable_directory(lock_path.parent)
     owner = threading.get_ident()
@@ -178,6 +187,8 @@ def _exclusive_file_lock(
                 metadata = os.fstat(descriptor)
                 if not stat.S_ISREG(metadata.st_mode):
                     raise ValueError(invalid_message)
+                if required_owner is not None and metadata.st_uid != required_owner:
+                    raise ValueError("baseline lock must be owned by the current user")
                 try:
                     fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except BlockingIOError as error:
@@ -219,22 +230,57 @@ def baseline_session_lock(root: Path):
         yield state
 
 
+def _baseline_output_lock_root() -> Path:
+    return Path("/tmp").resolve() / f"{OUTPUT_LOCK_DIRECTORY_NAME}-{os.getuid()}"
+
+
+def _prepare_private_lock_directory(path: Path) -> None:
+    _create_durable_directory(path.parent)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    else:
+        _fsync_directory(path.parent)
+        _fsync_directory(path)
+    _lstat_directory(path)
+    metadata = os.lstat(path)
+    if metadata.st_uid != os.getuid():
+        raise ValueError("baseline final output lock directory has the wrong owner")
+    if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise ValueError("baseline final output lock directory permissions are unsafe")
+
+
+def _canonical_output_lock_key(path: Path) -> str:
+    return unicodedata.normalize("NFC", str(path.resolve())).casefold()
+
+
 @contextmanager
 def baseline_output_lock(manifest_path: Path, raw_output_path: Path):
-    destinations = sorted(
-        (str(manifest_path.resolve()), str(raw_output_path.resolve()))
-    )
+    destinations = (manifest_path.resolve(), raw_output_path.resolve())
     if destinations[0] == destinations[1]:
         raise ValueError("baseline final output paths must be distinct")
-    identity = structured_identity(
-        "sml-baseline-final-output-lock-v1", destinations
-    ).removeprefix("sha256:")
-    lock_root = Path("/tmp").resolve() / f"{OUTPUT_LOCK_DIRECTORY_NAME}-{os.getuid()}"
-    with _exclusive_file_lock(
-        lock_root / f"{identity}.lock",
-        conflict_message="baseline final outputs are already locked",
-        invalid_message="baseline final output lock must be a regular file",
-    ):
+    lock_root = _baseline_output_lock_root()
+    _prepare_private_lock_directory(lock_root)
+    lock_paths = set()
+    for destination in destinations:
+        identity = structured_identity(
+            "sml-baseline-final-output-destination-lock-v1",
+            _canonical_output_lock_key(destination),
+        ).removeprefix("sha256:")
+        lock_paths.add(lock_root / f"{identity}.lock")
+    with ExitStack() as stack:
+        for lock_path in sorted(lock_paths, key=str):
+            stack.enter_context(
+                _exclusive_file_lock(
+                    lock_path,
+                    conflict_message="baseline final outputs are already locked",
+                    invalid_message=(
+                        "baseline final output lock must be a regular file"
+                    ),
+                    required_owner=os.getuid(),
+                )
+            )
         yield
 
 
