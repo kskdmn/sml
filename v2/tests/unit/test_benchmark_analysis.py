@@ -1040,6 +1040,53 @@ def test_raw_trial_round_trip_is_strict():
         RawTrial.from_dict(invalid)
 
 
+@pytest.mark.parametrize(
+    "field",
+    (
+        "schema_version",
+        "pair_index",
+        "attempt_index",
+        "process_order",
+        "warmup_units",
+        "measured_units",
+        "elapsed_seconds",
+        "value",
+        "startup_verification_seconds",
+        "compilation_seconds",
+        "peak_memory_bytes",
+    ),
+)
+def test_raw_trial_rejects_boolean_numeric_scalars_before_coercion(field):
+    raw = _valid_raw_trial(build_canonical_workload()).to_dict()
+    raw[field] = True
+
+    with pytest.raises(ValueError, match=field):
+        RawTrial.from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("elapsed_seconds", 2),
+        ("elapsed_seconds", 2.5),
+        ("value", 50),
+        ("value", 50.5),
+        ("startup_verification_seconds", 1),
+        ("startup_verification_seconds", 1.5),
+        ("compilation_seconds", 1),
+        ("compilation_seconds", 1.5),
+    ),
+)
+def test_raw_trial_accepts_real_integer_and_float_seconds_and_values(field, value):
+    raw = _valid_raw_trial(build_canonical_workload()).to_dict()
+    raw[field] = value
+
+    parsed = RawTrial.from_dict(raw)
+
+    assert getattr(parsed, field) == float(value)
+    assert type(getattr(parsed, field)) is float
+
+
 def test_baseline_manifest_binds_raw_trials_to_clean_source_and_harness():
     workload = build_canonical_workload()
     workload_identity = canonical_workload_identity(workload)
@@ -2172,6 +2219,109 @@ def test_capture_replays_persisted_thermal_state_before_preflight(
     assert recovered == [(expected_recovery_index, 7_200.0, expected_trigger)]
 
 
+def test_capture_anchors_persisted_deadline_before_later_history_reads():
+    workload = build_canonical_workload()
+    slot = BaselineSlot("prepared-data", 0)
+    fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
+    preflight_document = {
+        "identity": "sha256:" + "a" * 64,
+        "environment_status": fair.environment_status,
+    }
+    clock = SimpleNamespace(now=0.0)
+
+    class SlowHistoryJournal:
+        def load_accepted(self, slots):
+            return {}
+
+        def _preflight_records(self):
+            return ((slot, 0, Path("preflight.json"), preflight_document),)
+
+        def _attempt_records(self, category):
+            clock.now += 100.0
+            return ()
+
+        def _thermal_recovery_records(self):
+            clock.now += 100.0
+            return ()
+
+        def load_inflight(self, slots):
+            return ()
+
+        def _validate_preflight_history(self):
+            clock.now += 100.0
+            return {slot: ((0, preflight_document),)}
+
+        def _validate_thermal_recovery_history(self):
+            clock.now += 100.0
+            return {}
+
+    recovered_deadlines = []
+
+    def stop_after_recovery(current_slot, recovery_index, deadline, trigger):
+        recovered_deadlines.append(deadline)
+        raise RuntimeError("stop after recovery")
+
+    with pytest.raises(RuntimeError, match="stop after recovery"):
+        capture_baseline_trials(
+            journal=SlowHistoryJournal(),
+            slots=(slot,),
+            launch_trial=lambda current_slot, attempt: pytest.fail(
+                "trial launched before persisted recovery"
+            ),
+            preflight=lambda: pytest.fail("preflight ran before persisted recovery"),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=stop_after_recovery,
+            validate_trial=lambda trial, allow_non_nominal_thermal: None,
+            clock=lambda: clock.now,
+            progress=lambda message: None,
+        )
+
+    assert recovered_deadlines == [7_200.0]
+
+
+def test_persisted_recovery_reuses_first_recognition_deadline_for_slot():
+    workload = build_canonical_workload()
+    slot = BaselineSlot("prepared-data", 0)
+    fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
+    first = {
+        "identity": "sha256:" + "a" * 64,
+        "environment_status": fair.environment_status,
+    }
+    second = {
+        "identity": "sha256:" + "b" * 64,
+        "environment_status": fair.environment_status,
+    }
+
+    class MultiplePreflightJournal:
+        def _preflight_records(self):
+            return (
+                (slot, 0, Path("0.json"), first),
+                (slot, 1, Path("1.json"), second),
+            )
+
+        def _attempt_records(self, category):
+            return ()
+
+        def _thermal_recovery_records(self):
+            return ()
+
+    clock = SimpleNamespace(now=0.0)
+
+    def advancing_clock():
+        observed = clock.now
+        clock.now += 100.0
+        return observed
+
+    persisted = benchmark_runner._persisted_pending_thermal_triggers(
+        MultiplePreflightJournal(), (slot,), advancing_clock
+    )
+
+    assert persisted[slot] == (
+        {"source": "preflight", "preflight": second},
+        7_200.0,
+    )
+
+
 def test_capture_does_not_replay_thermal_state_closed_by_nominal_window(tmp_path):
     workload = build_canonical_workload()
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
@@ -2433,6 +2583,9 @@ def test_final_publication_never_overwrites_different_existing_output(tmp_path):
         ("same.json", "same.json"),
         ("baseline.json", "state/completed.json"),
         ("state/final-manifest.json", "baseline.jsonl"),
+        ("out", "out/raw.jsonl"),
+        ("out/manifest.json", "out"),
+        (".", "baseline.jsonl"),
     ),
 )
 def test_final_publication_rejects_colliding_or_journal_contained_outputs(
@@ -2445,6 +2598,15 @@ def test_final_publication_rejects_colliding_or_journal_contained_outputs(
     )
     manifest_path = tmp_path / manifest_name
     raw_path = tmp_path / raw_output_name
+    output_existence_before = {
+        manifest_path: manifest_path.exists(),
+        raw_path: raw_path.exists(),
+    }
+    journal_files_before = {
+        path.relative_to(journal.root): path.read_bytes()
+        for path in journal.root.rglob("*")
+        if path.is_file()
+    }
 
     with pytest.raises(ValueError, match="final output paths"):
         publish_baseline_from_journal(
@@ -2463,8 +2625,13 @@ def test_final_publication_rejects_colliding_or_journal_contained_outputs(
 
     assert not journal.completed_path.exists()
     for path in (manifest_path, raw_path):
-        if not path.is_relative_to(journal.root):
+        if not output_existence_before[path]:
             assert not path.exists()
+    assert {
+        path.relative_to(journal.root): path.read_bytes()
+        for path in journal.root.rglob("*")
+        if path.is_file()
+    } == journal_files_before
     assert (
         BaselineJournal.open(journal.root, journal.session).session == journal.session
     )
@@ -2502,6 +2669,46 @@ def test_detached_worktree_cleans_registration_after_verification_error(
         ("git", "worktree", "add"),
         ("git", "worktree", "remove"),
     ]
+
+
+def test_detached_worktree_preserves_verification_error_when_cleanup_fails(
+    tmp_path, monkeypatch
+):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    destination = tmp_path / "source"
+    commit = "a" * 40
+    original_error = RuntimeError("original verification failure")
+    commands = []
+
+    def run(command, *, cwd, check):
+        commands.append(command)
+        if command[:3] == ("git", "worktree", "add"):
+            destination.mkdir()
+            (destination / "tracked.py").write_text("content\n", encoding="utf-8")
+        return SimpleNamespace()
+
+    monkeypatch.setattr(benchmark_runner.subprocess, "run", run)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_require_clean_checkout",
+        lambda path, label: (_ for _ in ()).throw(original_error),
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_remove_worktree",
+        lambda repository, destination: (_ for _ in ()).throw(
+            RuntimeError("primary cleanup failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="original verification failure") as caught:
+        benchmark_runner._create_detached_worktree(repository, commit, destination)
+
+    assert caught.value is original_error
+    assert not destination.exists()
+    assert ("git", "worktree", "prune") in commands
+    assert any("primary cleanup failure" in note for note in caught.value.__notes__)
 
 
 def test_baseline_journal_resumes_only_an_identical_session(tmp_path):

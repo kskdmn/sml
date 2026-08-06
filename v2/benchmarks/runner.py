@@ -8,6 +8,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1883,8 +1884,19 @@ def _create_detached_worktree(repository: Path, commit: str, destination: Path) 
         _require_clean_checkout(destination, label="source")
         if _git_commit(destination) != commit:
             raise RuntimeError("detached source worktree resolved the wrong commit")
-    except BaseException:
-        _remove_worktree(repository, destination)
+    except BaseException as error:
+        try:
+            _remove_worktree(repository, destination)
+        except BaseException as cleanup_error:
+            cleanup_failures = (
+                cleanup_error,
+                *_fallback_cleanup_failed_worktree(repository, destination),
+            )
+            for failure in cleanup_failures:
+                error.add_note(
+                    "detached worktree cleanup failed: "
+                    f"{type(failure).__name__}: {failure}"
+                )
         raise
 
 
@@ -1894,6 +1906,41 @@ def _remove_worktree(repository: Path, destination: Path) -> None:
         cwd=repository,
         check=True,
     )
+
+
+def _fallback_cleanup_failed_worktree(
+    repository: Path, destination: Path
+) -> tuple[BaseException, ...]:
+    failures: list[BaseException] = []
+    try:
+        if not repository.is_absolute() or not destination.is_absolute():
+            raise RuntimeError("worktree cleanup paths must be absolute")
+        if destination.is_symlink():
+            raise RuntimeError("refusing to recursively remove a symlinked worktree")
+        repository_root = repository.resolve()
+        destination_root = destination.resolve()
+        if (
+            destination_root == Path(destination_root.anchor)
+            or destination_root == repository_root
+            or repository_root.is_relative_to(destination_root)
+        ):
+            raise RuntimeError("refusing to remove an unsafe worktree path")
+        if destination.exists():
+            if not destination.is_dir():
+                raise RuntimeError("failed worktree path is not a directory")
+            shutil.rmtree(destination)
+    except BaseException as error:
+        failures.append(error)
+
+    try:
+        subprocess.run(
+            ("git", "worktree", "prune"),
+            cwd=repository,
+            check=True,
+        )
+    except BaseException as error:
+        failures.append(error)
+    return tuple(failures)
 
 
 def _launch_trial(
@@ -1980,9 +2027,12 @@ def _thermal_trigger_payload(document: dict) -> tuple[tuple[str, str], dict]:
 
 
 def _persisted_pending_thermal_triggers(
-    journal: BaselineJournal, slots: Sequence[BaselineSlot]
-) -> dict[BaselineSlot, dict]:
+    journal: BaselineJournal,
+    slots: Sequence[BaselineSlot],
+    clock: Callable[[], float],
+) -> dict[BaselineSlot, tuple[dict, float]]:
     expected = set(slots)
+    recovery_deadlines: dict[BaselineSlot, float] = {}
     preflight_order: dict[BaselineSlot, list[tuple[tuple[str, str], dict]]] = {}
     for slot, _index, _path, document in journal._preflight_records():
         if slot not in expected:
@@ -1990,6 +2040,7 @@ def _persisted_pending_thermal_triggers(
         validate_thermal_observation(document["environment_status"])
         if document["environment_status"]["thermal_state"] == "nominal":
             continue
+        _start_recovery_deadline(recovery_deadlines, slot, clock)
         key = ("preflight", document["identity"])
         trigger = {"source": "preflight", "preflight": document}
         preflight_order.setdefault(slot, []).append((key, trigger))
@@ -2005,6 +2056,7 @@ def _persisted_pending_thermal_triggers(
             continue
         if trial.environment_status["thermal_state"] == "nominal":
             raise ValueError("thermal rejection contains a nominal trial")
+        _start_recovery_deadline(recovery_deadlines, attempt.slot, clock)
         key = ("rejected-trial", document["identity"])
         trigger = {
             "source": "rejected-trial",
@@ -2023,12 +2075,13 @@ def _persisted_pending_thermal_triggers(
             path / "trigger.json", label="thermal recovery trigger"
         )
         key, trigger = _thermal_trigger_payload(trigger_document)
+        _start_recovery_deadline(recovery_deadlines, slot, clock)
         recovery_by_slot.setdefault(slot, []).append(
             (recovery_index, path, key, trigger)
         )
         used_sources.setdefault(slot, set()).add(key)
 
-    pending: dict[BaselineSlot, dict] = {}
+    pending: dict[BaselineSlot, tuple[dict, float]] = {}
     for slot in slots:
         recoveries = sorted(recovery_by_slot.get(slot, ()))
         last_success = -1
@@ -2042,7 +2095,7 @@ def _persisted_pending_thermal_triggers(
                     last_success = recovery_index
         trailing = [record for record in recoveries if record[0] > last_success]
         if trailing:
-            pending[slot] = trailing[-1][3]
+            pending[slot] = (trailing[-1][3], recovery_deadlines[slot])
             continue
 
         used = used_sources.get(slot, set())
@@ -2050,13 +2103,13 @@ def _persisted_pending_thermal_triggers(
             trigger for key, trigger in rejected_order.get(slot, ()) if key not in used
         ]
         if unresolved_rejected:
-            pending[slot] = unresolved_rejected[-1]
+            pending[slot] = (unresolved_rejected[-1], recovery_deadlines[slot])
             continue
         unresolved_preflight = [
             trigger for key, trigger in preflight_order.get(slot, ()) if key not in used
         ]
         if unresolved_preflight:
-            pending[slot] = unresolved_preflight[-1]
+            pending[slot] = (unresolved_preflight[-1], recovery_deadlines[slot])
     return pending
 
 
@@ -2084,11 +2137,17 @@ def capture_baseline_trials(
 ) -> tuple[RawTrial, ...]:
     ordered_slots = tuple(slots)
     accepted = journal.load_accepted(ordered_slots)
-    pending_triggers = _persisted_pending_thermal_triggers(journal, ordered_slots)
-    recovery_deadlines: dict[BaselineSlot, float] = {}
-    for slot in ordered_slots:
-        if slot not in accepted and slot in pending_triggers:
-            _start_recovery_deadline(recovery_deadlines, slot, clock)
+    persisted_recoveries = _persisted_pending_thermal_triggers(
+        journal, ordered_slots, clock
+    )
+    pending_triggers = {
+        slot: trigger for slot, (trigger, _deadline) in persisted_recoveries.items()
+    }
+    recovery_deadlines = {
+        slot: deadline
+        for slot, (_trigger, deadline) in persisted_recoveries.items()
+        if slot not in accepted
+    }
     for slot in ordered_slots:
         if slot not in accepted:
             continue
@@ -2270,12 +2329,14 @@ def _resolve_baseline_output_paths(
     state = state_root.resolve()
     manifest = manifest_path.resolve()
     raw_output = raw_output_path.resolve()
-    if (
-        manifest == raw_output
-        or manifest == state
-        or raw_output == state
-        or manifest.is_relative_to(state)
-        or raw_output.is_relative_to(state)
+    path_pairs = (
+        (state, manifest),
+        (state, raw_output),
+        (manifest, raw_output),
+    )
+    if any(
+        left == right or left.is_relative_to(right) or right.is_relative_to(left)
+        for left, right in path_pairs
     ):
         raise ValueError(
             "final output paths must be distinct and outside the state directory"

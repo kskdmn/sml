@@ -239,8 +239,9 @@ class RawTrial:
             "warmup_units",
             "measured_units",
         )
-        if any(not isinstance(raw[name], int) for name in integer_fields):
-            raise ValueError("raw trial integer fields must be integers")
+        for name in integer_fields:
+            if type(raw[name]) is not int:
+                raise ValueError(f"raw trial {name} must be an integer")
         if raw["schema_version"] != 1:
             raise ValueError("unsupported raw trial schema version")
         if raw["pair_index"] < 0 or raw["process_order"] < 0:
@@ -279,16 +280,12 @@ class RawTrial:
         elapsed = raw["elapsed_seconds"]
         value = raw["value"]
         if (
-            not isinstance(elapsed, (int, float))
+            type(elapsed) not in (int, float)
             or not math.isfinite(elapsed)
             or elapsed <= 0
         ):
             raise ValueError("elapsed_seconds must be finite and positive")
-        if (
-            not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value <= 0
-        ):
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
             raise ValueError("value must be finite and positive")
         optional_float_fields = (
             "startup_verification_seconds",
@@ -297,13 +294,11 @@ class RawTrial:
         for name in optional_float_fields:
             item = raw[name]
             if item is not None and (
-                not isinstance(item, (int, float))
-                or not math.isfinite(item)
-                or item < 0
+                type(item) not in (int, float) or not math.isfinite(item) or item < 0
             ):
                 raise ValueError(f"{name} must be finite and non-negative")
         peak = raw["peak_memory_bytes"]
-        if peak is not None and (not isinstance(peak, int) or peak < 0):
+        if peak is not None and (type(peak) is not int or peak < 0):
             raise ValueError("peak_memory_bytes must be non-negative")
         mappings = {}
         for name in (

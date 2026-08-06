@@ -26,8 +26,9 @@ software mismatches.
 Baseline capture also requires `--state-directory PATH`. The path is resolved
 before use and must be outside both the harness checkout and the detached pinned
 source checkout. The final manifest and raw JSONL paths must be distinct from
-each other and both must be outside the state directory. The state directory is
-a durable journal that remains after success or failure:
+each other and both must be outside the state directory; none of the three
+resolved locations may contain another. The state directory is a durable
+journal that remains after success or failure:
 
 ```text
 <state-directory>/
