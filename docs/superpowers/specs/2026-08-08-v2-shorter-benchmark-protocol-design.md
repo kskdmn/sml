@@ -1,6 +1,6 @@
 # V2 Shorter Benchmark Protocol Design
 
-**Status:** Approved design; implementation pending specification review
+**Status:** Approved design; implementation planned
 
 **Date:** 2026-08-08
 
