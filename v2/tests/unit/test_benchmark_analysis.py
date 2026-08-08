@@ -2,6 +2,7 @@ import hashlib
 import inspect
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -220,13 +221,39 @@ def test_canonical_workload_round_trip_pins_complete_benchmark_contract():
     assert workload.precision["compute_dtype"] == "bfloat16"
     assert workload.loader["sequence_length"] == 1_024
     assert workload.loader["swag"]["sequence_length"] == 256
-    assert workload.compilation["compilation_passes"] == 1
+    assert workload.compilation == {
+        "compilation_passes": 1,
+        "warmup_units": 5,
+        "measured_units": 20,
+        "fresh_processes": True,
+        "state_reset_policy": "fresh-native-workload-per-process",
+    }
+    assert workload.generation["request_count"] == 32
     assert workload.generation["decode_chunk_size"] == 8
     assert tuple(unit.metric for unit in workload.work_units) == METRIC_NAMES
-    units = {unit.metric: unit.measured_units for unit in workload.work_units}
-    assert units["inference-prefill"] == 32
-    assert units["inference-decode"] == 32
-    assert units["compile-cold-start"] == 1
+    assert {unit.metric: unit.measured_units for unit in workload.work_units} == {
+        "prepared-data": 20,
+        "pretraining-compute": 20,
+        "pretraining-end-to-end": 20,
+        "swag-end-to-end": 20,
+        "inference-prefill": 32,
+        "inference-decode": 32,
+        "checkpoint-pause": 20,
+        "compile-cold-start": 1,
+        "peak-metal-memory": 1,
+    }
+
+    protocol_neutral = workload.to_dict()
+    protocol_neutral["compilation"].pop("warmup_units")
+    protocol_neutral["compilation"].pop("measured_units")
+    for unit in protocol_neutral["work_units"]:
+        unit.pop("measured_units")
+    assert (
+        structured_identity(
+            "sml-benchmark-protocol-neutral-workload-v1", protocol_neutral
+        )
+        == "sha256:fd49778a69efe0f3aafa82776b7c043e34fea9ac5b537d630f513772afacfb4a"
+    )
 
 
 def test_canonical_rows_are_derived_from_pinned_tokenizer_and_corpus():
@@ -505,6 +532,45 @@ def test_measurement_protocol_compiles_warms_and_times_with_explicit_syncs():
     assert measurement.peak_memory_bytes == 123
 
 
+def test_peak_memory_runs_one_measured_step_after_five_warmups_and_peak_reset():
+    workload = build_canonical_workload()
+    peak_unit = next(
+        unit for unit in workload.work_units if unit.metric == "peak-metal-memory"
+    )
+    events = []
+    adapter = SimpleNamespace(
+        run_warmup=lambda _metric, _native, units: events.append(("warmup", units)),
+        run_measured=lambda _metric, _native, units: (
+            events.append(("measured", units)) or 8_192.0
+        ),
+    )
+
+    measurement = measure_native_process(
+        adapter=adapter,
+        metric="peak-metal-memory",
+        native_workload="native",
+        warmup_units=workload.compilation["warmup_units"],
+        measured_units=peak_unit.measured_units,
+        synchronize=lambda: events.append(("synchronize",)),
+        clock=iter((0.0, 1.0, 2.0, 3.0)).__next__,
+        peak_memory=lambda: 7_875_602_848,
+        reset_peak_memory=lambda: events.append(("reset-peak-memory",)),
+    )
+
+    operations = [event for event in events if event != ("synchronize",)]
+    assert operations == [
+        ("warmup", 1),
+        ("warmup", 1),
+        ("warmup", 1),
+        ("warmup", 1),
+        ("warmup", 1),
+        ("warmup", 1),
+        ("reset-peak-memory",),
+        ("measured", 1),
+    ]
+    assert measurement.value == 7_875_602_848.0
+
+
 def test_latency_and_peak_memory_metrics_use_their_pinned_values():
     adapter = SimpleNamespace(
         run_warmup=lambda *_args: None,
@@ -730,6 +796,40 @@ def test_record_baseline_parser_requires_state_directory():
         )
 
 
+def test_benchmark_parser_defaults_to_the_shorter_protocol():
+    baseline = build_parser().parse_args(
+        [
+            "record-baseline",
+            "--source-commit",
+            "3687f8b",
+            "--manifest",
+            "manifest.json",
+            "--raw-output",
+            "raw.jsonl",
+            "--state-directory",
+            "state",
+        ]
+    )
+    comparison = build_parser().parse_args(
+        [
+            "compare",
+            "--baseline",
+            "manifest.json",
+            "--candidate",
+            "HEAD",
+            "--metrics",
+            "prepared-data",
+            "--predecessors",
+            '{"prepared-data":null}',
+            "--output",
+            "report.json",
+        ]
+    )
+
+    assert (baseline.pairs, baseline.warmup, baseline.measure) == (5, 5, 20)
+    assert (comparison.pairs, comparison.warmup, comparison.measure) == (5, 5, 20)
+
+
 def test_final_mode_is_inferred_only_for_the_strict_ten_pair_protocol():
     metrics = (
         "prepared-data,pretraining-end-to-end,swag-end-to-end,"
@@ -948,7 +1048,7 @@ def _valid_raw_trial(workload, metric="prepared-data", pair_index=0):
         execution_order_identity=canonical_execution_order_identity(metric, workload),
         initial_parameter_identity="sha256:" + "c" * 64,
         comparison_target="baseline",
-        warmup_units=0 if metric == "compile-cold-start" else 20,
+        warmup_units=0 if metric == "compile-cold-start" else 5,
         measured_units=work_unit.measured_units,
         elapsed_seconds=2.0,
         value=50.0,
@@ -1104,8 +1204,8 @@ def test_baseline_manifest_binds_raw_trials_to_clean_source_and_harness():
         harness_identity=trial.harness_identity,
         command="record-baseline --source-commit 3687f8b",
         pairs=5,
-        warmup_units=20,
-        measured_units=100,
+        warmup_units=5,
+        measured_units=20,
         paired_representations=paired_representations,
     )
 
@@ -1134,8 +1234,8 @@ def test_baseline_validator_rejects_partial_or_weakened_protocols():
         harness_identity=trials[0].harness_identity,
         command="record-baseline --source-commit 3687f8b",
         pairs=5,
-        warmup_units=20,
-        measured_units=100,
+        warmup_units=5,
+        measured_units=20,
         paired_representations=_valid_paired_representations(workload),
     )
 
@@ -1154,13 +1254,20 @@ def test_baseline_validator_rejects_partial_or_weakened_protocols():
     with pytest.raises(ValueError, match="every benchmark metric"):
         validate_baseline_manifest(missing_metric, without_decode)
 
-    wrong_warmup = replace(trials[0], warmup_units=19)
+    wrong_warmup = replace(trials[0], warmup_units=20)
     with pytest.raises(ValueError, match="warmup or measured"):
         validate_baseline_manifest(manifest, (wrong_warmup, *trials[1:]))
 
-    wrong_units = replace(trials[0], measured_units=99)
+    wrong_units = replace(trials[0], measured_units=100)
     with pytest.raises(ValueError, match="warmup or measured"):
         validate_baseline_manifest(manifest, (wrong_units, *trials[1:]))
+
+    old_protocol = json.loads(json.dumps(manifest))
+    old_protocol["protocol"]["warmup_units"] = 20
+    old_protocol["protocol"]["measured_units"] = 100
+    _resign_baseline(old_protocol)
+    with pytest.raises(ValueError, match="pinned protocol"):
+        validate_baseline_manifest(old_protocol, trials)
 
     with pytest.raises(ValueError, match="duplicate, missing, or extra"):
         validate_baseline_manifest(manifest, (*trials, trials[0]))
@@ -1191,8 +1298,8 @@ def test_baseline_rejects_invalid_environment_or_software(
         harness_identity=trials[0].harness_identity,
         command="record-baseline",
         pairs=5,
-        warmup_units=20,
-        measured_units=100,
+        warmup_units=5,
+        measured_units=20,
         paired_representations=_valid_paired_representations(workload),
     )
     changed = replace(
@@ -1315,8 +1422,8 @@ def test_comparison_report_pins_pairs_decisions_and_metric_lineage():
         harness_identity=baseline_trial.harness_identity,
         command="record-baseline",
         pairs=5,
-        warmup_units=20,
-        measured_units=100,
+        warmup_units=5,
+        measured_units=20,
         paired_representations=_valid_paired_representations(workload),
     )
     trials = []
@@ -1432,8 +1539,8 @@ def _valid_prepared_comparison():
         harness_identity=baseline_trials[0].harness_identity,
         command="record-baseline",
         pairs=5,
-        warmup_units=20,
-        measured_units=100,
+        warmup_units=5,
+        measured_units=20,
         paired_representations=_valid_paired_representations(workload),
     )
     candidate_commit = "e" * 40
@@ -1456,8 +1563,8 @@ def _valid_prepared_comparison():
     ("field", "value"),
     [
         ("pairs", 4),
-        ("warmup_units", 19),
-        ("measured_units", 99),
+        ("warmup_units", 20),
+        ("measured_units", 100),
         ("bootstrap_resamples", 9_999),
         ("minimum_ratio", 0.90),
         ("maximum_dispersion", 0.03),
@@ -1579,8 +1686,8 @@ def test_noisy_comparison_retains_exactly_one_cooled_retry():
         harness_identity=baseline_trials[0].harness_identity,
         command="record-baseline",
         pairs=5,
-        warmup_units=20,
-        measured_units=100,
+        warmup_units=5,
+        measured_units=20,
         paired_representations=_valid_paired_representations(workload),
     )
     candidate_commit = "e" * 40
@@ -1622,8 +1729,8 @@ def test_persistent_noise_blocks_acceptance_after_the_single_retry():
         harness_identity=baseline_trials[0].harness_identity,
         command="record-baseline",
         pairs=5,
-        warmup_units=20,
-        measured_units=100,
+        warmup_units=5,
+        measured_units=20,
         paired_representations=_valid_paired_representations(workload),
     )
     candidate_commit = "e" * 40
@@ -1708,8 +1815,8 @@ def test_predecessors_are_resolved_as_an_explicit_per_metric_mapping(tmp_path):
         harness_identity=baseline_trials[0].harness_identity,
         command="record-baseline",
         pairs=5,
-        warmup_units=20,
-        measured_units=100,
+        warmup_units=5,
+        measured_units=20,
         paired_representations=_valid_paired_representations(workload),
     )
 
@@ -1890,7 +1997,7 @@ def _session_document(
         source_commit="3687f8b3214a44c675ae67af52e4997762f6c634",
         canonical_workload=workload,
         canonical_workload_identity=canonical_workload_identity(workload),
-        protocol=protocol or {"pairs": 5, "warmup_units": 20, "measured_units": 100},
+        protocol=protocol or {"pairs": 5, "warmup_units": 5, "measured_units": 20},
         hardware=hardware or {"chip": "Apple M5"},
         software_versions=software_versions or {"python": "3.12.13", "mlx": "0.32.0"},
         paired_representations=paired_representations
@@ -2719,6 +2826,10 @@ def test_interrupted_manifest_publication_resumes_byte_identically_across_cli_sp
         ],
     )
     first_command = benchmark_runner.canonical_baseline_command(journal)
+    command_parts = shlex.split(first_command)
+    assert command_parts[command_parts.index("--pairs") + 1] == "5"
+    assert command_parts[command_parts.index("--warmup") + 1] == "5"
+    assert command_parts[command_parts.index("--measure") + 1] == "20"
     relocated = BaselineJournal(tmp_path / "equivalent-state", journal.session)
     assert benchmark_runner.canonical_baseline_command(relocated) == first_command
     monkeypatch.setattr(
@@ -2971,7 +3082,8 @@ def test_baseline_journal_resumes_only_an_identical_session(tmp_path):
 @pytest.mark.parametrize(
     "changed",
     [
-        {"protocol": {"pairs": 4, "warmup_units": 20, "measured_units": 100}},
+        {"protocol": {"pairs": 4, "warmup_units": 5, "measured_units": 20}},
+        {"protocol": {"pairs": 5, "warmup_units": 20, "measured_units": 100}},
         {"hardware": {"chip": "Apple M4"}},
         {"software_versions": {"python": "3.12.12", "mlx": "0.32.0"}},
         {"manifest_name": "other.json"},
@@ -3538,18 +3650,18 @@ def _single_process_arguments(tmp_path):
         attempt_index=0,
         pair_index=0,
         process_order=0,
-        warmup=20,
-        measure=100,
+        warmup=5,
+        measure=20,
         comparison_target="baseline",
         output=tmp_path / "state" / "inflight" / "prepared-data" / "0" / "0.json",
     )
 
 
-def _stub_single_process_measurement(monkeypatch, args):
+def _stub_single_process_measurement(monkeypatch, args, captured=None):
     args.harness_root.mkdir()
     args.source_root.mkdir()
     workload = build_canonical_workload()
-    trial = _valid_raw_trial(workload)
+    trial = _valid_raw_trial(workload, metric=args.metric)
     status = {
         "power_connected": True,
         "power_mode": "automatic",
@@ -3594,17 +3706,46 @@ def _stub_single_process_measurement(monkeypatch, args):
         "collect_environment",
         lambda: (trial.hardware, status, trial.software_versions),
     )
-    monkeypatch.setattr(
-        benchmark_runner,
-        "measure_native_process",
-        lambda **unused: benchmark_runner.ProcessMeasurement(
+
+    def measure(**kwargs):
+        if captured is not None:
+            captured.update(kwargs)
+        return benchmark_runner.ProcessMeasurement(
             elapsed_seconds=trial.elapsed_seconds,
             value=trial.value,
             work_count=100.0,
             compilation_seconds=trial.compilation_seconds,
             peak_memory_bytes=trial.peak_memory_bytes,
-        ),
-    )
+        )
+
+    monkeypatch.setattr(benchmark_runner, "measure_native_process", measure)
+
+
+@pytest.mark.parametrize(
+    ("metric", "expected_warmup", "expected_measured"),
+    [
+        ("prepared-data", 5, 20),
+        ("inference-prefill", 5, 32),
+        ("compile-cold-start", 0, 1),
+        ("peak-metal-memory", 5, 1),
+    ],
+)
+def test_child_process_forwards_each_canonical_metric_count(
+    tmp_path, monkeypatch, metric, expected_warmup, expected_measured
+):
+    args = _single_process_arguments(tmp_path)
+    args.metric = metric
+    args.output = tmp_path / "state" / "inflight" / metric / "0" / "0.json"
+    captured = {}
+    _stub_single_process_measurement(monkeypatch, args, captured)
+
+    benchmark_runner._run_single_process(args)
+
+    assert captured["warmup_units"] == expected_warmup
+    assert captured["measured_units"] == expected_measured
+    raw = RawTrial.from_dict(read_json_object(args.output, label="child output"))
+    assert raw.warmup_units == expected_warmup
+    assert raw.measured_units == expected_measured
 
 
 def test_completed_child_output_never_overwrites_an_existing_attempt(

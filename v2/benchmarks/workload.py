@@ -65,6 +65,8 @@ REPLACEMENT_PRECISION_POLICY = (
     "replacement FP32 authoritative master parameters and FP32 Adam moments with "
     "derived BF16 working parameters"
 )
+WARMUP_UNITS = 5
+DEFAULT_MEASURED_UNITS = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -387,6 +389,7 @@ def _work_units(request_count: int) -> tuple[WorkUnitDefinition, ...]:
         "inference-prefill": request_count,
         "inference-decode": request_count,
         "compile-cold-start": 1,
+        "peak-metal-memory": 1,
     }
     return tuple(
         WorkUnitDefinition(
@@ -396,7 +399,7 @@ def _work_units(request_count: int) -> tuple[WorkUnitDefinition, ...]:
             work_unit=work_unit,
             start_boundary=start_boundary,
             end_boundary=end_boundary,
-            measured_units=measured_units.get(metric, 100),
+            measured_units=measured_units.get(metric, DEFAULT_MEASURED_UNITS),
         )
         for metric, direction, numerator, work_unit, start_boundary, end_boundary in definitions
     )
@@ -571,8 +574,8 @@ def build_canonical_workload(
         loader=loader,
         compilation={
             "compilation_passes": 1,
-            "warmup_units": 20,
-            "measured_units": 100,
+            "warmup_units": WARMUP_UNITS,
+            "measured_units": DEFAULT_MEASURED_UNITS,
             "fresh_processes": True,
             "state_reset_policy": "fresh-native-workload-per-process",
         },

@@ -42,8 +42,10 @@ from v2.benchmarks.recovery import (
 )
 from v2.benchmarks.schema import METRIC_NAMES, CanonicalWorkload, MetricName, RawTrial
 from v2.benchmarks.workload import (
+    DEFAULT_MEASURED_UNITS,
     LEGACY_PRECISION_POLICY,
     REPLACEMENT_PRECISION_POLICY,
+    WARMUP_UNITS,
     build_canonical_workload,
     canonical_execution_order_identity,
     canonical_input_identity,
@@ -62,8 +64,6 @@ COMPARISON_SCREEN = "screen"
 COMPARISON_FINAL = "final"
 SCREEN_PAIRS = 5
 FINAL_PAIRS = 10
-WARMUP_UNITS = 20
-DEFAULT_MEASURED_UNITS = 100
 BOOTSTRAP_RESAMPLES = 10_000
 SCREEN_MAXIMUM_DISPERSION = 0.02
 FINAL_MAXIMUM_DISPERSION = 0.015
@@ -3457,18 +3457,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="external durable journal directory for baseline resume and diagnostics",
     )
     baseline.add_argument("--metrics", type=parse_metrics, default=METRIC_NAMES)
-    baseline.add_argument("--pairs", type=int, default=5)
-    baseline.add_argument("--warmup", type=int, default=20)
-    baseline.add_argument("--measure", type=int, default=100)
+    baseline.add_argument("--pairs", type=int, default=SCREEN_PAIRS)
+    baseline.add_argument("--warmup", type=int, default=WARMUP_UNITS)
+    baseline.add_argument("--measure", type=int, default=DEFAULT_MEASURED_UNITS)
 
     compare = subparsers.add_parser("compare")
     compare.add_argument("--baseline", type=Path, required=True)
     compare.add_argument("--candidate", required=True)
     compare.add_argument("--metrics", type=parse_metrics, required=True)
     compare.add_argument("--mode", choices=(COMPARISON_SCREEN, COMPARISON_FINAL))
-    compare.add_argument("--pairs", type=int, default=5)
-    compare.add_argument("--warmup", type=int, default=20)
-    compare.add_argument("--measure", type=int, default=100)
+    compare.add_argument("--pairs", type=int, default=SCREEN_PAIRS)
+    compare.add_argument("--warmup", type=int, default=WARMUP_UNITS)
+    compare.add_argument("--measure", type=int, default=DEFAULT_MEASURED_UNITS)
     compare.add_argument("--bootstrap-resamples", type=int, default=10_000)
     compare.add_argument("--minimum-ratio", type=float, default=0.97)
     compare.add_argument("--pretraining-minimum-ratio", type=float)
