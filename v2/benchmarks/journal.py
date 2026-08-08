@@ -14,6 +14,12 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from v2.benchmarks.evidence import (
+    finalize_raw_trial,
+    validate_child_trial_measurement,
+    validate_post_exit_observation,
+    validate_raw_trial_evidence,
+)
 from v2.benchmarks.schema import (
     METRIC_NAMES,
     CanonicalWorkload,
@@ -42,7 +48,15 @@ INITIALIZATION_MARKER = ".baseline-session-initializing"
 LOCK_FILE_NAME = ".baseline-session.lock"
 OUTPUT_LOCK_DIRECTORY_NAME = "sml-v2-baseline-output-locks"
 STATE_DIRECTORY_NAMES = frozenset(
-    {"accepted", "rejected", "inflight", "preflight", "thermal-waits"}
+    {
+        "accepted",
+        "rejected",
+        "inflight",
+        "measurements",
+        "post-exit",
+        "preflight",
+        "thermal-waits",
+    }
 )
 STATE_FILE_NAMES = frozenset({"session.json", "completed.json"})
 DECIMAL_INDEX = re.compile(r"(?:0|[1-9][0-9]*)")
@@ -304,7 +318,13 @@ def _is_journal_destination(root: Path, destination: Path) -> bool:
             and parts[2].endswith(".json")
             and DECIMAL_INDEX.fullmatch(parts[2][:-5]) is not None
         )
-    if len(parts) == 4 and parts[0] in {"inflight", "rejected", "preflight"}:
+    if len(parts) == 4 and parts[0] in {
+        "inflight",
+        "measurements",
+        "post-exit",
+        "rejected",
+        "preflight",
+    }:
         return (
             parts[1] in METRIC_NAMES
             and DECIMAL_INDEX.fullmatch(parts[2]) is not None
@@ -506,12 +526,17 @@ def _require_observation(
 
 
 def _validate_identity_document(
-    document: dict, *, kind: str, identity_domain: str, label: str
+    document: dict,
+    *,
+    kind: str,
+    identity_domain: str,
+    label: str,
+    expected_version: int = 1,
 ) -> dict:
     if (
         document.get("kind") != kind
         or type(document.get("version")) is not int
-        or document["version"] != 1
+        or document["version"] != expected_version
     ):
         raise ValueError(f"{label} has an invalid kind or version")
     identity = document.get("identity")
@@ -523,17 +548,27 @@ def _validate_identity_document(
 
 def _validate_rejected_document(
     document: dict, *, slot: BaselineSlot, journal_attempt_index: int
-) -> RawTrial:
+) -> tuple[dict, RawTrial | None]:
     _require_object_fields(
         document,
-        {"kind", "version", "journal_attempt_index", "reason", "trial", "identity"},
+        {
+            "kind",
+            "version",
+            "journal_attempt_index",
+            "reason",
+            "child_measurement_identity",
+            "post_exit_observation_identity",
+            "trial",
+            "identity",
+        },
         label="rejected trial",
     )
     body = _validate_identity_document(
         document,
         kind="sml-baseline-rejected-trial",
-        identity_domain="sml-baseline-rejected-trial-v1",
+        identity_domain="sml-baseline-rejected-trial-v2",
         label="rejected trial",
+        expected_version=2,
     )
     _require_non_negative_index(
         body["journal_attempt_index"], label="journal attempt index"
@@ -541,9 +576,25 @@ def _validate_rejected_document(
     if body["journal_attempt_index"] != journal_attempt_index:
         raise ValueError("rejected trial attempt index does not match its filename")
     _require_nonempty_string(body["reason"], label="rejected trial reason")
-    if not isinstance(body["trial"], dict):
-        raise ValueError("rejected trial must contain a raw trial object")
-    return _parse_trial_for_slot(body["trial"], slot=slot, label="rejected trial")
+    if (
+        not isinstance(body["child_measurement_identity"], str)
+        or IDENTITY.fullmatch(body["child_measurement_identity"]) is None
+    ):
+        raise ValueError("rejected trial child measurement identity is invalid")
+    post_exit_identity = body["post_exit_observation_identity"]
+    if post_exit_identity is not None and (
+        not isinstance(post_exit_identity, str)
+        or IDENTITY.fullmatch(post_exit_identity) is None
+    ):
+        raise ValueError("rejected trial post-exit observation identity is invalid")
+    raw_trial = body["trial"]
+    if raw_trial is None:
+        return body, None
+    if not isinstance(raw_trial, dict):
+        raise ValueError(  # noqa: TRY004
+            "rejected trial must contain a raw trial object or null"
+        )
+    return body, _parse_trial_for_slot(raw_trial, slot=slot, label="rejected trial")
 
 
 def _validate_preflight_document(
@@ -768,8 +819,17 @@ class JournalAttempt:
             raise ValueError("journal attempt path must be a path")
 
 
+@dataclass(frozen=True, slots=True)
+class JournalAttemptEvidence:
+    attempt: JournalAttempt
+    measurement: dict
+    post_exit: dict | None
+    trial: RawTrial | None
+
+
 def _parse_trial_for_slot(raw: dict, *, slot: BaselineSlot, label: str) -> RawTrial:
     trial = RawTrial.from_dict(raw)
+    validate_raw_trial_evidence(trial)
     if type(raw["pair_index"]) is not int:
         raise ValueError("raw trial pair index must be an integer")
     if type(raw["attempt_index"]) is not int or trial.attempt_index != 0:
@@ -914,6 +974,32 @@ class BaselineJournal:
             / f"{journal_attempt_index}.json"
         )
 
+    def measurement_path(self, slot: BaselineSlot, journal_attempt_index: int) -> Path:
+        self._require_slot(slot)
+        _require_non_negative_index(
+            journal_attempt_index, label="journal attempt index"
+        )
+        return (
+            self.root
+            / "measurements"
+            / slot.metric
+            / str(slot.pair_index)
+            / f"{journal_attempt_index}.json"
+        )
+
+    def post_exit_path(self, slot: BaselineSlot, journal_attempt_index: int) -> Path:
+        self._require_slot(slot)
+        _require_non_negative_index(
+            journal_attempt_index, label="journal attempt index"
+        )
+        return (
+            self.root
+            / "post-exit"
+            / slot.metric
+            / str(slot.pair_index)
+            / f"{journal_attempt_index}.json"
+        )
+
     def rejected_path(self, slot: BaselineSlot, journal_attempt_index: int) -> Path:
         self._require_slot(slot)
         _require_non_negative_index(
@@ -996,6 +1082,16 @@ class BaselineJournal:
     def _attempt_records(
         self, category: str
     ) -> tuple[tuple[JournalAttempt, Path], ...]:
+        path_for_category = {
+            "inflight": self.inflight_path,
+            "measurements": self.measurement_path,
+            "post-exit": self.post_exit_path,
+            "rejected": self.rejected_path,
+        }
+        try:
+            canonical_path = path_for_category[category]
+        except KeyError as error:
+            raise ValueError(f"unsupported attempt category: {category}") from error
         records: list[tuple[JournalAttempt, Path]] = []
         for metric, metric_path in self._category_metric_directories(category):
             for pair_path in metric_path.iterdir():
@@ -1013,16 +1109,16 @@ class BaselineJournal:
                     attempt_index = _parse_decimal_index(
                         path.stem, label=f"{category} attempt filename"
                     )
-                    attempt_path = (
-                        self.inflight_path(slot, attempt_index)
-                        if category == "inflight"
-                        else self.rejected_path(slot, attempt_index)
-                    )
+                    attempt_path = canonical_path(slot, attempt_index)
                     if path != attempt_path:
                         raise ValueError(f"{category} attempt has a non-canonical path")
                     records.append(
                         (
-                            JournalAttempt(slot, attempt_index, attempt_path),
+                            JournalAttempt(
+                                slot,
+                                attempt_index,
+                                self.inflight_path(slot, attempt_index),
+                            ),
                             path,
                         )
                     )
@@ -1030,79 +1126,181 @@ class BaselineJournal:
 
     def _validate_attempt_history(
         self,
-    ) -> tuple[dict[BaselineSlot, tuple[int, ...]], tuple[JournalAttempt, ...]]:
-        rejected: dict[tuple[BaselineSlot, int], tuple[dict, RawTrial]] = {}
+    ) -> tuple[dict[BaselineSlot, tuple[int, ...]], tuple[JournalAttemptEvidence, ...]]:
+        measurements: dict[tuple[BaselineSlot, int], dict] = {}
+        attempts: dict[tuple[BaselineSlot, int], JournalAttempt] = {}
+        for attempt, path in self._attempt_records("measurements"):
+            document = read_json_object(path, label="child measurement")
+            measurement = validate_child_trial_measurement(document)
+            trial_payload = measurement["trial"]
+            if measurement["session_identity"] != self.session["identity"]:
+                raise ValueError("child measurement does not match the journal session")
+            if (
+                trial_payload["metric"] != attempt.slot.metric
+                or type(trial_payload["pair_index"]) is not int
+                or trial_payload["pair_index"] != attempt.slot.pair_index
+            ):
+                raise ValueError(
+                    "child measurement metric or pair index does not match its slot"
+                )
+            if (
+                type(trial_payload["attempt_index"]) is not int
+                or trial_payload["attempt_index"] != 0
+            ):
+                raise ValueError(
+                    "baseline child measurement attempt_index must be zero"
+                )
+            if measurement["journal_attempt_index"] != attempt.journal_attempt_index:
+                raise ValueError(
+                    "child measurement attempt index does not match its filename"
+                )
+            key = (attempt.slot, attempt.journal_attempt_index)
+            measurements[key] = measurement
+            attempts[key] = attempt
+
+        post_exit: dict[tuple[BaselineSlot, int], dict] = {}
+        for attempt, path in self._attempt_records("post-exit"):
+            key = (attempt.slot, attempt.journal_attempt_index)
+            measurement = measurements.get(key)
+            if measurement is None:
+                raise ValueError("post-exit evidence has no measurement")
+            document = read_json_object(path, label="post-exit observation")
+            post_exit[key] = validate_post_exit_observation(
+                document, measurement=measurement
+            )
+            attempts[key] = attempt
+
+        inflight: dict[tuple[BaselineSlot, int], tuple[dict, RawTrial]] = {}
+        for attempt, path in self._attempt_records("inflight"):
+            key = (attempt.slot, attempt.journal_attempt_index)
+            if key not in post_exit:
+                raise ValueError("inflight trial has no post-exit evidence")
+            raw = read_json_object(path, label="inflight trial")
+            trial = _parse_trial_for_slot(
+                raw, slot=attempt.slot, label="inflight trial"
+            )
+            expected_trial = finalize_raw_trial(measurements[key], post_exit[key])
+            if raw != expected_trial.to_dict() or trial != expected_trial:
+                raise ValueError("inflight trial does not match its staged evidence")
+            inflight[key] = (raw, trial)
+            attempts[key] = attempt
+
+        rejected: dict[
+            tuple[BaselineSlot, int], tuple[dict, dict, RawTrial | None]
+        ] = {}
         for attempt, path in self._attempt_records("rejected"):
             document = read_json_object(path, label="rejected trial")
-            rejected[(attempt.slot, attempt.journal_attempt_index)] = (
+            body, trial = _validate_rejected_document(
                 document,
-                _validate_rejected_document(
-                    document,
-                    slot=attempt.slot,
-                    journal_attempt_index=attempt.journal_attempt_index,
-                ),
+                slot=attempt.slot,
+                journal_attempt_index=attempt.journal_attempt_index,
             )
-        inflight: dict[
-            tuple[BaselineSlot, int], tuple[JournalAttempt, dict, RawTrial]
-        ] = {}
-        for attempt, path in self._attempt_records("inflight"):
-            raw = read_json_object(path, label="inflight trial")
-            inflight[(attempt.slot, attempt.journal_attempt_index)] = (
-                attempt,
-                raw,
-                _parse_trial_for_slot(raw, slot=attempt.slot, label="inflight trial"),
-            )
-        accepted: dict[BaselineSlot, tuple[Path, dict, RawTrial]] = {}
+            key = (attempt.slot, attempt.journal_attempt_index)
+            measurement = measurements.get(key)
+            if measurement is None:
+                raise ValueError("rejected trial has no child measurement")
+            if body["child_measurement_identity"] != measurement["identity"]:
+                raise ValueError("rejected trial does not match its child measurement")
+            parent = post_exit.get(key)
+            expected_parent_identity = None if parent is None else parent["identity"]
+            if body["post_exit_observation_identity"] != expected_parent_identity:
+                raise ValueError(
+                    "rejected trial does not match its post-exit observation"
+                )
+            if trial is None:
+                if body["reason"] != "missing-immediate-post-exit-evidence":
+                    raise ValueError("unfinalized rejection has an invalid reason")
+                if parent is not None or key in inflight:
+                    raise ValueError(
+                        "unfinalized rejection contains finalized stage evidence"
+                    )
+            else:
+                if parent is None:
+                    raise ValueError("rejected trial has no post-exit evidence")
+                expected_trial = finalize_raw_trial(measurement, parent)
+                if body["trial"] != expected_trial.to_dict() or trial != expected_trial:
+                    raise ValueError(
+                        "rejected trial does not match its staged evidence"
+                    )
+            rejected[key] = (document, body, trial)
+            attempts[key] = attempt
+
+        accepted: dict[tuple[BaselineSlot, int], tuple[Path, dict, RawTrial]] = {}
         for slot, path in self._accepted_records():
             raw = read_json_object(path, label="accepted trial")
-            accepted[slot] = (
+            trial = _parse_trial_for_slot(raw, slot=slot, label="accepted trial")
+            key = (slot, trial.journal_attempt_index)
+            if key in accepted:
+                raise ValueError("accepted attempt is duplicated")
+            measurement = measurements.get(key)
+            parent = post_exit.get(key)
+            if measurement is None or parent is None:
+                raise ValueError("accepted trial has incomplete staged evidence")
+            expected_trial = finalize_raw_trial(measurement, parent)
+            if raw != expected_trial.to_dict() or trial != expected_trial:
+                raise ValueError("accepted trial does not match its staged evidence")
+            accepted[key] = (
                 path,
                 raw,
-                _parse_trial_for_slot(raw, slot=slot, label="accepted trial"),
+                trial,
             )
+            attempts[key] = JournalAttempt(
+                slot,
+                trial.journal_attempt_index,
+                self.inflight_path(slot, trial.journal_attempt_index),
+            )
+
+        if accepted.keys() & rejected.keys():
+            raise ValueError("journal attempt has both accepted and rejected outcomes")
 
         rejected_splits: list[JournalAttempt] = []
         for key in rejected.keys() & inflight.keys():
-            rejected_document, rejected_trial = rejected[key]
-            attempt, raw, inflight_trial = inflight[key]
-            if raw != rejected_document["trial"] or inflight_trial != rejected_trial:
+            rejected_document, _body, rejected_trial = rejected[key]
+            raw, inflight_trial = inflight[key]
+            if (
+                rejected_trial is None
+                or raw != rejected_document["trial"]
+                or inflight_trial != rejected_trial
+            ):
                 raise ValueError(
                     "inflight trial does not match its rejected transition"
                 )
-            rejected_splits.append(attempt)
+            rejected_splits.append(attempts[key])
 
+        all_keys = (
+            set(measurements)
+            | set(post_exit)
+            | set(inflight)
+            | set(rejected)
+            | set(accepted)
+        )
         histories: dict[BaselineSlot, list[int]] = {}
-        for slot, index in rejected:
+        for slot, index in all_keys:
             histories.setdefault(slot, []).append(index)
-        for (slot, index), (_attempt, _raw, _trial) in inflight.items():
-            if (slot, index) not in rejected:
-                histories.setdefault(slot, []).append(index)
         for slot, indices in histories.items():
-            if len(set(indices)) != len(indices):
-                raise ValueError(
-                    f"journal attempt index is duplicated for {slot.metric}"
-                )
             if sorted(indices) != list(range(len(indices))):
                 raise ValueError(
                     f"journal attempt indices have a gap for {slot.metric}"
                 )
 
         accepted_splits: list[JournalAttempt] = []
-        for slot, (accepted_path, accepted_raw, accepted_trial) in accepted.items():
+        for key, (accepted_path, accepted_raw, accepted_trial) in accepted.items():
+            slot, _index = key
             candidates = [
-                record
-                for key, record in inflight.items()
-                if key not in rejected and key[0] == slot
+                (candidate_key, record)
+                for candidate_key, record in inflight.items()
+                if candidate_key not in rejected and candidate_key[0] == slot
             ]
             if not candidates:
                 continue
-            if len(candidates) != 1:
+            if len(candidates) != 1 or candidates[0][0] != key:
                 raise ValueError("multiple accepted transition candidates")
-            attempt, raw, inflight_trial = candidates[0]
+            _candidate_key, (raw, inflight_trial) = candidates[0]
             if raw != accepted_raw or inflight_trial != accepted_trial:
                 raise ValueError(
                     "inflight trial does not match its accepted transition"
                 )
+            attempt = attempts[key]
             if _regular_file_identity(
                 accepted_path, label="accepted slot"
             ) != _regular_file_identity(attempt.path, label="inflight trial"):
@@ -1116,17 +1314,18 @@ class BaselineJournal:
             _fsync_directory(attempt.path.parent)
             del inflight[(attempt.slot, attempt.journal_attempt_index)]
 
-        remaining_histories: dict[BaselineSlot, list[int]] = {}
-        for slot, index in rejected:
-            remaining_histories.setdefault(slot, []).append(index)
-        for slot, index in inflight:
-            remaining_histories.setdefault(slot, []).append(index)
+        pending = tuple(
+            JournalAttemptEvidence(
+                attempt=attempts[key],
+                measurement=measurements[key],
+                post_exit=post_exit.get(key),
+                trial=None if key not in inflight else inflight[key][1],
+            )
+            for key in all_keys - set(accepted) - set(rejected)
+        )
         return (
-            {
-                slot: tuple(sorted(indices))
-                for slot, indices in remaining_histories.items()
-            },
-            tuple(record[0] for record in inflight.values()),
+            {slot: tuple(sorted(indices)) for slot, indices in histories.items()},
+            pending,
         )
 
     def _preflight_records(
@@ -1288,7 +1487,8 @@ class BaselineJournal:
         self, expected_slots: Sequence[BaselineSlot]
     ) -> tuple[JournalAttempt, ...]:
         expected = self._expected_slot_set(expected_slots)
-        _histories, inflight = self._validate_attempt_history()
+        _histories, pending = self._validate_attempt_history()
+        inflight = tuple(state.attempt for state in pending if state.trial is not None)
         for attempt in inflight:
             if attempt.slot not in expected:
                 raise ValueError("unexpected inflight slot")
@@ -1299,6 +1499,25 @@ class BaselineJournal:
                 key=lambda attempt: (
                     order[attempt.slot],
                     attempt.journal_attempt_index,
+                ),
+            )
+        )
+
+    def load_pending_attempts(
+        self, expected_slots: Sequence[BaselineSlot]
+    ) -> tuple[JournalAttemptEvidence, ...]:
+        expected = self._expected_slot_set(expected_slots)
+        _histories, pending = self._validate_attempt_history()
+        for state in pending:
+            if state.attempt.slot not in expected:
+                raise ValueError("unexpected pending slot")
+        order = {slot: index for index, slot in enumerate(expected_slots)}
+        return tuple(
+            sorted(
+                pending,
+                key=lambda state: (
+                    order[state.attempt.slot],
+                    state.attempt.journal_attempt_index,
                 ),
             )
         )
@@ -1361,16 +1580,20 @@ class BaselineJournal:
         validated_trial = self._trial_for_attempt(attempt, trial)
         _require_nonempty_string(reason, label="rejected trial reason")
         histories, _inflight = self._validate_attempt_history()
+        measurement = validated_trial.child_measurement
+        post_exit = validated_trial.post_exit_observation
         body = {
             "kind": "sml-baseline-rejected-trial",
-            "version": 1,
+            "version": 2,
             "journal_attempt_index": attempt.journal_attempt_index,
             "reason": reason,
+            "child_measurement_identity": measurement["identity"],
+            "post_exit_observation_identity": post_exit["identity"],
             "trial": validated_trial.to_dict(),
         }
         document = {
             **body,
-            "identity": structured_identity("sml-baseline-rejected-trial-v1", body),
+            "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
         }
         rejected_path = self.rejected_path(attempt.slot, attempt.journal_attempt_index)
         if _entry_exists(rejected_path) and not _entry_exists(attempt.path):
@@ -1390,6 +1613,67 @@ class BaselineJournal:
         _write_immutable_json(rejected_path, document, label="rejected trial")
         attempt.path.unlink()
         _fsync_directory(attempt.path.parent)
+
+    def reject_unfinalized(
+        self, attempt: JournalAttempt, measurement: dict, *, reason: str
+    ) -> None:
+        self._require_canonical_attempt(attempt)
+        if reason != "missing-immediate-post-exit-evidence":
+            raise ValueError("unfinalized rejection has an invalid reason")
+        validated_measurement = validate_child_trial_measurement(measurement)
+        payload = validated_measurement["trial"]
+        if validated_measurement["session_identity"] != self.session["identity"]:
+            raise ValueError("child measurement does not match the journal session")
+        if (
+            validated_measurement["journal_attempt_index"]
+            != attempt.journal_attempt_index
+        ):
+            raise ValueError("child measurement does not match the journal attempt")
+        if (
+            payload["metric"] != attempt.slot.metric
+            or type(payload["pair_index"]) is not int
+            or payload["pair_index"] != attempt.slot.pair_index
+        ):
+            raise ValueError(
+                "child measurement metric or pair index does not match its slot"
+            )
+        histories, pending = self._validate_attempt_history()
+        expected_pending = tuple(
+            state
+            for state in pending
+            if state.attempt.slot == attempt.slot
+            and state.attempt.journal_attempt_index == attempt.journal_attempt_index
+        )
+        rejected_path = self.rejected_path(attempt.slot, attempt.journal_attempt_index)
+        if not _entry_exists(rejected_path):
+            if len(expected_pending) != 1:
+                raise ValueError("unfinalized rejection has no pending measurement")
+            state = expected_pending[0]
+            if (
+                state.measurement != validated_measurement
+                or state.post_exit is not None
+                or state.trial is not None
+            ):
+                raise ValueError(
+                    "unfinalized rejection requires measurement-only evidence"
+                )
+            indices = histories.get(attempt.slot, ())
+            if not indices or indices[-1] != attempt.journal_attempt_index:
+                raise ValueError("journal attempt indices have a gap")
+        body = {
+            "kind": "sml-baseline-rejected-trial",
+            "version": 2,
+            "journal_attempt_index": attempt.journal_attempt_index,
+            "reason": reason,
+            "child_measurement_identity": validated_measurement["identity"],
+            "post_exit_observation_identity": None,
+            "trial": None,
+        }
+        document = {
+            **body,
+            "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
+        }
+        _write_immutable_json(rejected_path, document, label="rejected trial")
 
     def record_preflight(
         self, slot: BaselineSlot, preflight_index: int, observation: dict
