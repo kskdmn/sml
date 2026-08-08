@@ -19,3 +19,7 @@ dependencies = [
 dev = [
     "ruff>=0.15.21,<16.0.0",
 ]
+
+[tool.uv]
+required-version = ">=0.9.17"
+exclude-newer = "7 days"
