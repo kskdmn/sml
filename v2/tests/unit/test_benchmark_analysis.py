@@ -261,7 +261,7 @@ def test_canonical_workload_round_trip_pins_complete_benchmark_contract():
         structured_identity(
             "sml-benchmark-protocol-neutral-workload-v1", protocol_neutral
         )
-        == "sha256:fd49778a69efe0f3aafa82776b7c043e34fea9ac5b537d630f513772afacfb4a"
+        == "sha256:7f1f8c8f6721ebaf58745a219bf15765072744fa7f53ec2ccd7c83127dc76cdc"
     )
 
 
@@ -4003,8 +4003,31 @@ def _single_process_arguments(tmp_path):
         warmup=5,
         measure=20,
         comparison_target="baseline",
-        output=tmp_path / "state" / "inflight" / "prepared-data" / "0" / "0.json",
+        evidence_session_identity="sha256:" + "9" * 64,
+        journal_attempt_index=0,
+        measurement_output=(
+            tmp_path / "state" / "measurements" / "prepared-data" / "0" / "0.json"
+        ),
     )
+
+
+def _launch_trial_arguments(tmp_path):
+    return {
+        "harness_root": tmp_path / "harness",
+        "source_root": tmp_path / "source",
+        "source_commit": "3687f8b3214a44c675ae67af52e4997762f6c634",
+        "harness_commit": "a" * 40,
+        "harness_identity": "sha256:" + "b" * 64,
+        "adapter": "legacy",
+        "metric": "prepared-data",
+        "side": "reference",
+        "attempt_index": 0,
+        "pair_index": 0,
+        "order": 0,
+        "warmup": 5,
+        "measure": 20,
+        "comparison_target": "baseline",
+    }
 
 
 def _stub_single_process_measurement(monkeypatch, args, captured=None):
@@ -4085,7 +4108,9 @@ def test_child_process_forwards_each_canonical_metric_count(
 ):
     args = _single_process_arguments(tmp_path)
     args.metric = metric
-    args.output = tmp_path / "state" / "inflight" / metric / "0" / "0.json"
+    args.measurement_output = (
+        tmp_path / "state" / "measurements" / metric / "0" / "0.json"
+    )
     captured = {}
     _stub_single_process_measurement(monkeypatch, args, captured)
 
@@ -4093,9 +4118,11 @@ def test_child_process_forwards_each_canonical_metric_count(
 
     assert captured["warmup_units"] == expected_warmup
     assert captured["measured_units"] == expected_measured
-    raw = RawTrial.from_dict(read_json_object(args.output, label="child output"))
-    assert raw.warmup_units == expected_warmup
-    assert raw.measured_units == expected_measured
+    measurement = validate_child_trial_measurement(
+        read_json_object(args.measurement_output, label="child measurement")
+    )
+    assert measurement["trial"]["warmup_units"] == expected_warmup
+    assert measurement["trial"]["measured_units"] == expected_measured
 
 
 def test_completed_child_output_never_overwrites_an_existing_attempt(
@@ -4103,13 +4130,13 @@ def test_completed_child_output_never_overwrites_an_existing_attempt(
 ):
     args = _single_process_arguments(tmp_path)
     _stub_single_process_measurement(monkeypatch, args)
-    args.output.parent.mkdir(parents=True)
-    args.output.write_bytes(b"existing immutable attempt\n")
+    args.measurement_output.parent.mkdir(parents=True)
+    args.measurement_output.write_bytes(b"existing immutable measurement\n")
 
     with pytest.raises(FileExistsError):
         benchmark_runner._run_single_process(args)
 
-    assert args.output.read_bytes() == b"existing immutable attempt\n"
+    assert args.measurement_output.read_bytes() == b"existing immutable measurement\n"
 
 
 def test_completed_child_output_crosses_the_parent_fsync_boundary(
@@ -4126,13 +4153,263 @@ def test_completed_child_output_crosses_the_parent_fsync_boundary(
 
     benchmark_runner._run_single_process(args)
 
-    assert args.output.parent.resolve() in synced_directories
+    assert args.measurement_output.parent.resolve() in synced_directories
     assert (
-        RawTrial.from_dict(
-            read_json_object(args.output, label="completed child output")
-        ).attempt_index
+        validate_child_trial_measurement(
+            read_json_object(
+                args.measurement_output, label="completed child measurement"
+            )
+        )["trial"]["attempt_index"]
         == 0
     )
+
+
+def test_parent_samples_memory_first_after_child_exit_and_finalizes_trial(
+    tmp_path, monkeypatch
+):
+    workload = build_canonical_workload()
+    measurement = _valid_child_measurement(workload)
+    measurement_path = tmp_path / "measurement.json"
+    post_exit_path = tmp_path / "post-exit.json"
+    trial_path = tmp_path / "trial.json"
+    events = []
+    commands = []
+
+    def run_child(command, *, cwd, check):
+        events.append("child-exited")
+        commands.append(command)
+        atomic_write_json(measurement_path, measurement, create_only=True)
+
+    monkeypatch.setattr(benchmark_runner.subprocess, "run", run_child)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_memory_pressure",
+        lambda: events.append("memory") or ("normal", 69),
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "collect_environment",
+        lambda *, memory_sample=None: (
+            events.append(("environment", memory_sample))
+            or (
+                measurement["start"]["hardware"],
+                {
+                    **measurement["start"]["environment_status"],
+                    "memory_pressure": memory_sample[0],
+                    "memory_free_percentage": memory_sample[1],
+                },
+                measurement["start"]["software_versions"],
+            )
+        ),
+    )
+
+    trial = benchmark_runner._launch_trial(
+        **_launch_trial_arguments(tmp_path),
+        evidence_session_identity=measurement["session_identity"],
+        journal_attempt_index=0,
+        measurement_output=measurement_path,
+        post_exit_output=post_exit_path,
+        output=trial_path,
+    )
+
+    assert events == ["child-exited", "memory", ("environment", ("normal", 69))]
+    command = commands[0]
+    assert (
+        command[command.index("--evidence-session-identity") + 1]
+        == (measurement["session_identity"])
+    )
+    assert command[command.index("--journal-attempt-index") + 1] == "0"
+    assert command[command.index("--measurement-output") + 1] == str(measurement_path)
+    assert post_exit_path.is_file()
+    assert trial_path.is_file()
+    assert trial == RawTrial.from_dict(read_json_object(trial_path, label="trial"))
+    assert trial.environment_status["memory_pressure"] == "normal"
+
+
+def test_parent_post_exit_output_never_overwrites_existing_evidence(
+    tmp_path, monkeypatch
+):
+    measurement = _valid_child_measurement(build_canonical_workload())
+    measurement_path = tmp_path / "measurement.json"
+    post_exit_path = tmp_path / "post-exit.json"
+    trial_path = tmp_path / "trial.json"
+    post_exit_path.write_bytes(b"existing immutable post-exit evidence\n")
+
+    def run_child(command, *, cwd, check):
+        atomic_write_json(measurement_path, measurement, create_only=True)
+
+    monkeypatch.setattr(benchmark_runner.subprocess, "run", run_child)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "collect_post_exit_environment",
+        lambda: (
+            measurement["start"]["hardware"],
+            measurement["start"]["environment_status"],
+            measurement["start"]["software_versions"],
+        ),
+    )
+
+    with pytest.raises(FileExistsError):
+        benchmark_runner._launch_trial(
+            **_launch_trial_arguments(tmp_path),
+            evidence_session_identity=measurement["session_identity"],
+            journal_attempt_index=0,
+            measurement_output=measurement_path,
+            post_exit_output=post_exit_path,
+            output=trial_path,
+        )
+
+    assert post_exit_path.read_bytes() == b"existing immutable post-exit evidence\n"
+    assert not trial_path.exists()
+
+
+def test_parent_trial_output_never_overwrites_existing_evidence(tmp_path, monkeypatch):
+    measurement = _valid_child_measurement(build_canonical_workload())
+    measurement_path = tmp_path / "measurement.json"
+    post_exit_path = tmp_path / "post-exit.json"
+    trial_path = tmp_path / "trial.json"
+    trial_path.write_bytes(b"existing immutable trial evidence\n")
+
+    def run_child(command, *, cwd, check):
+        atomic_write_json(measurement_path, measurement, create_only=True)
+
+    monkeypatch.setattr(benchmark_runner.subprocess, "run", run_child)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "collect_post_exit_environment",
+        lambda: (
+            measurement["start"]["hardware"],
+            measurement["start"]["environment_status"],
+            measurement["start"]["software_versions"],
+        ),
+    )
+
+    with pytest.raises(FileExistsError):
+        benchmark_runner._launch_trial(
+            **_launch_trial_arguments(tmp_path),
+            evidence_session_identity=measurement["session_identity"],
+            journal_attempt_index=0,
+            measurement_output=measurement_path,
+            post_exit_output=post_exit_path,
+            output=trial_path,
+        )
+
+    assert post_exit_path.is_file()
+    assert trial_path.read_bytes() == b"existing immutable trial evidence\n"
+
+
+def test_nonzero_child_exit_does_not_publish_parent_evidence(tmp_path, monkeypatch):
+    measurement_path = tmp_path / "measurement.json"
+    post_exit_path = tmp_path / "post-exit.json"
+    trial_path = tmp_path / "trial.json"
+
+    def fail_child(command, *, cwd, check):
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(benchmark_runner.subprocess, "run", fail_child)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        benchmark_runner._launch_trial(
+            **_launch_trial_arguments(tmp_path),
+            evidence_session_identity="sha256:" + "9" * 64,
+            journal_attempt_index=0,
+            measurement_output=measurement_path,
+            post_exit_output=post_exit_path,
+            output=trial_path,
+        )
+
+    assert not measurement_path.exists()
+    assert not post_exit_path.exists()
+    assert not trial_path.exists()
+
+
+def test_paired_trials_stops_before_the_next_process_on_persistent_memory(
+    tmp_path, monkeypatch
+):
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    warning = dict(trial.environment_status["post_exit"])
+    warning["memory_pressure"] = "warning"
+    rejected = _with_environment_observations(trial, post_exit=warning)
+    launches = []
+
+    def launch(**kwargs):
+        launches.append(kwargs)
+        return rejected
+
+    monkeypatch.setattr(benchmark_runner, "_launch_trial", launch)
+
+    with pytest.raises(ValueError, match="persistent-post-exit-memory-pressure"):
+        benchmark_runner._run_paired_trials(
+            harness_root=tmp_path / "harness",
+            reference_root=tmp_path / "reference",
+            candidate_root=tmp_path / "candidate",
+            reference_commit=rejected.source_commit,
+            candidate_commit="c" * 40,
+            harness_commit=rejected.harness_commit,
+            harness_identity=rejected.harness_identity,
+            reference_adapter="legacy",
+            metrics=("prepared-data",),
+            pairs=2,
+            warmup=5,
+            measure=20,
+            comparison_target="baseline",
+            attempt_index=0,
+            output_directory=tmp_path,
+        )
+
+    assert len(launches) == 1
+
+
+def test_paired_trials_share_one_identity_bound_evidence_session(tmp_path, monkeypatch):
+    workload = build_canonical_workload()
+    launches = []
+
+    def launch(**kwargs):
+        launches.append(kwargs)
+        measurement = _valid_child_measurement(
+            workload,
+            session_identity=kwargs["evidence_session_identity"],
+            journal_attempt_index=kwargs["journal_attempt_index"],
+        )
+        return finalize_raw_trial(
+            measurement, _valid_post_exit_observation(measurement)
+        )
+
+    monkeypatch.setattr(benchmark_runner, "_launch_trial", launch)
+
+    trials = benchmark_runner._run_paired_trials(
+        harness_root=tmp_path / "harness",
+        reference_root=tmp_path / "reference",
+        candidate_root=tmp_path / "candidate",
+        reference_commit="1" * 40,
+        candidate_commit="2" * 40,
+        harness_commit="3" * 40,
+        harness_identity="sha256:" + "4" * 64,
+        reference_adapter="legacy",
+        metrics=("prepared-data",),
+        pairs=1,
+        warmup=5,
+        measure=20,
+        comparison_target="baseline:sha256:" + "5" * 64,
+        attempt_index=1,
+        output_directory=tmp_path,
+    )
+
+    assert len(trials) == 2
+    assert {launch["evidence_session_identity"] for launch in launches} == {
+        launches[0]["evidence_session_identity"]
+    }
+    assert {launch["journal_attempt_index"] for launch in launches} == {1}
+    assert {
+        tuple(launch["measurement_output"].suffixes[-2:]) for launch in launches
+    } == {(".measurement", ".json")}
+    assert {tuple(launch["post_exit_output"].suffixes[-2:]) for launch in launches} == {
+        (".post-exit", ".json")
+    }
+    assert {tuple(launch["output"].suffixes[-2:]) for launch in launches} == {
+        (".trial", ".json")
+    }
 
 
 def test_journal_promotes_an_inflight_trial_and_resumes_the_slot(tmp_path):

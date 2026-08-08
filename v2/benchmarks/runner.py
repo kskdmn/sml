@@ -22,7 +22,13 @@ from pathlib import Path
 from typing import Literal
 
 from v2.benchmarks.analysis import analyze_pairs
-from v2.benchmarks.evidence import validate_raw_trial_evidence
+from v2.benchmarks.evidence import (
+    build_child_trial_measurement,
+    build_post_exit_observation,
+    finalize_raw_trial,
+    validate_child_trial_measurement,
+    validate_raw_trial_evidence,
+)
 from v2.benchmarks.journal import (
     BaselineJournal,
     BaselineSlot,
@@ -1717,9 +1723,12 @@ def _has_competing_gpu_workload() -> bool:
     )
 
 
-def collect_environment() -> tuple[
-    dict[str, object], dict[str, object], dict[str, str]
-]:
+def collect_environment(
+    *, memory_sample: tuple[str, int] | None = None
+) -> tuple[dict[str, object], dict[str, object], dict[str, str]]:
+    if memory_sample is None:
+        memory_sample = _memory_pressure()
+    pressure, free_percentage = memory_sample
     hardware_record = _system_profiler("SPHardwareDataType")
     display_record = _system_profiler("SPDisplaysDataType")
     processor_match = re.search(
@@ -1749,7 +1758,6 @@ def collect_environment() -> tuple[
         "macos_build": macos_build,
     }
     connected, power_mode, low_power = _power_status()
-    pressure, free_percentage = _memory_pressure()
     thermal_state, thermal_state_raw_value = _thermal_state()
     environment_status = {
         "power_connected": connected,
@@ -1769,6 +1777,13 @@ def collect_environment() -> tuple[
         except importlib.metadata.PackageNotFoundError:
             versions[package] = "unavailable"
     return hardware, environment_status, versions
+
+
+def collect_post_exit_environment() -> tuple[
+    dict[str, object], dict[str, object], dict[str, str]
+]:
+    memory_sample = _memory_pressure()
+    return collect_environment(memory_sample=memory_sample)
 
 
 def merge_environment_status(start: dict, end: dict) -> dict:
@@ -1872,12 +1887,18 @@ def _run_single_process(args: argparse.Namespace) -> int:
     native = adapter.resolve_native_workload(args.metric, workload, source_root)
     if type(native).__name__ == "UnavailableNativeWorkload":
         raise RuntimeError(f"replacement metric unavailable: {native.reason}")
-    hardware, start_status, software_versions = collect_environment()
+    start_hardware, start_status, start_software_versions = collect_environment()
+    start_observation = {
+        "observed_at_utc": _utc_now_iso(),
+        "hardware": start_hardware,
+        "environment_status": start_status,
+        "software_versions": start_software_versions,
+    }
     import mlx.core as mx
 
     work_unit = next(unit for unit in workload.work_units if unit.metric == args.metric)
     measured_units = work_unit.measured_units
-    measurement = measure_native_process(
+    process_measurement = measure_native_process(
         adapter=adapter,
         metric=args.metric,
         native_workload=native,
@@ -1888,49 +1909,53 @@ def _run_single_process(args: argparse.Namespace) -> int:
         reset_peak_memory=mx.reset_peak_memory,
     )
     end_hardware, end_status, end_software_versions = collect_environment()
-    if end_hardware != hardware:
-        raise RuntimeError("hardware identity changed during measurement")
-    if end_software_versions != software_versions:
-        raise RuntimeError("software versions changed during measurement")
-    environment_status = merge_environment_status(start_status, end_status)
-    trial = RawTrial(
-        schema_version=1,
-        metric=args.metric,
-        side=args.side,
-        attempt_index=args.attempt_index,
-        pair_index=args.pair_index,
-        process_order=args.process_order,
-        source_commit=args.source_commit,
-        source_clean=True,
-        harness_commit=args.harness_commit,
-        harness_clean=True,
-        harness_identity=args.harness_identity,
-        canonical_workload_identity=workload_identity,
-        native_configuration=native.native_configuration,
-        native_representation_identity=native.native_representation_identity,
-        canonical_row_identity=native.canonical_row_identity,
-        canonical_input_identity=native.canonical_input_identity,
-        canonical_projection=native.canonical_projection,
-        execution_order_identity=native.execution_order_identity,
-        initial_parameter_identity=native.initial_parameter_identity,
-        comparison_target=args.comparison_target,
-        warmup_units=0 if args.metric == "compile-cold-start" else args.warmup,
-        measured_units=measured_units,
-        elapsed_seconds=measurement.elapsed_seconds,
-        value=measurement.value,
-        startup_verification_seconds=native.startup_verification_seconds,
-        compilation_seconds=(
-            measurement.elapsed_seconds
+    end_observation = {
+        "observed_at_utc": _utc_now_iso(),
+        "hardware": end_hardware,
+        "environment_status": end_status,
+        "software_versions": end_software_versions,
+    }
+    trial_payload = {
+        "metric": args.metric,
+        "side": args.side,
+        "attempt_index": args.attempt_index,
+        "pair_index": args.pair_index,
+        "process_order": args.process_order,
+        "source_commit": args.source_commit,
+        "source_clean": True,
+        "harness_commit": args.harness_commit,
+        "harness_clean": True,
+        "harness_identity": args.harness_identity,
+        "canonical_workload_identity": workload_identity,
+        "native_configuration": native.native_configuration,
+        "native_representation_identity": native.native_representation_identity,
+        "canonical_row_identity": native.canonical_row_identity,
+        "canonical_input_identity": native.canonical_input_identity,
+        "canonical_projection": native.canonical_projection,
+        "execution_order_identity": native.execution_order_identity,
+        "initial_parameter_identity": native.initial_parameter_identity,
+        "comparison_target": args.comparison_target,
+        "warmup_units": (0 if args.metric == "compile-cold-start" else args.warmup),
+        "measured_units": measured_units,
+        "elapsed_seconds": process_measurement.elapsed_seconds,
+        "value": process_measurement.value,
+        "startup_verification_seconds": native.startup_verification_seconds,
+        "compilation_seconds": (
+            process_measurement.elapsed_seconds
             if args.metric == "compile-cold-start"
-            else measurement.compilation_seconds
+            else process_measurement.compilation_seconds
         ),
-        peak_memory_bytes=measurement.peak_memory_bytes,
-        synchronization_boundaries=workload.synchronization_boundaries,
-        software_versions=software_versions,
-        hardware=hardware,
-        environment_status=environment_status,
+        "peak_memory_bytes": process_measurement.peak_memory_bytes,
+        "synchronization_boundaries": list(workload.synchronization_boundaries),
+    }
+    document = build_child_trial_measurement(
+        session_identity=args.evidence_session_identity,
+        journal_attempt_index=args.journal_attempt_index,
+        trial=trial_payload,
+        start=start_observation,
+        end=end_observation,
     )
-    atomic_write_json(args.output, trial.to_dict(), create_only=True)
+    atomic_write_json(args.measurement_output, document, create_only=True)
     return 0
 
 
@@ -2045,6 +2070,10 @@ def _launch_trial(
     warmup: int,
     measure: int,
     comparison_target: str,
+    evidence_session_identity: str,
+    journal_attempt_index: int,
+    measurement_output: Path,
+    post_exit_output: Path,
     output: Path,
 ) -> RawTrial:
     command = (
@@ -2080,14 +2109,33 @@ def _launch_trial(
         str(measure),
         "--comparison-target",
         comparison_target,
-        "--output",
-        str(output),
+        "--evidence-session-identity",
+        evidence_session_identity,
+        "--journal-attempt-index",
+        str(journal_attempt_index),
+        "--measurement-output",
+        str(measurement_output),
     )
     subprocess.run(command, cwd=harness_root, check=True)
-    raw = json.loads(output.read_text(encoding="utf-8"))
-    if not isinstance(raw, dict):
-        raise ValueError("fresh benchmark process did not emit an object")
-    return RawTrial.from_dict(raw)
+    measurement = validate_child_trial_measurement(
+        read_json_object(measurement_output, label="fresh child measurement")
+    )
+    if measurement["session_identity"] != evidence_session_identity:
+        raise ValueError("fresh child measurement has the wrong session identity")
+    if measurement["journal_attempt_index"] != journal_attempt_index:
+        raise ValueError("fresh child measurement has the wrong journal attempt index")
+    hardware, environment_status, software_versions = collect_post_exit_environment()
+    post_exit = build_post_exit_observation(
+        measurement=measurement,
+        observed_at_utc=_utc_now_iso(),
+        hardware=hardware,
+        environment_status=environment_status,
+        software_versions=software_versions,
+    )
+    atomic_write_json(post_exit_output, post_exit, create_only=True)
+    trial = finalize_raw_trial(measurement, post_exit)
+    atomic_write_json(output, trial.to_dict(), create_only=True)
+    return RawTrial.from_dict(read_json_object(output, label="fresh raw trial"))
 
 
 def _next_capture_indices(
@@ -2740,6 +2788,22 @@ def _record_baseline_locked(
                     warmup=args.warmup,
                     measure=args.measure,
                     comparison_target="baseline",
+                    evidence_session_identity=journal.session["identity"],
+                    journal_attempt_index=attempt.journal_attempt_index,
+                    measurement_output=(
+                        state_root
+                        / "measurements"
+                        / slot.metric
+                        / str(slot.pair_index)
+                        / f"{attempt.journal_attempt_index}.json"
+                    ),
+                    post_exit_output=(
+                        state_root
+                        / "post-exit"
+                        / slot.metric
+                        / str(slot.pair_index)
+                        / f"{attempt.journal_attempt_index}.json"
+                    ),
                     output=attempt.path,
                 ),
                 preflight=collect_preflight,
@@ -2937,6 +3001,36 @@ def _resolve_predecessor_mapping(
     return reports, lineages, proof
 
 
+def _comparison_evidence_session_identity(
+    *,
+    harness_commit: str,
+    harness_identity: str,
+    reference_commit: str,
+    candidate_commit: str,
+    comparison_target: str,
+    attempt_index: int,
+    metrics: Sequence[MetricName],
+    pairs: int,
+    warmup: int,
+    measure: int,
+) -> str:
+    return structured_identity(
+        "sml-comparison-evidence-session-v1",
+        {
+            "harness_commit": harness_commit,
+            "harness_identity": harness_identity,
+            "reference_commit": reference_commit,
+            "candidate_commit": candidate_commit,
+            "comparison_target": comparison_target,
+            "attempt_index": attempt_index,
+            "metrics": list(metrics),
+            "pairs": pairs,
+            "warmup": warmup,
+            "measure": measure,
+        },
+    )
+
+
 def _run_paired_trials(
     *,
     harness_root: Path,
@@ -2955,34 +3049,52 @@ def _run_paired_trials(
     attempt_index: int,
     output_directory: Path,
 ) -> list[RawTrial]:
+    workload = build_canonical_workload()
+    evidence_session_identity = _comparison_evidence_session_identity(
+        harness_commit=harness_commit,
+        harness_identity=harness_identity,
+        reference_commit=reference_commit,
+        candidate_commit=candidate_commit,
+        comparison_target=comparison_target,
+        attempt_index=attempt_index,
+        metrics=metrics,
+        pairs=pairs,
+        warmup=warmup,
+        measure=measure,
+    )
     trials = []
     for metric in metrics:
         for pair_index in range(pairs):
             order = process_order(pair_index)
             for order_index, side in enumerate(order):
                 is_reference = side == "reference"
-                trials.append(
-                    _launch_trial(
-                        harness_root=harness_root,
-                        source_root=reference_root if is_reference else candidate_root,
-                        source_commit=(
-                            reference_commit if is_reference else candidate_commit
-                        ),
-                        harness_commit=harness_commit,
-                        harness_identity=harness_identity,
-                        adapter=reference_adapter if is_reference else "replacement",
-                        metric=metric,
-                        side=side,
-                        attempt_index=attempt_index,
-                        pair_index=pair_index,
-                        order=order_index,
-                        warmup=warmup,
-                        measure=measure,
-                        comparison_target=comparison_target,
-                        output=output_directory
-                        / f"{metric}-{comparison_target[-12:]}-{pair_index}-{side}.json",
-                    )
+                stem = f"{metric}-{comparison_target[-12:]}-{pair_index}-{side}"
+                trial = _launch_trial(
+                    harness_root=harness_root,
+                    source_root=reference_root if is_reference else candidate_root,
+                    source_commit=(
+                        reference_commit if is_reference else candidate_commit
+                    ),
+                    harness_commit=harness_commit,
+                    harness_identity=harness_identity,
+                    adapter=reference_adapter if is_reference else "replacement",
+                    metric=metric,
+                    side=side,
+                    attempt_index=attempt_index,
+                    pair_index=pair_index,
+                    order=order_index,
+                    warmup=warmup,
+                    measure=measure,
+                    comparison_target=comparison_target,
+                    evidence_session_identity=evidence_session_identity,
+                    journal_attempt_index=attempt_index,
+                    measurement_output=(output_directory / f"{stem}.measurement.json"),
+                    post_exit_output=output_directory / f"{stem}.post-exit.json",
+                    output=output_directory / f"{stem}.trial.json",
                 )
+                _validate_acceptance_environment(workload, trial)
+                _validate_software_versions(workload, trial.software_versions)
+                trials.append(trial)
     return trials
 
 
@@ -3568,7 +3680,9 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument("--warmup", type=int, required=True)
     process.add_argument("--measure", type=int, required=True)
     process.add_argument("--comparison-target", required=True)
-    process.add_argument("--output", type=Path, required=True)
+    process.add_argument("--evidence-session-identity", required=True)
+    process.add_argument("--journal-attempt-index", type=int, required=True)
+    process.add_argument("--measurement-output", type=Path, required=True)
     return parser
 
 
