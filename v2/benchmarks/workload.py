@@ -18,6 +18,7 @@ from v2.benchmarks.schema import (
 
 HARNESS_COMPONENTS = (
     Path("v2/benchmarks/schema.py"),
+    Path("v2/benchmarks/evidence.py"),
     Path("v2/benchmarks/workload.py"),
     Path("v2/benchmarks/runner.py"),
     Path("v2/benchmarks/journal.py"),
@@ -642,6 +643,9 @@ def build_canonical_workload(
             "low_power_mode": False,
             "thermal_state": "nominal",
             "memory_pressure": "normal",
+            "measurement_end_memory_pressure_allowed": ["normal", "warning"],
+            "post_exit_memory_pressure": "normal",
+            "post_exit_evidence_required": True,
             "competing_gpu_workload": False,
         },
         software_requirements={

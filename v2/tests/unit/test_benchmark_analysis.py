@@ -26,6 +26,14 @@ from v2.benchmarks.adapters.replacement import (
 )
 from v2.benchmarks.adapters import legacy
 from v2.benchmarks.analysis import analyze_pairs
+from v2.benchmarks.evidence import (
+    build_child_trial_measurement,
+    build_post_exit_observation,
+    finalize_raw_trial,
+    validate_child_trial_measurement,
+    validate_post_exit_observation,
+    validate_raw_trial_evidence,
+)
 from v2.benchmarks.journal import (
     BaselineSlot,
     BaselineJournal,
@@ -644,6 +652,18 @@ def test_environment_status_fails_closed_when_run_degrades():
     assert merged["end"] == end
 
 
+def test_canonical_workload_binds_the_post_exit_memory_policy():
+    required = build_canonical_workload().required_environment
+
+    assert required["memory_pressure"] == "normal"
+    assert required["measurement_end_memory_pressure_allowed"] == [
+        "normal",
+        "warning",
+    ]
+    assert required["post_exit_memory_pressure"] == "normal"
+    assert required["post_exit_evidence_required"] is True
+
+
 @pytest.mark.parametrize(
     ("raw_value", "state"),
     [(0, "nominal"), (1, "fair"), (2, "serious"), (3, "critical")],
@@ -1020,27 +1040,55 @@ def test_legacy_adapter_executes_every_metric_against_real_tiny_mlx_workload(
         mx.synchronize()
 
 
-def _valid_raw_trial(workload, metric="prepared-data", pair_index=0):
+def _valid_observation(observed_at_utc):
+    return {
+        "observed_at_utc": observed_at_utc,
+        "hardware": {
+            "chip": "Apple M5",
+            "cpu_cores": 10,
+            "gpu_cores": 10,
+            "unified_memory_bytes": 24 * 1024**3,
+            "macos_build": "25F84",
+        },
+        "environment_status": {
+            "power_connected": True,
+            "power_mode": "automatic",
+            "low_power_mode": False,
+            "thermal_state": "nominal",
+            "thermal_state_raw_value": 0,
+            "memory_pressure": "normal",
+            "memory_free_percentage": 50,
+            "competing_gpu_workload": False,
+        },
+        "software_versions": {
+            "python": "3.12.13",
+            "mlx": "0.32.0",
+            "numpy": "2.4.6",
+            "sentencepiece": "0.2.1",
+        },
+    }
+
+
+def _valid_trial_payload(workload, metric="prepared-data", pair_index=0):
     work_unit = next(unit for unit in workload.work_units if unit.metric == metric)
     representation_suffix = {
         "swag-end-to-end": "e",
         "inference-prefill": "f",
         "inference-decode": "f",
     }.get(metric, "d")
-    return RawTrial(
-        schema_version=1,
-        metric=metric,
-        side="reference",
-        attempt_index=0,
-        pair_index=pair_index,
-        process_order=0,
-        source_commit="3687f8b3214a44c675ae67af52e4997762f6c634",
-        source_clean=True,
-        harness_commit="a" * 40,
-        harness_clean=True,
-        harness_identity="sha256:" + "b" * 64,
-        canonical_workload_identity=canonical_workload_identity(workload),
-        native_configuration={
+    return {
+        "metric": metric,
+        "side": "reference",
+        "attempt_index": 0,
+        "pair_index": pair_index,
+        "process_order": 0,
+        "source_commit": "3687f8b3214a44c675ae67af52e4997762f6c634",
+        "source_clean": True,
+        "harness_commit": "a" * 40,
+        "harness_clean": True,
+        "harness_identity": "sha256:" + "b" * 64,
+        "canonical_workload_identity": canonical_workload_identity(workload),
+        "native_configuration": {
             "rope_scaling_factor": 1.0,
             "canonical_projection_identity": structured_identity(
                 "sml-benchmark-metric-projection-v1",
@@ -1051,68 +1099,138 @@ def _valid_raw_trial(workload, metric="prepared-data", pair_index=0):
                 "authoritative master parameters"
             ),
         },
-        native_representation_identity="sha256:" + representation_suffix * 64,
-        canonical_row_identity=workload.semantic_identities["canonical_training_rows"],
-        canonical_input_identity=canonical_input_identity(metric, workload),
-        canonical_projection=canonical_metric_projection(metric, workload),
-        execution_order_identity=canonical_execution_order_identity(metric, workload),
-        initial_parameter_identity="sha256:" + "c" * 64,
-        comparison_target="baseline",
-        warmup_units=0 if metric == "compile-cold-start" else 5,
-        measured_units=work_unit.measured_units,
-        elapsed_seconds=2.0,
-        value=50.0,
-        startup_verification_seconds=0.1,
-        compilation_seconds=None,
-        peak_memory_bytes=1_024,
-        synchronization_boundaries=workload.synchronization_boundaries,
-        software_versions={
-            "python": "3.12.13",
-            "mlx": "0.32.0",
-            "numpy": "2.4.6",
-            "sentencepiece": "0.2.1",
-        },
-        hardware={
-            "chip": "Apple M5",
-            "cpu_cores": 10,
-            "gpu_cores": 10,
-            "unified_memory_bytes": 24 * 1024**3,
-            "macos_build": "25F84",
-        },
-        environment_status={
-            "power_connected": True,
-            "power_mode": "automatic",
-            "low_power_mode": False,
-            "thermal_state": "nominal",
-            "thermal_state_raw_value": 0,
-            "memory_pressure": "normal",
-            "competing_gpu_workload": False,
-            "start": {
-                "thermal_state": "nominal",
-                "thermal_state_raw_value": 0,
-            },
-            "end": {
-                "thermal_state": "nominal",
-                "thermal_state_raw_value": 0,
-            },
-        },
+        "native_representation_identity": "sha256:" + representation_suffix * 64,
+        "canonical_row_identity": workload.semantic_identities[
+            "canonical_training_rows"
+        ],
+        "canonical_input_identity": canonical_input_identity(metric, workload),
+        "canonical_projection": canonical_metric_projection(metric, workload),
+        "execution_order_identity": canonical_execution_order_identity(
+            metric, workload
+        ),
+        "initial_parameter_identity": "sha256:" + "c" * 64,
+        "comparison_target": "baseline",
+        "warmup_units": 0 if metric == "compile-cold-start" else 5,
+        "measured_units": work_unit.measured_units,
+        "elapsed_seconds": 2.0,
+        "value": 50.0,
+        "startup_verification_seconds": 0.1,
+        "compilation_seconds": None,
+        "peak_memory_bytes": 1_024,
+        "synchronization_boundaries": list(workload.synchronization_boundaries),
+    }
+
+
+def _valid_child_measurement(
+    workload,
+    metric="prepared-data",
+    pair_index=0,
+    session_identity="sha256:" + "9" * 64,
+    journal_attempt_index=0,
+):
+    return build_child_trial_measurement(
+        session_identity=session_identity,
+        journal_attempt_index=journal_attempt_index,
+        trial=_valid_trial_payload(workload, metric, pair_index),
+        start=_valid_observation("2026-08-08T00:00:00+00:00"),
+        end=_valid_observation("2026-08-08T00:00:01+00:00"),
     )
 
 
-def _with_thermal_state(trial, state, raw_value):
-    status = {
-        **trial.environment_status,
-        "thermal_state": state,
-        "thermal_state_raw_value": raw_value,
+def _valid_post_exit_observation(measurement):
+    observation = _valid_observation("2026-08-08T00:00:02+00:00")
+    return build_post_exit_observation(measurement=measurement, **observation)
+
+
+def _valid_raw_trial(workload, metric="prepared-data", pair_index=0):
+    measurement = _valid_child_measurement(workload, metric, pair_index)
+    return finalize_raw_trial(measurement, _valid_post_exit_observation(measurement))
+
+
+def _with_trial_payload(trial, **changes):
+    measurement = json.loads(json.dumps(trial.child_measurement))
+    measurement["trial"].update(changes)
+    measurement_body = {
+        key: value for key, value in measurement.items() if key != "identity"
     }
+    measurement["identity"] = structured_identity(
+        "sml-child-trial-measurement-v1", measurement_body
+    )
+    post_exit = json.loads(json.dumps(trial.post_exit_observation))
+    post_exit["metric"] = measurement["trial"]["metric"]
+    post_exit["pair_index"] = measurement["trial"]["pair_index"]
+    post_exit["child_measurement_identity"] = measurement["identity"]
+    post_exit_body = {
+        key: value for key, value in post_exit.items() if key != "identity"
+    }
+    post_exit["identity"] = structured_identity(
+        "sml-parent-post-exit-observation-v1", post_exit_body
+    )
+    return finalize_raw_trial(measurement, post_exit)
+
+
+def test_child_and_post_exit_documents_are_exactly_identity_bound():
+    measurement = _valid_child_measurement(build_canonical_workload())
+    post_exit = _valid_post_exit_observation(measurement)
+
+    assert validate_child_trial_measurement(measurement) == measurement
+    assert (
+        validate_post_exit_observation(post_exit, measurement=measurement) == post_exit
+    )
+
+    changed = json.loads(json.dumps(post_exit))
+    changed["environment_status"]["memory_free_percentage"] -= 1
+    with pytest.raises(ValueError, match="post-exit observation identity"):
+        validate_post_exit_observation(changed, measurement=measurement)
+
+
+def test_raw_trial_v2_embeds_and_revalidates_both_evidence_documents():
+    workload = build_canonical_workload()
+    measurement = _valid_child_measurement(workload)
+    post_exit = _valid_post_exit_observation(measurement)
+    trial = finalize_raw_trial(measurement, post_exit)
+
+    assert trial.schema_version == 2
+    assert trial.child_measurement == measurement
+    assert trial.post_exit_observation == post_exit
+    validate_raw_trial_evidence(trial)
+
+    version_one = trial.to_dict()
+    version_one["schema_version"] = 1
+    with pytest.raises(ValueError, match="schema version"):
+        RawTrial.from_dict(version_one)
+
+
+def _with_thermal_state(trial, state, raw_value):
+    measurement = json.loads(json.dumps(trial.child_measurement))
     for endpoint in ("start", "end"):
-        if endpoint in status:
-            status[endpoint] = {
-                **status[endpoint],
+        measurement[endpoint]["environment_status"].update(
+            {
                 "thermal_state": state,
                 "thermal_state_raw_value": raw_value,
             }
-    return replace(trial, environment_status=status)
+        )
+    measurement_body = {
+        key: value for key, value in measurement.items() if key != "identity"
+    }
+    measurement["identity"] = structured_identity(
+        "sml-child-trial-measurement-v1", measurement_body
+    )
+    post_exit = json.loads(json.dumps(trial.post_exit_observation))
+    post_exit["environment_status"].update(
+        {
+            "thermal_state": state,
+            "thermal_state_raw_value": raw_value,
+        }
+    )
+    updated_post_exit = build_post_exit_observation(
+        measurement=measurement,
+        observed_at_utc=post_exit["observed_at_utc"],
+        hardware=post_exit["hardware"],
+        environment_status=post_exit["environment_status"],
+        software_versions=post_exit["software_versions"],
+    )
+    return finalize_raw_trial(measurement, updated_post_exit)
 
 
 def _valid_baseline_trials(workload):
@@ -1264,11 +1382,11 @@ def test_baseline_validator_rejects_partial_or_weakened_protocols():
     with pytest.raises(ValueError, match="every benchmark metric"):
         validate_baseline_manifest(missing_metric, without_decode)
 
-    wrong_warmup = replace(trials[0], warmup_units=20)
+    wrong_warmup = _with_trial_payload(trials[0], warmup_units=20)
     with pytest.raises(ValueError, match="warmup or measured"):
         validate_baseline_manifest(manifest, (wrong_warmup, *trials[1:]))
 
-    wrong_units = replace(trials[0], measured_units=100)
+    wrong_units = _with_trial_payload(trials[0], measured_units=100)
     with pytest.raises(ValueError, match="warmup or measured"):
         validate_baseline_manifest(manifest, (wrong_units, *trials[1:]))
 
