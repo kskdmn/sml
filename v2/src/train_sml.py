@@ -1,20 +1,19 @@
 from __future__ import annotations
 
+# Checkpoint validation reports malformed persisted content uniformly as ValueError.
+# ruff: noqa: TRY004
 import argparse
 import json
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence, TypeVar
+from typing import TypeVar
 
 import mlx.core as mx
-import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
-
 from config import (
     DEFAULT_MODEL_PATH,
     DEFAULT_TOKENIZER_MODEL_PATH,
@@ -25,6 +24,8 @@ from config import (
     SUCCESS_RETURN_CODE,
     resolve_path,
 )
+from mlx import nn
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from pretraining_format import (
     DEFAULT_PRETRAINING_DATA_DIR,
     MANIFEST_NAME,
@@ -40,7 +41,6 @@ from utils import (
     load_tokenizer,
     set_seed,
 )
-
 
 STOCHASTIC_RESUME_NOTE = (
     "Resume restores model weights, optimizer state, and data position; "
@@ -288,7 +288,7 @@ def count_resume_batches(global_step: int, training_config: TrainingConfig) -> i
     return global_step * training_config.gradient_accumulation_steps
 
 
-def iter_unseen_batches(
+def iter_unseen_batches[BatchT](
     dataloader: Iterable[BatchT],
     progress: ResumeProgress,
 ) -> Iterator[BatchT]:
@@ -478,10 +478,8 @@ def resolve_parameter_weight_decay(
         return parameter_weight_decay.embed_tokens
     if parameter_name == "lm_head.weight":
         return parameter_weight_decay.lm_head
-    if (
-        parameter_name == "norm.weight"
-        or parameter_name.endswith(".input_norm.weight")
-        or parameter_name.endswith(".post_attn_norm.weight")
+    if parameter_name == "norm.weight" or parameter_name.endswith(
+        (".input_norm.weight", ".post_attn_norm.weight")
     ):
         return parameter_weight_decay.rms_norm
     parameter_suffixes = (
@@ -794,7 +792,7 @@ def train_model(
                     lr=lr,
                     avg_loss=avg_loss,
                     grad_norm=float(grad_norm.item()),
-                    timestamp=datetime.now(),
+                    timestamp=datetime.now().astimezone(),
                     progress=reading_progress,
                 )
             )

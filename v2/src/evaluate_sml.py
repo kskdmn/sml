@@ -12,18 +12,13 @@ generation tasks.
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass
-import json
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-from lm_eval import simple_evaluate
-from lm_eval.api.instance import Instance
-from lm_eval.api.model import LM
-from lm_eval.utils import handle_non_serializable, make_table
-
 from config import (
     DEFAULT_MODEL_PATH,
     DEFAULT_TOKENIZER_MODEL_PATH,
@@ -31,6 +26,10 @@ from config import (
     SUCCESS_RETURN_CODE,
 )
 from infer_sml import InferenceTokenizer, decode_token_ids, encode_prompt, load_model
+from lm_eval import simple_evaluate
+from lm_eval.api.instance import Instance
+from lm_eval.api.model import LM
+from lm_eval.utils import handle_non_serializable, make_table
 from utils import load_tokenizer
 
 BENCHMARKS = ("hellaswag", "winogrande")

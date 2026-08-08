@@ -14,17 +14,21 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import v2.benchmarks.runner as benchmark_runner
 import v2.benchmarks.journal as baseline_journal
+import v2.benchmarks.runner as benchmark_runner
+from v2.benchmarks.adapters import legacy
 from v2.benchmarks.adapters.replacement import (
     METRIC_OWNER_IMPORTS,
     ReplacementNativeWorkload,
     UnavailableNativeWorkload,
     resolve_native_workload,
+)
+from v2.benchmarks.adapters.replacement import (
     run_measured as run_replacement_measured,
+)
+from v2.benchmarks.adapters.replacement import (
     run_warmup as run_replacement_warmup,
 )
-from v2.benchmarks.adapters import legacy
 from v2.benchmarks.analysis import analyze_pairs
 from v2.benchmarks.evidence import (
     build_child_trial_measurement,
@@ -35,8 +39,8 @@ from v2.benchmarks.evidence import (
     validate_raw_trial_evidence,
 )
 from v2.benchmarks.journal import (
-    BaselineSlot,
     BaselineJournal,
+    BaselineSlot,
     JournalAttempt,
     atomic_write_json,
     atomic_write_text,
@@ -50,26 +54,25 @@ from v2.benchmarks.recovery import (
     wait_for_nominal_thermal_window,
 )
 from v2.benchmarks.runner import (
-    _resolve_predecessor_mapping,
     _resolve_comparison_mode,
+    _resolve_predecessor_mapping,
     build_baseline_manifest,
     build_comparison_report,
     build_parser,
     capture_baseline_trials,
     classify_trial_environment,
     comparison_has_noise,
-    detect_competing_gpu_workload,
-    decode_thermal_state,
     decode_memory_pressure_level,
+    decode_thermal_state,
+    detect_competing_gpu_workload,
     measure_native_process,
-    merge_environment_status,
     parse_metrics,
     parse_power_status,
     perform_cooldown,
     process_order,
     publish_baseline_from_journal,
-    validate_baseline_trial,
     validate_baseline_manifest,
+    validate_baseline_trial,
     validate_checkout_status,
     validate_comparison_report,
     validate_cooldown_evidence,
@@ -83,8 +86,8 @@ from v2.benchmarks.workload import (
     HARNESS_COMPONENTS,
     REPLACEMENT_PRECISION_POLICY,
     build_canonical_workload,
-    canonical_execution_order_identity,
     canonical_execution_order,
+    canonical_execution_order_identity,
     canonical_input_identity,
     canonical_metric_projection,
     canonical_workload_identity,
@@ -170,16 +173,16 @@ def test_noise_and_confidence_fail_closed():
 
 
 def test_bootstrap_is_reproducible_and_point_only_pass_is_inconclusive():
-    arguments = dict(
-        reference=[100.0, 100.0, 100.0, 100.0, 100.0],
-        candidate=[96.0, 98.0, 100.0, 103.0, 108.0],
-        direction="higher-is-better",
-        bootstrap_seed=1729,
-        resamples=10_000,
-        minimum_ratio=0.99,
-        maximum_dispersion=0.10,
-        require_lower_bound=True,
-    )
+    arguments = {
+        "reference": [100.0, 100.0, 100.0, 100.0, 100.0],
+        "candidate": [96.0, 98.0, 100.0, 103.0, 108.0],
+        "direction": "higher-is-better",
+        "bootstrap_seed": 1729,
+        "resamples": 10_000,
+        "minimum_ratio": 0.99,
+        "maximum_dispersion": 0.10,
+        "require_lower_bound": True,
+    }
     first = analyze_pairs(**arguments)
     second = analyze_pairs(**arguments)
     assert first.lower_confidence_bound == second.lower_confidence_bound
@@ -636,36 +639,6 @@ def test_latency_and_peak_memory_metrics_use_their_pinned_values():
     assert memory.value == 700.0
 
 
-def test_environment_status_fails_closed_when_run_degrades():
-    start = {
-        "power_connected": True,
-        "power_mode": "automatic",
-        "low_power_mode": False,
-        "thermal_state": "nominal",
-        "thermal_state_raw_value": 0,
-        "memory_pressure": "normal",
-        "memory_free_percentage": 50,
-        "competing_gpu_workload": False,
-    }
-    end = {
-        **start,
-        "power_connected": False,
-        "thermal_state": "serious",
-        "thermal_state_raw_value": 2,
-        "memory_pressure": "warning",
-        "memory_free_percentage": 7,
-    }
-
-    merged = merge_environment_status(start, end)
-
-    assert merged["power_connected"] is False
-    assert merged["thermal_state"] == "serious"
-    assert merged["memory_pressure"] == "warning"
-    assert merged["memory_free_percentage"] == 7
-    assert merged["start"] == start
-    assert merged["end"] == end
-
-
 def test_canonical_workload_binds_the_post_exit_memory_policy():
     required = build_canonical_workload().required_environment
 
@@ -687,26 +660,6 @@ def test_thermal_state_retains_foundation_raw_value(raw_value, state):
     validate_thermal_observation(
         {"thermal_state": state, "thermal_state_raw_value": raw_value}
     )
-
-
-def test_thermal_merge_retains_the_worse_matching_raw_value():
-    start = {
-        "power_connected": True,
-        "power_mode": "automatic",
-        "low_power_mode": False,
-        "thermal_state": "nominal",
-        "thermal_state_raw_value": 0,
-        "memory_pressure": "normal",
-        "memory_free_percentage": 60,
-        "competing_gpu_workload": False,
-    }
-    end = {**start, "thermal_state": "serious", "thermal_state_raw_value": 2}
-
-    merged = merge_environment_status(start, end)
-
-    assert merged["thermal_state"] == "serious"
-    assert merged["thermal_state_raw_value"] == 2
-    validate_thermal_observation(merged)
 
 
 def test_thermal_observation_rejects_a_mismatched_string_and_raw_value():
@@ -997,17 +950,26 @@ def test_legacy_adapter_executes_every_metric_against_real_tiny_mlx_workload(
                     original = getattr(runtime.train, name)
 
                     def recording_helper(
-                        *args, _original=original, _label=label, **kwargs
+                        *args,
+                        _events=events,
+                        _original=original,
+                        _label=label,
+                        **kwargs,
                     ):
-                        events.append(_label)
+                        _events.append(_label)
                         return _original(*args, **kwargs)
 
                     patch.setattr(runtime.train, name, recording_helper)
                 original_update = runtime.optimizer.update
 
-                def recording_update(*args, **kwargs):
-                    events.append("update")
-                    return original_update(*args, **kwargs)
+                def recording_update(
+                    *args,
+                    _events=events,
+                    _original_update=original_update,
+                    **kwargs,
+                ):
+                    _events.append("update")
+                    return _original_update(*args, **kwargs)
 
                 patch.setattr(runtime.optimizer, "update", recording_update)
                 measured_work = legacy.run_measured(metric, native, 2)
@@ -3951,11 +3913,11 @@ def test_managed_worktree_preserves_capture_error_when_final_cleanup_fails(
         lambda command, *, cwd, check: commands.append(command) or SimpleNamespace(),
     )
 
-    with pytest.raises(RuntimeError, match="outer capture failure") as caught:
-        with benchmark_runner._managed_detached_worktree(
-            repository, "a" * 40, destination
-        ):
-            raise original_error
+    with (
+        pytest.raises(RuntimeError, match="outer capture failure") as caught,
+        benchmark_runner._managed_detached_worktree(repository, "a" * 40, destination),
+    ):
+        raise original_error
 
     assert caught.value is original_error
     assert not destination.exists()
@@ -4187,11 +4149,13 @@ def test_output_lock_root_is_private_and_rejects_unsafe_permissions(
         baseline_journal, "_baseline_output_lock_root", lambda: unsafe_root
     )
 
-    with pytest.raises(ValueError, match="lock directory permissions"):
-        with baseline_journal.baseline_output_lock(
+    with (
+        pytest.raises(ValueError, match="lock directory permissions"),
+        baseline_journal.baseline_output_lock(
             tmp_path / "other-manifest.json", tmp_path / "other-raw.jsonl"
-        ):
-            pass
+        ),
+    ):
+        pass
 
 
 def test_durable_directory_creation_tolerates_a_concurrent_creator(
@@ -4396,7 +4360,7 @@ def test_record_baseline_holds_the_session_lock_across_cleanup_and_capture_entry
     def first_invocation():
         try:
             benchmark_runner._record_baseline(args)
-        except BaseException as error:
+        except Exception as error:  # noqa: BLE001 - surface thread failures to test
             failures.append(error)
 
     thread = threading.Thread(target=first_invocation)
@@ -4449,7 +4413,7 @@ def test_different_state_roots_cannot_clean_a_live_shared_output_temporary(
     def first_invocation():
         try:
             benchmark_runner._record_baseline(first_args)
-        except BaseException as error:
+        except Exception as error:  # noqa: BLE001 - surface thread failures to test
             failures.append(error)
 
     thread = threading.Thread(target=first_invocation)
@@ -5928,8 +5892,10 @@ def test_recovery_import_does_not_eagerly_import_runner():
         [
             sys.executable,
             "-c",
-            "import sys; import v2.benchmarks.recovery; "
-            "assert 'v2.benchmarks.runner' not in sys.modules",
+            (
+                "import sys; import v2.benchmarks.recovery; "
+                "assert 'v2.benchmarks.runner' not in sys.modules"
+            ),
         ],
         cwd=Path(__file__).resolve().parents[3],
         check=False,

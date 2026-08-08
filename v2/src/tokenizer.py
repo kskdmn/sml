@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Iterator, Sequence
 
 from utils import MAX_TEXT_LENGTH, TEXT_COLUMN, filter_text, iter_jsonl_records
 

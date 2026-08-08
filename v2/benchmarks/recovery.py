@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 _SAMPLE_INTERVAL_SECONDS = 27.0
 _REQUIRED_NOMINAL_SECONDS = 300.0

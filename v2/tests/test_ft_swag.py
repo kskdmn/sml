@@ -2,8 +2,8 @@ import inspect
 import sys
 from pathlib import Path
 
-from helpers import Spy
 import pytest
+from helpers import Spy
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"
@@ -112,13 +112,12 @@ class TestFtSwag:
 
     def test_swag_parameter_weight_decay_config_classifies_lora_parameters(self):
         require_mlx_runtime()
-        from mlx.utils import tree_flatten
-
         import ft_swag
+        import train_sml
         from lora import LoRAConfig, apply_lora
+        from mlx.utils import tree_flatten
         from sml import SMLLanguageModel
         from test_train import tiny_config
-        import train_sml
 
         model = SMLLanguageModel(tiny_config())
         apply_lora(
@@ -592,8 +591,9 @@ class TestFtSwag:
     def test_lora_checkpoint_round_trip_writes_mlx_directory_files(self, tmp_path):
         mx = require_mlx_runtime()
         import json
-        import mlx.optimizers as optim
+
         import ft_swag
+        import mlx.optimizers as optim
         from ft_swag import SwagFineTuneConfig
         from lora import apply_lora
         from sml import SMLConfig, SMLLanguageModel

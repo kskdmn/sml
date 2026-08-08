@@ -60,7 +60,7 @@ class TestLoRA:
         assert not config.target_down_proj
 
     def test_lora_config_can_include_mlp_targets_with_flags(self):
-        from lora import ATTENTION_TARGET_MODULES, LoRAConfig, MLP_TARGET_MODULES
+        from lora import ATTENTION_TARGET_MODULES, MLP_TARGET_MODULES, LoRAConfig
 
         config = LoRAConfig(
             target_gate_proj=True,
@@ -129,8 +129,8 @@ class TestLoRA:
 
     def test_lora_linear_validates_rank_and_alpha(self):
         require_mlx_runtime()
-        import mlx.nn as nn
         from lora import LoRALinear
+        from mlx import nn
 
         linear = nn.Linear(8, 4)
 
@@ -141,8 +141,8 @@ class TestLoRA:
 
     def test_lora_linear_uses_rank_stabilized_scaling_by_default(self):
         require_mlx_runtime()
-        import mlx.nn as nn
         from lora import LoRALinear
+        from mlx import nn
 
         adapter = LoRALinear(nn.Linear(8, 4, bias=False), rank=4, alpha=8.0)
 
@@ -150,8 +150,8 @@ class TestLoRA:
 
     def test_lora_linear_can_use_legacy_rank_scaling(self):
         require_mlx_runtime()
-        import mlx.nn as nn
         from lora import LoRALinear
+        from mlx import nn
 
         adapter = LoRALinear(
             nn.Linear(8, 4, bias=False),
@@ -165,8 +165,8 @@ class TestLoRA:
     def test_lora_linear_uses_adapter_initializer_ranges(self, monkeypatch):
         mx = require_mlx_runtime()
         import lora
-        import mlx.nn as nn
         from lora import LoRALinear
+        from mlx import nn
 
         def fake_normal(*, shape, scale):
             return mx.full(shape, scale)
@@ -198,8 +198,8 @@ class TestLoRA:
 
     def test_lora_linear_keeps_default_b_adapter_zero(self):
         mx = require_mlx_runtime()
-        import mlx.nn as nn
         from lora import LoRALinear
+        from mlx import nn
 
         adapter = LoRALinear(nn.Linear(8, 4, bias=False), rank=2, alpha=4.0)
         mx.eval(adapter.lora_B)
@@ -210,10 +210,11 @@ class TestLoRA:
 
     def test_apply_lora_passes_adapter_initializer_ranges(self, monkeypatch):
         mx = require_mlx_runtime()
+        from types import SimpleNamespace
+
         import lora
         from lora import LoRAConfig, apply_lora
         from sml import SMLLanguageModel
-        from types import SimpleNamespace
 
         def fake_normal(*, shape, scale):
             return mx.full(shape, scale)
@@ -283,8 +284,8 @@ class TestLoRA:
 
     def test_lora_forward_changes_output_after_nonzero_b(self):
         mx = require_mlx_runtime()
-        import mlx.nn as nn
         from lora import LoRALinear
+        from mlx import nn
 
         linear = nn.Linear(8, 4, bias=True)
         lora = LoRALinear(linear, rank=4, alpha=8.0)
@@ -299,8 +300,8 @@ class TestLoRA:
 
     def test_lora_forward_matches_base_output_dtype(self):
         mx = require_mlx_runtime()
-        import mlx.nn as nn
         from lora import LoRALinear
+        from mlx import nn
 
         linear = nn.Linear(8, 4, bias=False)
         linear.weight = linear.weight.astype(mx.float16)
@@ -315,8 +316,8 @@ class TestLoRA:
 
     def test_merge_lora_preserves_output_and_restores_base_linear(self):
         mx = require_mlx_runtime()
-        import mlx.nn as nn
         from lora import apply_lora, merge_lora
+        from mlx import nn
         from sml import SMLLanguageModel
 
         config, lora_config = self.tiny_config()

@@ -2,12 +2,11 @@ import inspect
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
-from helpers import Spy
 import pytest
-
+from helpers import Spy
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"
@@ -255,9 +254,8 @@ class TestTrainData:
 
     def test_parameter_weight_decay_config_classifies_base_model_parameters(self):
         require_mlx()
-        from mlx.utils import tree_flatten
-
         import train_sml
+        from mlx.utils import tree_flatten
         from sml import SMLLanguageModel
 
         model = SMLLanguageModel(tiny_config())
@@ -298,9 +296,8 @@ class TestTrainData:
 
     def test_decoupled_weight_decay_scales_trainable_parameters_by_decay_tree(self):
         mx = require_mlx()
-        from mlx.utils import tree_flatten, tree_map
-
         import train_sml
+        from mlx.utils import tree_flatten, tree_map
         from sml import SMLLanguageModel
 
         model = SMLLanguageModel(tiny_config())
@@ -348,9 +345,8 @@ class TestTrainData:
 
     def test_apply_model_dtype_casts_parameters(self):
         import mlx.core as mx
-        from mlx.utils import tree_flatten
-
         import train_sml
+        from mlx.utils import tree_flatten
         from sml import create_model
 
         model = create_model()
@@ -361,9 +357,8 @@ class TestTrainData:
 
     def test_apply_model_dtype_keeps_float32_when_disabled(self):
         import mlx.core as mx
-        from mlx.utils import tree_flatten
-
         import train_sml
+        from mlx.utils import tree_flatten
         from sml import create_model
 
         model = create_model()
@@ -497,7 +492,7 @@ class TestTrainData:
             lr=0.0003,
             avg_loss=1.23456,
             grad_norm=5.859,
-            timestamp=datetime(2026, 6, 5, 12, 34, 56),
+            timestamp=datetime(2026, 6, 5, 12, 34, 56, tzinfo=UTC),
         )
 
         assert (
@@ -514,7 +509,7 @@ class TestTrainData:
             lr=0.0003,
             avg_loss=9.8457,
             grad_norm=6.069,
-            timestamp=datetime(2026, 6, 30, 7, 50, 0),
+            timestamp=datetime(2026, 6, 30, 7, 50, 0, tzinfo=UTC),
             progress=train_sml.ReadingProgress(
                 input_file="swag-train",
                 line_number=42,
@@ -536,7 +531,7 @@ class TestTrainData:
             lr=0.0003,
             avg_loss=9.8457,
             grad_norm=6.069,
-            timestamp=datetime(2026, 6, 30, 7, 50, 0),
+            timestamp=datetime(2026, 6, 30, 7, 50, 0, tzinfo=UTC),
             progress=train_sml.ReadingProgress(
                 input_file="pile-0000.jsonl.zst",
                 line_number=42,
@@ -663,8 +658,8 @@ class TestPreparedPretrainingBlocks:
         assert [{"input_ids": [3, 30, 31, 32], "labels": [30, 31, 32, 2]}] == blocks
 
     def test_iter_prepared_token_blocks_rejects_wrong_block_width(self, tmp_path):
-        import train_sml
         import numpy as np
+        import train_sml
 
         path = tmp_path / "train-000000.npz"
         np.savez_compressed(

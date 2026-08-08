@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import importlib
+# Canonical artifact validation reports malformed content uniformly as ValueError.
+# ruff: noqa: TRY004
 import hashlib
+import importlib
 import os
 import shutil
 import sys

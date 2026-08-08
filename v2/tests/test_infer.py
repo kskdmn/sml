@@ -6,8 +6,8 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
-from helpers import Spy
 import pytest
+from helpers import Spy
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"

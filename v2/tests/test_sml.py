@@ -17,8 +17,7 @@ except (ImportError, RuntimeError) as exc:
 
 class TestSMLConfig:
     def test_default_config_targets_small_model_size(self):
-        from sml import count_parameters, create_model, estimate_model_size
-        from sml import SMLConfig
+        from sml import SMLConfig, count_parameters, create_model, estimate_model_size
 
         config = SMLConfig()
 
@@ -450,8 +449,7 @@ class TestSMLModel:
         assert bool(mx.isinf(adjusted[0, 3]).item())
 
     def test_generate_uses_repetition_penalty_without_sampling(self):
-        from sml import GenerationConfig
-        from sml import SMLLanguageModel
+        from sml import GenerationConfig, SMLLanguageModel
 
         config = self.tiny_config()
         model = SMLLanguageModel(config)
@@ -474,8 +472,7 @@ class TestSMLModel:
         assert not bool(mx.all(greedy == penalized).item())
 
     def test_generate_sampling_is_reproducible_with_seed(self):
-        from sml import GenerationConfig
-        from sml import SMLLanguageModel
+        from sml import GenerationConfig, SMLLanguageModel
 
         config = self.tiny_config()
         model = SMLLanguageModel(config)

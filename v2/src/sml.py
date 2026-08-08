@@ -4,10 +4,9 @@ import math
 from dataclasses import dataclass
 
 import mlx.core as mx
-import mlx.nn as nn
-from mlx.utils import tree_flatten
-
 from config import BOS_TOKEN_ID, EOS_TOKEN_ID, PAD_TOKEN_ID, UNK_TOKEN_ID
+from mlx import nn
+from mlx.utils import tree_flatten
 
 
 @dataclass(slots=True)
@@ -56,7 +55,7 @@ class ParameterInitializerRangeConfig:
         cls,
         initializer_range: float,
         num_layers: int,
-    ) -> "ParameterInitializerRangeConfig":
+    ) -> ParameterInitializerRangeConfig:
         if initializer_range is None or not math.isfinite(initializer_range):
             raise ValueError("initializer_range must be non-negative and finite")
         if initializer_range < 0.0:

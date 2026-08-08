@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+# Schema validation reports malformed serialized content uniformly as ValueError.
+# ruff: noqa: TRY004
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
-from typing import Literal, Mapping, TypeAlias
+from typing import Literal
 
-JsonScalar: TypeAlias = str | int | float | bool | None
-JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+type JsonScalar = str | int | float | bool | None
+type JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 MetricName = Literal[
     "prepared-data",
     "pretraining-compute",

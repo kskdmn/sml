@@ -1,7 +1,6 @@
 import importlib.util
 from pathlib import Path
 
-
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = PROJECT_DIR / "src" / "config.py"
 

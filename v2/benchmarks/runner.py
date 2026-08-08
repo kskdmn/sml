@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Benchmark artifact validation reports malformed content uniformly as ValueError.
+# ruff: noqa: TRY004
 import argparse
 import importlib.metadata
 import json
@@ -16,7 +18,7 @@ import time
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from numbers import Real
 from pathlib import Path
 from typing import Literal
@@ -150,7 +152,7 @@ def _validate_raw_trials_evidence(trials: Sequence[RawTrial]) -> None:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _metric_report_dict(report) -> dict:
@@ -1038,9 +1040,12 @@ def comparison_has_noise(report: dict, *, attempt_index: int = 0) -> bool:
         raise ValueError("comparison metrics must be an object")
     for metric_record in metrics.values():
         attempts = metric_record.get("attempts")
-        if isinstance(attempts, list) and len(attempts) > attempt_index:
-            if attempts[attempt_index]["analysis"]["decision"] == "too-noisy":
-                return True
+        if (
+            isinstance(attempts, list)
+            and len(attempts) > attempt_index
+            and attempts[attempt_index]["analysis"]["decision"] == "too-noisy"
+        ):
+            return True
         previous = metric_record.get("previous_comparison")
         if isinstance(previous, dict):
             previous_attempts = previous.get("attempts")
@@ -1502,8 +1507,7 @@ def _run_command(arguments: Sequence[str], *, cwd: Path) -> str:
         arguments,
         cwd=cwd,
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     )
     return completed.stdout.strip()
@@ -1542,8 +1546,7 @@ def _system_profiler(data_type: str) -> dict:
     output = subprocess.run(
         ("system_profiler", data_type, "-json"),
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     ).stdout
     parsed = json.loads(output)
@@ -1594,8 +1597,7 @@ def _thermal_state() -> tuple[str, int]:
             "import Foundation; print(ProcessInfo.processInfo.thermalState.rawValue)",
         ),
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         env=environment,
     ).stdout.strip()
@@ -1619,8 +1621,7 @@ def _memory_pressure() -> tuple[str, int]:
     output = subprocess.run(
         ("memory_pressure", "-Q"),
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     ).stdout
     match = re.search(r"System-wide memory free percentage:\s*(\d+)%", output)
@@ -1630,8 +1631,7 @@ def _memory_pressure() -> tuple[str, int]:
     raw_level = subprocess.run(
         ("sysctl", "-n", "kern.memorystatus_vm_pressure_level"),
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     ).stdout.strip()
     return decode_memory_pressure_level(int(raw_level)), free_percentage
@@ -1669,15 +1669,13 @@ def _power_status() -> tuple[bool, str, bool]:
     source = subprocess.run(
         ("pmset", "-g", "ps"),
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     ).stdout
     custom = subprocess.run(
         ("pmset", "-g", "custom"),
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     ).stdout
     return parse_power_status(source, custom)
@@ -1732,8 +1730,7 @@ def _has_competing_gpu_workload() -> bool:
     result = subprocess.run(
         ("ps", "-axo", "pid=,ppid=,command="),
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     ).stdout
     return detect_competing_gpu_workload(
@@ -1765,8 +1762,7 @@ def collect_environment(
     macos_build = subprocess.run(
         ("sw_vers", "-buildVersion"),
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
     ).stdout.strip()
     hardware = {
@@ -1804,39 +1800,6 @@ def collect_post_exit_environment() -> tuple[
 ]:
     memory_sample = _memory_pressure()
     return collect_environment(memory_sample=memory_sample)
-
-
-def merge_environment_status(start: dict, end: dict) -> dict:
-    pressure_order = {"normal": 0, "warning": 1, "critical": 2}
-    thermal_state_raw_value = max(
-        start["thermal_state_raw_value"],
-        end["thermal_state_raw_value"],
-    )
-    memory_pressure = max(
-        (start["memory_pressure"], end["memory_pressure"]),
-        key=lambda value: pressure_order[value],
-    )
-    return {
-        "power_connected": bool(start["power_connected"])
-        and bool(end["power_connected"]),
-        "power_mode": (
-            start["power_mode"]
-            if start["power_mode"] == end["power_mode"]
-            else "changed"
-        ),
-        "low_power_mode": bool(start["low_power_mode"]) or bool(end["low_power_mode"]),
-        "thermal_state": decode_thermal_state(thermal_state_raw_value),
-        "thermal_state_raw_value": thermal_state_raw_value,
-        "memory_pressure": memory_pressure,
-        "memory_free_percentage": min(
-            int(start["memory_free_percentage"]),
-            int(end["memory_free_percentage"]),
-        ),
-        "competing_gpu_workload": bool(start["competing_gpu_workload"])
-        or bool(end["competing_gpu_workload"]),
-        "start": start,
-        "end": end,
-    }
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -2026,7 +1989,7 @@ def _fallback_cleanup_failed_worktree(
             if not destination.is_dir():
                 raise RuntimeError("failed worktree path is not a directory")
             shutil.rmtree(destination)
-    except BaseException as error:
+    except BaseException as error:  # noqa: BLE001 - collect every cleanup failure
         failures.append(error)
 
     try:
@@ -2035,7 +1998,7 @@ def _fallback_cleanup_failed_worktree(
             cwd=repository,
             check=True,
         )
-    except BaseException as error:
+    except BaseException as error:  # noqa: BLE001 - collect every cleanup failure
         failures.append(error)
     return tuple(failures)
 
@@ -2648,17 +2611,19 @@ def _record_baseline(args: argparse.Namespace) -> int:
         manifest_path=args.manifest,
         raw_output_path=args.raw_output,
     )
-    with baseline_output_lock(manifest_path, raw_output_path):
-        with baseline_session_lock(state_root):
-            cleanup_orphaned_journal_temporaries(state_root)
-            cleanup_orphaned_atomic_temporaries((manifest_path, raw_output_path))
-            return _record_baseline_locked(
-                args,
-                harness_root=harness_root,
-                state_root=state_root,
-                manifest_path=manifest_path,
-                raw_output_path=raw_output_path,
-            )
+    with (
+        baseline_output_lock(manifest_path, raw_output_path),
+        baseline_session_lock(state_root),
+    ):
+        cleanup_orphaned_journal_temporaries(state_root)
+        cleanup_orphaned_atomic_temporaries((manifest_path, raw_output_path))
+        return _record_baseline_locked(
+            args,
+            harness_root=harness_root,
+            state_root=state_root,
+            manifest_path=manifest_path,
+            raw_output_path=raw_output_path,
+        )
 
 
 def _record_baseline_locked(
@@ -2938,14 +2903,10 @@ def _validate_comparison_document(report: dict, baseline: dict) -> None:
 def _validate_report_raw_trial_evidence(report: dict) -> None:
     raw_trials = report.get("raw_trials")
     if not isinstance(raw_trials, list):
-        raise ValueError(  # noqa: TRY004
-            "comparison raw_trials must be a list"
-        )
+        raise ValueError("comparison raw_trials must be a list")
     for raw in raw_trials:
         if not isinstance(raw, dict):
-            raise ValueError(  # noqa: TRY004
-                "comparison raw trials must be objects"
-            )
+            raise ValueError("comparison raw trials must be objects")
         validate_raw_trial_evidence(RawTrial.from_dict(raw))
 
 
@@ -3376,22 +3337,22 @@ def _compare(args: argparse.Namespace) -> int:
         attempt_index=0,
     )
     previous_comparisons = _combine_previous_attempts(first_previous)
-    report_arguments = dict(
-        baseline=baseline,
-        candidate_commit=candidate_commit,
-        minimum_ratio=args.minimum_ratio,
-        pretraining_minimum_ratio=args.pretraining_minimum_ratio,
-        maximum_dispersion=args.maximum_dispersion,
-        require_lower_bound=not args.lower_bound_report_only,
-        bootstrap_resamples=args.bootstrap_resamples,
-        predecessor_metrics=predecessor_metrics,
-        predecessors=predecessor_proof,
-        previous_comparisons=previous_comparisons,
-        comparison_mode=comparison_mode,
-        pairs=args.pairs,
-        warmup_units=args.warmup,
-        measured_units=args.measure,
-    )
+    report_arguments = {
+        "baseline": baseline,
+        "candidate_commit": candidate_commit,
+        "minimum_ratio": args.minimum_ratio,
+        "pretraining_minimum_ratio": args.pretraining_minimum_ratio,
+        "maximum_dispersion": args.maximum_dispersion,
+        "require_lower_bound": not args.lower_bound_report_only,
+        "bootstrap_resamples": args.bootstrap_resamples,
+        "predecessor_metrics": predecessor_metrics,
+        "predecessors": predecessor_proof,
+        "previous_comparisons": previous_comparisons,
+        "comparison_mode": comparison_mode,
+        "pairs": args.pairs,
+        "warmup_units": args.warmup,
+        "measured_units": args.measure,
+    }
     provisional = build_comparison_report(trials=trials, **report_arguments)
     cooldown_evidence = None
     if comparison_has_noise(provisional):

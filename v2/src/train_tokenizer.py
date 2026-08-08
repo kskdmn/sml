@@ -2,23 +2,23 @@ from __future__ import annotations
 
 import argparse
 import itertools
+from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import Iterator, NamedTuple, Sequence
+from typing import NamedTuple
 
 import sentencepiece as spm
-
+import tokenizer
 from config import (
     BOS_TOKEN_ID,
     DEFAULT_TOKENIZER_MODEL_PATH,
     EOS_TOKEN_ID,
+    PAD_TOKEN_ID,
     PRETRAINING_INPUT_DIR,
     PRETRAINING_INPUT_FILE_NAME_REGEX,
-    PAD_TOKEN_ID,
     SUCCESS_RETURN_CODE,
     UNK_TOKEN_ID,
     resolve_path,
 )
-import tokenizer
 from utils import discover_input_files, shuffle_input_files
 
 MAX_ROWS_PER_FILE = 8_192
@@ -82,25 +82,25 @@ def train_tokenizer(
     sentence_iterator = require_non_empty_iterator(iter(text_iterable))
 
     model_prefix = tokenizer_model_path.with_suffix("")
-    trainer_kwargs = dict(
-        sentence_iterator=sentence_iterator,
-        model_prefix=str(model_prefix),
-        vocab_size=tokenizer.VOCAB_SIZE,
-        model_type=tokenizer.MODEL_TYPE,
-        character_coverage=tokenizer.CHARACTER_COVERAGE,
-        byte_fallback=tokenizer.BYTE_FALLBACK,
-        num_threads=NUM_THREADS,
-        input_sentence_size=INPUT_SENTENCE_SIZE,
-        shuffle_input_sentence=SHUFFLE_INPUT_SENTENCE,
-        self_test_sample_size=SELF_TEST_SAMPLE_SIZE,
-        hard_vocab_limit=tokenizer.HARD_VOCAB_LIMIT,
-        train_extremely_large_corpus=TRAIN_EXTREMELY_LARGE_CORPUS,
-        unk_id=UNK_TOKEN_ID,
-        bos_id=BOS_TOKEN_ID,
-        eos_id=EOS_TOKEN_ID,
-        pad_id=PAD_TOKEN_ID,
-        user_defined_symbols=list(tokenizer.CONVERSATION_SPECIAL_TOKENS),
-    )
+    trainer_kwargs = {
+        "sentence_iterator": sentence_iterator,
+        "model_prefix": str(model_prefix),
+        "vocab_size": tokenizer.VOCAB_SIZE,
+        "model_type": tokenizer.MODEL_TYPE,
+        "character_coverage": tokenizer.CHARACTER_COVERAGE,
+        "byte_fallback": tokenizer.BYTE_FALLBACK,
+        "num_threads": NUM_THREADS,
+        "input_sentence_size": INPUT_SENTENCE_SIZE,
+        "shuffle_input_sentence": SHUFFLE_INPUT_SENTENCE,
+        "self_test_sample_size": SELF_TEST_SAMPLE_SIZE,
+        "hard_vocab_limit": tokenizer.HARD_VOCAB_LIMIT,
+        "train_extremely_large_corpus": TRAIN_EXTREMELY_LARGE_CORPUS,
+        "unk_id": UNK_TOKEN_ID,
+        "bos_id": BOS_TOKEN_ID,
+        "eos_id": EOS_TOKEN_ID,
+        "pad_id": PAD_TOKEN_ID,
+        "user_defined_symbols": list(tokenizer.CONVERSATION_SPECIAL_TOKENS),
+    }
     if tokenizer.MAX_SENTENCE_LENGTH is not None:
         trainer_kwargs["max_sentence_length"] = tokenizer.MAX_SENTENCE_LENGTH
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+# Manifest validation reports malformed persisted content uniformly as ValueError.
+# ruff: noqa: TRY004
 import json
 from pathlib import Path
 
 from config import OUTPUT_DIR, resolve_path
-
 
 FORMAT_NAME = "sml-pretokenized-blocks-v1"
 TOKENS_ARRAY_NAME = "tokens"

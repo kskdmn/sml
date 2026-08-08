@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 
 if TYPE_CHECKING:
     from sml import SMLLanguageModel
@@ -174,10 +174,10 @@ def resolve_lora_initializer_range(
 
 
 def apply_lora(
-    model: "SMLLanguageModel",
+    model: SMLLanguageModel,
     config: LoRAConfig,
     parameter_initializer_range=None,
-) -> "SMLLanguageModel":
+) -> SMLLanguageModel:
     """
     Replace matching linear projections with ``LoRALinear`` wrappers in place.
     """

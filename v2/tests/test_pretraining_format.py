@@ -4,11 +4,10 @@ from pathlib import Path
 
 import pytest
 
-
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC_DIR))
 
-import pretraining_format as fmt  # noqa: E402
+import pretraining_format as fmt
 
 
 def manifest(sequence_length=4, vocab_size=128):

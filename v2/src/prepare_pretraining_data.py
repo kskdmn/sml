@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-
 from config import (
     BOS_TOKEN_ID,
     DEFAULT_TOKENIZER_MODEL_PATH,
@@ -20,6 +19,8 @@ from config import (
 )
 from pretraining_format import (
     DEFAULT_PRETRAINING_DATA_DIR as DEFAULT_OUTPUT_DIR,
+)
+from pretraining_format import (
     FORMAT_NAME,
     MANIFEST_NAME,
     TOKEN_DTYPE_NAME,
@@ -36,7 +37,6 @@ from utils import (
     load_tokenizer,
     shuffle_input_files,
 )
-
 
 UINT16_VOCAB_SIZE_LIMIT = 65_536
 UINT16_MAX_TOKEN_ID = UINT16_VOCAB_SIZE_LIMIT - 1

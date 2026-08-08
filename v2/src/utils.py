@@ -16,7 +16,6 @@ from pathlib import Path
 import mlx.core as mx
 import sentencepiece as spm
 import zstandard as zstd
-
 from config import resolve_path
 
 MIN_TEXT_LENGTH = 100
@@ -91,19 +90,21 @@ def iter_zstd_jsonl_lines(
     Decode zstd streams as replacement-tolerant UTF-8 without materializing shards.
     """
     try:
-        with path.open("rb") as compressed_stream:
-            decompressor = zstd.ZstdDecompressor()
-            with decompressor.stream_reader(compressed_stream) as zstd_stream:
-                with io.TextIOWrapper(
-                    zstd_stream,
-                    encoding=TEXT_ENCODING,
-                    errors=TEXT_DECODE_ERRORS,
-                ) as text_stream:
-                    yield from enumerate_limited_lines(
-                        text_stream,
-                        max_rows_per_file,
-                        start_after_line=start_after_line,
-                    )
+        decompressor = zstd.ZstdDecompressor()
+        with (
+            path.open("rb") as compressed_stream,
+            decompressor.stream_reader(compressed_stream) as zstd_stream,
+            io.TextIOWrapper(
+                zstd_stream,
+                encoding=TEXT_ENCODING,
+                errors=TEXT_DECODE_ERRORS,
+            ) as text_stream,
+        ):
+            yield from enumerate_limited_lines(
+                text_stream,
+                max_rows_per_file,
+                start_after_line=start_after_line,
+            )
     except zstd.ZstdError as exc:
         raise RuntimeError(f"zstd failed for {path}: {exc}") from exc
 

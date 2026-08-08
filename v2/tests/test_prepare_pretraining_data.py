@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 import zstandard as zstd
 
-
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"
 SCRIPT_PATH = SRC_DIR / "prepare_pretraining_data.py"

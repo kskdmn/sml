@@ -4,7 +4,6 @@ from pathlib import Path
 
 import pytest
 
-
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"
 

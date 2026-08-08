@@ -1,7 +1,6 @@
 import ast
-from pathlib import Path
 import re
-
+from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = PROJECT_DIR.parent

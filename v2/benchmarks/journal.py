@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Journal validation reports malformed persisted content uniformly as ValueError.
+# ruff: noqa: TRY004
 import fcntl
 import json
 import math
@@ -591,9 +593,7 @@ def _validate_rejected_document(
     if raw_trial is None:
         return body, None
     if not isinstance(raw_trial, dict):
-        raise ValueError(  # noqa: TRY004
-            "rejected trial must contain a raw trial object or null"
-        )
+        raise ValueError("rejected trial must contain a raw trial object or null")
     return body, _parse_trial_for_slot(raw_trial, slot=slot, label="rejected trial")
 
 

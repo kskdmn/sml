@@ -5,8 +5,8 @@ import tempfile
 import warnings
 from pathlib import Path
 
-from helpers import Spy
 import zstandard as zstd
+from helpers import Spy
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"

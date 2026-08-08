@@ -11,13 +11,15 @@ exposed as ``--temperature``, ``--top-p``, ``--repetition-penalty``,
 
 from __future__ import annotations
 
+# Checkpoint validation reports malformed persisted content uniformly as ValueError.
+# ruff: noqa: TRY004
 import argparse
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Protocol, Sequence
+from typing import Any, Protocol
 
 import mlx.core as mx
-
 from config import (
     DEFAULT_MODEL_PATH,
     DEFAULT_TOKENIZER_MODEL_PATH,

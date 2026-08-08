@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+# Canonical workload validation reports malformed content uniformly as ValueError.
+# ruff: noqa: TRY004
 import hashlib
 import json
 import re
 import unicodedata
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 

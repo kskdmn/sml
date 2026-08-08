@@ -8,21 +8,19 @@ the gold continuation above the other candidate endings. Defaults read from
 
 from __future__ import annotations
 
+# Dataset and checkpoint validation reports malformed content uniformly as ValueError.
+# ruff: noqa: TRY004
 import argparse
 import copy
 import json
 import random
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Sequence
 
 import mlx.core as mx
-import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten, tree_unflatten
-
 from config import (
     BOS_TOKEN_ID,
     DEFAULT_MODEL_PATH,
@@ -46,6 +44,8 @@ from lora import (
     merge_lora,
     require_lora_modules,
 )
+from mlx import nn
+from mlx.utils import tree_flatten, tree_unflatten
 from sml import (
     ParameterInitializerRangeConfig,
     SMLConfig,
@@ -737,7 +737,7 @@ def fine_tune_swag(
                     lr=lr,
                     avg_loss=avg_loss,
                     grad_norm=float(grad_norm.item()),
-                    timestamp=datetime.now(),
+                    timestamp=datetime.now().astimezone(),
                     progress=reading_progress,
                 )
             )
