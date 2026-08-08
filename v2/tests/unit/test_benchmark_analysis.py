@@ -68,6 +68,7 @@ from v2.benchmarks.runner import (
     perform_cooldown,
     process_order,
     publish_baseline_from_journal,
+    validate_baseline_trial,
     validate_baseline_manifest,
     validate_checkout_status,
     validate_comparison_report,
@@ -2369,6 +2370,343 @@ def _session_document(
     )
 
 
+def _persist_journal_trial(journal, attempt, trial):
+    measurement = json.loads(json.dumps(trial.child_measurement))
+    measurement["session_identity"] = journal.session["identity"]
+    measurement["journal_attempt_index"] = attempt.journal_attempt_index
+    measurement_body = {
+        key: value for key, value in measurement.items() if key != "identity"
+    }
+    measurement["identity"] = structured_identity(
+        "sml-child-trial-measurement-v1", measurement_body
+    )
+    post_exit = json.loads(json.dumps(trial.post_exit_observation))
+    post_exit["session_identity"] = journal.session["identity"]
+    post_exit["journal_attempt_index"] = attempt.journal_attempt_index
+    post_exit["child_measurement_identity"] = measurement["identity"]
+    post_exit_body = {
+        key: value for key, value in post_exit.items() if key != "identity"
+    }
+    post_exit["identity"] = structured_identity(
+        "sml-parent-post-exit-observation-v1", post_exit_body
+    )
+    persisted = finalize_raw_trial(measurement, post_exit)
+    atomic_write_json(
+        journal.measurement_path(attempt.slot, attempt.journal_attempt_index),
+        measurement,
+        create_only=True,
+    )
+    atomic_write_json(
+        journal.post_exit_path(attempt.slot, attempt.journal_attempt_index),
+        post_exit,
+        create_only=True,
+    )
+    atomic_write_json(attempt.path, persisted.to_dict(), create_only=True)
+    return persisted
+
+
+def _preflight_from_trial(trial):
+    return (
+        trial.hardware,
+        trial.environment_status["start"],
+        trial.software_versions,
+    )
+
+
+def _baseline_validator(workload):
+    expected = _valid_raw_trial(workload)
+
+    def validate(trial, *, allow_rejected_environment):
+        validate_baseline_trial(
+            trial,
+            workload=workload,
+            source_commit=expected.source_commit,
+            harness_commit=expected.harness_commit,
+            harness_identity=expected.harness_identity,
+            expected_hardware=expected.hardware,
+            expected_software_versions=expected.software_versions,
+            allow_rejected_environment=allow_rejected_environment,
+        )
+
+    return validate
+
+
+def _accept_trial(_trial):
+    return benchmark_runner.TrialEnvironmentDisposition("accept", None)
+
+
+def test_persistent_memory_rejection_stops_then_manual_resume_fills_only_missing_slot(
+    tmp_path,
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    first = BaselineSlot("prepared-data", 0)
+    second = BaselineSlot("prepared-data", 1)
+    first_attempt = journal.next_attempt(first)
+    accepted = _persist_journal_trial(
+        journal,
+        first_attempt,
+        _valid_raw_trial(workload, pair_index=0),
+    )
+    journal.accept_inflight(first_attempt, accepted)
+    normal = _valid_raw_trial(workload, pair_index=1)
+    warning = dict(normal.environment_status["post_exit"])
+    warning["memory_pressure"] = "warning"
+    rejected = _with_environment_observations(normal, post_exit=warning)
+    first_run_launches = []
+
+    with pytest.raises(
+        benchmark_runner.MemoryPressureTrialRejected,
+        match="persistent-post-exit-memory-pressure",
+    ):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(first, second),
+            launch_trial=lambda slot, attempt: (
+                first_run_launches.append(slot)
+                or _persist_journal_trial(journal, attempt, rejected)
+            ),
+            preflight=lambda: _preflight_from_trial(normal),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=lambda slot, index, deadline, trigger: pytest.fail(
+                "memory rejection entered thermal recovery"
+            ),
+            validate_trial=_baseline_validator(workload),
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            progress=lambda message: None,
+        )
+
+    assert first_run_launches == [second]
+    assert journal.load_accepted((first, second)) == {first: accepted}
+    assert (
+        read_json_object(journal.rejected_path(second, 0), label="memory rejection")[
+            "reason"
+        ]
+        == "persistent-post-exit-memory-pressure"
+    )
+
+    second_run_launches = []
+    trials = capture_baseline_trials(
+        journal=journal,
+        slots=(first, second),
+        launch_trial=lambda slot, attempt: (
+            second_run_launches.append(slot)
+            or _persist_journal_trial(journal, attempt, normal)
+        ),
+        preflight=lambda: _preflight_from_trial(normal),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda slot, index, deadline, trigger: pytest.fail(
+            "memory rejection created a thermal trigger"
+        ),
+        validate_trial=_baseline_validator(workload),
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
+        progress=lambda message: None,
+    )
+
+    assert second_run_launches == [second]
+    assert trials[0] == accepted
+    assert (trials[1].metric, trials[1].pair_index, trials[1].value) == (
+        normal.metric,
+        normal.pair_index,
+        normal.value,
+    )
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "pressure", "reason"),
+    (
+        ("start", "warning", "non-normal-start-memory-pressure"),
+        ("end", "critical", "critical-measurement-memory-pressure"),
+    ),
+)
+def test_capture_stops_immediately_for_rejected_child_memory_observations(
+    tmp_path, endpoint, pressure, reason
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    normal = _valid_raw_trial(workload)
+    status = dict(normal.environment_status[endpoint])
+    status["memory_pressure"] = pressure
+    rejected = _with_environment_observations(normal, **{endpoint: status})
+    launches = []
+
+    with pytest.raises(benchmark_runner.MemoryPressureTrialRejected) as raised:
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=lambda current_slot, attempt: (
+                launches.append(current_slot)
+                or _persist_journal_trial(journal, attempt, rejected)
+            ),
+            preflight=lambda: _preflight_from_trial(normal),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=lambda *args: pytest.fail(
+                "child memory rejection entered thermal recovery"
+            ),
+            validate_trial=_baseline_validator(workload),
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            progress=lambda message: None,
+        )
+
+    assert raised.value.slot == slot
+    assert raised.value.reason == reason
+    assert launches == [slot]
+    assert (
+        read_json_object(journal.rejected_path(slot, 0), label="memory rejection")[
+            "reason"
+        ]
+        == reason
+    )
+
+
+def test_capture_accepts_child_end_warning_when_post_exit_is_normal(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    normal = _valid_raw_trial(workload)
+    warning = dict(normal.environment_status["end"])
+    warning["memory_pressure"] = "warning"
+    diagnostic_warning = _with_environment_observations(normal, end=warning)
+    launches = []
+
+    trials = capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, attempt: (
+            launches.append(current_slot)
+            or _persist_journal_trial(journal, attempt, diagnostic_warning)
+        ),
+        preflight=lambda: _preflight_from_trial(normal),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda *args: pytest.fail("accepted memory warning entered recovery"),
+        validate_trial=_baseline_validator(workload),
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
+        progress=lambda message: None,
+    )
+
+    assert launches == [slot]
+    assert trials[0].environment_status["measurement_memory_pressure"] == "warning"
+    assert journal.load_accepted((slot,)) == {slot: trials[0]}
+
+
+def test_capture_rejects_measurement_only_crash_then_launches_a_new_attempt(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    normal = _valid_raw_trial(workload)
+    attempt = journal.next_attempt(slot)
+    measurement, _post_exit, _persisted = _journal_trial_evidence(
+        journal, attempt, normal
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    events = []
+
+    trials = capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, current_attempt: (
+            events.append(("launch", current_attempt.journal_attempt_index))
+            or _persist_journal_trial(journal, current_attempt, normal)
+        ),
+        preflight=lambda: (
+            events.append(("preflight", 1)) or _preflight_from_trial(normal)
+        ),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda *args: pytest.fail("missing evidence entered thermal recovery"),
+        validate_trial=_baseline_validator(workload),
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
+        progress=lambda message: None,
+    )
+
+    assert events == [("preflight", 1), ("launch", 1)]
+    assert (
+        read_json_object(
+            journal.rejected_path(slot, 0), label="missing evidence rejection"
+        )["reason"]
+        == "missing-immediate-post-exit-evidence"
+    )
+    assert trials[0].pair_index == 0
+
+    resumed = capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, current_attempt: pytest.fail(
+            "accepted slot was relaunched after missing-evidence rejection"
+        ),
+        preflight=lambda: pytest.fail(
+            "accepted slot reached preflight after missing-evidence rejection"
+        ),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda *args: pytest.fail(
+            "missing-evidence rejection created a thermal trigger on resume"
+        ),
+        validate_trial=_baseline_validator(workload),
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
+        progress=lambda message: None,
+    )
+
+    assert resumed == trials
+
+
+def test_capture_never_creates_raw_evidence_for_an_unstaged_launcher_result(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    normal = _valid_raw_trial(workload)
+
+    with pytest.raises(FileNotFoundError):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=lambda current_slot, current_attempt: normal,
+            preflight=lambda: _preflight_from_trial(normal),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=lambda *args: pytest.fail("unstaged launch entered recovery"),
+            validate_trial=_baseline_validator(workload),
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            progress=lambda message: None,
+        )
+
+    assert not journal.inflight_path(slot, 0).exists()
+
+
+def test_capture_reconstructs_measurement_and_post_exit_before_replacement_launch(
+    tmp_path,
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, expected = _journal_trial_evidence(
+        journal, attempt, _valid_raw_trial(workload)
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+
+    trials = capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, current_attempt: pytest.fail(
+            "complete staged evidence launched a replacement"
+        ),
+        preflight=lambda: pytest.fail(
+            "complete staged evidence reached replacement preflight"
+        ),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda *args: pytest.fail(
+            "complete staged evidence entered thermal recovery"
+        ),
+        validate_trial=_baseline_validator(workload),
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
+        progress=lambda message: None,
+    )
+
+    assert trials == (expected,)
+    assert not attempt.path.exists()
+    assert journal.load_accepted((slot,)) == {slot: expected}
+
+
 def test_capture_retries_only_the_thermal_slot_and_resumes_accepted_slots(tmp_path):
     workload = build_canonical_workload()
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
@@ -2378,7 +2716,7 @@ def test_capture_retries_only_the_thermal_slot_and_resumes_accepted_slots(tmp_pa
     )
     accepted_first = _valid_raw_trial(workload, pair_index=0)
     first_attempt = journal.next_attempt(slots[0])
-    atomic_write_json(first_attempt.path, accepted_first.to_dict(), create_only=True)
+    accepted_first = _persist_journal_trial(journal, first_attempt, accepted_first)
     journal.accept_inflight(first_attempt, accepted_first)
     launches = []
 
@@ -2386,22 +2724,19 @@ def test_capture_retries_only_the_thermal_slot_and_resumes_accepted_slots(tmp_pa
         launches.append(slot)
         base = _valid_raw_trial(workload, pair_index=slot.pair_index)
         if len(launches) == 1:
-            return _with_thermal_state(base, "fair", 1)
-        return base
+            base = _with_thermal_state(base, "fair", 1)
+        return _persist_journal_trial(journal, attempt, base)
 
     recovered = []
     trials = capture_baseline_trials(
         journal=journal,
         slots=slots,
         launch_trial=launch,
-        preflight=lambda: (
-            accepted_first.hardware,
-            accepted_first.environment_status,
-            accepted_first.software_versions,
-        ),
+        preflight=lambda: _preflight_from_trial(accepted_first),
         validate_preflight=lambda hardware, status, software: None,
         recover=lambda slot, recovery_index, deadline, trigger: recovered.append(slot),
-        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        validate_trial=lambda trial, allow_rejected_environment: None,
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
         clock=lambda: 0.0,
         utc_now=lambda: "2026-08-05T00:00:00+00:00",
         progress=lambda message: None,
@@ -2429,7 +2764,7 @@ def test_capture_reports_resumed_slots_in_supplied_order(tmp_path):
     for slot in reversed(slots):
         trial = _valid_raw_trial(workload, pair_index=slot.pair_index)
         attempt = journal.next_attempt(slot)
-        atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+        trial = _persist_journal_trial(journal, attempt, trial)
         journal.accept_inflight(attempt, trial)
     messages = []
 
@@ -2440,7 +2775,8 @@ def test_capture_reports_resumed_slots_in_supplied_order(tmp_path):
         preflight=lambda: pytest.fail("accepted slot reached preflight"),
         validate_preflight=lambda hardware, status, software: None,
         recover=lambda slot, recovery_index, deadline, trigger: None,
-        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        validate_trial=lambda trial, allow_rejected_environment: None,
+        classify_trial=_accept_trial,
         progress=messages.append,
     )
 
@@ -2450,17 +2786,19 @@ def test_capture_reports_resumed_slots_in_supplied_order(tmp_path):
     ]
 
 
-def test_capture_passes_the_thermal_policy_to_trial_validation_by_keyword(tmp_path):
+def test_capture_passes_the_environment_policy_to_trial_validation_by_keyword(
+    tmp_path,
+):
     workload = build_canonical_workload()
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     trial = _valid_raw_trial(workload)
     attempt = journal.next_attempt(slot)
-    atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+    trial = _persist_journal_trial(journal, attempt, trial)
     policies = []
 
-    def validate(current_trial, *, allow_non_nominal_thermal):
-        policies.append(allow_non_nominal_thermal)
+    def validate(current_trial, *, allow_rejected_environment):
+        policies.append(allow_rejected_environment)
 
     capture_baseline_trials(
         journal=journal,
@@ -2472,6 +2810,7 @@ def test_capture_passes_the_thermal_policy_to_trial_validation_by_keyword(tmp_pa
         validate_preflight=lambda hardware, status, software: None,
         recover=lambda current_slot, recovery_index, deadline, trigger: None,
         validate_trial=validate,
+        classify_trial=_accept_trial,
         progress=lambda message: None,
     )
 
@@ -2484,7 +2823,7 @@ def test_capture_records_preflight_thermal_trigger_before_launch(tmp_path):
     slot = BaselineSlot("prepared-data", 0)
     nominal_trial = _valid_raw_trial(workload)
     fair = {
-        **nominal_trial.environment_status,
+        **nominal_trial.environment_status["start"],
         "thermal_state": "fair",
         "thermal_state_raw_value": 1,
     }
@@ -2493,7 +2832,7 @@ def test_capture_records_preflight_thermal_trigger_before_launch(tmp_path):
             (nominal_trial.hardware, fair, nominal_trial.software_versions),
             (
                 nominal_trial.hardware,
-                nominal_trial.environment_status,
+                nominal_trial.environment_status["start"],
                 nominal_trial.software_versions,
             ),
         ]
@@ -2505,14 +2844,16 @@ def test_capture_records_preflight_thermal_trigger_before_launch(tmp_path):
         journal=journal,
         slots=(slot,),
         launch_trial=lambda current_slot, attempt: (
-            launches.append(current_slot) or nominal_trial
+            launches.append(current_slot)
+            or _persist_journal_trial(journal, attempt, nominal_trial)
         ),
         preflight=lambda: next(preflights),
         validate_preflight=lambda hardware, status, software: None,
         recover=lambda current_slot, recovery_index, deadline, trigger: triggers.append(
             trigger
         ),
-        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        validate_trial=lambda trial, allow_rejected_environment: None,
+        classify_trial=_accept_trial,
         clock=lambda: 0.0,
         utc_now=lambda: "2026-08-05T00:00:00+00:00",
         progress=lambda message: None,
@@ -2532,7 +2873,7 @@ def test_capture_classifies_complete_inflight_before_launching(tmp_path):
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
     trial = _valid_raw_trial(workload)
-    atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
+    trial = _persist_journal_trial(journal, attempt, trial)
 
     trials = capture_baseline_trials(
         journal=journal,
@@ -2543,7 +2884,8 @@ def test_capture_classifies_complete_inflight_before_launching(tmp_path):
         preflight=lambda: pytest.fail("accepted in-flight slot reached preflight"),
         validate_preflight=lambda hardware, status, software: None,
         recover=lambda current_slot, recovery_index, deadline, trigger: None,
-        validate_trial=lambda current_trial, allow_non_nominal_thermal: None,
+        validate_trial=lambda current_trial, allow_rejected_environment: None,
+        classify_trial=_accept_trial,
         clock=lambda: 0.0,
         utc_now=lambda: "2026-08-05T00:00:00+00:00",
         progress=lambda message: None,
@@ -2560,7 +2902,7 @@ def test_capture_timeout_preserves_prior_acceptance_and_rejected_attempt(tmp_pat
     second = BaselineSlot("prepared-data", 1)
     accepted = _valid_raw_trial(workload, pair_index=0)
     attempt = journal.next_attempt(first)
-    atomic_write_json(attempt.path, accepted.to_dict(), create_only=True)
+    accepted = _persist_journal_trial(journal, attempt, accepted)
     journal.accept_inflight(attempt, accepted)
     fair_trial = _with_thermal_state(
         _valid_raw_trial(workload, pair_index=1), "fair", 1
@@ -2573,15 +2915,14 @@ def test_capture_timeout_preserves_prior_acceptance_and_rejected_attempt(tmp_pat
         capture_baseline_trials(
             journal=journal,
             slots=(first, second),
-            launch_trial=lambda current_slot, current_attempt: fair_trial,
-            preflight=lambda: (
-                accepted.hardware,
-                accepted.environment_status,
-                accepted.software_versions,
+            launch_trial=lambda current_slot, current_attempt: _persist_journal_trial(
+                journal, current_attempt, fair_trial
             ),
+            preflight=lambda: _preflight_from_trial(accepted),
             validate_preflight=lambda hardware, status, software: None,
             recover=timeout_recovery,
-            validate_trial=lambda current_trial, allow_non_nominal_thermal: None,
+            validate_trial=lambda current_trial, allow_rejected_environment: None,
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
             clock=lambda: 0.0,
             utc_now=lambda: "2026-08-05T00:00:00+00:00",
             progress=lambda message: None,
@@ -2617,7 +2958,7 @@ def test_capture_replays_persisted_thermal_state_before_preflight(
 
     if persisted_state == "unrecovered-rejected":
         attempt = journal.next_attempt(slot)
-        atomic_write_json(attempt.path, fair.to_dict(), create_only=True)
+        fair = _persist_journal_trial(journal, attempt, fair)
         journal.reject_inflight(attempt, fair, reason="non-nominal-thermal")
         rejected = read_json_object(
             journal.rejected_path(slot, 0), label="rejected trial"
@@ -2658,17 +2999,17 @@ def test_capture_replays_persisted_thermal_state_before_preflight(
     capture_baseline_trials(
         journal=journal,
         slots=(slot,),
-        launch_trial=lambda current_slot, attempt: events.append("launch") or nominal,
-        preflight=lambda: (
-            events.append("preflight")
-            or (nominal.hardware, nominal.environment_status, nominal.software_versions)
+        launch_trial=lambda current_slot, attempt: (
+            events.append("launch") or _persist_journal_trial(journal, attempt, nominal)
         ),
+        preflight=lambda: events.append("preflight") or _preflight_from_trial(nominal),
         validate_preflight=lambda hardware, status, software: None,
         recover=lambda current_slot, recovery_index, deadline, trigger: (
             events.append("recover"),
             recovered.append((recovery_index, deadline, trigger)),
         ),
-        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        validate_trial=lambda trial, allow_rejected_environment: None,
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
         clock=lambda: clock.now,
         utc_now=lambda: "2026-08-05T00:01:00+00:00",
         progress=progress,
@@ -2724,7 +3065,8 @@ def test_capture_rejects_an_invalid_persisted_preflight_before_any_action(tmp_pa
             recover=lambda current_slot, recovery_index, deadline, trigger: pytest.fail(
                 "recovery ran before persisted preflight validation"
             ),
-            validate_trial=lambda current_trial, allow_non_nominal_thermal: None,
+            validate_trial=lambda current_trial, allow_rejected_environment: None,
+            classify_trial=_accept_trial,
             progress=lambda message: None,
         )
 
@@ -2784,7 +3126,8 @@ def test_capture_rejects_every_persisted_recovery_sample_before_any_action(tmp_p
             recover=lambda current_slot, recovery_index, deadline, trigger: pytest.fail(
                 "recovery ran before persisted recovery validation"
             ),
-            validate_trial=lambda current_trial, allow_non_nominal_thermal: None,
+            validate_trial=lambda current_trial, allow_rejected_environment: None,
+            classify_trial=_accept_trial,
             progress=lambda message: None,
         )
 
@@ -2819,6 +3162,9 @@ def test_capture_anchors_persisted_deadline_before_later_history_reads():
         def load_inflight(self, slots):
             return ()
 
+        def load_pending_attempts(self, slots):
+            return ()
+
         def _validate_preflight_history(self):
             clock.now += 100.0
             return {slot: ((0, preflight_document),)}
@@ -2843,7 +3189,8 @@ def test_capture_anchors_persisted_deadline_before_later_history_reads():
             preflight=lambda: pytest.fail("preflight ran before persisted recovery"),
             validate_preflight=lambda hardware, status, software: None,
             recover=stop_after_recovery,
-            validate_trial=lambda trial, allow_non_nominal_thermal: None,
+            validate_trial=lambda trial, allow_rejected_environment: None,
+            classify_trial=_accept_trial,
             clock=lambda: clock.now,
             progress=lambda message: None,
         )
@@ -2946,17 +3293,16 @@ def test_capture_does_not_replay_thermal_state_closed_by_nominal_window(tmp_path
     capture_baseline_trials(
         journal=journal,
         slots=(slot,),
-        launch_trial=lambda current_slot, attempt: nominal,
-        preflight=lambda: (
-            nominal.hardware,
-            nominal.environment_status,
-            nominal.software_versions,
+        launch_trial=lambda current_slot, attempt: _persist_journal_trial(
+            journal, attempt, nominal
         ),
+        preflight=lambda: _preflight_from_trial(nominal),
         validate_preflight=lambda hardware, status, software: None,
         recover=lambda current_slot, recovery_index, deadline, trigger: pytest.fail(
             "completed nominal recovery was replayed"
         ),
-        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        validate_trial=lambda trial, allow_rejected_environment: None,
+        classify_trial=_accept_trial,
         progress=lambda message: None,
     )
 
@@ -2993,7 +3339,7 @@ def test_capture_deadline_starts_before_slow_thermal_transition(
         monkeypatch.setattr(BaselineJournal, "record_preflight", slow_record_preflight)
 
         def launch(current_slot, attempt):
-            return nominal
+            return _persist_journal_trial(journal, attempt, nominal)
 
     else:
         preflights = iter(
@@ -3023,8 +3369,10 @@ def test_capture_deadline_starts_before_slow_thermal_transition(
             launches.append(current_slot)
             if len(launches) == 1:
                 clock.now = 0.0
-                return fair
-            return nominal
+                trial = fair
+            else:
+                trial = nominal
+            return _persist_journal_trial(journal, attempt, trial)
 
     def progress(message):
         clock.now += 100.0
@@ -3038,7 +3386,8 @@ def test_capture_deadline_starts_before_slow_thermal_transition(
         recover=lambda current_slot, recovery_index, deadline, trigger: (
             deadlines.append(deadline)
         ),
-        validate_trial=lambda trial, allow_non_nominal_thermal: None,
+        validate_trial=lambda trial, allow_rejected_environment: None,
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
         clock=lambda: clock.now,
         utc_now=lambda: "2026-08-05T00:00:00+00:00",
         progress=progress,

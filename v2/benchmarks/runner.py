@@ -73,6 +73,13 @@ class TrialEnvironmentDisposition:
     reason: str | None
 
 
+class MemoryPressureTrialRejected(RuntimeError):
+    def __init__(self, slot: BaselineSlot, reason: str):
+        self.slot = slot
+        self.reason = reason
+        super().__init__(f"{slot.metric} pair {slot.pair_index}: {reason}")
+
+
 PINNED_BASELINE_SOURCE_COMMIT = "3687f8b3214a44c675ae67af52e4997762f6c634"
 COMPARISON_SCREEN = "screen"
 COMPARISON_FINAL = "final"
@@ -2190,10 +2197,10 @@ def _persisted_pending_thermal_triggers(
         if attempt.slot not in expected:
             raise ValueError("unexpected rejected slot")
         document = read_json_object(path, label="rejected trial")
-        trial = RawTrial.from_dict(document["trial"])
-        validate_thermal_observation(trial.environment_status)
         if document["reason"] != "non-nominal-thermal":
             continue
+        trial = RawTrial.from_dict(document["trial"])
+        validate_thermal_observation(trial.environment_status)
         if trial.environment_status["thermal_state"] == "nominal":
             raise ValueError("thermal rejection contains a nominal trial")
         _start_recovery_deadline(recovery_deadlines, attempt.slot, clock)
@@ -2277,7 +2284,8 @@ def capture_baseline_trials(
     preflight: Callable[[], tuple[dict, dict, dict]],
     validate_preflight: Callable[[dict, dict, dict], None],
     recover: Callable[[BaselineSlot, int, float, dict], None],
-    validate_trial: Callable[[RawTrial, bool], None],
+    validate_trial: Callable[..., None],
+    classify_trial: Callable[[RawTrial], TrialEnvironmentDisposition],
     clock: Callable[[], float] = time.monotonic,
     utc_now: Callable[[], str] = _utc_now_iso,
     progress: Callable[[str], None] = print,
@@ -2295,41 +2303,67 @@ def capture_baseline_trials(
         for slot, (_trigger, deadline) in persisted_recoveries.items()
         if slot not in accepted
     }
+
+    def transition_attempt(
+        attempt: JournalAttempt, trial: RawTrial, *, resumed: bool
+    ) -> None:
+        disposition = classify_trial(trial)
+        if disposition.outcome == "accept":
+            journal.accept_inflight(attempt, trial)
+            accepted[attempt.slot] = trial
+            prefix = "accepted in-flight" if resumed else "accepted"
+            progress(
+                f"{prefix} {attempt.slot.metric} pair {attempt.slot.pair_index} "
+                f"({len(accepted)}/{len(ordered_slots)})"
+            )
+            return
+        if disposition.outcome == "thermal-reject":
+            _start_recovery_deadline(recovery_deadlines, attempt.slot, clock)
+            journal.reject_inflight(attempt, trial, reason="non-nominal-thermal")
+            rejected = read_json_object(
+                journal.rejected_path(attempt.slot, attempt.journal_attempt_index),
+                label="rejected trial",
+            )
+            pending_triggers[attempt.slot] = {
+                "source": "rejected-trial",
+                "rejected_trial_identity": rejected["identity"],
+            }
+            prefix = "rejected in-flight" if resumed else "rejected"
+            progress(
+                f"{prefix} {attempt.slot.metric} pair {attempt.slot.pair_index}: "
+                f"thermal={trial.environment_status['thermal_state']} "
+                f"raw={trial.environment_status['thermal_state_raw_value']}"
+            )
+            return
+        if disposition.outcome != "memory-reject":
+            raise AssertionError("trial classification has an unknown outcome")
+        if disposition.reason is None:
+            raise AssertionError("memory rejection is missing its reason")
+        journal.reject_inflight(attempt, trial, reason=disposition.reason)
+        raise MemoryPressureTrialRejected(attempt.slot, disposition.reason)
+
     for slot in ordered_slots:
         if slot not in accepted:
             continue
         trial = accepted[slot]
-        validate_trial(trial, allow_non_nominal_thermal=False)
+        validate_trial(trial, allow_rejected_environment=False)
         progress(f"resumed accepted {slot.metric} pair {slot.pair_index}")
 
-    for attempt in journal.load_inflight(ordered_slots):
-        raw = read_json_object(attempt.path, label="inflight trial")
-        trial = RawTrial.from_dict(raw)
-        validate_trial(trial, allow_non_nominal_thermal=True)
-        if trial.environment_status["thermal_state"] == "nominal":
-            journal.accept_inflight(attempt, trial)
-            accepted[attempt.slot] = trial
-            progress(
-                f"accepted in-flight {attempt.slot.metric} pair "
-                f"{attempt.slot.pair_index} ({len(accepted)}/{len(ordered_slots)})"
+    for state in journal.load_pending_attempts(ordered_slots):
+        if state.post_exit is None:
+            journal.reject_unfinalized(
+                state.attempt,
+                state.measurement,
+                reason="missing-immediate-post-exit-evidence",
             )
             continue
-        _start_recovery_deadline(recovery_deadlines, attempt.slot, clock)
-        journal.reject_inflight(attempt, trial, reason="non-nominal-thermal")
-        rejected = read_json_object(
-            journal.rejected_path(attempt.slot, attempt.journal_attempt_index),
-            label="rejected trial",
-        )
-        pending_triggers[attempt.slot] = {
-            "source": "rejected-trial",
-            "rejected_trial_identity": rejected["identity"],
-        }
-        progress(
-            f"rejected in-flight {attempt.slot.metric} pair "
-            f"{attempt.slot.pair_index}: thermal="
-            f"{trial.environment_status['thermal_state']} "
-            f"raw={trial.environment_status['thermal_state_raw_value']}"
-        )
+        if state.trial is None:
+            trial = finalize_raw_trial(state.measurement, state.post_exit)
+            atomic_write_json(state.attempt.path, trial.to_dict(), create_only=True)
+        else:
+            trial = state.trial
+        validate_trial(trial, allow_rejected_environment=True)
+        transition_attempt(state.attempt, trial, resumed=True)
 
     for slot in ordered_slots:
         if slot in accepted:
@@ -2387,42 +2421,15 @@ def capture_baseline_trials(
                 f"journal attempt {attempt.journal_attempt_index}"
             )
             launched_trial = launch_trial(slot, attempt)
-            if not attempt.path.exists():
-                atomic_write_json(
-                    attempt.path, launched_trial.to_dict(), create_only=True
-                )
             persisted = RawTrial.from_dict(
                 read_json_object(attempt.path, label="inflight trial")
             )
             if persisted != launched_trial:
                 raise ValueError("launched trial does not match in-flight output")
-            validate_trial(persisted, allow_non_nominal_thermal=True)
-            if persisted.environment_status["thermal_state"] == "nominal":
-                journal.accept_inflight(attempt, persisted)
-                accepted[slot] = persisted
-                progress(
-                    f"accepted {slot.metric} pair {slot.pair_index} "
-                    f"({len(accepted)}/{len(ordered_slots)})"
-                )
-                continue
-
-            if recovery_deadline is None:
-                recovery_deadline = clock() + 7_200.0
-                recovery_deadlines[slot] = recovery_deadline
-            journal.reject_inflight(attempt, persisted, reason="non-nominal-thermal")
-            rejected = read_json_object(
-                journal.rejected_path(slot, attempt.journal_attempt_index),
-                label="rejected trial",
-            )
-            pending_trigger = {
-                "source": "rejected-trial",
-                "rejected_trial_identity": rejected["identity"],
-            }
-            progress(
-                f"rejected {slot.metric} pair {slot.pair_index}: thermal="
-                f"{persisted.environment_status['thermal_state']} "
-                f"raw={persisted.environment_status['thermal_state_raw_value']}"
-            )
+            validate_trial(persisted, allow_rejected_environment=True)
+            transition_attempt(attempt, persisted, resumed=False)
+            recovery_deadline = recovery_deadlines.get(slot)
+            pending_trigger = pending_triggers.get(slot)
 
     return tuple(accepted[slot] for slot in ordered_slots)
 
@@ -2790,19 +2797,11 @@ def _record_baseline_locked(
                     comparison_target="baseline",
                     evidence_session_identity=journal.session["identity"],
                     journal_attempt_index=attempt.journal_attempt_index,
-                    measurement_output=(
-                        state_root
-                        / "measurements"
-                        / slot.metric
-                        / str(slot.pair_index)
-                        / f"{attempt.journal_attempt_index}.json"
+                    measurement_output=journal.measurement_path(
+                        slot, attempt.journal_attempt_index
                     ),
-                    post_exit_output=(
-                        state_root
-                        / "post-exit"
-                        / slot.metric
-                        / str(slot.pair_index)
-                        / f"{attempt.journal_attempt_index}.json"
+                    post_exit_output=journal.post_exit_path(
+                        slot, attempt.journal_attempt_index
                     ),
                     output=attempt.path,
                 ),
@@ -2818,7 +2817,7 @@ def _record_baseline_locked(
                     )
                 ),
                 recover=recover_thermal,
-                validate_trial=lambda trial, allow_non_nominal_thermal: (
+                validate_trial=lambda trial, allow_rejected_environment: (
                     validate_baseline_trial(
                         trial,
                         workload=workload,
@@ -2827,8 +2826,11 @@ def _record_baseline_locked(
                         harness_identity=harness_identity,
                         expected_hardware=initial_hardware,
                         expected_software_versions=initial_software_versions,
-                        allow_rejected_environment=allow_non_nominal_thermal,
+                        allow_rejected_environment=allow_rejected_environment,
                     )
+                ),
+                classify_trial=lambda trial: classify_trial_environment(
+                    workload, trial
                 ),
             )
     publish_baseline_from_journal(
