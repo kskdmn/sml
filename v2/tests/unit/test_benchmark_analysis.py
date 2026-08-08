@@ -1184,6 +1184,38 @@ def test_child_and_post_exit_documents_are_exactly_identity_bound():
         validate_post_exit_observation(changed, measurement=measurement)
 
 
+def test_child_measurement_rejects_a_boolean_version():
+    measurement = _valid_child_measurement(build_canonical_workload())
+    measurement["version"] = True
+
+    with pytest.raises(ValueError, match="version"):
+        validate_child_trial_measurement(measurement)
+
+
+def test_post_exit_observation_rejects_a_boolean_version():
+    measurement = _valid_child_measurement(build_canonical_workload())
+    post_exit = _valid_post_exit_observation(measurement)
+    post_exit["version"] = True
+
+    with pytest.raises(ValueError, match="version"):
+        validate_post_exit_observation(post_exit, measurement=measurement)
+
+
+def test_post_exit_observation_rejects_a_boolean_pair_index():
+    measurement = _valid_child_measurement(build_canonical_workload(), pair_index=1)
+    post_exit = _valid_post_exit_observation(measurement)
+    post_exit["pair_index"] = True
+    post_exit_body = {
+        key: value for key, value in post_exit.items() if key != "identity"
+    }
+    post_exit["identity"] = structured_identity(
+        "sml-parent-post-exit-observation-v1", post_exit_body
+    )
+
+    with pytest.raises(ValueError, match="pair_index"):
+        validate_post_exit_observation(post_exit, measurement=measurement)
+
+
 def test_raw_trial_v2_embeds_and_revalidates_both_evidence_documents():
     workload = build_canonical_workload()
     measurement = _valid_child_measurement(workload)
@@ -1201,15 +1233,15 @@ def test_raw_trial_v2_embeds_and_revalidates_both_evidence_documents():
         RawTrial.from_dict(version_one)
 
 
-def _with_thermal_state(trial, state, raw_value):
+def _with_observation_changes(
+    trial, *, environment_changes=None, software_changes=None
+):
+    environment_changes = environment_changes or {}
+    software_changes = software_changes or {}
     measurement = json.loads(json.dumps(trial.child_measurement))
     for endpoint in ("start", "end"):
-        measurement[endpoint]["environment_status"].update(
-            {
-                "thermal_state": state,
-                "thermal_state_raw_value": raw_value,
-            }
-        )
+        measurement[endpoint]["environment_status"].update(environment_changes)
+        measurement[endpoint]["software_versions"].update(software_changes)
     measurement_body = {
         key: value for key, value in measurement.items() if key != "identity"
     }
@@ -1217,12 +1249,8 @@ def _with_thermal_state(trial, state, raw_value):
         "sml-child-trial-measurement-v1", measurement_body
     )
     post_exit = json.loads(json.dumps(trial.post_exit_observation))
-    post_exit["environment_status"].update(
-        {
-            "thermal_state": state,
-            "thermal_state_raw_value": raw_value,
-        }
-    )
+    post_exit["environment_status"].update(environment_changes)
+    post_exit["software_versions"].update(software_changes)
     updated_post_exit = build_post_exit_observation(
         measurement=measurement,
         observed_at_utc=post_exit["observed_at_utc"],
@@ -1231,6 +1259,16 @@ def _with_thermal_state(trial, state, raw_value):
         software_versions=post_exit["software_versions"],
     )
     return finalize_raw_trial(measurement, updated_post_exit)
+
+
+def _with_thermal_state(trial, state, raw_value):
+    return _with_observation_changes(
+        trial,
+        environment_changes={
+            "thermal_state": state,
+            "thermal_state_raw_value": raw_value,
+        },
+    )
 
 
 def _valid_baseline_trials(workload):
@@ -1430,13 +1468,10 @@ def test_baseline_rejects_invalid_environment_or_software(
         measured_units=20,
         paired_representations=_valid_paired_representations(workload),
     )
-    changed = replace(
+    changed = _with_observation_changes(
         trials[0],
-        environment_status={
-            **trials[0].environment_status,
-            **environment_change,
-        },
-        software_versions={**trials[0].software_versions, **software_change},
+        environment_changes=environment_change,
+        software_changes=software_change,
     )
 
     with pytest.raises(ValueError, match=message):
@@ -1563,12 +1598,12 @@ def test_comparison_report_pins_pairs_decisions_and_metric_lineage():
         )
         trials.extend(
             (
-                replace(
+                _with_trial_payload(
                     reference_template,
                     process_order=order.index("reference"),
                     value=100.0,
                 ),
-                replace(
+                _with_trial_payload(
                     reference_template,
                     side="candidate",
                     process_order=order.index("candidate"),
@@ -1632,13 +1667,13 @@ def _comparison_trials(
         reference = _valid_raw_trial(workload, metric=metric, pair_index=pair_index)
         trials.extend(
             (
-                replace(
+                _with_trial_payload(
                     reference,
                     attempt_index=attempt_index,
                     process_order=order.index("reference"),
                     value=100.0,
                 ),
-                replace(
+                _with_trial_payload(
                     reference,
                     side="candidate",
                     attempt_index=attempt_index,
@@ -1653,6 +1688,35 @@ def _comparison_trials(
             )
         )
     return trials
+
+
+def test_evidence_resigned_comparison_and_thermal_variants_are_valid():
+    workload = build_canonical_workload()
+    comparison_trials = _comparison_trials(
+        workload,
+        "e" * 40,
+        [101.0],
+        attempt_index=1,
+    )
+    thermal_trial = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
+
+    for trial in (*comparison_trials, thermal_trial):
+        validate_raw_trial_evidence(trial)
+
+
+def test_raw_trial_evidence_rejects_a_cached_only_environment_change():
+    trial = _valid_raw_trial(build_canonical_workload())
+    mismatched = replace(
+        trial,
+        environment_status={
+            **trial.environment_status,
+            "thermal_state": "fair",
+            "thermal_state_raw_value": 1,
+        },
+    )
+
+    with pytest.raises(ValueError, match="embedded evidence"):
+        validate_raw_trial_evidence(mismatched)
 
 
 def _valid_prepared_comparison():
@@ -1713,7 +1777,7 @@ def test_comparison_validator_rejects_weakened_screen_protocol(field, value):
 def test_comparison_validator_rejects_unreferenced_raw_trials():
     _workload, baseline, report = _valid_prepared_comparison()
     invalid = json.loads(json.dumps(report))
-    extra = replace(
+    extra = _with_trial_payload(
         RawTrial.from_dict(invalid["raw_trials"][0]),
         comparison_target="unreferenced-extra",
     )
@@ -1749,8 +1813,12 @@ def test_comparison_validator_rejects_false_round_trip_and_precision_annotation(
         )
         trials.extend(
             (
-                replace(reference, process_order=order.index("reference"), value=100.0),
-                replace(
+                _with_trial_payload(
+                    reference,
+                    process_order=order.index("reference"),
+                    value=100.0,
+                ),
+                _with_trial_payload(
                     reference,
                     side="candidate",
                     process_order=order.index("candidate"),
@@ -2152,14 +2220,7 @@ def test_capture_retries_only_the_thermal_slot_and_resumes_accepted_slots(tmp_pa
         launches.append(slot)
         base = _valid_raw_trial(workload, pair_index=slot.pair_index)
         if len(launches) == 1:
-            return replace(
-                base,
-                environment_status={
-                    **base.environment_status,
-                    "thermal_state": "fair",
-                    "thermal_state_raw_value": 1,
-                },
-            )
+            return _with_thermal_state(base, "fair", 1)
         return base
 
     recovered = []
@@ -2335,13 +2396,8 @@ def test_capture_timeout_preserves_prior_acceptance_and_rejected_attempt(tmp_pat
     attempt = journal.next_attempt(first)
     atomic_write_json(attempt.path, accepted.to_dict(), create_only=True)
     journal.accept_inflight(attempt, accepted)
-    fair_trial = replace(
-        _valid_raw_trial(workload, pair_index=1),
-        environment_status={
-            **_valid_raw_trial(workload, pair_index=1).environment_status,
-            "thermal_state": "fair",
-            "thermal_state_raw_value": 1,
-        },
+    fair_trial = _with_thermal_state(
+        _valid_raw_trial(workload, pair_index=1), "fair", 1
     )
 
     def timeout_recovery(current_slot, recovery_index, deadline, trigger):
@@ -3928,7 +3984,7 @@ def test_journal_promotes_an_inflight_trial_and_resumes_the_slot(tmp_path):
     with pytest.raises(ValueError, match="accepted slot is immutable"):
         journal.accept_inflight(
             JournalAttempt(slot, 1, journal.inflight_path(slot, 1)),
-            replace(trial, value=trial.value + 1.0),
+            _with_trial_payload(trial, value=trial.value + 1.0),
         )
 
 
@@ -3937,14 +3993,7 @@ def test_journal_preserves_rejected_trial_and_uses_a_new_attempt_number(tmp_path
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    trial = replace(
-        _valid_raw_trial(workload),
-        environment_status={
-            **_valid_raw_trial(workload).environment_status,
-            "thermal_state": "fair",
-            "thermal_state_raw_value": 1,
-        },
-    )
+    trial = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
     atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
 
     journal.reject_inflight(attempt, trial, reason="non-nominal-thermal")

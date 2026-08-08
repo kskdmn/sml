@@ -164,7 +164,11 @@ def validate_child_trial_measurement(
     }
     if set(document) != expected:
         raise ValueError("child measurement has an invalid field set")
-    if document["kind"] != CHILD_KIND or document["version"] != 1:
+    if (
+        document["kind"] != CHILD_KIND
+        or type(document["version"]) is not int
+        or document["version"] != 1
+    ):
         raise ValueError("unsupported child measurement kind or version")
     trial = document["trial"]
     start = document["start"]
@@ -251,8 +255,14 @@ def validate_post_exit_observation(
     }
     if set(document) != expected:
         raise ValueError("post-exit observation has an invalid field set")
-    if document["kind"] != POST_EXIT_KIND or document["version"] != 1:
+    if (
+        document["kind"] != POST_EXIT_KIND
+        or type(document["version"]) is not int
+        or document["version"] != 1
+    ):
         raise ValueError("unsupported post-exit observation kind or version")
+    if type(document["pair_index"]) is not int:
+        raise ValueError("post-exit observation pair_index must be an integer")
     observation = _validate_observation(
         {
             name: document[name]
