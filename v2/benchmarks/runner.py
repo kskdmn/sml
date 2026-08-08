@@ -2935,6 +2935,20 @@ def _validate_comparison_document(report: dict, baseline: dict) -> None:
     validate_throughput_gates(report, label="predecessor")
 
 
+def _validate_report_raw_trial_evidence(report: dict) -> None:
+    raw_trials = report.get("raw_trials")
+    if not isinstance(raw_trials, list):
+        raise ValueError(  # noqa: TRY004
+            "comparison raw_trials must be a list"
+        )
+    for raw in raw_trials:
+        if not isinstance(raw, dict):
+            raise ValueError(  # noqa: TRY004
+                "comparison raw trials must be objects"
+            )
+        validate_raw_trial_evidence(RawTrial.from_dict(raw))
+
+
 def _resolve_predecessor_mapping(
     value: str,
     repository: Path,
@@ -3419,6 +3433,7 @@ def _validate_phase(args: argparse.Namespace) -> int:
     baseline = _read_json_object(args.baseline, label="baseline manifest")
     _validate_baseline_document(baseline)
     report = _read_json_object(args.results, label="phase results")
+    _validate_report_raw_trial_evidence(report)
     predecessor_reports, _lineages, _proof = _resolve_predecessor_mapping(
         args.predecessors,
         repository,
@@ -3473,6 +3488,7 @@ def _validate_final(args: argparse.Namespace) -> int:
     baseline = _read_json_object(args.baseline, label="baseline manifest")
     _validate_baseline_document(baseline)
     report = _read_json_object(args.report, label="final report")
+    _validate_report_raw_trial_evidence(report)
     proofs = report.get("predecessors")
     if not isinstance(proofs, dict) or set(proofs) != set(FINAL_METRICS):
         raise ValueError("final acceptance has an invalid predecessor proof set")

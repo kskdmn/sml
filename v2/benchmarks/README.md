@@ -84,11 +84,18 @@ Every preflight is persisted before validation. Child-start memory pressure
 must be `normal`. Child-end `warning` is diagnostic and may pass only when
 child-start and immediate parent post-exit pressure are both `normal` and every
 other strict check passes. Any non-normal child-start pressure, child-end
-`critical`, any non-normal post-exit memory pressure, or any other non-thermal
-hardware, software, power, competing-workload, protocol, identity, subprocess,
-or schema failure is durably rejected and stops the invocation without a
-same-run retry. The accepted slots remain in place, and the rejected attempt
-index remains part of the journal's retry accounting.
+`critical`, or any non-normal post-exit memory pressure is classified as a
+memory rejection: the version 2 rejected-trial record is written durably and
+the invocation stops without a same-run retry. The accepted slots remain in
+place, and the rejected attempt index remains part of the journal's retry
+accounting.
+
+Other strict hardware, software, power, competing-workload, protocol,
+identity, subprocess, or schema failures are not classified trial rejections
+and do not create a rejected-trial record. They stop the invocation immediately
+and preserve the current persisted journal topology—such as a preflight,
+measurement, post-exit observation, or in-flight trial—for diagnosis and exact
+revalidation on resume.
 
 Only a consistent non-nominal thermal observation enters recovery. Recovery
 samples at intervals no longer than 30 seconds and permits another trial only

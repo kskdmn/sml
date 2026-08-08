@@ -2410,6 +2410,76 @@ def test_predecessors_are_resolved_as_an_explicit_per_metric_mapping(tmp_path):
         )
 
 
+def _with_tampered_report_post_exit_evidence(report):
+    invalid = json.loads(json.dumps(report))
+    invalid["raw_trials"][0]["post_exit_observation"]["child_measurement_identity"] = (
+        "sha256:" + "0" * 64
+    )
+    body = {key: value for key, value in invalid.items() if key != "identity"}
+    invalid["identity"] = structured_identity("sml-performance-comparison-v1", body)
+    return invalid
+
+
+def test_validate_phase_rejects_embedded_evidence_before_predecessor_lookup(
+    tmp_path,
+):
+    _workload, baseline, report = _valid_prepared_comparison()
+    baseline_path = tmp_path / "baseline.json"
+    results_path = tmp_path / "phase.json"
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+    results_path.write_text(
+        json.dumps(_with_tampered_report_post_exit_evidence(report)),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        baseline=baseline_path,
+        results=results_path,
+        predecessors=json.dumps(
+            {"prepared-data": str(tmp_path / "missing-predecessor.json")}
+        ),
+        phase=2,
+        output=None,
+    )
+
+    with pytest.raises(ValueError, match="post-exit observation identity"):
+        benchmark_runner._validate_phase(args)
+
+
+def test_validate_final_rejects_embedded_evidence_before_predecessor_lookup(
+    tmp_path,
+):
+    _workload, baseline, report = _valid_prepared_comparison()
+    report["predecessors"] = {
+        metric: (
+            {
+                "report_identity": "sha256:" + "0" * 64,
+                "result_identity": "sha256:" + "1" * 64,
+            }
+            if metric in benchmark_runner.FINAL_PREDECESSOR_METRICS
+            else None
+        )
+        for metric in benchmark_runner.FINAL_METRICS
+    }
+    invalid = _with_tampered_report_post_exit_evidence(report)
+    baseline_path = tmp_path / "baseline.json"
+    report_path = tmp_path / "final.json"
+    raw_path = tmp_path / "final.jsonl"
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+    report_path.write_text(json.dumps(invalid), encoding="utf-8")
+    raw_path.write_text(
+        "".join(json.dumps(raw) + "\n" for raw in invalid["raw_trials"]),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        baseline=baseline_path,
+        report=report_path,
+        raw_input=raw_path,
+    )
+
+    with pytest.raises(ValueError, match="post-exit observation identity"):
+        benchmark_runner._validate_final(args)
+
+
 def test_parser_exposes_final_acceptance_validation():
     arguments = build_parser().parse_args(
         [
