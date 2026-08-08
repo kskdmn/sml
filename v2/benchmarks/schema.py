@@ -64,7 +64,7 @@ class WorkUnitDefinition:
             raise ValueError(f"unsupported benchmark metric: {metric!r}")
         if direction not in ("higher-is-better", "lower-is-better"):
             raise ValueError(f"unsupported metric direction: {direction!r}")
-        if not isinstance(measured_units, int) or measured_units <= 0:
+        if type(measured_units) is not int or measured_units <= 0:
             raise ValueError("measured_units must be a positive integer")
         string_fields = {
             name: raw[name]

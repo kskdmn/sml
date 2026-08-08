@@ -256,6 +256,16 @@ def test_canonical_workload_round_trip_pins_complete_benchmark_contract():
     )
 
 
+@pytest.mark.parametrize("metric", ("compile-cold-start", "peak-metal-memory"))
+def test_canonical_workload_rejects_boolean_measured_units(metric):
+    raw = build_canonical_workload().to_dict()
+    work_unit = next(unit for unit in raw["work_units"] if unit["metric"] == metric)
+    work_unit["measured_units"] = True
+
+    with pytest.raises(ValueError, match="measured_units must be a positive integer"):
+        CanonicalWorkload.from_dict(raw)
+
+
 def test_canonical_rows_are_derived_from_pinned_tokenizer_and_corpus():
     workload = build_canonical_workload(row_count=2)
     rows = fixed_canonical_rows(row_count=2)

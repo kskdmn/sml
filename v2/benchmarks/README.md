@@ -6,11 +6,13 @@ the legacy and replacement native representations.
 
 All measurements run in fresh processes from clean source checkouts. Timed MLX
 regions synchronize immediately before and after execution, perform one untimed
-compilation pass, warm up for 5 units, and measure 20 units by default. Inference
-consumes its complete fixed 32-request set; compile cold-start and peak Metal
-memory each measure one canonical unit. Trial order alternates by pair. Raw
-process records are retained alongside reports; statistical decisions use
-direction-normalized paired ratios and a reproducible whole-pair bootstrap.
+compilation pass, and, except for compile cold-start, warm up for 5 units and
+measure 20 units by default. Compile cold-start uses zero warmups and measures
+its first compiled invocation. Inference consumes its complete fixed 32-request
+set; compile cold-start and peak Metal memory each measure one canonical unit.
+Trial order alternates by pair. Raw process records are retained alongside
+reports; statistical decisions use direction-normalized paired ratios and a
+reproducible whole-pair bootstrap.
 
 The harness identity hashes the ordered bytes of the schema, workload, runner,
 analysis, both adapters, and the fixed analysis-vector test module. Any change
@@ -18,11 +20,13 @@ to those files invalidates dependent baseline and phase evidence.
 
 `record-baseline` is intentionally immutable: it accepts only the fully resolved
 `3687f8b` source commit, all nine metrics, five fresh processes per metric, five
-warmups, and the canonical measured-unit counts. Inference consumes the complete
-32-request set exactly once, while compile cold-start and peak Metal memory each
-consume one canonical unit. Validation rejects metric subsets, changed protocol
-values, duplicate raw records, a different canonical projection or logical work
-order, and environment or software mismatches.
+warmups for every non-compile metric, and the canonical measured-unit counts.
+Compile cold-start uses zero warmups and measures its first compiled invocation.
+Inference consumes the complete 32-request set exactly once, while compile
+cold-start and peak Metal memory each consume one canonical unit. Validation
+rejects metric subsets, changed protocol values, duplicate raw records, a
+different canonical projection or logical work order, and environment or software
+mismatches.
 
 Baseline capture also requires `--state-directory PATH`. The path is resolved
 before use and must be outside both the harness checkout and the detached pinned
