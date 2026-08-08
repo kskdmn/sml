@@ -140,7 +140,13 @@ class ProcessMeasurement:
 
 
 def _raw_trial_identity(trial: RawTrial) -> str:
-    return structured_identity("sml-raw-benchmark-trial-v1", trial.to_dict())
+    validate_raw_trial_evidence(trial)
+    return structured_identity("sml-raw-benchmark-trial-v2", trial.to_dict())
+
+
+def _validate_raw_trials_evidence(trials: Sequence[RawTrial]) -> None:
+    for trial in trials:
+        validate_raw_trial_evidence(trial)
 
 
 def _utc_now_iso() -> str:
@@ -165,6 +171,7 @@ def build_baseline_manifest(
     measured_units: int,
     paired_representations: dict,
 ) -> dict:
+    _validate_raw_trials_evidence(trials)
     if pairs <= 0:
         raise ValueError("pairs must be positive")
     if not trials:
@@ -235,6 +242,7 @@ def validate_baseline_trial(
     expected_software_versions: dict[str, str],
     allow_rejected_environment: bool = False,
 ) -> None:
+    validate_raw_trial_evidence(trial)
     if trial.side != "reference":
         raise ValueError("baseline raw trials must be reference-side records")
     if type(trial.attempt_index) is not int or trial.attempt_index != 0:
@@ -312,6 +320,7 @@ def validate_baseline_manifest(
     manifest: dict,
     trials: Sequence[RawTrial],
 ) -> None:
+    _validate_raw_trials_evidence(trials)
     expected_fields = {
         "kind",
         "version",
@@ -662,6 +671,7 @@ def build_comparison_report(
     measured_units: int = DEFAULT_MEASURED_UNITS,
     cooldown_evidence: dict | None = None,
 ) -> dict:
+    _validate_raw_trials_evidence(trials)
     workload = CanonicalWorkload.from_dict(baseline["canonical_workload"])
     baseline_commit = baseline["source"]["commit"]
     baseline_targets = {"baseline", f"baseline:{baseline['identity']}"}
@@ -909,6 +919,7 @@ def _validate_comparison_trial_pair(
     expected_warmup: int,
     expected_units: int,
 ) -> None:
+    _validate_raw_trials_evidence((reference_trial, candidate_trial))
     if (
         reference_trial.pair_index != pair_index
         or candidate_trial.pair_index != pair_index
@@ -977,6 +988,7 @@ def _validate_predecessor_trial_pair(
     expected_warmup: int,
     expected_units: int,
 ) -> None:
+    _validate_raw_trials_evidence((reference_trial, candidate_trial))
     if (
         reference_trial.pair_index != pair_index
         or candidate_trial.pair_index != pair_index
@@ -1191,6 +1203,7 @@ def validate_comparison_report(
     )
     if any(trial is None for trial in trials):
         raise ValueError("comparison raw trials must be objects")
+    _validate_raw_trials_evidence(trials)
     candidate_commit = report["candidate_commit"]
     baseline_commit = baseline["source"]["commit"]
     baseline_targets = {"baseline", f"baseline:{baseline['identity']}"}
@@ -1851,6 +1864,7 @@ def _write_json(path: Path, value: dict) -> None:
 
 
 def _write_jsonl(path: Path, trials: Sequence[RawTrial]) -> None:
+    _validate_raw_trials_evidence(trials)
     lines = "".join(
         json.dumps(trial.to_dict(), sort_keys=True, ensure_ascii=False) + "\n"
         for trial in trials
@@ -1868,7 +1882,9 @@ def _read_trials(path: Path) -> tuple[RawTrial, ...]:
         raw = json.loads(line)
         if not isinstance(raw, dict):
             raise ValueError(f"raw trial line {line_number} must be an object")
-        trials.append(RawTrial.from_dict(raw))
+        trial = RawTrial.from_dict(raw)
+        validate_raw_trial_evidence(trial)
+        trials.append(trial)
     if not trials:
         raise ValueError("raw trial file is empty")
     return tuple(trials)
@@ -3434,6 +3450,7 @@ def validate_final_report(
     predecessor_reports: dict[str, dict | None],
     raw_trials: Sequence[RawTrial],
 ) -> None:
+    _validate_raw_trials_evidence(raw_trials)
     if [trial.to_dict() for trial in raw_trials] != report.get("raw_trials"):
         raise ValueError("final raw input does not exactly match the complete report")
     metrics = report.get("metrics")

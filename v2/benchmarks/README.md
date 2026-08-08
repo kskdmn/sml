@@ -14,9 +14,10 @@ Trial order alternates by pair. Raw process records are retained alongside
 reports; statistical decisions use direction-normalized paired ratios and a
 reproducible whole-pair bootstrap.
 
-The harness identity hashes the ordered bytes of the schema, workload, runner,
-analysis, both adapters, and the fixed analysis-vector test module. Any change
-to those files invalidates dependent baseline and phase evidence.
+The harness identity hashes the ordered bytes of the schema, evidence,
+workload, runner, journal, recovery, and analysis modules, both adapters, and
+the fixed analysis-vector test module. Any change to those files invalidates
+dependent baseline and phase evidence.
 
 `record-baseline` is intentionally immutable: it accepts only the fully resolved
 `3687f8b` source commit, all nine metrics, five fresh processes per metric, five
@@ -27,6 +28,19 @@ cold-start and peak Metal memory each consume one canonical unit. Validation
 rejects metric subsets, changed protocol values, duplicate raw records, a
 different canonical projection or logical work order, and environment or software
 mismatches.
+
+Each process publishes an identity-bound child measurement containing separate
+start and end observations recorded while MLX is alive; the child never
+publishes a final trial. Immediately after the child exits, the parent samples
+memory pressure and free-memory percentage before any slower hardware or
+software probe. It then publishes an identity-bound post-exit observation and
+finalizes a self-contained `RawTrial` schema version 2. Raw-trial identities use
+the `sml-raw-benchmark-trial-v2` domain. Baseline manifests, raw JSONL,
+comparison reports, predecessor replay, phase validation, and final validation
+all revalidate the embedded child and post-exit evidence before accepting its
+identity or measured value. Version 1 raw trials and evidence whose nested
+identities were changed are incompatible diagnostic records, not current
+benchmark evidence.
 
 Baseline capture also requires `--state-directory PATH`. The path is resolved
 before use and must be outside both the harness checkout and the detached pinned
@@ -41,6 +55,8 @@ journal that remains after success or failure:
 ├── session.json
 ├── accepted/<metric>/<pair-index>.json
 ├── rejected/<metric>/<pair-index>/<attempt-index>.json
+├── measurements/<metric>/<pair-index>/<attempt-index>.json
+├── post-exit/<metric>/<pair-index>/<attempt-index>.json
 ├── inflight/<metric>/<pair-index>/<attempt-index>.json
 ├── preflight/<metric>/<pair-index>/<preflight-index>.json
 ├── thermal-waits/<metric>/<pair-index>/<recovery-index>/
@@ -64,14 +80,21 @@ before clean-checkout validation. Other hidden files, malformed names,
 unsupported locations, directories, and symlinks are retained and continue to
 fail the strict topology or checkout checks.
 
-Every preflight is persisted before validation. A non-thermal hardware,
-software, power, memory-pressure, competing-workload, protocol, identity,
-subprocess, or schema failure stops the invocation and leaves the journal for
-diagnosis. Only a consistent non-nominal thermal observation enters recovery.
-Recovery samples at intervals no longer than 30 seconds and permits another
-trial only after five continuous minutes of nominal thermals. The first thermal
-violation for a missing slot starts one two-hour deadline for that slot during
-the invocation; rejected retries do not reset it. Rejected trials and recovery
+Every preflight is persisted before validation. Child-start memory pressure
+must be `normal`. Child-end `warning` is diagnostic and may pass only when
+child-start and immediate parent post-exit pressure are both `normal` and every
+other strict check passes. Any non-normal child-start pressure, child-end
+`critical`, any non-normal post-exit memory pressure, or any other non-thermal
+hardware, software, power, competing-workload, protocol, identity, subprocess,
+or schema failure is durably rejected and stops the invocation without a
+same-run retry. The accepted slots remain in place, and the rejected attempt
+index remains part of the journal's retry accounting.
+
+Only a consistent non-nominal thermal observation enters recovery. Recovery
+samples at intervals no longer than 30 seconds and permits another trial only
+after five continuous minutes of nominal thermals. The first thermal violation
+for a missing slot starts one two-hour deadline for that slot during the
+invocation; rejected retries do not reset it. Rejected trials and recovery
 samples remain diagnostic evidence and never enter the baseline.
 
 On resume, every persisted preflight and every persisted thermal-recovery
@@ -83,13 +106,24 @@ a nominal window.
 
 Resume requires the exact same harness commit and content identity, pinned
 source commit, canonical workload, immutable protocol, hardware, software,
-paired representations, and resolved final output paths. Compatible accepted
-slots are validated and reused; a complete in-flight trial is classified before
-any replacement is launched. Persisted non-nominal preflights, thermally
+paired representations, and resolved final output paths. A session created
+before the post-exit memory policy is incompatible and is never migrated.
+Compatible accepted slots are validated and reused. Measurement-only crash
+evidence is durably rejected as `missing-immediate-post-exit-evidence`; a later
+invocation never fabricates a new post-exit observation for an old process. A
+matching child measurement plus post-exit observation reconstructs the final
+version 2 trial deterministically before classification. A complete in-flight
+trial is likewise classified before any replacement is launched.
+
+After a memory rejection, the operator resumes by running the same canonical
+`record-baseline` command against the same state directory. The later manual
+resume revalidates the complete journal, performs a new strict preflight, and
+launches only the still-missing slot with the next journal attempt index; it
+does not rerun accepted slots. Persisted non-nominal preflights, thermally
 rejected trials, unfinished recovery episodes, and timed-out recovery episodes
 resume with a fresh five-continuous-minute nominal window before a new preflight
-or trial can run. Only the same thermally rejected slot is retried. The final raw
-JSONL and manifest remain absent until all 45 canonical slots validate.
+or trial can run. Only the same thermally rejected slot is retried. The final
+raw JSONL and manifest remain absent until all 45 canonical slots validate.
 Publication creates the raw JSONL first, the manifest second, and
 `completed.json` last; existing identical bytes are accepted for crash resume,
 while different final content is never overwritten. The external journal is

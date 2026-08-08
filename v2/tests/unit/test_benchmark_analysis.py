@@ -379,6 +379,18 @@ def test_paired_native_pretraining_representations_preserve_canonical_rows(tmp_p
 
 
 def test_harness_identity_hashes_every_component_in_fixed_order(tmp_path: Path):
+    assert HARNESS_COMPONENTS == (
+        Path("v2/benchmarks/schema.py"),
+        Path("v2/benchmarks/evidence.py"),
+        Path("v2/benchmarks/workload.py"),
+        Path("v2/benchmarks/runner.py"),
+        Path("v2/benchmarks/journal.py"),
+        Path("v2/benchmarks/recovery.py"),
+        Path("v2/benchmarks/analysis.py"),
+        Path("v2/benchmarks/adapters/legacy.py"),
+        Path("v2/benchmarks/adapters/replacement.py"),
+        Path("v2/tests/unit/test_benchmark_analysis.py"),
+    )
     expected = hashlib.sha256()
     for index, relative_path in enumerate(HARNESS_COMPONENTS):
         path = tmp_path / relative_path
@@ -1541,9 +1553,48 @@ def test_baseline_manifest_binds_raw_trials_to_clean_source_and_harness():
     validate_baseline_manifest(manifest, trials)
     assert manifest["paired_pretraining_representations"] == paired_representations
     assert manifest["identity"].startswith("sha256:")
-    mutated = replace(trial, harness_identity="sha256:" + "e" * 64)
+    mutated = _with_trial_payload(trial, harness_identity="sha256:" + "e" * 64)
     with pytest.raises(ValueError, match="harness identity"):
         validate_baseline_manifest(manifest, (mutated, *trials[1:]))
+
+
+def test_baseline_rejects_raw_trial_without_valid_post_exit_evidence():
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    raw = trial.to_dict()
+    raw["post_exit_observation"]["child_measurement_identity"] = "sha256:" + "0" * 64
+
+    with pytest.raises(ValueError, match="post-exit observation identity"):
+        validate_baseline_trial(
+            RawTrial.from_dict(raw),
+            workload=workload,
+            source_commit=trial.source_commit,
+            harness_commit=trial.harness_commit,
+            harness_identity=trial.harness_identity,
+            expected_hardware=trial.hardware,
+            expected_software_versions=trial.software_versions,
+        )
+
+
+def test_baseline_manifest_construction_rejects_tampered_embedded_evidence():
+    workload = build_canonical_workload()
+    trials = _valid_baseline_trials(workload)
+    tampered = replace(trials[0], value=trials[0].value + 1.0)
+
+    with pytest.raises(ValueError, match="embedded evidence"):
+        build_baseline_manifest(
+            trials=(tampered, *trials[1:]),
+            workload=workload,
+            workload_identity=canonical_workload_identity(workload),
+            source_commit=trials[0].source_commit,
+            harness_commit=trials[0].harness_commit,
+            harness_identity=trials[0].harness_identity,
+            command="record-baseline",
+            pairs=5,
+            warmup_units=5,
+            measured_units=20,
+            paired_representations=_valid_paired_representations(workload),
+        )
 
 
 def _resign_baseline(manifest):
@@ -1646,12 +1697,20 @@ def test_baseline_rejects_invalid_environment_or_software(
 
 
 @pytest.mark.parametrize(
-    ("field", "build_invalid"),
+    ("field", "build_invalid", "message"),
     (
-        ("pair_index", lambda trial: replace(trial, pair_index=False)),
-        ("attempt_index", lambda trial: replace(trial, attempt_index=False)),
-        ("warmup_units", lambda trial: replace(trial, warmup_units=False)),
-        ("measured_units", lambda trial: replace(trial, measured_units=True)),
+        ("pair_index", lambda trial: replace(trial, pair_index=False), "pair_index"),
+        (
+            "attempt_index",
+            lambda trial: replace(trial, attempt_index=False),
+            "attempt_index",
+        ),
+        ("warmup_units", lambda trial: replace(trial, warmup_units=False), "warmup"),
+        (
+            "measured_units",
+            lambda trial: replace(trial, measured_units=True),
+            "measured",
+        ),
         (
             "rope_scaling_factor",
             lambda trial: replace(
@@ -1661,8 +1720,9 @@ def test_baseline_rejects_invalid_environment_or_software(
                     "rope_scaling_factor": 1,
                 },
             ),
+            "rope_scaling_factor",
         ),
-        ("value", lambda trial: replace(trial, value=True)),
+        ("value", lambda trial: replace(trial, value=True), "embedded evidence"),
         (
             "power_connected",
             lambda trial: replace(
@@ -1672,6 +1732,7 @@ def test_baseline_rejects_invalid_environment_or_software(
                     "power_connected": 1,
                 },
             ),
+            "power_connected",
         ),
         (
             "low_power_mode",
@@ -1682,6 +1743,7 @@ def test_baseline_rejects_invalid_environment_or_software(
                     "low_power_mode": 0,
                 },
             ),
+            "low_power_mode",
         ),
         (
             "competing_gpu_workload",
@@ -1692,17 +1754,18 @@ def test_baseline_rejects_invalid_environment_or_software(
                     "competing_gpu_workload": 0,
                 },
             ),
+            "competing_gpu_workload",
         ),
     ),
 )
 def test_single_baseline_trial_validation_rejects_boolean_numeric_substitutes(
-    field, build_invalid
+    field, build_invalid, message
 ):
     workload = build_canonical_workload()
     valid = _valid_raw_trial(workload, metric="compile-cold-start")
     invalid = build_invalid(valid)
 
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(ValueError, match=message):
         benchmark_runner.validate_baseline_trial(
             invalid,
             workload=workload,
@@ -1812,7 +1875,9 @@ def test_comparison_report_pins_pairs_decisions_and_metric_lineage():
     )
 
     invalid = json.loads(json.dumps(report))
-    invalid["raw_trials"][1]["process_order"] = 0
+    invalid["raw_trials"][1] = _with_trial_payload(
+        RawTrial.from_dict(invalid["raw_trials"][1]), process_order=0
+    ).to_dict()
     invalid_body = {key: value for key, value in invalid.items() if key != "identity"}
     invalid["identity"] = structured_identity(
         "sml-performance-comparison-v1", invalid_body
@@ -1886,6 +1951,32 @@ def test_raw_trial_evidence_rejects_a_cached_only_environment_change():
         validate_raw_trial_evidence(mismatched)
 
 
+def test_raw_trial_identity_uses_version_two_domain():
+    trial = _valid_raw_trial(build_canonical_workload())
+
+    assert benchmark_runner._raw_trial_identity(trial) == structured_identity(
+        "sml-raw-benchmark-trial-v2", trial.to_dict()
+    )
+
+
+def test_raw_trial_identity_rejects_tampered_embedded_evidence():
+    trial = _valid_raw_trial(build_canonical_workload())
+    tampered = replace(trial, value=trial.value + 1.0)
+
+    with pytest.raises(ValueError, match="embedded evidence"):
+        benchmark_runner._raw_trial_identity(tampered)
+
+
+def test_raw_trial_jsonl_rejects_tampered_embedded_evidence(tmp_path):
+    trial = _valid_raw_trial(build_canonical_workload())
+    raw = replace(trial, value=trial.value + 1.0).to_dict()
+    path = tmp_path / "baseline.jsonl"
+    path.write_text(json.dumps(raw) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="embedded evidence"):
+        benchmark_runner._read_trials(path)
+
+
 def _valid_prepared_comparison():
     workload = build_canonical_workload()
     baseline_trials = _valid_baseline_trials(workload)
@@ -1916,6 +2007,37 @@ def _valid_prepared_comparison():
         predecessor_metrics={},
     )
     return workload, baseline, report
+
+
+def test_comparison_rejects_raw_trial_without_valid_post_exit_evidence():
+    _workload, baseline, report = _valid_prepared_comparison()
+    report["raw_trials"][0]["post_exit_observation"]["child_measurement_identity"] = (
+        "sha256:" + "0" * 64
+    )
+    body = {key: value for key, value in report.items() if key != "identity"}
+    report["identity"] = structured_identity("sml-performance-comparison-v1", body)
+
+    with pytest.raises(ValueError, match="post-exit observation identity"):
+        validate_comparison_report(report, baseline, None)
+
+
+def test_comparison_construction_revalidates_evidence_before_using_values():
+    _workload, baseline, report = _valid_prepared_comparison()
+    trials = tuple(RawTrial.from_dict(raw) for raw in report["raw_trials"])
+    tampered = replace(trials[0], value=float("nan"))
+
+    with pytest.raises(ValueError, match="embedded evidence"):
+        build_comparison_report(
+            baseline=baseline,
+            trials=(tampered, *trials[1:]),
+            candidate_commit=report["candidate_commit"],
+            minimum_ratio=0.97,
+            pretraining_minimum_ratio=None,
+            maximum_dispersion=0.02,
+            require_lower_bound=False,
+            bootstrap_resamples=10_000,
+            predecessor_metrics={},
+        )
 
 
 @pytest.mark.parametrize(
@@ -1959,9 +2081,12 @@ def test_comparison_validator_rejects_unreferenced_raw_trials():
 def test_comparison_validator_rejects_false_round_trip_and_precision_annotation():
     workload, baseline, report = _valid_prepared_comparison()
     invalid_projection = json.loads(json.dumps(report))
-    invalid_projection["raw_trials"][1]["canonical_projection"]["model"][
-        "hidden_size"
-    ] = 1
+    trial = RawTrial.from_dict(invalid_projection["raw_trials"][1])
+    projection = json.loads(json.dumps(trial.canonical_projection))
+    projection["model"]["hidden_size"] = 1
+    invalid_projection["raw_trials"][1] = _with_trial_payload(
+        trial, canonical_projection=projection
+    ).to_dict()
     body = {key: item for key, item in invalid_projection.items() if key != "identity"}
     invalid_projection["identity"] = structured_identity(
         "sml-performance-comparison-v1", body
@@ -3780,6 +3905,30 @@ def test_baseline_journal_resumes_only_an_identical_session(tmp_path):
     changed = _session_document(tmp_path, harness_commit="d" * 40)
     with pytest.raises(ValueError, match="session does not match"):
         BaselineJournal.open(state, changed)
+
+
+def test_baseline_journal_rejects_old_journal_session_without_post_exit_policy(
+    tmp_path,
+):
+    state = tmp_path / "state"
+    current = _session_document(tmp_path)
+    old = json.loads(json.dumps(current))
+    required = old["canonical_workload"]["required_environment"]
+    for key in (
+        "measurement_end_memory_pressure_allowed",
+        "post_exit_memory_pressure",
+        "post_exit_evidence_required",
+    ):
+        required.pop(key)
+    old["canonical_workload_identity"] = structured_identity(
+        "sml-canonical-benchmark-workload-v1", old["canonical_workload"]
+    )
+    old_body = {key: value for key, value in old.items() if key != "identity"}
+    old["identity"] = structured_identity("sml-baseline-journal-session-v1", old_body)
+    BaselineJournal.open(state, old)
+
+    with pytest.raises(ValueError, match="session does not match expected session"):
+        BaselineJournal.open(state, current)
 
 
 @pytest.mark.parametrize(
