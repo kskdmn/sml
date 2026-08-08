@@ -414,7 +414,7 @@ Add `Path("v2/benchmarks/evidence.py")` immediately after `schema.py` in
             "post_exit_evidence_required": True,
 ```
 
-- [ ] **Step 6: Run evidence tests and the complete benchmark unit module**
+- [ ] **Step 6: Run the focused evidence and schema tests**
 
 Run outside the sandbox:
 
@@ -424,12 +424,13 @@ uv run pytest \
   v2/tests/unit/test_benchmark_analysis.py::test_child_and_post_exit_documents_are_exactly_identity_bound \
   v2/tests/unit/test_benchmark_analysis.py::test_raw_trial_v2_embeds_and_revalidates_both_evidence_documents \
   -v
-uv run pytest v2/tests/unit/test_benchmark_analysis.py -q
 ```
 
-Expected: PASS. Update direct version 1 fixture literals in this test module to
-version 2 only when they represent valid current evidence; retain an explicit
-version 1 negative fixture.
+Expected: PASS. Task 1 intentionally does not run the full benchmark module:
+the child producer remains version 1 until Task 3. Update direct version 1
+fixture literals in the focused evidence/schema tests to version 2 only when
+they represent valid current evidence; retain an explicit version 1 negative
+fixture. Task 3 owns the first required complete benchmark-module pass.
 
 - [ ] **Step 7: Commit the evidence contract**
 
@@ -904,10 +905,13 @@ uv run pytest \
   v2/tests/unit/test_benchmark_analysis.py -k \
   'child_process or child_output or parent_samples_memory or paired_trials or comparison' \
   -v
+uv run pytest v2/tests/unit/test_benchmark_analysis.py -q
 ```
 
 Expected: PASS. The test event sequence must prove the parent memory sample
 occurs after child exit and before the rest of parent environment collection.
+The complete benchmark unit module must also pass now that every raw-trial
+producer and fixture emits version 2 evidence.
 
 - [ ] **Step 7: Commit the process lifecycle**
 
