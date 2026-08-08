@@ -28,6 +28,7 @@ from v2.benchmarks.evidence import (
     build_child_trial_measurement,
     build_post_exit_observation,
     finalize_raw_trial,
+    finalized_trial_rejection_reason,
     validate_child_trial_measurement,
     validate_raw_trial_evidence,
 )
@@ -555,29 +556,11 @@ def _validate_preflight_environment(
 def classify_trial_environment(
     workload: CanonicalWorkload, trial: RawTrial
 ) -> TrialEnvironmentDisposition:
-    required = workload.required_environment
-    status = trial.environment_status
-    if status["start"]["memory_pressure"] != required["memory_pressure"]:
-        return TrialEnvironmentDisposition(
-            "memory-reject", "non-normal-start-memory-pressure"
-        )
-    if (
-        status["end"]["memory_pressure"]
-        not in required["measurement_end_memory_pressure_allowed"]
-    ):
-        return TrialEnvironmentDisposition(
-            "memory-reject", "critical-measurement-memory-pressure"
-        )
-    if status["post_exit"]["memory_pressure"] != required["post_exit_memory_pressure"]:
-        return TrialEnvironmentDisposition(
-            "memory-reject", "persistent-post-exit-memory-pressure"
-        )
-    if any(
-        status[name]["thermal_state"] != required["thermal_state"]
-        for name in ("start", "end", "post_exit")
-    ):
-        return TrialEnvironmentDisposition("thermal-reject", "non-nominal-thermal")
-    return TrialEnvironmentDisposition("accept", None)
+    reason = finalized_trial_rejection_reason(trial, workload.required_environment)
+    if reason is None:
+        return TrialEnvironmentDisposition("accept", None)
+    outcome = "thermal-reject" if reason == "non-nominal-thermal" else "memory-reject"
+    return TrialEnvironmentDisposition(outcome, reason)
 
 
 def _validate_acceptance_environment(
@@ -1570,7 +1553,7 @@ def validate_thermal_observation(status: dict[str, object]) -> None:
     state = status.get("thermal_state")
     if type(raw_value) is not int or state != decode_thermal_state(raw_value):
         raise ValueError("thermal state and raw value disagree")
-    for nested_name in ("start", "end"):
+    for nested_name in ("start", "end", "post_exit"):
         nested = status.get(nested_name)
         if nested is not None:
             if not isinstance(nested, dict):
@@ -1578,11 +1561,12 @@ def validate_thermal_observation(status: dict[str, object]) -> None:
             validate_thermal_observation(nested)
     if isinstance(status.get("start"), dict) and isinstance(status.get("end"), dict):
         expected_raw = max(
-            status["start"]["thermal_state_raw_value"],
-            status["end"]["thermal_state_raw_value"],
+            status[name]["thermal_state_raw_value"]
+            for name in ("start", "end", "post_exit")
+            if isinstance(status.get(name), dict)
         )
         if raw_value != expected_raw:
-            raise ValueError("merged thermal state is not the worse endpoint")
+            raise ValueError("merged thermal state is not the worse observation")
 
 
 def _thermal_state() -> tuple[str, int]:
@@ -1796,10 +1780,14 @@ def collect_environment(
 
 
 def collect_post_exit_environment() -> tuple[
-    dict[str, object], dict[str, object], dict[str, str]
+    str, dict[str, object], dict[str, object], dict[str, str]
 ]:
     memory_sample = _memory_pressure()
-    return collect_environment(memory_sample=memory_sample)
+    observed_at_utc = _utc_now_iso()
+    hardware, environment_status, software_versions = collect_environment(
+        memory_sample=memory_sample
+    )
+    return observed_at_utc, hardware, environment_status, software_versions
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -2110,10 +2098,15 @@ def _launch_trial(
         raise ValueError("fresh child measurement has the wrong session identity")
     if measurement["journal_attempt_index"] != journal_attempt_index:
         raise ValueError("fresh child measurement has the wrong journal attempt index")
-    hardware, environment_status, software_versions = collect_post_exit_environment()
+    (
+        observed_at_utc,
+        hardware,
+        environment_status,
+        software_versions,
+    ) = collect_post_exit_environment()
     post_exit = build_post_exit_observation(
         measurement=measurement,
-        observed_at_utc=_utc_now_iso(),
+        observed_at_utc=observed_at_utc,
         hardware=hardware,
         environment_status=environment_status,
         software_versions=software_versions,

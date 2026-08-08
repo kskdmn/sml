@@ -11,6 +11,16 @@ CHILD_KIND = "sml-child-trial-measurement"
 CHILD_IDENTITY_DOMAIN = "sml-child-trial-measurement-v1"
 POST_EXIT_KIND = "sml-parent-post-exit-observation"
 POST_EXIT_IDENTITY_DOMAIN = "sml-parent-post-exit-observation-v1"
+MISSING_POST_EXIT_REASON = "missing-immediate-post-exit-evidence"
+FINALIZED_REJECTION_REASONS = frozenset(
+    {
+        "non-normal-start-memory-pressure",
+        "critical-measurement-memory-pressure",
+        "persistent-post-exit-memory-pressure",
+        "non-nominal-thermal",
+    }
+)
+REJECTION_REASONS = FINALIZED_REJECTION_REASONS | {MISSING_POST_EXIT_REASON}
 
 ENVIRONMENT_FIELDS = frozenset(
     {
@@ -342,6 +352,30 @@ def merge_environment_status(
         "end": dict(end),
         "post_exit": dict(post_exit),
     }
+
+
+def finalized_trial_rejection_reason(
+    trial: RawTrial, required_environment: Mapping[str, object]
+) -> str | None:
+    status = trial.environment_status
+    if status["start"]["memory_pressure"] != required_environment["memory_pressure"]:
+        return "non-normal-start-memory-pressure"
+    if (
+        status["end"]["memory_pressure"]
+        not in required_environment["measurement_end_memory_pressure_allowed"]
+    ):
+        return "critical-measurement-memory-pressure"
+    if (
+        status["post_exit"]["memory_pressure"]
+        != required_environment["post_exit_memory_pressure"]
+    ):
+        return "persistent-post-exit-memory-pressure"
+    if any(
+        status[name]["thermal_state"] != required_environment["thermal_state"]
+        for name in ("start", "end", "post_exit")
+    ):
+        return "non-nominal-thermal"
+    return None
 
 
 def finalize_raw_trial(

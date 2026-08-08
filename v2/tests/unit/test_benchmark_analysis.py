@@ -3176,6 +3176,57 @@ def test_capture_replays_persisted_thermal_state_before_preflight(
     assert recovered == [(expected_recovery_index, 7_200.0, expected_trigger)]
 
 
+def test_capture_replays_post_exit_only_thermal_rejection_before_preflight(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    nominal = _valid_raw_trial(workload)
+    post_exit_fair = dict(nominal.environment_status["post_exit"])
+    post_exit_fair.update(thermal_state="fair", thermal_state_raw_value=1)
+    rejected = _with_environment_observations(nominal, post_exit=post_exit_fair)
+    attempt = journal.next_attempt(slot)
+    _measurement, _post_exit, rejected = _persist_journal_evidence(
+        journal, attempt, rejected
+    )
+    journal.reject_inflight(attempt, rejected, reason="non-nominal-thermal")
+    persisted_document = read_json_object(
+        journal.rejected_path(slot, 0), label="rejected trial"
+    )
+    recovered = []
+
+    def stop_after_recovery(current_slot, recovery_index, deadline, trigger):
+        recovered.append((current_slot, recovery_index, deadline, trigger))
+        raise RuntimeError("stop after persisted recovery")
+
+    with pytest.raises(RuntimeError, match="stop after persisted recovery"):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=lambda current_slot, current_attempt: pytest.fail(
+                "trial launched before persisted recovery"
+            ),
+            preflight=lambda: pytest.fail("preflight ran before persisted recovery"),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=stop_after_recovery,
+            validate_trial=lambda trial, allow_rejected_environment: None,
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            clock=lambda: 0.0,
+            progress=lambda message: None,
+        )
+
+    assert recovered == [
+        (
+            slot,
+            0,
+            7_200.0,
+            {
+                "source": "rejected-trial",
+                "rejected_trial_identity": persisted_document["identity"],
+            },
+        )
+    ]
+
+
 def _session_bound_preflight_validator(workload, trial):
     return lambda hardware, status, software: (
         benchmark_runner._validate_baseline_preflight(
@@ -4702,7 +4753,7 @@ def test_completed_child_output_crosses_the_parent_fsync_boundary(
     )
 
 
-def test_parent_samples_memory_first_after_child_exit_and_finalizes_trial(
+def test_parent_samples_memory_then_timestamps_before_slow_post_exit_probes(
     tmp_path, monkeypatch
 ):
     workload = build_canonical_workload()
@@ -4723,6 +4774,11 @@ def test_parent_samples_memory_first_after_child_exit_and_finalizes_trial(
         benchmark_runner,
         "_memory_pressure",
         lambda: events.append("memory") or ("normal", 69),
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_utc_now_iso",
+        lambda: events.append("timestamp") or "2026-08-08T00:00:02+00:00",
     )
     monkeypatch.setattr(
         benchmark_runner,
@@ -4750,7 +4806,12 @@ def test_parent_samples_memory_first_after_child_exit_and_finalizes_trial(
         output=trial_path,
     )
 
-    assert events == ["child-exited", "memory", ("environment", ("normal", 69))]
+    assert events == [
+        "child-exited",
+        "memory",
+        "timestamp",
+        ("environment", ("normal", 69)),
+    ]
     command = commands[0]
     assert (
         command[command.index("--evidence-session-identity") + 1]
@@ -4762,6 +4823,7 @@ def test_parent_samples_memory_first_after_child_exit_and_finalizes_trial(
     assert trial_path.is_file()
     assert trial == RawTrial.from_dict(read_json_object(trial_path, label="trial"))
     assert trial.environment_status["memory_pressure"] == "normal"
+    assert trial.post_exit_observation["observed_at_utc"] == "2026-08-08T00:00:02+00:00"
 
 
 def test_parent_post_exit_output_never_overwrites_existing_evidence(
@@ -4781,6 +4843,7 @@ def test_parent_post_exit_output_never_overwrites_existing_evidence(
         benchmark_runner,
         "collect_post_exit_environment",
         lambda: (
+            "2026-08-08T00:00:02+00:00",
             measurement["start"]["hardware"],
             measurement["start"]["environment_status"],
             measurement["start"]["software_versions"],
@@ -4816,6 +4879,7 @@ def test_parent_trial_output_never_overwrites_existing_evidence(tmp_path, monkey
         benchmark_runner,
         "collect_post_exit_environment",
         lambda: (
+            "2026-08-08T00:00:02+00:00",
             measurement["start"]["hardware"],
             measurement["start"]["environment_status"],
             measurement["start"]["software_versions"],
@@ -5208,11 +5272,187 @@ def test_journal_memory_rejection_needs_no_thermal_trigger(tmp_path):
     assert journal.next_attempt(slot).journal_attempt_index == 1
 
 
-def test_journal_rejects_both_outcomes_for_one_attempt(tmp_path):
+def test_journal_reject_inflight_rejects_an_unknown_reason_before_writing(tmp_path):
+    workload = build_canonical_workload()
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, post_exit, trial = _persist_journal_evidence(journal, attempt)
+    fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
+    _measurement, _post_exit, fair = _persist_journal_evidence(journal, attempt, fair)
+
+    with pytest.raises(ValueError, match="rejected trial reason is invalid"):
+        journal.reject_inflight(attempt, fair, reason="retry-environment-later")
+
+    assert attempt.path.is_file()
+    assert not journal.rejected_path(slot, 0).exists()
+
+
+def test_journal_reject_inflight_refuses_an_accept_disposition(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    _measurement, _post_exit, nominal = _persist_journal_evidence(
+        journal, attempt, _valid_raw_trial(workload)
+    )
+
+    with pytest.raises(ValueError, match="accepted trial cannot be rejected"):
+        journal.reject_inflight(attempt, nominal, reason="non-nominal-thermal")
+
+    assert attempt.path.is_file()
+    assert not journal.rejected_path(slot, 0).exists()
+
+
+@pytest.mark.parametrize(
+    ("primary_signal", "supplied_reason", "expected_reason"),
+    (
+        (
+            "start-memory",
+            "critical-measurement-memory-pressure",
+            "non-normal-start-memory-pressure",
+        ),
+        (
+            "end-memory",
+            "persistent-post-exit-memory-pressure",
+            "critical-measurement-memory-pressure",
+        ),
+        (
+            "post-exit-memory",
+            "non-nominal-thermal",
+            "persistent-post-exit-memory-pressure",
+        ),
+        (
+            "thermal",
+            "persistent-post-exit-memory-pressure",
+            "non-nominal-thermal",
+        ),
+    ),
+)
+def test_journal_reject_inflight_requires_the_ordered_evidence_reason(
+    tmp_path, primary_signal, supplied_reason, expected_reason
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    nominal = _valid_raw_trial(workload)
+    start = dict(nominal.environment_status["start"])
+    end = dict(nominal.environment_status["end"])
+    post_exit = dict(nominal.environment_status["post_exit"])
+    if primary_signal == "start-memory":
+        start["memory_pressure"] = "warning"
+        end["memory_pressure"] = "critical"
+        post_exit["memory_pressure"] = "warning"
+        post_exit.update(thermal_state="fair", thermal_state_raw_value=1)
+    elif primary_signal == "end-memory":
+        end["memory_pressure"] = "critical"
+        post_exit["memory_pressure"] = "warning"
+        post_exit.update(thermal_state="fair", thermal_state_raw_value=1)
+    elif primary_signal == "post-exit-memory":
+        post_exit["memory_pressure"] = "warning"
+        post_exit.update(thermal_state="fair", thermal_state_raw_value=1)
+    else:
+        post_exit.update(thermal_state="fair", thermal_state_raw_value=1)
+    rejected = _with_environment_observations(
+        nominal,
+        start=start,
+        end=end,
+        post_exit=post_exit,
+    )
+    attempt = journal.next_attempt(slot)
+    _measurement, _post_exit, rejected = _persist_journal_evidence(
+        journal, attempt, rejected
+    )
+
+    with pytest.raises(ValueError, match=expected_reason):
+        journal.reject_inflight(attempt, rejected, reason=supplied_reason)
+
+    assert attempt.path.is_file()
+    assert not journal.rejected_path(slot, 0).exists()
+
+
+def _rewrite_rejected_reason(journal, slot, reason):
+    path = journal.rejected_path(slot, 0)
+    document = read_json_object(path, label="rejected trial")
+    body = {
+        **{key: value for key, value in document.items() if key != "identity"},
+        "reason": reason,
+    }
+    path.unlink()
+    atomic_write_json(
+        path,
+        {
+            **body,
+            "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
+        },
+        create_only=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutated_reason",
+    (
+        "retry-environment-later",
+        "missing-immediate-post-exit-evidence",
+        "persistent-post-exit-memory-pressure",
+    ),
+)
+def test_journal_load_rejects_a_resigned_wrong_finalized_reason(
+    tmp_path, mutated_reason
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
+    _measurement, _post_exit, fair = _persist_journal_evidence(journal, attempt, fair)
+    journal.reject_inflight(attempt, fair, reason="non-nominal-thermal")
+    _rewrite_rejected_reason(journal, slot, mutated_reason)
+
+    with pytest.raises(ValueError, match="rejected trial reason"):
+        journal.next_attempt(slot)
+
+
+def test_journal_load_refuses_a_rejected_accept_disposition(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, nominal = _persist_journal_evidence(
+        journal, attempt, _valid_raw_trial(workload)
+    )
+    body = {
+        "kind": "sml-baseline-rejected-trial",
+        "version": 2,
+        "journal_attempt_index": 0,
+        "reason": "non-nominal-thermal",
+        "child_measurement_identity": measurement["identity"],
+        "post_exit_observation_identity": post_exit["identity"],
+        "trial": nominal.to_dict(),
+    }
+    attempt.path.unlink()
+    atomic_write_json(
+        journal.rejected_path(slot, 0),
+        {
+            **body,
+            "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
+        },
+        create_only=True,
+    )
+
+    with pytest.raises(ValueError, match="accepted trial cannot be rejected"):
+        journal.next_attempt(slot)
+
+
+def test_journal_rejects_both_outcomes_for_one_attempt(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, trial = _persist_journal_evidence(
+        journal,
+        attempt,
+        _with_thermal_state(_valid_raw_trial(workload), "fair", 1),
+    )
     accepted_path = journal.accepted_path(slot)
     accepted_path.parent.mkdir(parents=True)
     os.link(attempt.path, accepted_path)
@@ -5409,9 +5649,8 @@ def test_journal_replays_a_rejected_inflight_crash_split(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, trial = _persist_journal_evidence(
-        journal, attempt, _valid_raw_trial(workload)
-    )
+    fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
+    _measurement, _post_exit, trial = _persist_journal_evidence(journal, attempt, fair)
     journal.reject_inflight(attempt, trial, reason="non-nominal-thermal")
     atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
 

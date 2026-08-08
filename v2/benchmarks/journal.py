@@ -17,7 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from v2.benchmarks.evidence import (
+    MISSING_POST_EXIT_REASON,
+    REJECTION_REASONS,
     finalize_raw_trial,
+    finalized_trial_rejection_reason,
     validate_child_trial_measurement,
     validate_post_exit_observation,
     validate_raw_trial_evidence,
@@ -549,7 +552,11 @@ def _validate_identity_document(
 
 
 def _validate_rejected_document(
-    document: dict, *, slot: BaselineSlot, journal_attempt_index: int
+    document: dict,
+    *,
+    slot: BaselineSlot,
+    journal_attempt_index: int,
+    required_environment: dict,
 ) -> tuple[dict, RawTrial | None]:
     _require_object_fields(
         document,
@@ -577,7 +584,10 @@ def _validate_rejected_document(
     )
     if body["journal_attempt_index"] != journal_attempt_index:
         raise ValueError("rejected trial attempt index does not match its filename")
-    _require_nonempty_string(body["reason"], label="rejected trial reason")
+    reason = body["reason"]
+    _require_nonempty_string(reason, label="rejected trial reason")
+    if reason not in REJECTION_REASONS:
+        raise ValueError("rejected trial reason is invalid")
     if (
         not isinstance(body["child_measurement_identity"], str)
         or IDENTITY.fullmatch(body["child_measurement_identity"]) is None
@@ -591,10 +601,20 @@ def _validate_rejected_document(
         raise ValueError("rejected trial post-exit observation identity is invalid")
     raw_trial = body["trial"]
     if raw_trial is None:
+        if reason != MISSING_POST_EXIT_REASON:
+            raise ValueError("unfinalized rejection has an invalid reason")
         return body, None
     if not isinstance(raw_trial, dict):
         raise ValueError("rejected trial must contain a raw trial object or null")
-    return body, _parse_trial_for_slot(raw_trial, slot=slot, label="rejected trial")
+    trial = _parse_trial_for_slot(raw_trial, slot=slot, label="rejected trial")
+    expected_reason = finalized_trial_rejection_reason(trial, required_environment)
+    if expected_reason is None:
+        raise ValueError("accepted trial cannot be rejected")
+    if reason != expected_reason:
+        raise ValueError(
+            f"rejected trial reason does not match evidence: expected {expected_reason}"
+        )
+    return body, trial
 
 
 def _validate_preflight_document(
@@ -1194,6 +1214,9 @@ class BaselineJournal:
                 document,
                 slot=attempt.slot,
                 journal_attempt_index=attempt.journal_attempt_index,
+                required_environment=self.session["canonical_workload"][
+                    "required_environment"
+                ],
             )
             key = (attempt.slot, attempt.journal_attempt_index)
             measurement = measurements.get(key)
@@ -1432,6 +1455,9 @@ class BaselineJournal:
                 rejected,
                 slot=attempt.slot,
                 journal_attempt_index=attempt.journal_attempt_index,
+                required_environment=self.session["canonical_workload"][
+                    "required_environment"
+                ],
             )
             reasons_by_identity[rejected["identity"]] = rejected_body["reason"]
         rejected_identity = body["rejected_trial_identity"]
@@ -1600,6 +1626,14 @@ class BaselineJournal:
             **body,
             "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
         }
+        _validate_rejected_document(
+            document,
+            slot=attempt.slot,
+            journal_attempt_index=attempt.journal_attempt_index,
+            required_environment=self.session["canonical_workload"][
+                "required_environment"
+            ],
+        )
         rejected_path = self.rejected_path(attempt.slot, attempt.journal_attempt_index)
         if _entry_exists(rejected_path) and not _entry_exists(attempt.path):
             _write_immutable_json(rejected_path, document, label="rejected trial")
@@ -1678,6 +1712,14 @@ class BaselineJournal:
             **body,
             "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
         }
+        _validate_rejected_document(
+            document,
+            slot=attempt.slot,
+            journal_attempt_index=attempt.journal_attempt_index,
+            required_environment=self.session["canonical_workload"][
+                "required_environment"
+            ],
+        )
         _write_immutable_json(rejected_path, document, label="rejected trial")
 
     def record_preflight(
