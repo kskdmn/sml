@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Literal
 
 from v2.benchmarks.analysis import analyze_pairs
+from v2.benchmarks.evidence import validate_raw_trial_evidence
 from v2.benchmarks.journal import (
     BaselineJournal,
     BaselineSlot,
@@ -58,6 +59,13 @@ from v2.benchmarks.workload import (
 )
 
 Side = Literal["reference", "candidate"]
+
+
+@dataclass(frozen=True, slots=True)
+class TrialEnvironmentDisposition:
+    outcome: Literal["accept", "thermal-reject", "memory-reject"]
+    reason: str | None
+
 
 PINNED_BASELINE_SOURCE_COMMIT = "3687f8b3214a44c675ae67af52e4997762f6c634"
 COMPARISON_SCREEN = "screen"
@@ -212,7 +220,7 @@ def validate_baseline_trial(
     harness_identity: str,
     expected_hardware: dict,
     expected_software_versions: dict[str, str],
-    allow_non_nominal_thermal: bool = False,
+    allow_rejected_environment: bool = False,
 ) -> None:
     if trial.side != "reference":
         raise ValueError("baseline raw trials must be reference-side records")
@@ -278,7 +286,7 @@ def validate_baseline_trial(
     _validate_acceptance_environment(
         workload,
         trial,
-        allow_non_nominal_thermal=allow_non_nominal_thermal,
+        allow_rejected_environment=allow_rejected_environment,
     )
     if trial.hardware != expected_hardware:
         raise ValueError("raw hardware records are inconsistent")
@@ -495,7 +503,7 @@ def validate_baseline_manifest(
         raise ValueError("baseline software summary does not match raw trials")
 
 
-def _validate_nonthermal_environment_status(
+def _validate_observation_power(
     status: dict,
     required: dict,
     *,
@@ -505,32 +513,79 @@ def _validate_nonthermal_environment_status(
         observed = status.get(key)
         if type(observed) is not bool or observed is not required[key]:
             raise ValueError(f"{label} does not match required {key}")
-    for key in ("power_mode", "memory_pressure"):
-        if status.get(key) != required[key]:
-            raise ValueError(f"{label} does not match required {key}")
+    if status.get("power_mode") != required["power_mode"]:
+        raise ValueError(f"{label} does not match required power_mode")
+
+
+def _validate_preflight_environment(
+    status: dict,
+    required: dict,
+    *,
+    label: str,
+) -> None:
+    _validate_observation_power(status, required, label=label)
+    if status.get("memory_pressure") != required["memory_pressure"]:
+        raise ValueError(f"{label} does not match required memory_pressure")
+
+
+def classify_trial_environment(
+    workload: CanonicalWorkload, trial: RawTrial
+) -> TrialEnvironmentDisposition:
+    required = workload.required_environment
+    status = trial.environment_status
+    if status["start"]["memory_pressure"] != required["memory_pressure"]:
+        return TrialEnvironmentDisposition(
+            "memory-reject", "non-normal-start-memory-pressure"
+        )
+    if (
+        status["end"]["memory_pressure"]
+        not in required["measurement_end_memory_pressure_allowed"]
+    ):
+        return TrialEnvironmentDisposition(
+            "memory-reject", "critical-measurement-memory-pressure"
+        )
+    if status["post_exit"]["memory_pressure"] != required["post_exit_memory_pressure"]:
+        return TrialEnvironmentDisposition(
+            "memory-reject", "persistent-post-exit-memory-pressure"
+        )
+    if any(
+        status[name]["thermal_state"] != required["thermal_state"]
+        for name in ("start", "end", "post_exit")
+    ):
+        return TrialEnvironmentDisposition("thermal-reject", "non-nominal-thermal")
+    return TrialEnvironmentDisposition("accept", None)
 
 
 def _validate_acceptance_environment(
     workload: CanonicalWorkload,
     trial: RawTrial,
     *,
-    allow_non_nominal_thermal: bool = False,
+    allow_rejected_environment: bool = False,
 ) -> None:
-    validate_thermal_observation(trial.environment_status)
+    validate_raw_trial_evidence(trial)
     required = workload.required_environment
     for key in ("chip", "cpu_cores", "gpu_cores", "unified_memory_bytes"):
         if trial.hardware.get(key) != required[key]:
             raise ValueError(f"raw hardware does not match required {key}")
-    _validate_nonthermal_environment_status(
+    _validate_software_versions(workload, trial.software_versions)
+    for name in ("start", "end", "post_exit"):
+        status = trial.environment_status[name]
+        validate_thermal_observation(status)
+        _validate_observation_power(
+            status,
+            required,
+            label=f"raw {name} environment",
+        )
+    _validate_observation_power(
         trial.environment_status,
         required,
-        label="raw environment",
+        label="raw environment summary",
     )
-    if (
-        not allow_non_nominal_thermal
-        and trial.environment_status.get("thermal_state") != required["thermal_state"]
-    ):
-        raise ValueError("raw environment does not match required thermal_state")
+    disposition = classify_trial_environment(workload, trial)
+    if disposition.outcome not in {"accept", "thermal-reject", "memory-reject"}:
+        raise ValueError("raw environment has an unknown disposition")
+    if not allow_rejected_environment and disposition.outcome != "accept":
+        raise ValueError(f"raw environment rejected: {disposition.reason}")
 
 
 def _validate_software_versions(
@@ -2344,7 +2399,7 @@ def _validate_baseline_preflight(
     for key in ("chip", "cpu_cores", "gpu_cores", "unified_memory_bytes"):
         if hardware.get(key) != required[key]:
             raise ValueError(f"preflight hardware does not match required {key}")
-    _validate_nonthermal_environment_status(
+    _validate_preflight_environment(
         status,
         required,
         label="preflight environment",
@@ -2708,7 +2763,7 @@ def _record_baseline_locked(
                         harness_identity=harness_identity,
                         expected_hardware=initial_hardware,
                         expected_software_versions=initial_software_versions,
-                        allow_non_nominal_thermal=allow_non_nominal_thermal,
+                        allow_rejected_environment=allow_non_nominal_thermal,
                     )
                 ),
             )

@@ -56,6 +56,7 @@ from v2.benchmarks.runner import (
     build_comparison_report,
     build_parser,
     capture_baseline_trials,
+    classify_trial_environment,
     comparison_has_noise,
     detect_competing_gpu_workload,
     decode_thermal_state,
@@ -1234,14 +1235,16 @@ def test_raw_trial_v2_embeds_and_revalidates_both_evidence_documents():
 
 
 def _with_observation_changes(
-    trial, *, environment_changes=None, software_changes=None
+    trial, *, environment_changes=None, software_changes=None, hardware_changes=None
 ):
     environment_changes = environment_changes or {}
     software_changes = software_changes or {}
+    hardware_changes = hardware_changes or {}
     measurement = json.loads(json.dumps(trial.child_measurement))
     for endpoint in ("start", "end"):
         measurement[endpoint]["environment_status"].update(environment_changes)
         measurement[endpoint]["software_versions"].update(software_changes)
+        measurement[endpoint]["hardware"].update(hardware_changes)
     measurement_body = {
         key: value for key, value in measurement.items() if key != "identity"
     }
@@ -1251,6 +1254,7 @@ def _with_observation_changes(
     post_exit = json.loads(json.dumps(trial.post_exit_observation))
     post_exit["environment_status"].update(environment_changes)
     post_exit["software_versions"].update(software_changes)
+    post_exit["hardware"].update(hardware_changes)
     updated_post_exit = build_post_exit_observation(
         measurement=measurement,
         observed_at_utc=post_exit["observed_at_utc"],
@@ -1259,6 +1263,164 @@ def _with_observation_changes(
         software_versions=post_exit["software_versions"],
     )
     return finalize_raw_trial(measurement, updated_post_exit)
+
+
+def _with_environment_observations(trial, *, start=None, end=None, post_exit=None):
+    measurement = json.loads(json.dumps(trial.child_measurement))
+    parent = json.loads(json.dumps(trial.post_exit_observation))
+    if start is not None:
+        measurement["start"]["environment_status"] = start
+    if end is not None:
+        measurement["end"]["environment_status"] = end
+    measurement_body = {
+        key: value for key, value in measurement.items() if key != "identity"
+    }
+    measurement["identity"] = structured_identity(
+        "sml-child-trial-measurement-v1", measurement_body
+    )
+    parent["child_measurement_identity"] = measurement["identity"]
+    if post_exit is not None:
+        parent["environment_status"] = post_exit
+    parent_body = {key: value for key, value in parent.items() if key != "identity"}
+    parent["identity"] = structured_identity(
+        "sml-parent-post-exit-observation-v1", parent_body
+    )
+    return finalize_raw_trial(measurement, parent)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "pressure", "outcome", "reason"),
+    (
+        ("end", "warning", "accept", None),
+        (
+            "start",
+            "warning",
+            "memory-reject",
+            "non-normal-start-memory-pressure",
+        ),
+        (
+            "end",
+            "critical",
+            "memory-reject",
+            "critical-measurement-memory-pressure",
+        ),
+        (
+            "post_exit",
+            "warning",
+            "memory-reject",
+            "persistent-post-exit-memory-pressure",
+        ),
+        (
+            "post_exit",
+            "critical",
+            "memory-reject",
+            "persistent-post-exit-memory-pressure",
+        ),
+    ),
+)
+def test_trial_memory_disposition_uses_post_exit_as_authority(
+    endpoint, pressure, outcome, reason
+):
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    statuses = {
+        name: dict(trial.environment_status[name])
+        for name in ("start", "end", "post_exit")
+    }
+    statuses[endpoint]["memory_pressure"] = pressure
+    changed = _with_environment_observations(trial, **statuses)
+
+    disposition = classify_trial_environment(workload, changed)
+
+    assert (disposition.outcome, disposition.reason) == (outcome, reason)
+
+
+@pytest.mark.parametrize("endpoint", ("start", "end", "post_exit"))
+def test_trial_thermal_disposition_rejects_each_non_nominal_observation(endpoint):
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    statuses = {
+        name: dict(trial.environment_status[name])
+        for name in ("start", "end", "post_exit")
+    }
+    statuses[endpoint].update(thermal_state="fair", thermal_state_raw_value=1)
+    changed = _with_environment_observations(trial, **statuses)
+
+    disposition = classify_trial_environment(workload, changed)
+
+    assert (disposition.outcome, disposition.reason) == (
+        "thermal-reject",
+        "non-nominal-thermal",
+    )
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "change", "message"),
+    (
+        ("start", {"power_connected": False}, "power_connected"),
+        ("end", {"power_mode": "changed"}, "power_mode"),
+        ("post_exit", {"low_power_mode": True}, "low_power_mode"),
+        ("start", {"competing_gpu_workload": True}, "competing_gpu_workload"),
+    ),
+)
+def test_rejected_environment_override_never_allows_power_policy_failures(
+    endpoint, change, message
+):
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    statuses = {
+        name: dict(trial.environment_status[name])
+        for name in ("start", "end", "post_exit")
+    }
+    statuses[endpoint].update(change)
+    changed = _with_environment_observations(trial, **statuses)
+
+    with pytest.raises(ValueError, match=message):
+        benchmark_runner._validate_acceptance_environment(
+            workload, changed, allow_rejected_environment=True
+        )
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    (
+        ({"hardware_changes": {"chip": "unexpected"}}, "required chip"),
+        ({"software_changes": {"python": "3.12.12"}}, "Python version"),
+        ({"identity_mismatch": True}, "embedded evidence"),
+    ),
+)
+def test_rejected_environment_override_never_allows_proof_failures(change, message):
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    if change.get("identity_mismatch"):
+        changed = replace(
+            trial,
+            evidence_session_identity="sha256:" + "e" * 64,
+        )
+    else:
+        changed = _with_observation_changes(trial, **change)
+
+    with pytest.raises(ValueError, match=message):
+        benchmark_runner._validate_acceptance_environment(
+            workload, changed, allow_rejected_environment=True
+        )
+
+
+def test_rejected_environment_override_allows_only_retryable_dispositions():
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    statuses = {
+        name: dict(trial.environment_status[name])
+        for name in ("start", "end", "post_exit")
+    }
+    statuses["post_exit"]["memory_pressure"] = "warning"
+    changed = _with_environment_observations(trial, **statuses)
+
+    with pytest.raises(ValueError, match="persistent-post-exit-memory-pressure"):
+        benchmark_runner._validate_acceptance_environment(workload, changed)
+    benchmark_runner._validate_acceptance_environment(
+        workload, changed, allow_rejected_environment=True
+    )
 
 
 def _with_thermal_state(trial, state, raw_value):
@@ -1445,9 +1607,13 @@ def test_baseline_validator_rejects_partial_or_weakened_protocols():
         ({"power_connected": False}, {}, "power_connected"),
         ({"power_mode": "changed"}, {}, "power_mode"),
         ({"low_power_mode": True}, {}, "low_power_mode"),
-        ({"memory_pressure": "warning"}, {}, "memory_pressure"),
+        (
+            {"memory_pressure": "warning"},
+            {},
+            "non-normal-start-memory-pressure",
+        ),
         ({"competing_gpu_workload": True}, {}, "competing_gpu_workload"),
-        ({}, {"python": "3.12.12"}, "software-version"),
+        ({}, {"python": "3.12.12"}, "Python version"),
     ],
 )
 def test_baseline_rejects_invalid_environment_or_software(
@@ -1544,7 +1710,7 @@ def test_single_baseline_trial_validation_rejects_boolean_numeric_substitutes(
             harness_identity=valid.harness_identity,
             expected_hardware=valid.hardware,
             expected_software_versions=valid.software_versions,
-            allow_non_nominal_thermal=True,
+            allow_rejected_environment=True,
         )
 
 
@@ -2060,7 +2226,7 @@ def test_predecessors_are_resolved_as_an_explicit_per_metric_mapping(tmp_path):
     forged["identity"] = structured_identity("sml-performance-comparison-v1", body)
     forged_path = tmp_path / "forged.json"
     forged_path.write_text(json.dumps(forged), encoding="utf-8")
-    with pytest.raises(ValueError, match="raw pairs"):
+    with pytest.raises(ValueError, match="embedded evidence"):
         _resolve_predecessor_mapping(
             json.dumps(
                 {
