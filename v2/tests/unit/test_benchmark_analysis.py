@@ -5333,6 +5333,109 @@ def test_journal_requires_a_recovery_trigger_rejected_identity_from_its_slot(tmp
         )
 
 
+def _persist_rejected_trial_for_recovery_test(journal, slot, reason):
+    attempt = journal.next_attempt(slot)
+    workload = build_canonical_workload()
+    if reason == "missing-immediate-post-exit-evidence":
+        measurement, _post_exit, _trial = _persist_journal_evidence(
+            journal, attempt, post_exit=False, inflight=False
+        )
+        journal.reject_unfinalized(attempt, measurement, reason=reason)
+    else:
+        trial = _valid_raw_trial(workload, pair_index=slot.pair_index)
+        if reason == "persistent-post-exit-memory-pressure":
+            warning = dict(trial.environment_status["post_exit"])
+            warning["memory_pressure"] = "warning"
+            trial = _with_environment_observations(trial, post_exit=warning)
+        elif reason == "non-nominal-thermal":
+            trial = _with_thermal_state(trial, "fair", 1)
+        _measurement, _post_exit, persisted = _persist_journal_evidence(
+            journal, attempt, trial
+        )
+        journal.reject_inflight(attempt, persisted, reason=reason)
+    return read_json_object(
+        journal.rejected_path(slot, attempt.journal_attempt_index),
+        label="rejected trial",
+    )
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "persistent-post-exit-memory-pressure",
+        "missing-immediate-post-exit-evidence",
+    ),
+)
+@pytest.mark.parametrize("boundary", ("record", "load"))
+def test_journal_never_uses_a_nonthermal_rejection_as_a_thermal_trigger(
+    tmp_path, reason, boundary
+):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    rejected = _persist_rejected_trial_for_recovery_test(journal, slot, reason)
+    trigger_body = {
+        "kind": "sml-baseline-thermal-recovery-trigger",
+        "version": 1,
+        "source": "rejected-trial",
+        "rejected_trial_identity": rejected["identity"],
+    }
+
+    if boundary == "load":
+        trigger = {
+            **trigger_body,
+            "identity": structured_identity(
+                "sml-baseline-thermal-recovery-trigger-v1", trigger_body
+            ),
+        }
+        atomic_write_json(
+            journal.root
+            / "thermal-waits"
+            / slot.metric
+            / str(slot.pair_index)
+            / "0"
+            / "trigger.json",
+            trigger,
+            create_only=True,
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="requires a non-nominal-thermal rejected trial",
+    ):
+        if boundary == "record":
+            journal.record_recovery_trigger(
+                slot,
+                0,
+                {
+                    "source": "rejected-trial",
+                    "rejected_trial_identity": rejected["identity"],
+                },
+            )
+        else:
+            journal._validate_thermal_recovery_history()
+
+
+def test_journal_accepts_a_non_nominal_thermal_rejection_as_a_recovery_trigger(
+    tmp_path,
+):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    rejected = _persist_rejected_trial_for_recovery_test(
+        journal, slot, "non-nominal-thermal"
+    )
+
+    journal.record_recovery_trigger(
+        slot,
+        0,
+        {
+            "source": "rejected-trial",
+            "rejected_trial_identity": rejected["identity"],
+        },
+    )
+
+    assert journal._validate_thermal_recovery_history() == {slot: (0,)}
+
+
 def test_journal_rejects_boolean_rejected_attempt_index(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)

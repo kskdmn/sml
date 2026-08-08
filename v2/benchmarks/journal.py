@@ -1423,20 +1423,25 @@ class BaselineJournal:
                 )
             return
 
-        identities: set[str] = set()
+        reasons_by_identity: dict[str, str] = {}
         for attempt, path in self._attempt_records("rejected"):
             if attempt.slot != slot:
                 continue
             rejected = read_json_object(path, label="rejected trial")
-            _validate_rejected_document(
+            rejected_body, _trial = _validate_rejected_document(
                 rejected,
                 slot=attempt.slot,
                 journal_attempt_index=attempt.journal_attempt_index,
             )
-            identities.add(rejected["identity"])
-        if body["rejected_trial_identity"] not in identities:
+            reasons_by_identity[rejected["identity"]] = rejected_body["reason"]
+        rejected_identity = body["rejected_trial_identity"]
+        if rejected_identity not in reasons_by_identity:
             raise ValueError(
                 "thermal recovery trigger does not match a persisted rejected trial"
+            )
+        if reasons_by_identity[rejected_identity] != "non-nominal-thermal":
+            raise ValueError(
+                "thermal recovery trigger requires a non-nominal-thermal rejected trial"
             )
 
     def _validate_thermal_recovery_history(
