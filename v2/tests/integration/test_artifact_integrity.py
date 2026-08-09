@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -34,22 +35,30 @@ class RecordingFilesystemOps:
         self,
         *,
         failure_stage: str | None = None,
+        target: Path | None = None,
         swap_candidate: tuple[Path, Path] | None = None,
+        mutate_after_payload_fsync: Callable[[], None] | None = None,
     ) -> None:
         self._inner: FilesystemOps = OS_FILESYSTEM
         self._failure_stage = failure_stage
+        self._target = target
         self._raised = False
-        self._temporary_descriptors: set[int] = set()
+        self._parent_descriptor: int | None = None
+        self._temporary_descriptor: int | None = None
         self._manifest_descriptors: set[int] = set()
         self._temporary_fsyncs: dict[int, int] = {}
         self._swap_candidate = swap_candidate
         self._swapped = False
+        self._mutate_after_payload_fsync = mutate_after_payload_fsync
+        self._mutated = False
+        self.completed_stages: list[str] = []
 
     @classmethod
-    def raise_after(cls, stage: str) -> RecordingFilesystemOps:
-        return cls(failure_stage=stage)
+    def raise_after(cls, stage: str, *, target: Path) -> RecordingFilesystemOps:
+        return cls(failure_stage=stage, target=target)
 
     def _complete(self, stage: str) -> None:
+        self.completed_stages.append(stage)
         if not self._raised and self._failure_stage == stage:
             self._raised = True
             raise InjectedFailure(stage)
@@ -76,8 +85,19 @@ class RecordingFilesystemOps:
             self._swapped = True
         descriptor = self._inner.open(path, flags, mode, dir_fd=dir_fd)
         name = Path(path_text).name
-        if name.startswith(".sml-tmp-") and flags & os.O_DIRECTORY:
-            self._temporary_descriptors.add(descriptor)
+        if (
+            self._target is not None
+            and dir_fd is None
+            and Path(path_text) == self._target.parent
+            and flags & os.O_DIRECTORY
+        ):
+            self._parent_descriptor = descriptor
+        elif (
+            dir_fd == self._parent_descriptor
+            and name.startswith(".sml-tmp-")
+            and flags & os.O_DIRECTORY
+        ):
+            self._temporary_descriptor = descriptor
         if name in {"manifest.json", "checkpoint.json", "run.json"}:
             self._manifest_descriptors.add(descriptor)
         return descriptor
@@ -98,16 +118,19 @@ class RecordingFilesystemOps:
         self._inner.fsync_file(descriptor)
         if descriptor in self._manifest_descriptors:
             self._complete("manifest-written")
+        elif self._mutate_after_payload_fsync is not None and not self._mutated:
+            self._mutated = True
+            self._mutate_after_payload_fsync()
 
     def fsync_directory(self, descriptor: int) -> None:
         self._inner.fsync_directory(descriptor)
-        if descriptor in self._temporary_descriptors:
+        if descriptor == self._temporary_descriptor:
             count = self._temporary_fsyncs.get(descriptor, 0) + 1
             self._temporary_fsyncs[descriptor] = count
             self._complete(
                 "payloads-written" if count == 1 else "temporary-directory-fsynced"
             )
-        else:
+        elif descriptor == self._parent_descriptor:
             self._complete("parent-directory-fsynced")
 
     def rename(
@@ -163,9 +186,15 @@ class RecordingFilesystemOps:
         self._inner.flock(descriptor, operation)
 
 
-def _tokenizer_manifest_with_payloads(root):
-    model_path = root / "tokenizer.model"
-    vocab_path = root / "tokenizer.vocab"
+def _tokenizer_manifest_with_payloads(root, *, payload_directory: str | None = None):
+    payload_root = root
+    logical_prefix = ""
+    if payload_directory is not None:
+        payload_root = root / payload_directory
+        payload_root.mkdir()
+        logical_prefix = f"{payload_directory}/"
+    model_path = payload_root / "tokenizer.model"
+    vocab_path = payload_root / "tokenizer.vocab"
     model_path.write_bytes(b"model bytes")
     vocab_path.write_bytes(b"vocab bytes")
     with model_path.open("rb") as file:
@@ -183,8 +212,16 @@ def _tokenizer_manifest_with_payloads(root):
         eos_token_id=2,
         pad_token_id=3,
         unk_token_id=0,
-        model=PayloadRef("tokenizer.model", model_identity, model_path.stat().st_size),
-        vocab=PayloadRef("tokenizer.vocab", vocab_identity, vocab_path.stat().st_size),
+        model=PayloadRef(
+            f"{logical_prefix}tokenizer.model",
+            model_identity,
+            model_path.stat().st_size,
+        ),
+        vocab=PayloadRef(
+            f"{logical_prefix}tokenizer.vocab",
+            vocab_identity,
+            vocab_path.stat().st_size,
+        ),
         diagnostic_source_locator="/source/tokenizer",
     )
     return replace(manifest, identity=manifest.recompute_identity())
@@ -197,17 +234,25 @@ def _published_tokenizer_manifest(root):
 
 
 def _immutable_bundle_builder(private_path: Path) -> TokenizerManifest:
-    return _tokenizer_manifest_with_payloads(private_path)
+    return _tokenizer_manifest_with_payloads(
+        private_path,
+        payload_directory="payloads",
+    )
 
 
 @pytest.mark.parametrize("stage", IMMUTABLE_PUBLICATION_STAGES)
 def test_interrupted_bundle_never_exposes_partial_target(stage, tmp_path):
     """Every completed durability boundary must leave absence or a full bundle."""
     target = tmp_path / "bundle"
-    fs = RecordingFilesystemOps.raise_after(stage)
+    fs = RecordingFilesystemOps.raise_after(stage, target=target)
 
     with pytest.raises(InjectedFailure, match=stage):
         publish_immutable_bundle(target, _immutable_bundle_builder, fs=fs)
+
+    completed_index = IMMUTABLE_PUBLICATION_STAGES.index(stage)
+    assert fs.completed_stages == list(
+        IMMUTABLE_PUBLICATION_STAGES[: completed_index + 1]
+    )
 
     if target.exists():
         verified = read_manifest(target, TokenizerManifest, VerificationLevel.FULL)
@@ -253,6 +298,28 @@ def test_cleanup_revalidates_candidate_before_descriptor_relative_delete(tmp_pat
         publish_immutable_bundle(target, _immutable_bundle_builder, fs=fs)
 
     assert sentinel.read_bytes() == b"outside"
+    assert not target.exists()
+
+
+def test_payload_mutation_during_durability_is_revalidated_before_commit(tmp_path):
+    """FULL must be established after durability work, immediately before rename."""
+    target = tmp_path / "bundle"
+    private_paths: list[Path] = []
+
+    def builder(private_path: Path) -> TokenizerManifest:
+        private_paths.append(private_path)
+        return _immutable_bundle_builder(private_path)
+
+    def mutate_payload() -> None:
+        (private_paths[0] / "payloads" / "tokenizer.model").write_bytes(
+            b"mutated-bytes"
+        )
+
+    fs = RecordingFilesystemOps(mutate_after_payload_fsync=mutate_payload)
+
+    with pytest.raises(SMLArtifactError, match="payload identity|payload byte size"):
+        publish_immutable_bundle(target, builder, fs=fs)
+
     assert not target.exists()
 
 

@@ -33,6 +33,7 @@ from sml.artifacts.manifest import (
     VerificationLevel,
     _descriptor_is_local_apfs,
     canonical_json_bytes,
+    parse_logical_path,
     read_manifest,
 )
 from sml.errors import SMLArtifactError
@@ -53,8 +54,8 @@ _OPEN_MANIFEST = (
     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
 _TEMPORARY_SUFFIX_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
-_LOCK_RETRY_SECONDS = 10.0
-_LOCK_RETRY_INTERVAL_SECONDS = 0.005
+_LOCK_RETRY_INITIAL_SECONDS = 0.001
+_LOCK_RETRY_MAX_SECONDS = 0.1
 _RENAME_EXCL = 0x00000004
 
 _MANIFEST_TYPES = (
@@ -303,13 +304,64 @@ def _lock_name(protected_name: str, category: str) -> str:
     return f".sml-{category}-lock-{_name_digest(protected_name)}"
 
 
-def _read_lock_owner(descriptor: int) -> str:
+def _diagnostic_name(protected_name: str, category: str) -> str:
+    return f".sml-{category}-diagnostic-{_name_digest(protected_name)}"
+
+
+def _read_lock_owners(descriptor: int) -> list[dict[str, object]]:
     try:
         os.lseek(descriptor, 0, os.SEEK_SET)
-        owner = os.read(descriptor, 4096).decode("utf-8", errors="replace").strip()
-    except OSError:
+        raw_bytes = bytearray()
+        while chunk := os.read(descriptor, 4096):
+            raw_bytes.extend(chunk)
+            if len(raw_bytes) > 1024 * 1024:
+                return []
+        raw = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, dict) or set(raw) != {"holders"}:
+        return []
+    holders = raw["holders"]
+    if not isinstance(holders, list):
+        return []
+    validated: list[dict[str, object]] = []
+    for holder in holders:
+        if (
+            not isinstance(holder, dict)
+            or set(holder) != {"pid", "protected_path", "token"}
+            or isinstance(holder["pid"], bool)
+            or not isinstance(holder["pid"], int)
+            or not isinstance(holder["protected_path"], str)
+            or not isinstance(holder["token"], str)
+        ):
+            return []
+        validated.append(holder)
+    return validated
+
+
+def _write_lock_owners(
+    descriptor: int,
+    holders: list[dict[str, object]],
+) -> None:
+    document = json.dumps(
+        {"holders": holders},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    os.ftruncate(descriptor, 0)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    OS_FILESYSTEM.write_all(descriptor, document)
+    OS_FILESYSTEM.fsync_file(descriptor)
+
+
+def _owner_diagnostics(holders: list[dict[str, object]]) -> str:
+    if not holders:
         return "owner diagnostics unavailable"
-    return owner or "owner diagnostics unavailable"
+    return json.dumps(
+        {"holders": holders},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _open_lock_sidecar(sidecar: str, parent_descriptor: int) -> int:
@@ -335,37 +387,74 @@ def _protected_lock(
     *,
     category: str,
     exclusive: bool,
+    wait: bool = False,
 ) -> Iterator[None]:
     parent, protected_name = _path_parts(protected)
     parent_descriptor = _open_writable_parent(parent, OS_FILESYSTEM)
     lock_descriptor = -1
+    diagnostic_descriptor = -1
+    acquired = False
+    owner_token = uuid.uuid4().hex
     try:
         sidecar = _lock_name(protected_name, category)
         lock_descriptor = _open_lock_sidecar(sidecar, parent_descriptor)
-        lock_stat = OS_FILESYSTEM.stat(lock_descriptor)
-        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
-            raise SMLArtifactError("lock sidecar must be a singly linked regular file")
+        diagnostic_descriptor = _open_lock_sidecar(
+            _diagnostic_name(protected_name, category),
+            parent_descriptor,
+        )
+        for descriptor in (lock_descriptor, diagnostic_descriptor):
+            sidecar_stat = OS_FILESYSTEM.stat(descriptor)
+            if not stat.S_ISREG(sidecar_stat.st_mode) or sidecar_stat.st_nlink != 1:
+                raise SMLArtifactError(
+                    "lock sidecars must be singly linked regular files"
+                )
         operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        try:
-            OS_FILESYSTEM.flock(lock_descriptor, operation | fcntl.LOCK_NB)
-        except OSError as error:
-            if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
-                raise
-            owner = _read_lock_owner(lock_descriptor)
-            raise _LockUnavailable(
-                f"{category} lock for {protected} is held by {owner}"
-            ) from None
+        retry_delay = _LOCK_RETRY_INITIAL_SECONDS
+        while not acquired:
+            OS_FILESYSTEM.flock(diagnostic_descriptor, fcntl.LOCK_EX)
+            conflict: _LockUnavailable | None = None
+            try:
+                try:
+                    OS_FILESYSTEM.flock(
+                        lock_descriptor,
+                        operation | fcntl.LOCK_NB,
+                    )
+                except OSError as error:
+                    if error.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        errno.EWOULDBLOCK,
+                    }:
+                        raise
+                    conflict = _LockUnavailable(
+                        f"{category} lock for {protected} is held by "
+                        f"{_owner_diagnostics(_read_lock_owners(diagnostic_descriptor))}"
+                    )
+                else:
+                    holders = (
+                        [] if exclusive else _read_lock_owners(diagnostic_descriptor)
+                    )
+                    holders.append(
+                        {
+                            "pid": os.getpid(),
+                            "protected_path": str(protected),
+                            "token": owner_token,
+                        }
+                    )
+                    _write_lock_owners(diagnostic_descriptor, holders)
+                    OS_FILESYSTEM.fsync_directory(parent_descriptor)
+                    acquired = True
+            finally:
+                OS_FILESYSTEM.flock(diagnostic_descriptor, fcntl.LOCK_UN)
 
-        owner = json.dumps(
-            {"pid": os.getpid(), "protected_path": str(protected)},
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        os.ftruncate(lock_descriptor, 0)
-        os.lseek(lock_descriptor, 0, os.SEEK_SET)
-        OS_FILESYSTEM.write_all(lock_descriptor, owner)
-        OS_FILESYSTEM.fsync_file(lock_descriptor)
-        OS_FILESYSTEM.fsync_directory(parent_descriptor)
+            if conflict is not None:
+                if not wait:
+                    raise conflict from None
+                time.sleep(retry_delay)
+                retry_delay = min(
+                    retry_delay * 2,
+                    _LOCK_RETRY_MAX_SECONDS,
+                )
         yield
     except SMLArtifactError:
         raise
@@ -374,12 +463,28 @@ def _protected_lock(
             f"could not manage {category} lock for {protected}"
         ) from error
     finally:
+        if acquired and diagnostic_descriptor >= 0:
+            try:
+                OS_FILESYSTEM.flock(diagnostic_descriptor, fcntl.LOCK_EX)
+                try:
+                    remaining = [
+                        holder
+                        for holder in _read_lock_owners(diagnostic_descriptor)
+                        if holder["token"] != owner_token
+                    ]
+                    _write_lock_owners(diagnostic_descriptor, remaining)
+                finally:
+                    OS_FILESYSTEM.flock(diagnostic_descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
         if lock_descriptor >= 0:
             try:
                 OS_FILESYSTEM.flock(lock_descriptor, fcntl.LOCK_UN)
             except OSError:
                 pass
             os.close(lock_descriptor)
+        if diagnostic_descriptor >= 0:
+            os.close(diagnostic_descriptor)
         os.close(parent_descriptor)
 
 
@@ -601,6 +706,153 @@ def _payload_references(value: object) -> Iterator[PayloadRef]:
             yield from _payload_references(item)
 
 
+def _expected_closed_world(
+    references: Sequence[PayloadRef],
+) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
+    expected_files: set[tuple[str, ...]] = set()
+    expected_directories: set[tuple[str, ...]] = set()
+    for reference in references:
+        components = parse_logical_path(reference.logical_path)
+        expected_files.add(components)
+        expected_directories.update(
+            components[:depth] for depth in range(1, len(components))
+        )
+    if expected_files & expected_directories:
+        raise SMLArtifactError(
+            "closed-world payload paths cannot be both files and directories"
+        )
+    return expected_files, expected_directories
+
+
+def _scan_closed_world(
+    fs: FilesystemOps,
+    directory_descriptor: int,
+    *,
+    prefix: tuple[str, ...] = (),
+    files: set[tuple[str, ...]] | None = None,
+    directories: set[tuple[str, ...]] | None = None,
+    collision_paths: dict[tuple[str, ...], tuple[str, ...]] | None = None,
+) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
+    if files is None:
+        files = set()
+    if directories is None:
+        directories = set()
+    if collision_paths is None:
+        collision_paths = {}
+    for name in sorted(fs.listdir(directory_descriptor)):
+        if not _safe_child_name(name):
+            raise SMLArtifactError("closed-world tree contains an invalid entry name")
+        normalized_name = parse_logical_path(name)
+        if len(normalized_name) != 1:
+            raise SMLArtifactError("closed-world entry must be one direct child")
+        logical_path = prefix + normalized_name
+        collision_key = tuple(component.casefold() for component in logical_path)
+        previous = collision_paths.get(collision_key)
+        if previous is not None:
+            raise SMLArtifactError(
+                "closed-world tree contains a normalized or case-folded collision: "
+                f"{'/'.join(previous)!r} and {'/'.join(logical_path)!r}"
+            )
+        collision_paths[collision_key] = logical_path
+        entry_stat = fs.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISREG(entry_stat.st_mode):
+            if entry_stat.st_nlink != 1:
+                raise SMLArtifactError(
+                    f"closed-world payload is hard-linked: {'/'.join(logical_path)}"
+                )
+            descriptor, opened_stat = _opened_entry(
+                fs,
+                name,
+                parent_descriptor=directory_descriptor,
+                flags=_OPEN_PAYLOAD,
+            )
+            try:
+                if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
+                    raise SMLArtifactError(
+                        f"closed-world payload is not a regular file: "
+                        f"{'/'.join(logical_path)}"
+                    )
+                files.add(logical_path)
+            finally:
+                os.close(descriptor)
+        elif stat.S_ISDIR(entry_stat.st_mode):
+            descriptor, opened_stat = _opened_entry(
+                fs,
+                name,
+                parent_descriptor=directory_descriptor,
+                flags=_OPEN_DIRECTORY,
+            )
+            try:
+                if not stat.S_ISDIR(opened_stat.st_mode):
+                    raise SMLArtifactError(
+                        f"closed-world component is not a directory: "
+                        f"{'/'.join(logical_path)}"
+                    )
+                directories.add(logical_path)
+                _scan_closed_world(
+                    fs,
+                    descriptor,
+                    prefix=logical_path,
+                    files=files,
+                    directories=directories,
+                    collision_paths=collision_paths,
+                )
+            finally:
+                os.close(descriptor)
+        else:
+            raise SMLArtifactError(
+                f"closed-world tree rejects symlink or special file: "
+                f"{'/'.join(logical_path)}"
+            )
+    return files, directories
+
+
+def _format_logical_paths(paths: set[tuple[str, ...]]) -> list[str]:
+    return ["/".join(path) for path in sorted(paths)]
+
+
+def _verify_closed_world(
+    fs: FilesystemOps,
+    temporary_descriptor: int,
+    manifest: object,
+    *,
+    manifest_present: bool,
+) -> None:
+    references = tuple(_payload_references(manifest))
+    expected_files, expected_directories = _expected_closed_world(references)
+    if manifest_present:
+        expected_files.add(parse_logical_path(manifest.MANIFEST_FILENAME))
+    actual_files, actual_directories = _scan_closed_world(
+        fs,
+        temporary_descriptor,
+    )
+    if actual_files != expected_files or actual_directories != expected_directories:
+        raise SMLArtifactError(
+            "artifact closed-world mismatch: "
+            f"unreferenced files={_format_logical_paths(actual_files - expected_files)}, "
+            f"missing files={_format_logical_paths(expected_files - actual_files)}, "
+            "unreferenced directories="
+            f"{_format_logical_paths(actual_directories - expected_directories)}, "
+            "missing directories="
+            f"{_format_logical_paths(expected_directories - actual_directories)}"
+        )
+
+    with ArtifactRoot(os.dup(temporary_descriptor), local_apfs=True) as artifact_root:
+        artifact_root.verify_payloads(references, full=True)
+        if manifest_present:
+            with artifact_root.open_payload(
+                manifest.MANIFEST_FILENAME
+            ) as manifest_file:
+                if manifest_file.read() != canonical_json_bytes(manifest):
+                    raise SMLArtifactError(
+                        "publisher-owned manifest changed before immutable commit"
+                    )
+
+
 def _make_payload_tree_durable(fs: FilesystemOps, directory_descriptor: int) -> None:
     for name in sorted(fs.listdir(directory_descriptor)):
         if not _safe_child_name(name):
@@ -667,8 +919,12 @@ def _validate_builder_result(
         is not None
     ):
         raise SMLArtifactError("builder must not write the manifest")
-    with ArtifactRoot(os.dup(temporary_descriptor), local_apfs=True) as artifact_root:
-        artifact_root.verify_payloads(tuple(_payload_references(manifest)), full=True)
+    _verify_closed_world(
+        fs,
+        temporary_descriptor,
+        manifest,
+        manifest_present=False,
+    )
     return manifest
 
 
@@ -749,6 +1005,12 @@ def _publish_with_lock[M](
             fs, target_name, parent_descriptor=parent_descriptor
         )
         if existing is not None:
+            _verify_closed_world(
+                fs,
+                temporary_descriptor,
+                manifest,
+                manifest_present=True,
+            )
             return _accept_existing(target, manifest)
 
         named_temporary = fs.stat(
@@ -761,6 +1023,12 @@ def _publish_with_lock[M](
             named_temporary, opened_temporary
         ):
             raise SMLArtifactError("temporary publication directory was swapped")
+        _verify_closed_world(
+            fs,
+            temporary_descriptor,
+            manifest,
+            manifest_present=True,
+        )
         try:
             fs.rename(
                 temporary_name,
@@ -808,15 +1076,13 @@ def publish_immutable_bundle[M](
         raise TypeError("build must be callable")
     if not isinstance(fs, FilesystemOps):
         raise TypeError("fs must implement FilesystemOps")
-    deadline = time.monotonic() + _LOCK_RETRY_SECONDS
-    while True:
-        try:
-            with publication_lock(target):
-                return _publish_with_lock(target, build, fs=fs)
-        except _LockUnavailable:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(_LOCK_RETRY_INTERVAL_SECONDS)
+    with _protected_lock(
+        target,
+        category="publication",
+        exclusive=True,
+        wait=True,
+    ):
+        return _publish_with_lock(target, build, fs=fs)
 
 
 __all__ = [
