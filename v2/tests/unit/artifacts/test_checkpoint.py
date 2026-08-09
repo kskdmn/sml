@@ -291,35 +291,51 @@ class _MutateAfterStepParentFsyncFilesystemOps(RecordingFilesystemOps):
             ).write_bytes(b"mutated-after-commit")
 
 
-class _SwapRunAfterRecoveryFilesystemOps(_SwapRunOnSecondOpenFilesystemOps):
-    pass
+class _SwapRunDuringRecoveryFilesystemOps(RecordingFilesystemOps):
+    def __init__(self, run: Path, replacement: Path) -> None:
+        super().__init__(run)
+        self._replacement = replacement
+        self.swapped = False
+
+    def listdir(self, descriptor: int) -> list[str]:
+        if descriptor == self._checkpoints_descriptor and not self.swapped:
+            self._run.rename(self._run.with_name("moved-original-run"))
+            self._replacement.rename(self._run)
+            self.swapped = True
+        return super().listdir(descriptor)
 
 
-class _SwapCandidateOnReopenFilesystemOps(RecordingFilesystemOps):
+class _SwapCandidateAtDetachFilesystemOps(RecordingFilesystemOps):
     def __init__(self, run: Path, *, candidate: str, replacement: Path) -> None:
         super().__init__(run)
         self._candidate = candidate
         self._replacement = replacement
-        self._candidate_open_count = 0
+        self.swapped = False
 
-    def open(
+    def rename(
         self,
-        path: str | os.PathLike[str],
-        flags: int,
-        mode: int = 0o777,
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
         *,
-        dir_fd: int | None = None,
-    ) -> int:
+        source_dir_fd: int,
+        destination_dir_fd: int,
+    ) -> None:
         if (
-            dir_fd == self._checkpoints_descriptor
-            and os.fspath(path) == self._candidate
+            not self.swapped
+            and source_dir_fd == self._checkpoints_descriptor
+            and os.fspath(source) == self._candidate
+            and os.fspath(destination).startswith(".sml-tmp-step-")
         ):
-            self._candidate_open_count += 1
-            if self._candidate_open_count == 2:
-                candidate = self._run / "checkpoints" / self._candidate
-                candidate.rename(candidate.with_name("parked-original-candidate"))
-                self._replacement.rename(candidate)
-        return super().open(path, flags, mode, dir_fd=dir_fd)
+            candidate = self._run / "checkpoints" / self._candidate
+            candidate.rename(candidate.with_name("parked-original-candidate"))
+            self._replacement.rename(candidate)
+            self.swapped = True
+        super().rename(
+            source,
+            destination,
+            source_dir_fd=source_dir_fd,
+            destination_dir_fd=destination_dir_fd,
+        )
 
 
 class _SwapLatestIntoCandidateFilesystemOps(RecordingFilesystemOps):
@@ -386,6 +402,48 @@ class _SwapLatestIntoCandidateFilesystemOps(RecordingFilesystemOps):
             source_dir_fd=source_dir_fd,
             destination_dir_fd=destination_dir_fd,
         )
+
+    @property
+    def swapped(self) -> bool:
+        return self._swapped
+
+
+class _SwapLatestIntoCleanupTemporaryFilesystemOps(RecordingFilesystemOps):
+    def __init__(
+        self,
+        run: Path,
+        *,
+        temporary: str,
+        latest: str,
+        latest_replacement: Path,
+    ) -> None:
+        super().__init__(run)
+        self._temporary = temporary
+        self._latest = latest
+        self._latest_replacement = latest_replacement
+        self.swapped = False
+
+    def open(
+        self,
+        path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if (
+            not self.swapped
+            and dir_fd == self._checkpoints_descriptor
+            and os.fspath(path) == self._temporary
+        ):
+            checkpoints = self._run / "checkpoints"
+            (checkpoints / self._temporary).rename(
+                checkpoints / "parked-original-cleanup-temporary"
+            )
+            (checkpoints / self._latest).rename(checkpoints / self._temporary)
+            self._latest_replacement.rename(checkpoints / self._latest)
+            self.swapped = True
+        return super().open(path, flags, mode, dir_fd=dir_fd)
 
 
 class _MutateLatestBeforeFreshProofFilesystemOps(RecordingFilesystemOps):
@@ -895,41 +953,60 @@ def test_retention_reports_persisted_latest_recovery(valid_run: Path) -> None:
     assert retained.latest_repair_persisted is True
 
 
-def test_retention_keeps_recovered_run_descriptor_bound(valid_run: Path) -> None:
-    """A path swap after recovery must never redirect deletion into another run."""
+def test_retention_run_path_swap_uses_retained_original_descriptor(
+    valid_run: Path,
+) -> None:
+    """A real path swap during recovery must not redirect later retention work."""
     _publish_step(valid_run, 2)
     replacement = valid_run.with_name("replacement-run")
     shutil.copytree(valid_run, replacement)
-    fs = _SwapRunAfterRecoveryFilesystemOps(valid_run, replacement)
+    sentinel = replacement / "decoy-must-survive.bin"
+    sentinel.write_bytes(b"decoy-run")
+    fs = _SwapRunDuringRecoveryFilesystemOps(valid_run, replacement)
 
     with checkpoint.run_writer_lock(valid_run):
         retained = checkpoint.apply_retention(valid_run, keep_last=1, fs=fs)
 
     assert retained.step == 2
-    assert replacement.is_dir()
-    assert (replacement / "checkpoints" / "step-000000001").is_dir()
-    assert not valid_run.with_name("moved-original-run").exists()
+    assert fs.swapped is True
+    moved_original = valid_run.with_name("moved-original-run")
+    assert sorted(path.name for path in (moved_original / "checkpoints").iterdir()) == [
+        "step-000000002"
+    ]
+    assert sorted(path.name for path in (valid_run / "checkpoints").iterdir()) == [
+        "step-000000001",
+        "step-000000002",
+    ]
+    assert (valid_run / sentinel.name).read_bytes() == b"decoy-run"
 
 
-def test_retention_never_reopens_proved_candidate_by_name(valid_run: Path) -> None:
-    """Candidate proof must own the same inode later detached for deletion."""
+def test_retention_candidate_swap_at_detach_preserves_replacement(
+    valid_run: Path,
+) -> None:
+    """A real canonical swap at detach must fail before replacement deletion."""
     _publish_step(valid_run, 2)
     _publish_step(valid_run, 3)
     replacement = valid_run.with_name("candidate-replacement")
     replacement.mkdir()
     sentinel = replacement / "must-survive.bin"
     sentinel.write_bytes(b"outside-candidate")
-    fs = _SwapCandidateOnReopenFilesystemOps(
+    fs = _SwapCandidateAtDetachFilesystemOps(
         valid_run,
         candidate="step-000000001",
         replacement=replacement,
     )
 
-    with checkpoint.run_writer_lock(valid_run):
+    with (
+        checkpoint.run_writer_lock(valid_run),
+        pytest.raises(SMLArtifactError, match="inode|bound|swapped|candidate"),
+    ):
         checkpoint.apply_retention(valid_run, keep_last=2, fs=fs)
 
-    assert sentinel.read_bytes() == b"outside-candidate"
-    assert not (valid_run / "checkpoints" / "parked-original-candidate").exists()
+    assert fs.swapped is True
+    assert (valid_run / "checkpoints" / "parked-original-candidate").is_dir()
+    surviving_sentinels = list((valid_run / "checkpoints").glob("*/must-survive.bin"))
+    assert len(surviving_sentinels) == 1
+    assert surviving_sentinels[0].read_bytes() == b"outside-candidate"
 
 
 def test_retention_latest_swap_never_deletes_proved_latest(valid_run: Path) -> None:
@@ -955,9 +1032,49 @@ def test_retention_latest_swap_never_deletes_proved_latest(valid_run: Path) -> N
     ):
         checkpoint.apply_retention(valid_run, keep_last=2, fs=fs)
 
+    assert fs.swapped is True
     surviving_inodes = {
         (entry.stat().st_dev, entry.stat().st_ino)
         for entry in (valid_run / "checkpoints").iterdir()
+        if entry.is_dir()
+    }
+    assert latest_inode in surviving_inodes
+
+
+def test_retention_cleanup_never_deletes_latest_swapped_under_exact_temp(
+    valid_run: Path,
+) -> None:
+    """Retry cleanup must reject a temp rebound to the retained latest inode."""
+    _publish_step(valid_run, 2)
+    checkpoints = valid_run / "checkpoints"
+    temporary_name = ".sml-tmp-step-" + "a" * 32
+    cleanup_temporary = checkpoints / temporary_name
+    cleanup_temporary.mkdir()
+    (cleanup_temporary / "old-temp.bin").write_bytes(b"old-temp")
+    latest_path = checkpoints / "step-000000002"
+    latest_stat = latest_path.stat()
+    latest_inode = (latest_stat.st_dev, latest_stat.st_ino)
+    latest_replacement = valid_run.with_name("cleanup-latest-replacement")
+    latest_replacement.mkdir()
+    (latest_replacement / "replacement.bin").write_bytes(b"replacement")
+    fs = _SwapLatestIntoCleanupTemporaryFilesystemOps(
+        valid_run,
+        temporary=temporary_name,
+        latest="step-000000002",
+        latest_replacement=latest_replacement,
+    )
+
+    with (
+        checkpoint.run_writer_lock(valid_run),
+        pytest.raises(SMLArtifactError, match="inode|bound|swapped|latest|temporary"),
+    ):
+        checkpoint.apply_retention(valid_run, keep_last=None, fs=fs)
+
+    assert fs.swapped is True
+    assert fs.delete_count == 0
+    surviving_inodes = {
+        (entry.stat().st_dev, entry.stat().st_ino)
+        for entry in checkpoints.iterdir()
         if entry.is_dir()
     }
     assert latest_inode in surviving_inodes

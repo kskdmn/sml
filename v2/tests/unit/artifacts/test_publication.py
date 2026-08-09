@@ -99,23 +99,22 @@ class _ForwardingFilesystemOps:
 
 
 class _DelayedMetadataFilesystemOps(_ForwardingFilesystemOps):
-    def __init__(self, inner, *, started, release, claimed) -> None:
+    def __init__(self, inner, *, transition) -> None:
         super().__init__(inner)
-        self._started = started
-        self._release = release
-        self._claimed = claimed
+        self._transition = transition
+        self._claimed = False
 
     def write_all(self, descriptor, data):
         delay = False
-        if b"protected_path" in data:
-            with self._claimed.get_lock():
-                if self._claimed.value == 0:
-                    self._claimed.value = 1
-                    delay = True
+        if b"protected_path" in data and not self._claimed:
+            self._claimed = True
+            delay = True
         if delay:
-            self._started.set()
-            if not self._release.wait(10):
+            self._transition.send("metadata-started")
+            if not self._transition.poll(10):
                 raise RuntimeError("timed out delaying owner diagnostics")
+            if self._transition.recv() != "allow-metadata":
+                raise RuntimeError("unexpected owner diagnostic release message")
         self._inner.write_all(descriptor, data)
 
 
@@ -163,10 +162,9 @@ class _SwappingRenameFilesystemOps(_ForwardingFilesystemOps):
 
 
 class _DelayedReleaseFilesystemOps(_ForwardingFilesystemOps):
-    def __init__(self, inner, *, started, release) -> None:
+    def __init__(self, inner, *, transition) -> None:
         super().__init__(inner)
-        self._started = started
-        self._release = release
+        self._transition = transition
         self._creator_pid = os.getpid()
         self._empty_metadata_descriptor: int | None = None
         self._delayed = False
@@ -185,9 +183,11 @@ class _DelayedReleaseFilesystemOps(_ForwardingFilesystemOps):
             and operation == fcntl.LOCK_UN
         ):
             self._delayed = True
-            self._started.set()
-            if not self._release.wait(10):
+            self._transition.send("transition-started")
+            if not self._transition.poll(10):
                 raise RuntimeError("timed out delaying release transition")
+            if self._transition.recv() != "allow-transition":
+                raise RuntimeError("unexpected release transition message")
 
 
 def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
@@ -239,23 +239,53 @@ def _acquire_publication_lock_then_exit(target: str, connection) -> None:
         os._exit(0)
 
 
-def _hold_run_writer(run: str, ready, release) -> None:
-    with run_writer_lock(Path(run)):
-        ready.set()
-        if not release.wait(10):
-            raise RuntimeError("timed out waiting to release run writer")
+def _hold_run_writer(run: str, connection) -> None:
+    try:
+        with run_writer_lock(Path(run)):
+            connection.send("holder-ready")
+            if not connection.poll(10):
+                raise RuntimeError("timed out waiting to release run writer")
+            if connection.recv() != "release-holder":
+                raise RuntimeError("unexpected run writer release message")
+    finally:
+        connection.close()
 
 
-def _hold_run_writer_with_fs(run: str, ready, release, fs) -> None:
+def _hold_run_writer_with_fs(run: str, connection, fs) -> None:
     checkpoint.OS_FILESYSTEM = fs
-    _hold_run_writer(run, ready, release)
+    try:
+        _hold_run_writer(run, connection)
+    finally:
+        fs._transition.close()
 
 
-def _hold_run_access(run: str, ready, release) -> None:
-    with run_access_lock(Path(run), exclusive=False):
-        ready.set()
-        if not release.wait(10):
-            raise RuntimeError("timed out waiting to release run access")
+def _hold_run_access(run: str, connection) -> None:
+    try:
+        with run_access_lock(Path(run), exclusive=False):
+            connection.send("holder-ready")
+            if not connection.poll(10):
+                raise RuntimeError("timed out waiting to release run access")
+            if connection.recv() != "release-holder":
+                raise RuntimeError("unexpected run access release message")
+    finally:
+        connection.close()
+
+
+def _send_if_open(connection, message: str) -> None:
+    try:
+        connection.send(message)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+
+
+def _join_or_terminate(process) -> tuple[int | None, bool]:
+    terminated = False
+    process.join(timeout=10)
+    if process.is_alive():
+        terminated = True
+        process.terminate()
+        process.join(timeout=5)
+    return process.exitcode, terminated
 
 
 def _acquire_run_access_then_exit(run: str, connection) -> None:
@@ -413,15 +443,18 @@ def test_conflicting_process_reports_live_owner(tmp_path):
     run = tmp_path / "run-0001"
     run.mkdir()
     context = multiprocessing.get_context("spawn")
-    ready = context.Event()
-    release = context.Event()
+    parent_connection, child_connection = context.Pipe()
     process = context.Process(
         target=_hold_run_writer,
-        args=(str(run), ready, release),
+        args=(str(run), child_connection),
     )
     process.start()
+    child_connection.close()
+    child_exitcode = None
+    child_terminated = False
     try:
-        assert ready.wait(10), "child did not acquire the run writer lock"
+        assert parent_connection.poll(10), "child did not acquire the run writer lock"
+        assert parent_connection.recv() == "holder-ready"
         with (
             pytest.raises(SMLArtifactError) as conflict,
             run_writer_lock(run),
@@ -431,12 +464,12 @@ def test_conflicting_process_reports_live_owner(tmp_path):
         assert str(process.pid) in message
         assert str(run) in message
     finally:
-        release.set()
-        process.join(timeout=10)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
+        _send_if_open(parent_connection, "release-holder")
+        child_exitcode, child_terminated = _join_or_terminate(process)
+        parent_connection.close()
         process.close()
+    assert child_terminated is False
+    assert child_exitcode == 0
 
 
 def test_conflict_waits_for_complete_owner_diagnostics(tmp_path, monkeypatch):
@@ -444,44 +477,48 @@ def test_conflict_waits_for_complete_owner_diagnostics(tmp_path, monkeypatch):
     run = tmp_path / "run-0001"
     run.mkdir()
     context = multiprocessing.get_context("spawn")
-    metadata_started = context.Event()
-    allow_metadata = context.Event()
-    holder_ready = context.Event()
-    holder_release = context.Event()
-    claimed = context.Value("i", 0)
+    metadata_parent, metadata_child = context.Pipe()
+    holder_parent, holder_child = context.Pipe()
     delayed_fs = _DelayedMetadataFilesystemOps(
         checkpoint.OS_FILESYSTEM,
-        started=metadata_started,
-        release=allow_metadata,
-        claimed=claimed,
+        transition=metadata_child,
     )
     monkeypatch.setattr(checkpoint, "OS_FILESYSTEM", delayed_fs)
     process = context.Process(
         target=_hold_run_writer_with_fs,
-        args=(str(run), holder_ready, holder_release, delayed_fs),
+        args=(str(run), holder_child, delayed_fs),
     )
     process.start()
+    metadata_child.close()
+    holder_child.close()
+    child_exitcode = None
+    child_terminated = False
     try:
-        assert metadata_started.wait(10), "owner did not begin diagnostic transition"
+        assert metadata_parent.poll(10), "owner did not begin diagnostic transition"
+        assert metadata_parent.recv() == "metadata-started"
         with ThreadPoolExecutor(max_workers=1) as executor:
             conflict = executor.submit(_conflicting_run_writer_message, run)
             try:
                 time.sleep(0.15)
                 assert not conflict.done()
             finally:
-                allow_metadata.set()
-            assert holder_ready.wait(10), "owner did not complete diagnostic transition"
+                _send_if_open(metadata_parent, "allow-metadata")
+            assert holder_parent.poll(10), (
+                "owner did not complete diagnostic transition"
+            )
+            assert holder_parent.recv() == "holder-ready"
             message = conflict.result(timeout=5)
         assert str(process.pid) in message
         assert str(run) in message
     finally:
-        allow_metadata.set()
-        holder_release.set()
-        process.join(timeout=10)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
+        _send_if_open(metadata_parent, "allow-metadata")
+        _send_if_open(holder_parent, "release-holder")
+        child_exitcode, child_terminated = _join_or_terminate(process)
+        metadata_parent.close()
+        holder_parent.close()
         process.close()
+    assert child_terminated is False
+    assert child_exitcode == 0
 
 
 def test_release_transition_never_exposes_empty_owner_diagnostics(
@@ -491,25 +528,28 @@ def test_release_transition_never_exposes_empty_owner_diagnostics(
     run = tmp_path / "run-0001"
     run.mkdir()
     context = multiprocessing.get_context("spawn")
-    holder_ready = context.Event()
-    holder_release = context.Event()
-    transition_started = context.Event()
-    allow_transition = context.Event()
+    holder_parent, holder_child = context.Pipe()
+    transition_parent, transition_child = context.Pipe()
     delayed_fs = _DelayedReleaseFilesystemOps(
         checkpoint.OS_FILESYSTEM,
-        started=transition_started,
-        release=allow_transition,
+        transition=transition_child,
     )
     monkeypatch.setattr(checkpoint, "OS_FILESYSTEM", delayed_fs)
     process = context.Process(
         target=_hold_run_writer_with_fs,
-        args=(str(run), holder_ready, holder_release, delayed_fs),
+        args=(str(run), holder_child, delayed_fs),
     )
     process.start()
+    holder_child.close()
+    transition_child.close()
+    child_exitcode = None
+    child_terminated = False
     try:
-        assert holder_ready.wait(10), "child did not acquire the run writer lock"
-        holder_release.set()
-        assert transition_started.wait(10), "child did not reach release transition"
+        assert holder_parent.poll(10), "child did not acquire the run writer lock"
+        assert holder_parent.recv() == "holder-ready"
+        holder_parent.send("release-holder")
+        assert transition_parent.poll(10), "child did not reach release transition"
+        assert transition_parent.recv() == "transition-started"
         outcome, message = _run_writer_outcome(run)
         if outcome == "conflict":
             assert "owner diagnostics unavailable" not in message
@@ -518,13 +558,14 @@ def test_release_transition_never_exposes_empty_owner_diagnostics(
         else:
             assert outcome == "acquired"
     finally:
-        allow_transition.set()
-        holder_release.set()
-        process.join(timeout=10)
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=5)
+        _send_if_open(transition_parent, "allow-transition")
+        _send_if_open(holder_parent, "release-holder")
+        child_exitcode, child_terminated = _join_or_terminate(process)
+        holder_parent.close()
+        transition_parent.close()
         process.close()
+    assert child_terminated is False
+    assert child_exitcode == 0
 
 
 def test_dead_shared_holder_is_pruned_before_conflict_diagnostics(tmp_path):
@@ -539,23 +580,31 @@ def test_dead_shared_holder_is_pruned_before_conflict_diagnostics(tmp_path):
     )
     dead_holder.start()
     sending.close()
-    assert receiving.poll(10), "abrupt holder did not acquire shared access"
-    assert receiving.recv() == "locked"
     dead_pid = dead_holder.pid
-    dead_holder.join(timeout=10)
-    assert dead_holder.exitcode == 0
-    receiving.close()
-    dead_holder.close()
+    dead_exitcode = None
+    dead_terminated = False
+    try:
+        assert receiving.poll(10), "abrupt holder did not acquire shared access"
+        assert receiving.recv() == "locked"
+    finally:
+        dead_exitcode, dead_terminated = _join_or_terminate(dead_holder)
+        receiving.close()
+        dead_holder.close()
+    assert dead_terminated is False
+    assert dead_exitcode == 0
 
-    live_ready = context.Event()
-    live_release = context.Event()
+    live_parent, live_child = context.Pipe()
     live_holder = context.Process(
         target=_hold_run_access,
-        args=(str(run), live_ready, live_release),
+        args=(str(run), live_child),
     )
     live_holder.start()
+    live_child.close()
+    live_exitcode = None
+    live_terminated = False
     try:
-        assert live_ready.wait(10), "live holder did not acquire shared access"
+        assert live_parent.poll(10), "live holder did not acquire shared access"
+        assert live_parent.recv() == "holder-ready"
         with (
             pytest.raises(SMLArtifactError) as conflict,
             run_access_lock(run, exclusive=True),
@@ -566,12 +615,12 @@ def test_dead_shared_holder_is_pruned_before_conflict_diagnostics(tmp_path):
         assert str(dead_pid) not in message
         assert str(run) in message
     finally:
-        live_release.set()
-        live_holder.join(timeout=10)
-        if live_holder.is_alive():
-            live_holder.terminate()
-            live_holder.join(timeout=5)
+        _send_if_open(live_parent, "release-holder")
+        live_exitcode, live_terminated = _join_or_terminate(live_holder)
+        live_parent.close()
         live_holder.close()
+    assert live_terminated is False
+    assert live_exitcode == 0
 
 
 def test_lock_is_released_on_process_exit(tmp_path):

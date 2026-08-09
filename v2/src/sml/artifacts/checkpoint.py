@@ -2141,6 +2141,8 @@ def _retention_entries(
 def _delete_directory_contents_durable(
     fs: FilesystemOps,
     directory_descriptor: int,
+    *,
+    after_destructive_transition: Callable[[], None] | None = None,
 ) -> None:
     for name in sorted(fs.listdir(directory_descriptor)):
         if not _safe_child_name(name):
@@ -2172,6 +2174,8 @@ def _delete_directory_contents_durable(
                 if not _same_inode(opened_stat, current_stat):
                     raise SMLArtifactError(f"retention detected a file swap: {name}")
                 fs.unlink(name, dir_fd=directory_descriptor)
+                if after_destructive_transition is not None:
+                    after_destructive_transition()
             finally:
                 os.close(descriptor)
         elif stat.S_ISDIR(entry_stat.st_mode):
@@ -2184,7 +2188,11 @@ def _delete_directory_contents_durable(
             try:
                 if not stat.S_ISDIR(opened_stat.st_mode):
                     raise SMLArtifactError(f"retention rejects non-directory: {name}")
-                _delete_directory_contents_durable(fs, descriptor)
+                _delete_directory_contents_durable(
+                    fs,
+                    descriptor,
+                    after_destructive_transition=after_destructive_transition,
+                )
                 current_stat = fs.stat(
                     name,
                     dir_fd=directory_descriptor,
@@ -2195,6 +2203,8 @@ def _delete_directory_contents_durable(
                         f"retention detected a directory swap: {name}"
                     )
                 fs.rmdir(name, dir_fd=directory_descriptor)
+                if after_destructive_transition is not None:
+                    after_destructive_transition()
             finally:
                 os.close(descriptor)
         else:
@@ -2205,11 +2215,19 @@ def _delete_directory_contents_durable(
 def _cleanup_retention_temporaries(
     checkpoints_descriptor: int,
     *,
+    latest: _OwnedStep,
     fs: FilesystemOps,
 ) -> None:
     for name in sorted(fs.listdir(checkpoints_descriptor)):
         if not _is_temporary_step_name(name):
             continue
+        _require_named_directory_inode(
+            fs,
+            latest.name,
+            parent_descriptor=checkpoints_descriptor,
+            directory_descriptor=latest.descriptor,
+            context="retained latest checkpoint before temporary cleanup",
+        )
         descriptor, opened_stat = _opened_entry(
             fs,
             name,
@@ -2221,7 +2239,18 @@ def _cleanup_retention_temporaries(
                 raise SMLArtifactError(
                     f"retention temporary is not a directory: {name}"
                 )
-            _delete_directory_contents_durable(fs, descriptor)
+            latest_stat = fs.stat(latest.descriptor)
+            if _same_inode(opened_stat, latest_stat):
+                raise SMLArtifactError(
+                    "retention temporary is bound to the retained latest checkpoint"
+                )
+            _require_named_directory_inode(
+                fs,
+                latest.name,
+                parent_descriptor=checkpoints_descriptor,
+                directory_descriptor=latest.descriptor,
+                context="retained latest checkpoint before temporary deletion",
+            )
             _require_named_directory_inode(
                 fs,
                 name,
@@ -2229,8 +2258,47 @@ def _cleanup_retention_temporaries(
                 directory_descriptor=descriptor,
                 context=f"retention temporary {name}",
             )
+            _delete_directory_contents_durable(
+                fs,
+                descriptor,
+                after_destructive_transition=lambda: _require_named_directory_inode(
+                    fs,
+                    latest.name,
+                    parent_descriptor=checkpoints_descriptor,
+                    directory_descriptor=latest.descriptor,
+                    context="retained latest checkpoint during temporary deletion",
+                ),
+            )
+            _require_named_directory_inode(
+                fs,
+                latest.name,
+                parent_descriptor=checkpoints_descriptor,
+                directory_descriptor=latest.descriptor,
+                context="retained latest checkpoint before temporary removal",
+            )
+            _require_named_directory_inode(
+                fs,
+                name,
+                parent_descriptor=checkpoints_descriptor,
+                directory_descriptor=descriptor,
+                context=f"emptied retention temporary {name}",
+            )
             fs.rmdir(name, dir_fd=checkpoints_descriptor)
+            _require_named_directory_inode(
+                fs,
+                latest.name,
+                parent_descriptor=checkpoints_descriptor,
+                directory_descriptor=latest.descriptor,
+                context="retained latest checkpoint after temporary removal",
+            )
             fs.fsync_directory(checkpoints_descriptor)
+            _require_named_directory_inode(
+                fs,
+                latest.name,
+                parent_descriptor=checkpoints_descriptor,
+                directory_descriptor=latest.descriptor,
+                context="retained latest checkpoint after temporary cleanup",
+            )
         finally:
             os.close(descriptor)
 
@@ -2299,7 +2367,17 @@ def _detach_and_delete_owned_step(
         directory_descriptor=latest.descriptor,
         context="retained latest checkpoint before recursive delete",
     )
-    _delete_directory_contents_durable(fs, candidate.descriptor)
+    _delete_directory_contents_durable(
+        fs,
+        candidate.descriptor,
+        after_destructive_transition=lambda: _require_named_directory_inode(
+            fs,
+            latest.name,
+            parent_descriptor=checkpoints_descriptor,
+            directory_descriptor=latest.descriptor,
+            context="retained latest checkpoint during candidate deletion",
+        ),
+    )
     _require_named_directory_inode(
         fs,
         temporary_name,
@@ -2315,7 +2393,21 @@ def _detach_and_delete_owned_step(
         context="retained latest checkpoint before temporary removal",
     )
     fs.rmdir(temporary_name, dir_fd=checkpoints_descriptor)
+    _require_named_directory_inode(
+        fs,
+        latest.name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=latest.descriptor,
+        context="retained latest checkpoint after candidate removal",
+    )
     fs.fsync_directory(checkpoints_descriptor)
+    _require_named_directory_inode(
+        fs,
+        latest.name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=latest.descriptor,
+        context="retained latest checkpoint after candidate cleanup",
+    )
 
 
 def apply_retention(
@@ -2374,33 +2466,27 @@ def apply_retention(
             )
             if latest is None:
                 raise SMLArtifactError("run has no published checkpoints")
-            _cleanup_retention_temporaries(
-                checkpoints_descriptor,
-                fs=fs,
-            )
-            if keep_last is None:
-                return latest
-
-            entries = _retention_entries(checkpoints_descriptor, fs=fs)
-            retained_names = {name for _step, name in sorted(entries)[-keep_last:]}
-            latest_name = _step_name(latest.step)
-            retained_names.add(latest_name)
-            deletions = [
-                (step, name)
-                for step, name in entries
-                if name not in retained_names and name != latest_name
-            ]
-            for step, _name in deletions:
-                owned_deletions.append(
-                    _open_verified_step_from_descriptor(
-                        run,
-                        latest.run,
-                        checkpoints_descriptor,
-                        step=step,
-                        verification=VerificationLevel.FULL,
-                        fs=fs,
+            if keep_last is not None:
+                entries = _retention_entries(checkpoints_descriptor, fs=fs)
+                retained_names = {name for _step, name in sorted(entries)[-keep_last:]}
+                latest_name = _step_name(latest.step)
+                retained_names.add(latest_name)
+                deletions = [
+                    (step, name)
+                    for step, name in entries
+                    if name not in retained_names and name != latest_name
+                ]
+                for step, _name in deletions:
+                    owned_deletions.append(
+                        _open_verified_step_from_descriptor(
+                            run,
+                            latest.run,
+                            checkpoints_descriptor,
+                            step=step,
+                            verification=VerificationLevel.FULL,
+                            fs=fs,
+                        )
                     )
-                )
 
             owned_latest = _open_verified_step_from_descriptor(
                 run,
@@ -2420,6 +2506,13 @@ def apply_retention(
                 latest_recovered=latest.latest_recovered,
                 latest_repair_persisted=latest.latest_repair_persisted,
             )
+            _cleanup_retention_temporaries(
+                checkpoints_descriptor,
+                latest=owned_latest,
+                fs=fs,
+            )
+            if keep_last is None:
+                return latest
             for candidate in owned_deletions:
                 _detach_and_delete_owned_step(
                     checkpoints_descriptor,
