@@ -104,6 +104,91 @@ GENERATION_CONFIGS = {
         "no_repeat_ngram_size": 2,
         "seed": SAMPLING_SEED,
     },
+    "primitive_sampling": {
+        "temperature": 0.8,
+        "top_p": 0.9,
+        "repetition_penalty": 1.0,
+        "no_repeat_ngram_size": 0,
+        "seed": None,
+    },
+    "serial_unequal": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "repetition_penalty": 1.0,
+        "no_repeat_ngram_size": 0,
+        "seed": None,
+    },
+    "padded_unequal": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "repetition_penalty": 1.0,
+        "no_repeat_ngram_size": 0,
+        "seed": None,
+    },
+}
+GENERATION_REFERENCE_CONFIGURATIONS = {
+    "greedy": {
+        "generation_config": GENERATION_CONFIGS["greedy"],
+        "max_new_tokens": MAX_NEW_TOKENS,
+    },
+    "seeded": {
+        "generation_config": GENERATION_CONFIGS["seeded"],
+        "max_new_tokens": MAX_NEW_TOKENS,
+    },
+    "primitive_sampling": {
+        "generation_config": GENERATION_CONFIGS["primitive_sampling"],
+        "key_seed": SAMPLING_SEED,
+        "max_new_tokens": 1,
+    },
+    "serial_unequal": {
+        "generation_config": GENERATION_CONFIGS["serial_unequal"],
+        "max_new_tokens": MAX_NEW_TOKENS,
+    },
+    "padded_unequal": {
+        "generation_config": GENERATION_CONFIGS["padded_unequal"],
+        "max_new_tokens": MAX_NEW_TOKENS,
+    },
+}
+GENERATION_REFERENCES = {
+    "greedy": {
+        "configuration": "greedy",
+        "arrays": [
+            "generation.greedy_prompt",
+            "generation.greedy_tokens",
+            "generation.greedy_winning_margins",
+        ],
+    },
+    "seeded": {
+        "configuration": "seeded",
+        "arrays": [
+            "generation.seeded_prompt",
+            "generation.seeded_tokens",
+            "generation.seeded_winning_margins",
+        ],
+    },
+    "primitive_sampling": {
+        "configuration": "primitive_sampling",
+        "arrays": ["generation.logits", "generation.sampled_token"],
+    },
+    "serial_unequal": {
+        "configuration": "serial_unequal",
+        "arrays": [
+            "generation.serial_prompt.0",
+            "generation.serial_prompt.1",
+            "generation.serial_tokens.0",
+            "generation.serial_tokens.1",
+            "generation.serial_winning_margins.0",
+            "generation.serial_winning_margins.1",
+        ],
+    },
+    "padded_unequal": {
+        "configuration": "padded_unequal",
+        "arrays": [
+            "generation.padded_unequal_prompts",
+            "generation.padded_unequal_tokens",
+            "generation.padded_unequal_winning_margins",
+        ],
+    },
 }
 
 LOGLIKELIHOOD_INPUTS = [[1, 24, 25, 26], [1, 27, 28]]
@@ -525,7 +610,6 @@ def _capture_references(args, modules):
         _add_array(arrays, f"cache.chunked_key.{layer_index}", key_array)
         _add_array(arrays, f"cache.chunked_value.{layer_index}", value_array)
 
-    generation_record = {}
     for name, prompt_values in (
         ("greedy", GREEDY_PROMPT),
         ("seeded", SAMPLED_PROMPT),
@@ -548,24 +632,20 @@ def _capture_references(args, modules):
         _add_array(arrays, f"generation.{name}_prompt", prompt)
         _add_array(arrays, f"generation.{name}_tokens", generated)
         _add_array(arrays, f"generation.{name}_winning_margins", margins)
-        generation_record[name] = {
-            **GENERATION_CONFIGS[name],
-            "max_new_tokens": MAX_NEW_TOKENS,
-            "winning_margins": _json_array_values(margins, mx, np),
-        }
 
     literal_logits = mx.array([GENERATION_LOGITS], dtype=mx.float32)
     sampled_token = sml.select_next_token(
         literal_logits,
-        sml.GenerationConfig(temperature=0.8, top_p=0.9),
+        sml.GenerationConfig(**GENERATION_CONFIGS["primitive_sampling"]),
         key=mx.random.key(SAMPLING_SEED),
     )
     mx.eval(sampled_token)
     _add_array(arrays, "generation.logits", literal_logits)
     _add_array(arrays, "generation.sampled_token", sampled_token)
 
-    serial_tokens = []
-    serial_margins = []
+    serial_generation_config = sml.GenerationConfig(
+        **GENERATION_CONFIGS["serial_unequal"]
+    )
     for index, prompt_values in enumerate(UNEQUAL_PROMPTS):
         prompt = mx.array([prompt_values], dtype=mx.int32)
         tokens, margins = _generated_with_margins(
@@ -573,17 +653,20 @@ def _capture_references(args, modules):
             sml,
             mx,
             prompt,
-            sml.GenerationConfig(),
+            serial_generation_config,
             MAX_NEW_TOKENS,
         )
-        serial_tokens.append(tokens)
-        serial_margins.append(margins)
         _add_array(arrays, f"generation.serial_prompt.{index}", prompt)
         _add_array(arrays, f"generation.serial_tokens.{index}", tokens)
         _add_array(arrays, f"generation.serial_winning_margins.{index}", margins)
     padded_prompts = mx.array(PADDED_UNEQUAL_PROMPTS, dtype=mx.int32)
     padded_tokens, padded_margins = _generated_with_margins(
-        model, sml, mx, padded_prompts, sml.GenerationConfig(), MAX_NEW_TOKENS
+        model,
+        sml,
+        mx,
+        padded_prompts,
+        sml.GenerationConfig(**GENERATION_CONFIGS["padded_unequal"]),
+        MAX_NEW_TOKENS,
     )
     _add_array(arrays, "generation.padded_unequal_prompts", padded_prompts)
     _add_array(arrays, "generation.padded_unequal_tokens", padded_tokens)
@@ -696,10 +779,10 @@ def _capture_references(args, modules):
         },
         "generation": {
             "arrays": [name for name in arrays if name.startswith("generation.")],
-            "configurations": generation_record,
+            "configurations": GENERATION_REFERENCE_CONFIGURATIONS,
+            "references": GENERATION_REFERENCES,
             "unequal_prompts": UNEQUAL_PROMPTS,
             "padded_unequal_prompts": PADDED_UNEQUAL_PROMPTS,
-            "primitive_sampling_seed": SAMPLING_SEED,
         },
         "loglikelihood": {
             "arrays": [name for name in arrays if name.startswith("loglikelihood.")],

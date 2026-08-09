@@ -84,6 +84,106 @@ def test_legacy_fixture_records_source_and_required_cases(legacy_control):
     assert legacy_control["parameter_state"]["payload_identity"].startswith("sha256:")
 
 
+def test_generation_references_serialize_complete_named_configurations(
+    legacy_control,
+):
+    generation = legacy_control["cases"]["generation"]
+    assert generation["configurations"] == {
+        "greedy": {
+            "generation_config": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "repetition_penalty": 1.0,
+                "no_repeat_ngram_size": 0,
+                "seed": None,
+            },
+            "max_new_tokens": 3,
+        },
+        "padded_unequal": {
+            "generation_config": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "repetition_penalty": 1.0,
+                "no_repeat_ngram_size": 0,
+                "seed": None,
+            },
+            "max_new_tokens": 3,
+        },
+        "primitive_sampling": {
+            "generation_config": {
+                "temperature": 0.8,
+                "top_p": 0.9,
+                "repetition_penalty": 1.0,
+                "no_repeat_ngram_size": 0,
+                "seed": None,
+            },
+            "key_seed": 1234,
+            "max_new_tokens": 1,
+        },
+        "seeded": {
+            "generation_config": {
+                "temperature": 0.8,
+                "top_p": 0.9,
+                "repetition_penalty": 1.1,
+                "no_repeat_ngram_size": 2,
+                "seed": 1234,
+            },
+            "max_new_tokens": 3,
+        },
+        "serial_unequal": {
+            "generation_config": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "repetition_penalty": 1.0,
+                "no_repeat_ngram_size": 0,
+                "seed": None,
+            },
+            "max_new_tokens": 3,
+        },
+    }
+    assert generation["references"] == {
+        "greedy": {
+            "configuration": "greedy",
+            "arrays": [
+                "generation.greedy_prompt",
+                "generation.greedy_tokens",
+                "generation.greedy_winning_margins",
+            ],
+        },
+        "padded_unequal": {
+            "configuration": "padded_unequal",
+            "arrays": [
+                "generation.padded_unequal_prompts",
+                "generation.padded_unequal_tokens",
+                "generation.padded_unequal_winning_margins",
+            ],
+        },
+        "primitive_sampling": {
+            "configuration": "primitive_sampling",
+            "arrays": ["generation.logits", "generation.sampled_token"],
+        },
+        "seeded": {
+            "configuration": "seeded",
+            "arrays": [
+                "generation.seeded_prompt",
+                "generation.seeded_tokens",
+                "generation.seeded_winning_margins",
+            ],
+        },
+        "serial_unequal": {
+            "configuration": "serial_unequal",
+            "arrays": [
+                "generation.serial_prompt.0",
+                "generation.serial_prompt.1",
+                "generation.serial_tokens.0",
+                "generation.serial_tokens.1",
+                "generation.serial_winning_margins.0",
+                "generation.serial_winning_margins.1",
+            ],
+        },
+    }
+
+
 def test_capture_driver_rejects_an_uncommitted_or_wrong_checkout(tmp_path):
     assert_clean_checkout = _load_capture_module().assert_clean_checkout
 
