@@ -43,6 +43,20 @@ def test_rope_matches_captured_reference(legacy_arrays, tiny_model_config):
     assert_close(actual_k, legacy_arrays["rope.output_k"], atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize("position", [-1, 16])
+def test_rope_fails_closed_for_out_of_bounds_positions(tiny_model_config, position):
+    """Wrapped cache indexing must never yield a plausible but wrong rotation."""
+    rope = RotaryEmbedding(tiny_model_config)
+    q = mx.ones((1, 4, 1, 4), dtype=mx.bfloat16)
+    k = mx.ones((1, 2, 1, 4), dtype=mx.bfloat16)
+
+    actual_q, actual_k = rope(q, k, mx.array([position], dtype=mx.int32))
+
+    mx.eval(actual_q, actual_k)
+    assert bool(mx.all(mx.isnan(actual_q)).item())
+    assert bool(mx.all(mx.isnan(actual_k)).item())
+
+
 def test_apply_rotary_returns_bfloat16_after_fp32_cache_multiplication():
     """A widened result would change downstream attention precision and memory use."""
     q = mx.array([[[[1.0, 2.0, 3.0, 4.0]]]], dtype=mx.bfloat16)

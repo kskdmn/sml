@@ -128,11 +128,33 @@ class RotaryEmbedding:
         k: mx.array,
         positions: mx.array,
     ) -> tuple[mx.array, mx.array]:
-        return apply_rotary(
+        positions_in_bounds = (positions >= 0) & (
+            positions < self.config.effective_context_length
+        )
+        safe_positions = mx.where(
+            positions_in_bounds, positions, mx.zeros_like(positions)
+        )
+        rotated_q, rotated_k = apply_rotary(
             q,
             k,
-            self.cos_cached[positions],
-            self.sin_cached[positions],
+            self.cos_cached[safe_positions],
+            self.sin_cached[safe_positions],
+        )
+        sequence_mask = mx.expand_dims(
+            mx.expand_dims(mx.expand_dims(positions_in_bounds, axis=0), axis=0),
+            axis=-1,
+        )
+        return (
+            mx.where(
+                sequence_mask,
+                rotated_q,
+                mx.full(rotated_q.shape, float("nan"), dtype=rotated_q.dtype),
+            ),
+            mx.where(
+                sequence_mask,
+                rotated_k,
+                mx.full(rotated_k.shape, float("nan"), dtype=rotated_k.dtype),
+            ),
         )
 
 
