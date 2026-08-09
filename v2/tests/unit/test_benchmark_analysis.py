@@ -5618,6 +5618,77 @@ def test_paired_trials_stops_before_the_next_process_on_persistent_memory(
     assert len(launches) == 1
 
 
+@pytest.mark.parametrize("outcome", ("timeout", "critical", "environment-failure"))
+def test_paired_trials_rejects_every_terminal_recovery_outcome_before_next_launch(
+    tmp_path, monkeypatch, outcome
+):
+    workload = build_canonical_workload()
+    if outcome == "timeout":
+        trial = _recovery_evidence(
+            workload,
+            immediate_pressure="warning",
+            sample_pressures=("warning",),
+            sample_elapsed=(300.0,),
+            outcome=outcome,
+        )[4]
+    elif outcome == "critical":
+        trial = _recovery_evidence(
+            workload,
+            immediate_pressure="critical",
+            outcome=outcome,
+        )[4]
+    else:
+        trial = _recovery_evidence(
+            workload,
+            immediate_pressure="warning",
+            sample_pressures=("normal",),
+            sample_elapsed=(5.0,),
+            sample_status_changes=({"power_connected": False},),
+            outcome=outcome,
+            failure_fields=("power_connected",),
+        )[4]
+    launches = []
+    validated = []
+    original_validate = benchmark_runner._validate_acceptance_environment
+
+    def launch(**kwargs):
+        launches.append(kwargs)
+        return trial
+
+    def validate_at_boundary(current_workload, current_trial):
+        validated.append(current_trial)
+        original_validate(current_workload, current_trial)
+
+    monkeypatch.setattr(benchmark_runner, "_launch_trial", launch)
+    monkeypatch.setattr(
+        benchmark_runner, "_validate_acceptance_environment", validate_at_boundary
+    )
+
+    with pytest.raises(ValueError, match="raw environment"):
+        benchmark_runner._run_paired_trials(
+            harness_root=tmp_path / "harness",
+            reference_root=tmp_path / "reference",
+            candidate_root=tmp_path / "candidate",
+            reference_commit=trial.source_commit,
+            candidate_commit="c" * 40,
+            harness_commit=trial.harness_commit,
+            harness_identity=trial.harness_identity,
+            reference_adapter="legacy",
+            metrics=("prepared-data",),
+            pairs=2,
+            warmup=5,
+            measure=20,
+            comparison_target="baseline",
+            attempt_index=0,
+            output_directory=tmp_path,
+        )
+
+    assert len(launches) == 1
+    assert validated == [trial]
+    assert validated[0].schema_version == 3
+    assert validated[0].post_exit_recovery["outcome"] == outcome
+
+
 def test_paired_trials_share_one_identity_bound_evidence_session(tmp_path, monkeypatch):
     workload = build_canonical_workload()
     launches = []
