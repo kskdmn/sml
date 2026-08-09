@@ -265,17 +265,17 @@ def _acquire_run_access_then_exit(run: str, connection) -> None:
         os._exit(0)
 
 
-def _conflicting_run_access_message(run: Path) -> str:
+def _conflicting_run_writer_message(run: Path) -> str:
     try:
-        with run_access_lock(run, exclusive=False):
-            raise AssertionError("conflicting accessor entered protected operation")
+        with run_writer_lock(run):
+            raise AssertionError("conflicting writer entered protected operation")
     except SMLArtifactError as error:
         return str(error)
 
 
 def _run_access_outcome(run: Path) -> tuple[str, str]:
     try:
-        with run_access_lock(run, exclusive=False):
+        with run_access_lock(run, exclusive=True):
             return "acquired", ""
     except SMLArtifactError as error:
         return "conflict", str(error)
@@ -392,16 +392,16 @@ def test_identical_existing_target_requires_full_verification(bundle_builder, ta
 
 
 def test_conflicting_writer_reports_owner(tmp_path):
-    """A conflicting run accessor needs the live writer PID and protected run."""
+    """A conflicting run writer needs the live owner PID and protected run."""
     run = tmp_path / "run-0001"
     run.mkdir()
 
     with (
         run_writer_lock(run),
         pytest.raises(SMLArtifactError) as conflict,
-        run_access_lock(run, exclusive=False),
+        run_writer_lock(run),
     ):
-        pytest.fail("conflicting accessor entered the protected operation")
+        pytest.fail("conflicting writer entered the protected operation")
 
     message = str(conflict.value)
     assert str(os.getpid()) in message
@@ -424,9 +424,9 @@ def test_conflicting_process_reports_live_owner(tmp_path):
         assert ready.wait(10), "child did not acquire the run writer lock"
         with (
             pytest.raises(SMLArtifactError) as conflict,
-            run_access_lock(run, exclusive=False),
+            run_writer_lock(run),
         ):
-            pytest.fail("conflicting accessor entered the protected operation")
+            pytest.fail("conflicting writer entered the protected operation")
         message = str(conflict.value)
         assert str(process.pid) in message
         assert str(run) in message
@@ -464,7 +464,7 @@ def test_conflict_waits_for_complete_owner_diagnostics(tmp_path, monkeypatch):
     try:
         assert metadata_started.wait(10), "owner did not begin diagnostic transition"
         with ThreadPoolExecutor(max_workers=1) as executor:
-            conflict = executor.submit(_conflicting_run_access_message, run)
+            conflict = executor.submit(_conflicting_run_writer_message, run)
             try:
                 time.sleep(0.15)
                 assert not conflict.done()

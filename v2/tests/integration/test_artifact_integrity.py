@@ -11,10 +11,17 @@ from sml.artifacts.checkpoint import (
     IMMUTABLE_PUBLICATION_STAGES,
     OS_FILESYSTEM,
     FilesystemOps,
+    publish_checkpoint,
     publish_immutable_bundle,
+    resolve_exact_step,
+    run_writer_lock,
 )
 from sml.artifacts.manifest import (
+    ArrayPayloadRef,
+    ArraySpec,
+    CheckpointManifest,
     PayloadRef,
+    RunManifest,
     TokenizerManifest,
     VerificationLevel,
     canonical_json_bytes,
@@ -384,3 +391,77 @@ def test_full_verification_rejects_external_hard_link(tmp_path):
 
     with pytest.raises(SMLArtifactError, match="link count"):
         read_manifest(bundle, type(expected), VerificationLevel.FULL)
+
+
+def test_checkpoint_full_verification_rehashes_payloads(tmp_path):
+    """Exact checkpoint resolution must not report FULL for changed array bytes."""
+    run = tmp_path / "run-0001"
+    run.mkdir()
+    (run / "checkpoints").mkdir()
+    run_manifest = RunManifest(
+        kind="run",
+        version=1,
+        identity="sha256:" + "0" * 64,
+        run_kind="pretraining",
+        model={"rope_scaling_factor": 1.0},
+        precision={"working": "bfloat16"},
+        optimizer={"name": "adamw"},
+        loader={"batch_size": 1},
+        checkpoint={"keep_last": None},
+        tokenizer_identity="sha256:" + "1" * 64,
+        base_identity=None,
+        data_identity="sha256:" + "2" * 64,
+        diagnostic_data_locator=None,
+        diagnostic_source_locator=None,
+    )
+    run_manifest = replace(
+        run_manifest,
+        identity=run_manifest.recompute_identity(),
+    )
+    (run / "run.json").write_bytes(canonical_json_bytes(run_manifest))
+
+    def build(private_step: Path) -> CheckpointManifest:
+        arrays_path = private_step / "arrays.safetensors"
+        state_path = private_step / "state.json"
+        arrays_path.write_bytes(b"array bytes")
+        state_path.write_bytes(b'{"step":1}')
+        with arrays_path.open("rb") as arrays_file:
+            arrays_identity = file_identity(arrays_file)
+        with state_path.open("rb") as state_file:
+            state_identity = file_identity(state_file)
+        manifest = CheckpointManifest(
+            kind="checkpoint",
+            version=1,
+            identity="sha256:" + "0" * 64,
+            owning_run_identity=run_manifest.identity,
+            checkpoint_kind="pretraining",
+            step=1,
+            scalar_state=PayloadRef(
+                "state.json",
+                state_identity,
+                state_path.stat().st_size,
+            ),
+            arrays=(
+                ArrayPayloadRef(
+                    PayloadRef(
+                        "arrays.safetensors",
+                        arrays_identity,
+                        arrays_path.stat().st_size,
+                    ),
+                    (ArraySpec("model.weight", (1,), "float32"),),
+                ),
+            ),
+        )
+        return replace(manifest, identity=manifest.recompute_identity())
+
+    with run_writer_lock(run):
+        publish_checkpoint(run, build)
+    arrays_path = run / "checkpoints" / "step-000000001" / "arrays.safetensors"
+    arrays_path.write_bytes(b"tampered!!!")
+
+    with pytest.raises(SMLArtifactError, match="payload identity|byte size"):
+        resolve_exact_step(
+            run,
+            step=1,
+            verification=VerificationLevel.FULL,
+        )

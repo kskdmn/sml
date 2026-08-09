@@ -16,7 +16,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
@@ -32,9 +32,13 @@ from sml.artifacts.manifest import (
     TokenizerManifest,
     VerificationLevel,
     _descriptor_is_local_apfs,
+    _json_object_no_duplicates,
+    _parse_manifest,
+    _reject_json_constant,
     canonical_json_bytes,
     parse_logical_path,
     read_manifest,
+    structured_identity,
 )
 from sml.errors import SMLArtifactError
 
@@ -46,6 +50,18 @@ IMMUTABLE_PUBLICATION_STAGES = (
     "parent-directory-fsynced",
 )
 
+CHECKPOINT_PUBLICATION_STAGES = (
+    "arrays-written",
+    "scalar-state-written",
+    "checkpoint-manifest-written",
+    "step-directory-fsynced",
+    "step-directory-renamed",
+    "step-parent-fsynced",
+    "latest-temporary-fsynced",
+    "latest-replaced",
+    "latest-parent-fsynced",
+)
+
 _OPEN_READ = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 _OPEN_DIRECTORY = _OPEN_READ | os.O_DIRECTORY
 _OPEN_PAYLOAD = _OPEN_READ | os.O_NONBLOCK
@@ -54,6 +70,7 @@ _OPEN_MANIFEST = (
     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 )
 _TEMPORARY_SUFFIX_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+_TEMPORARY_STEP_PATTERN = re.compile(r"\.sml-tmp-step-([0-9a-f]{32})\Z")
 _LOCK_RETRY_INITIAL_SECONDS = 0.001
 _LOCK_RETRY_MAX_SECONDS = 0.1
 _RENAME_EXCL = 0x00000004
@@ -256,6 +273,21 @@ class Published[M]:
             raise TypeError("published path must be a Path")
         if not isinstance(self.verification, VerificationLevel):
             raise TypeError("verification must be a VerificationLevel")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedStep:
+    run: RunManifest
+    checkpoint: CheckpointManifest
+    step_directory: Path
+    run_step_identity: str
+    verification: VerificationLevel
+    latest_recovered: bool
+    latest_repair_persisted: bool
+
+    @property
+    def step(self) -> int:
+        return self.checkpoint.step
 
 
 class _LockUnavailable(SMLArtifactError):
@@ -538,13 +570,13 @@ def publication_lock(target: Path) -> Iterator[None]:
 
 
 def run_writer_lock(run: Path) -> Iterator[None]:
-    return _protected_lock(run, category="run", exclusive=True)
+    return _protected_lock(run, category="run-writer", exclusive=True)
 
 
 def run_access_lock(run: Path, *, exclusive: bool) -> Iterator[None]:
     if not isinstance(exclusive, bool):
         raise TypeError("exclusive must be a bool")
-    return _protected_lock(run, category="run", exclusive=exclusive)
+    return _protected_lock(run, category="run-access", exclusive=exclusive)
 
 
 def _same_inode(first: os.stat_result, second: os.stat_result) -> bool:
@@ -894,6 +926,7 @@ def _verify_closed_world(
     manifest: object,
     *,
     manifest_present: bool,
+    full: bool = True,
 ) -> None:
     references = tuple(_payload_references(manifest))
     expected_files, expected_directories = _expected_closed_world(references)
@@ -915,7 +948,7 @@ def _verify_closed_world(
         )
 
     with ArtifactRoot(os.dup(temporary_descriptor), local_apfs=True) as artifact_root:
-        artifact_root.verify_payloads(references, full=True)
+        artifact_root.verify_payloads(references, full=full)
         if manifest_present:
             with artifact_root.open_payload(
                 manifest.MANIFEST_FILENAME
@@ -1175,13 +1208,997 @@ def publish_immutable_bundle[M](
         return _publish_with_lock(target, build, fs=fs)
 
 
+def _require_step(step: object) -> int:
+    if isinstance(step, bool) or not isinstance(step, int):
+        raise TypeError("step must be an integer")
+    if step < 0:
+        raise ValueError("step must be nonnegative")
+    return step
+
+
+def _step_name(step: int) -> str:
+    return f"step-{_require_step(step):09d}"
+
+
+def _parse_step_name(name: str) -> int | None:
+    if not name.startswith("step-"):
+        return None
+    digits = name.removeprefix("step-")
+    if not digits or not digits.isascii() or not digits.isdecimal():
+        return None
+    step = int(digits)
+    return step if name == _step_name(step) else None
+
+
+def _is_temporary_step_name(name: str) -> bool:
+    return _TEMPORARY_STEP_PATTERN.fullmatch(name) is not None
+
+
+def _temporary_step_name() -> str:
+    return f".sml-tmp-step-{uuid.uuid4().hex}"
+
+
+def _open_directory(
+    path: Path,
+    fs: FilesystemOps,
+    *,
+    writable: bool,
+    context: str,
+) -> int:
+    descriptor = -1
+    try:
+        descriptor = fs.open(path, _OPEN_DIRECTORY)
+        opened_stat = fs.stat(descriptor)
+        if not stat.S_ISDIR(opened_stat.st_mode):
+            raise SMLArtifactError(f"{context} is not a directory")
+        if writable and not _descriptor_is_local_apfs(descriptor):
+            raise SMLArtifactError(f"writable {context} requires local APFS")
+        return descriptor
+    except BaseException as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if isinstance(error, (SMLArtifactError, TypeError, ValueError)):
+            raise
+        if isinstance(error, OSError):
+            raise SMLArtifactError(
+                f"could not open {context} with no-follow semantics: {path}"
+            ) from error
+        raise
+
+
+def _read_manifest_from_descriptor[M](
+    descriptor: int,
+    manifest_type: type[M],
+    verification: VerificationLevel,
+    *,
+    context: str,
+) -> M:
+    try:
+        local_apfs = _descriptor_is_local_apfs(descriptor)
+        with ArtifactRoot(os.dup(descriptor), local_apfs=local_apfs) as artifact_root:
+            with artifact_root.open_payload(
+                manifest_type.MANIFEST_FILENAME
+            ) as manifest_file:
+                manifest_bytes = manifest_file.read()
+            raw = json.loads(
+                manifest_bytes.decode("utf-8"),
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_json_object_no_duplicates,
+            )
+            manifest = _parse_manifest(raw, manifest_type)
+            if manifest.recompute_identity() != manifest.identity:
+                raise SMLArtifactError(f"manifest identity mismatch in {context}")
+            if manifest_bytes != canonical_json_bytes(manifest):
+                raise SMLArtifactError(f"noncanonical manifest bytes in {context}")
+            artifact_root.verify_payloads(
+                tuple(_payload_references(manifest)),
+                full=verification is VerificationLevel.FULL,
+            )
+            return cast(M, manifest)
+    except SMLArtifactError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise SMLArtifactError(f"invalid manifest in {context}: {error}") from error
+
+
+def _validate_checkpoint_owner(
+    run_manifest: RunManifest,
+    manifest: CheckpointManifest,
+    *,
+    expected_step: int,
+) -> None:
+    if manifest.owning_run_identity != run_manifest.identity:
+        raise SMLArtifactError("checkpoint belongs to a different run")
+    if manifest.checkpoint_kind != run_manifest.run_kind:
+        raise SMLArtifactError("checkpoint kind does not match the owning run")
+    if manifest.step != expected_step:
+        raise SMLArtifactError(
+            "checkpoint logical step does not match its canonical directory"
+        )
+
+
+def _resolved_step(
+    run_path: Path,
+    run_manifest: RunManifest,
+    checkpoint_manifest: CheckpointManifest,
+    verification: VerificationLevel,
+    *,
+    latest_recovered: bool,
+    latest_repair_persisted: bool,
+) -> ResolvedStep:
+    return ResolvedStep(
+        run=run_manifest,
+        checkpoint=checkpoint_manifest,
+        step_directory=run_path / "checkpoints" / _step_name(checkpoint_manifest.step),
+        run_step_identity=structured_identity(
+            "sml-run-step-v1",
+            {
+                "run_identity": run_manifest.identity,
+                "checkpoint_identity": checkpoint_manifest.identity,
+            },
+        ),
+        verification=verification,
+        latest_recovered=latest_recovered,
+        latest_repair_persisted=latest_repair_persisted,
+    )
+
+
+def _open_checkpoints_directory(
+    run: Path,
+    fs: FilesystemOps,
+    run_descriptor: int,
+    *,
+    writable: bool,
+) -> int:
+    descriptor = -1
+    try:
+        descriptor = fs.open(
+            "checkpoints",
+            _OPEN_DIRECTORY,
+            dir_fd=run_descriptor,
+        )
+        opened_stat = fs.stat(descriptor)
+        if not stat.S_ISDIR(opened_stat.st_mode):
+            raise SMLArtifactError("checkpoints entry is not a directory")
+        if writable and not _descriptor_is_local_apfs(descriptor):
+            raise SMLArtifactError("writable checkpoints directory requires local APFS")
+        _require_named_directory_inode(
+            fs,
+            "checkpoints",
+            parent_descriptor=run_descriptor,
+            directory_descriptor=descriptor,
+            context="checkpoints directory",
+        )
+        return descriptor
+    except BaseException as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if isinstance(error, SMLArtifactError):
+            raise
+        if isinstance(error, OSError):
+            raise SMLArtifactError(
+                f"could not open checkpoints directory for run: {run}"
+            ) from error
+        raise
+
+
+def _resolve_step_from_descriptor(
+    run: Path,
+    run_manifest: RunManifest,
+    checkpoints_descriptor: int,
+    *,
+    step: int,
+    verification: VerificationLevel,
+    fs: FilesystemOps,
+) -> ResolvedStep:
+    name = _step_name(step)
+    descriptor = -1
+    try:
+        descriptor, opened_stat = _opened_entry(
+            fs,
+            name,
+            parent_descriptor=checkpoints_descriptor,
+            flags=_OPEN_DIRECTORY,
+        )
+        if not stat.S_ISDIR(opened_stat.st_mode):
+            raise SMLArtifactError(f"checkpoint candidate is not a directory: {name}")
+        manifest = _read_manifest_from_descriptor(
+            descriptor,
+            CheckpointManifest,
+            verification,
+            context=str(run / "checkpoints" / name),
+        )
+        _validate_checkpoint_owner(
+            run_manifest,
+            manifest,
+            expected_step=step,
+        )
+        _verify_closed_world(
+            fs,
+            descriptor,
+            manifest,
+            manifest_present=True,
+            full=verification is VerificationLevel.FULL,
+        )
+        _require_named_directory_inode(
+            fs,
+            name,
+            parent_descriptor=checkpoints_descriptor,
+            directory_descriptor=descriptor,
+            context=f"checkpoint step {step}",
+        )
+        return _resolved_step(
+            run,
+            run_manifest,
+            manifest,
+            verification,
+            latest_recovered=False,
+            latest_repair_persisted=False,
+        )
+    except FileNotFoundError as error:
+        raise SMLArtifactError(f"checkpoint step does not exist: {step}") from error
+    except SMLArtifactError:
+        raise
+    except OSError as error:
+        raise SMLArtifactError(f"could not resolve checkpoint step: {step}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def resolve_exact_step(
+    run: Path,
+    *,
+    step: int,
+    verification: VerificationLevel,
+) -> ResolvedStep:
+    requested_step = _require_step(step)
+    if not isinstance(verification, VerificationLevel):
+        raise TypeError("verification must be a VerificationLevel")
+    run_descriptor = _open_directory(
+        run,
+        OS_FILESYSTEM,
+        writable=False,
+        context="run directory",
+    )
+    checkpoints_descriptor = -1
+    try:
+        run_manifest = _read_manifest_from_descriptor(
+            run_descriptor,
+            RunManifest,
+            verification,
+            context=str(run / RunManifest.MANIFEST_FILENAME),
+        )
+        checkpoints_descriptor = _open_checkpoints_directory(
+            run,
+            OS_FILESYSTEM,
+            run_descriptor,
+            writable=False,
+        )
+        return _resolve_step_from_descriptor(
+            run,
+            run_manifest,
+            checkpoints_descriptor,
+            step=requested_step,
+            verification=verification,
+            fs=OS_FILESYSTEM,
+        )
+    finally:
+        if checkpoints_descriptor >= 0:
+            os.close(checkpoints_descriptor)
+        os.close(run_descriptor)
+
+
+def _latest_index_for(resolved: ResolvedStep) -> LatestIndex:
+    index = LatestIndex(
+        kind="latest-index",
+        version=1,
+        identity="sha256:" + "0" * 64,
+        owning_run_identity=resolved.run.identity,
+        step=resolved.step,
+        checkpoint_identity=resolved.checkpoint.identity,
+    )
+    return dataclasses.replace(index, identity=index.recompute_identity())
+
+
+def _persist_latest_index(
+    run_descriptor: int,
+    resolved: ResolvedStep,
+    fs: FilesystemOps,
+) -> None:
+    temporary_name = f".sml-tmp-latest-{uuid.uuid4().hex}"
+    descriptor = -1
+    replaced = False
+    try:
+        descriptor = fs.open(
+            temporary_name,
+            _OPEN_MANIFEST,
+            0o600,
+            dir_fd=run_descriptor,
+        )
+        fs.write_all(descriptor, canonical_json_bytes(_latest_index_for(resolved)))
+        fs.fsync_file(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        fs.replace(
+            temporary_name,
+            LatestIndex.MANIFEST_FILENAME,
+            source_dir_fd=run_descriptor,
+            destination_dir_fd=run_descriptor,
+        )
+        replaced = True
+        fs.fsync_directory(run_descriptor)
+    except SMLArtifactError:
+        raise
+    except OSError as error:
+        raise SMLArtifactError("could not durably publish latest index") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if not replaced:
+            try:
+                fs.unlink(temporary_name, dir_fd=run_descriptor)
+            except FileNotFoundError:
+                pass
+
+
+def _stored_latest(
+    run: Path,
+    run_manifest: RunManifest,
+    run_descriptor: int,
+    checkpoints_descriptor: int,
+    verification: VerificationLevel,
+    fs: FilesystemOps,
+) -> tuple[LatestIndex | None, ResolvedStep | None]:
+    try:
+        index = _read_manifest_from_descriptor(
+            run_descriptor,
+            LatestIndex,
+            VerificationLevel.MANIFEST_TRUSTED,
+            context=str(run / LatestIndex.MANIFEST_FILENAME),
+        )
+    except SMLArtifactError:
+        return None, None
+    if index.owning_run_identity != run_manifest.identity:
+        return None, None
+    try:
+        pointed = _resolve_step_from_descriptor(
+            run,
+            run_manifest,
+            checkpoints_descriptor,
+            step=index.step,
+            verification=verification,
+            fs=fs,
+        )
+    except SMLArtifactError:
+        return None, None
+    if pointed.checkpoint.identity != index.checkpoint_identity:
+        return None, None
+    return index, pointed
+
+
+def _malformed_candidate_could_be_newer(name: str, lower_bound: int | None) -> bool:
+    if lower_bound is None:
+        return True
+    if not name.startswith("step-"):
+        return True
+    digits = name.removeprefix("step-")
+    if not digits or not digits.isascii() or not digits.isdecimal():
+        return True
+    return int(digits) > lower_bound
+
+
+def _scan_checkpoint_candidates(
+    run: Path,
+    run_manifest: RunManifest,
+    checkpoints_descriptor: int,
+    *,
+    lower_bound: int | None,
+    verification: VerificationLevel,
+    fs: FilesystemOps,
+) -> list[ResolvedStep]:
+    candidates: list[ResolvedStep] = []
+    for name in sorted(fs.listdir(checkpoints_descriptor)):
+        if _is_temporary_step_name(name):
+            continue
+        step = _parse_step_name(name)
+        if step is None:
+            if _malformed_candidate_could_be_newer(name, lower_bound):
+                raise SMLArtifactError(
+                    f"malformed required checkpoint candidate: {name}"
+                )
+            continue
+        if lower_bound is not None and step <= lower_bound:
+            continue
+        candidates.append(
+            _resolve_step_from_descriptor(
+                run,
+                run_manifest,
+                checkpoints_descriptor,
+                step=step,
+                verification=verification,
+                fs=fs,
+            )
+        )
+    return candidates
+
+
+def _recover_latest_open(
+    run: Path,
+    run_manifest: RunManifest,
+    run_descriptor: int,
+    checkpoints_descriptor: int,
+    *,
+    writable: bool,
+    verification: VerificationLevel,
+    fs: FilesystemOps,
+    allow_empty: bool,
+) -> ResolvedStep | None:
+    stored_index, pointed = _stored_latest(
+        run,
+        run_manifest,
+        run_descriptor,
+        checkpoints_descriptor,
+        verification,
+        fs,
+    )
+    lower_bound = pointed.step if pointed is not None else None
+    candidates = _scan_checkpoint_candidates(
+        run,
+        run_manifest,
+        checkpoints_descriptor,
+        lower_bound=lower_bound,
+        verification=verification,
+        fs=fs,
+    )
+    available = ([pointed] if pointed is not None else []) + candidates
+    if not available:
+        if allow_empty:
+            return None
+        raise SMLArtifactError("run has no published checkpoints")
+    selected = max(available, key=lambda candidate: candidate.step)
+    exact_stored_match = (
+        stored_index is not None
+        and stored_index.step == selected.step
+        and stored_index.checkpoint_identity == selected.checkpoint.identity
+    )
+    recovered = not exact_stored_match
+    selected = dataclasses.replace(
+        selected,
+        latest_recovered=recovered,
+        latest_repair_persisted=False,
+    )
+    if writable and recovered:
+        _persist_latest_index(run_descriptor, selected, fs)
+        selected = dataclasses.replace(
+            selected,
+            latest_repair_persisted=True,
+        )
+    return selected
+
+
+def recover_latest_index(
+    run: Path,
+    *,
+    writable: bool,
+    verification: VerificationLevel,
+    fs: FilesystemOps = OS_FILESYSTEM,
+) -> ResolvedStep:
+    if not isinstance(run, Path):
+        raise TypeError("run must be a Path")
+    if not isinstance(writable, bool):
+        raise TypeError("writable must be a bool")
+    if not isinstance(verification, VerificationLevel):
+        raise TypeError("verification must be a VerificationLevel")
+    if not isinstance(fs, FilesystemOps):
+        raise TypeError("fs must implement FilesystemOps")
+    if writable and verification is not VerificationLevel.FULL:
+        raise SMLArtifactError("writable latest recovery requires FULL verification")
+    run_descriptor = _open_directory(
+        run,
+        fs,
+        writable=writable,
+        context="run directory",
+    )
+    checkpoints_descriptor = -1
+    try:
+        run_manifest = _read_manifest_from_descriptor(
+            run_descriptor,
+            RunManifest,
+            verification,
+            context=str(run / RunManifest.MANIFEST_FILENAME),
+        )
+        checkpoints_descriptor = _open_checkpoints_directory(
+            run,
+            fs,
+            run_descriptor,
+            writable=writable,
+        )
+        resolved = _recover_latest_open(
+            run,
+            run_manifest,
+            run_descriptor,
+            checkpoints_descriptor,
+            writable=writable,
+            verification=verification,
+            fs=fs,
+            allow_empty=False,
+        )
+        if resolved is None:
+            raise SMLArtifactError("run has no published checkpoints")
+        return resolved
+    finally:
+        if checkpoints_descriptor >= 0:
+            os.close(checkpoints_descriptor)
+        os.close(run_descriptor)
+
+
+def resolve_latest_step(
+    run: Path,
+    *,
+    writable: bool,
+    verification: VerificationLevel,
+) -> ResolvedStep:
+    return recover_latest_index(
+        run,
+        writable=writable,
+        verification=verification,
+    )
+
+
+def _fsync_payload_reference(
+    fs: FilesystemOps,
+    root_descriptor: int,
+    reference: PayloadRef,
+) -> None:
+    components = parse_logical_path(reference.logical_path)
+    current_descriptor = os.dup(root_descriptor)
+    payload_descriptor = -1
+    try:
+        for component in components[:-1]:
+            next_descriptor = fs.open(
+                component,
+                _OPEN_DIRECTORY,
+                dir_fd=current_descriptor,
+            )
+            component_stat = fs.stat(next_descriptor)
+            if not stat.S_ISDIR(component_stat.st_mode):
+                os.close(next_descriptor)
+                raise SMLArtifactError(
+                    f"checkpoint payload component is not a directory: {component}"
+                )
+            os.close(current_descriptor)
+            current_descriptor = next_descriptor
+        payload_descriptor, payload_stat = _opened_entry(
+            fs,
+            components[-1],
+            parent_descriptor=current_descriptor,
+            flags=_OPEN_PAYLOAD,
+        )
+        if not stat.S_ISREG(payload_stat.st_mode) or payload_stat.st_nlink != 1:
+            raise SMLArtifactError(
+                f"checkpoint payload is not a singly linked file: {reference.logical_path}"
+            )
+        fs.fsync_file(payload_descriptor)
+    finally:
+        if payload_descriptor >= 0:
+            os.close(payload_descriptor)
+        os.close(current_descriptor)
+
+
+def _fsync_directory_tree(fs: FilesystemOps, directory_descriptor: int) -> None:
+    for name in sorted(fs.listdir(directory_descriptor)):
+        entry_stat = fs.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISDIR(entry_stat.st_mode):
+            continue
+        child_descriptor, opened_stat = _opened_entry(
+            fs,
+            name,
+            parent_descriptor=directory_descriptor,
+            flags=_OPEN_DIRECTORY,
+        )
+        try:
+            if not stat.S_ISDIR(opened_stat.st_mode):
+                raise SMLArtifactError(
+                    f"checkpoint payload component is not a directory: {name}"
+                )
+            _fsync_directory_tree(fs, child_descriptor)
+        finally:
+            os.close(child_descriptor)
+    fs.fsync_directory(directory_descriptor)
+
+
+def _make_checkpoint_group_durable(
+    fs: FilesystemOps,
+    temporary_descriptor: int,
+    references: Sequence[PayloadRef],
+) -> None:
+    for reference in references:
+        _fsync_payload_reference(fs, temporary_descriptor, reference)
+    _fsync_directory_tree(fs, temporary_descriptor)
+
+
+def _cleanup_checkpoint_temporary(
+    fs: FilesystemOps,
+    checkpoints_descriptor: int,
+    temporary_name: str,
+) -> None:
+    if not _is_temporary_step_name(temporary_name):
+        return
+    candidate_stat = _stat_if_present(
+        fs,
+        temporary_name,
+        parent_descriptor=checkpoints_descriptor,
+    )
+    if candidate_stat is None:
+        return
+    descriptor, opened_stat = _opened_entry(
+        fs,
+        temporary_name,
+        parent_descriptor=checkpoints_descriptor,
+        flags=_OPEN_DIRECTORY,
+    )
+    try:
+        if not stat.S_ISDIR(opened_stat.st_mode):
+            raise SMLArtifactError("temporary checkpoint is not a directory")
+        _delete_directory_contents(fs, descriptor)
+        _require_named_directory_inode(
+            fs,
+            temporary_name,
+            parent_descriptor=checkpoints_descriptor,
+            directory_descriptor=descriptor,
+            context="temporary checkpoint directory",
+        )
+        fs.rmdir(temporary_name, dir_fd=checkpoints_descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def publish_checkpoint(
+    run: Path,
+    build: Callable[[Path], CheckpointManifest],
+    *,
+    fs: FilesystemOps = OS_FILESYSTEM,
+) -> ResolvedStep:
+    if not isinstance(run, Path):
+        raise TypeError("run must be a Path")
+    if not callable(build):
+        raise TypeError("build must be callable")
+    if not isinstance(fs, FilesystemOps):
+        raise TypeError("fs must implement FilesystemOps")
+    run_descriptor = _open_directory(
+        run,
+        fs,
+        writable=True,
+        context="run directory",
+    )
+    checkpoints_descriptor = -1
+    temporary_descriptor = -1
+    temporary_name = ""
+    committed = False
+    try:
+        run_manifest = _read_manifest_from_descriptor(
+            run_descriptor,
+            RunManifest,
+            VerificationLevel.FULL,
+            context=str(run / RunManifest.MANIFEST_FILENAME),
+        )
+        checkpoints_descriptor = _open_checkpoints_directory(
+            run,
+            fs,
+            run_descriptor,
+            writable=True,
+        )
+        temporary_name = _temporary_step_name()
+        fs.mkdir(temporary_name, 0o700, dir_fd=checkpoints_descriptor)
+        temporary_descriptor = fs.open(
+            temporary_name,
+            _OPEN_DIRECTORY,
+            dir_fd=checkpoints_descriptor,
+        )
+        temporary_path = run / "checkpoints" / temporary_name
+        manifest = build(temporary_path)
+        if not isinstance(manifest, CheckpointManifest):
+            raise SMLArtifactError(
+                "checkpoint builder returned the wrong manifest type"
+            )
+        _validate_checkpoint_owner(
+            run_manifest,
+            manifest,
+            expected_step=manifest.step,
+        )
+        validated_manifest = _validate_builder_result(
+            manifest,
+            temporary_descriptor,
+            fs,
+        )
+        if validated_manifest is not manifest:
+            raise SMLArtifactError(
+                "checkpoint builder result changed during validation"
+            )
+
+        current_latest = _recover_latest_open(
+            run,
+            run_manifest,
+            run_descriptor,
+            checkpoints_descriptor,
+            writable=True,
+            verification=VerificationLevel.FULL,
+            fs=fs,
+            allow_empty=True,
+        )
+        if current_latest is not None and manifest.step < current_latest.step:
+            raise SMLArtifactError(
+                "older checkpoint publication cannot move latest backward"
+            )
+
+        target_name = _step_name(manifest.step)
+        if (
+            _stat_if_present(
+                fs,
+                target_name,
+                parent_descriptor=checkpoints_descriptor,
+            )
+            is not None
+        ):
+            existing = _resolve_step_from_descriptor(
+                run,
+                run_manifest,
+                checkpoints_descriptor,
+                step=manifest.step,
+                verification=VerificationLevel.FULL,
+                fs=fs,
+            )
+            if existing.checkpoint.identity != manifest.identity:
+                raise SMLArtifactError(
+                    "existing checkpoint step has a different identity collision"
+                )
+            if current_latest is None or current_latest.step != existing.step:
+                _persist_latest_index(run_descriptor, existing, fs)
+                return dataclasses.replace(
+                    existing,
+                    latest_recovered=True,
+                    latest_repair_persisted=True,
+                )
+            return current_latest
+
+        array_references = tuple(array.payload for array in manifest.arrays)
+        _make_checkpoint_group_durable(
+            fs,
+            temporary_descriptor,
+            array_references,
+        )
+        _make_checkpoint_group_durable(
+            fs,
+            temporary_descriptor,
+            (manifest.scalar_state,),
+        )
+        _write_manifest_last(fs, temporary_descriptor, manifest)
+        fs.fsync_directory(temporary_descriptor)
+        _verify_closed_world(
+            fs,
+            temporary_descriptor,
+            manifest,
+            manifest_present=True,
+            full=True,
+        )
+        _require_named_directory_inode(
+            fs,
+            temporary_name,
+            parent_descriptor=checkpoints_descriptor,
+            directory_descriptor=temporary_descriptor,
+            context="private checkpoint directory",
+        )
+        try:
+            fs.rename(
+                temporary_name,
+                target_name,
+                source_dir_fd=checkpoints_descriptor,
+                destination_dir_fd=checkpoints_descriptor,
+            )
+        except FileExistsError as error:
+            raise SMLArtifactError(
+                f"checkpoint step collision while committing: {manifest.step}"
+            ) from error
+        committed = True
+        fs.fsync_directory(checkpoints_descriptor)
+        _require_named_directory_inode(
+            fs,
+            target_name,
+            parent_descriptor=checkpoints_descriptor,
+            directory_descriptor=temporary_descriptor,
+            context="committed checkpoint directory",
+        )
+        published = _resolved_step(
+            run,
+            run_manifest,
+            manifest,
+            VerificationLevel.FULL,
+            latest_recovered=False,
+            latest_repair_persisted=False,
+        )
+        _persist_latest_index(run_descriptor, published, fs)
+        return published
+    finally:
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if checkpoints_descriptor >= 0:
+            try:
+                if temporary_name and not committed:
+                    _cleanup_checkpoint_temporary(
+                        fs,
+                        checkpoints_descriptor,
+                        temporary_name,
+                    )
+            finally:
+                os.close(checkpoints_descriptor)
+        os.close(run_descriptor)
+
+
+def _retention_entries(
+    checkpoints_descriptor: int,
+    *,
+    fs: FilesystemOps,
+) -> list[tuple[int, str]]:
+    entries: list[tuple[int, str]] = []
+    for name in sorted(fs.listdir(checkpoints_descriptor)):
+        if _is_temporary_step_name(name):
+            continue
+        step = _parse_step_name(name)
+        if step is None:
+            raise SMLArtifactError(f"malformed retention candidate: {name}")
+        entries.append((step, name))
+    return entries
+
+
+def _delete_owned_step_directory(
+    checkpoints_descriptor: int,
+    *,
+    name: str,
+    latest_name: str,
+    fs: FilesystemOps,
+) -> None:
+    if name == latest_name or _parse_step_name(name) is None:
+        raise SMLArtifactError("retention refuses to delete latest or malformed step")
+    descriptor, opened_stat = _opened_entry(
+        fs,
+        name,
+        parent_descriptor=checkpoints_descriptor,
+        flags=_OPEN_DIRECTORY,
+    )
+    try:
+        if not stat.S_ISDIR(opened_stat.st_mode):
+            raise SMLArtifactError(f"retention candidate is not a directory: {name}")
+        _delete_directory_contents(fs, descriptor)
+        _require_named_directory_inode(
+            fs,
+            name,
+            parent_descriptor=checkpoints_descriptor,
+            directory_descriptor=descriptor,
+            context=f"retention candidate {name}",
+        )
+        fs.rmdir(name, dir_fd=checkpoints_descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def apply_retention(
+    run: Path,
+    *,
+    keep_last: int | None,
+    fs: FilesystemOps = OS_FILESYSTEM,
+) -> ResolvedStep:
+    if not isinstance(run, Path):
+        raise TypeError("run must be a Path")
+    if keep_last is not None:
+        if isinstance(keep_last, bool) or not isinstance(keep_last, int):
+            raise TypeError("keep_last must be a positive integer or None")
+        if keep_last <= 0:
+            raise ValueError("keep_last must be positive")
+    if not isinstance(fs, FilesystemOps):
+        raise TypeError("fs must implement FilesystemOps")
+
+    with _protected_lock(
+        run,
+        category="run-access",
+        exclusive=True,
+        wait=True,
+    ):
+        latest = recover_latest_index(
+            run,
+            writable=True,
+            verification=VerificationLevel.FULL,
+            fs=fs,
+        )
+        if keep_last is None:
+            return latest
+
+        run_descriptor = _open_directory(
+            run,
+            fs,
+            writable=True,
+            context="run directory",
+        )
+        checkpoints_descriptor = -1
+        try:
+            checkpoints_descriptor = _open_checkpoints_directory(
+                run,
+                fs,
+                run_descriptor,
+                writable=True,
+            )
+            entries = _retention_entries(checkpoints_descriptor, fs=fs)
+            retained_names = {name for _step, name in sorted(entries)[-keep_last:]}
+            latest_name = _step_name(latest.step)
+            retained_names.add(latest_name)
+            deletions = [
+                (step, name)
+                for step, name in entries
+                if name not in retained_names and name != latest_name
+            ]
+            for step, _name in deletions:
+                _resolve_step_from_descriptor(
+                    run,
+                    latest.run,
+                    checkpoints_descriptor,
+                    step=step,
+                    verification=VerificationLevel.FULL,
+                    fs=fs,
+                )
+
+            latest_proof = _resolve_step_from_descriptor(
+                run,
+                latest.run,
+                checkpoints_descriptor,
+                step=latest.step,
+                verification=VerificationLevel.FULL,
+                fs=fs,
+            )
+            latest = dataclasses.replace(
+                latest_proof,
+                latest_recovered=latest.latest_recovered,
+                latest_repair_persisted=latest.latest_repair_persisted,
+            )
+            for _step, name in deletions:
+                _delete_owned_step_directory(
+                    checkpoints_descriptor,
+                    name=name,
+                    latest_name=latest_name,
+                    fs=fs,
+                )
+            if deletions:
+                fs.fsync_directory(checkpoints_descriptor)
+            return latest
+        finally:
+            if checkpoints_descriptor >= 0:
+                os.close(checkpoints_descriptor)
+            os.close(run_descriptor)
+
+
 __all__ = [
+    "CHECKPOINT_PUBLICATION_STAGES",
     "IMMUTABLE_PUBLICATION_STAGES",
     "OS_FILESYSTEM",
     "FilesystemOps",
     "Published",
+    "ResolvedStep",
+    "apply_retention",
     "publication_lock",
+    "publish_checkpoint",
     "publish_immutable_bundle",
+    "recover_latest_index",
+    "resolve_exact_step",
+    "resolve_latest_step",
     "run_access_lock",
     "run_writer_lock",
 ]
