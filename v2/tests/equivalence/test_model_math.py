@@ -5,7 +5,8 @@ import math
 import mlx.core as mx
 import pytest
 from sml.model.cache import KVCache
-from sml.model.config import ModelConfig
+from sml.model.config import GenerationConfig, ModelConfig
+from sml.model.generation import select_next_token
 from sml.model.language_model import SMLLanguageModel, causal_lm_loss
 from sml.model.rope import (
     RotaryEmbedding,
@@ -230,3 +231,17 @@ def test_explicit_parameter_forward_supports_consecutive_compiled_fixture_calls(
 
     assert_close(first, legacy_arrays["compiled_state.logits.0"], atol=2e-2, rtol=2e-2)
     assert_close(second, legacy_arrays["compiled_state.logits.1"], atol=2e-2, rtol=2e-2)
+
+
+def test_generation_sampling_matches_captured_legacy_primitive(legacy_arrays):
+    """Seeded nucleus sampling must preserve the accepted legacy token choice."""
+    result = select_next_token(
+        legacy_arrays["generation.logits"],
+        GenerationConfig(temperature=0.8, top_p=0.9),
+        mx.random.key(1234),
+    )
+    expected = mx.squeeze(legacy_arrays["generation.sampled_token"], axis=-1)
+
+    assert result.token_ids.shape == (1,)
+    assert result.token_ids.dtype == mx.uint32
+    assert_close(result.token_ids, expected, atol=0.0, rtol=0.0)
