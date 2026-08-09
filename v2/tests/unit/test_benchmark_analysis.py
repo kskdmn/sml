@@ -5738,6 +5738,7 @@ def test_paired_trials_share_one_identity_bound_evidence_session(tmp_path, monke
     assert {tuple(launch["recovery_output"].suffixes[-2:]) for launch in launches} == {
         (".recovery", ".json")
     }
+    assert len({launch["recovery_output"] for launch in launches}) == 2
     assert len({launch["recovery_samples_directory"] for launch in launches}) == 2
     assert all(
         path.name.endswith(".recovery-samples")
