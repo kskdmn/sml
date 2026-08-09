@@ -180,6 +180,34 @@ def test_top_p_uses_stable_order_for_equal_logits():
     _assert_array_equal(token_id, mx.array(0, dtype=mx.uint32))
 
 
+def test_bfloat16_top_p_uses_fp32_probability_cutoff_at_base_vocabulary(
+    monkeypatch,
+):
+    """BF16 model logits must not truncate a production-size nucleus early."""
+    captured_logits = []
+    categorical = mx.random.categorical
+
+    def capture_sampling_logits(logits, *, key):
+        captured_logits.append(logits)
+        return categorical(logits, key=key)
+
+    monkeypatch.setattr(mx.random, "categorical", capture_sampling_logits)
+
+    select_next_token_arrays(
+        mx.zeros((28_672,), dtype=mx.bfloat16),
+        mx.random.key(35),
+        temperature=1.0,
+        top_p=0.9,
+    )
+
+    assert len(captured_logits) == 1
+    masked_logits = captured_logits[0]
+    masked_count = mx.sum(masked_logits == float("-inf"))
+    mx.eval(masked_count)
+    assert masked_logits.dtype == mx.bfloat16
+    assert int(masked_count.item()) == 2_867
+
+
 def test_compiled_vmap_accepts_one_distinct_key_per_row():
     """Batched compilation must never pass a stacked key to categorical sampling."""
     logits = mx.array(

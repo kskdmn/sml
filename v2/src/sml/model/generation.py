@@ -109,7 +109,7 @@ def select_next_token_arrays(
             sorted_indices,
             axis=-1,
         )
-        sorted_probabilities = mx.softmax(sorted_logits, axis=-1)
+        sorted_probabilities = mx.softmax(sorted_logits.astype(mx.float32), axis=-1)
         cumulative_probabilities = mx.cumsum(sorted_probabilities, axis=-1)
         sorted_mask = cumulative_probabilities - sorted_probabilities >= top_p
         sorted_logits = mx.where(sorted_mask, float("-inf"), sorted_logits)
