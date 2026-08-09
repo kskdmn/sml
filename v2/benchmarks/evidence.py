@@ -615,38 +615,39 @@ def _validate_recovery_outcome(
         raise ValueError(
             "recovery failure_fields do not match environment failure evidence"
         )
+    last_nonmatching = max(
+        (
+            sample["elapsed_seconds"]
+            for sample in samples
+            if not _environment_matches_recovery_policy(
+                sample["environment_status"], policy
+            )
+        ),
+        default=0.0,
+    )
+    stable_samples = [
+        sample
+        for sample in samples
+        if sample["elapsed_seconds"] >= last_nonmatching
+        and _environment_matches_recovery_policy(sample["environment_status"], policy)
+    ]
+    has_stable_recovery_window = (
+        bool(stable_samples)
+        and duration_seconds - stable_samples[0]["elapsed_seconds"]
+        >= policy["stability_seconds"]
+    )
     if outcome == "not-required":
         valid = (
             immediate_pressure == "normal" and not samples and duration_seconds == 0.0
         )
     elif outcome == "recovered":
-        last_nonmatching = max(
-            (
-                sample["elapsed_seconds"]
-                for sample in samples
-                if not _environment_matches_recovery_policy(
-                    sample["environment_status"], policy
-                )
-            ),
-            default=0.0,
-        )
-        stable_samples = [
-            sample
-            for sample in samples
-            if sample["elapsed_seconds"] > last_nonmatching
-            and _environment_matches_recovery_policy(
-                sample["environment_status"], policy
-            )
-        ]
         valid = (
             immediate_pressure == "warning"
             and bool(samples)
             and not requires_critical_outcome
             and not environment_failure_fields
             and _environment_matches_recovery_policy(terminal, policy)
-            and stable_samples
-            and duration_seconds - stable_samples[0]["elapsed_seconds"]
-            >= policy["stability_seconds"]
+            and has_stable_recovery_window
         )
     elif outcome == "timeout":
         valid = (
@@ -654,7 +655,7 @@ def _validate_recovery_outcome(
             and duration_seconds == policy["timeout_seconds"]
             and not requires_critical_outcome
             and not environment_failure_fields
-            and not _environment_matches_recovery_policy(terminal, policy)
+            and not has_stable_recovery_window
         )
     elif outcome == "critical":
         valid = requires_critical_outcome

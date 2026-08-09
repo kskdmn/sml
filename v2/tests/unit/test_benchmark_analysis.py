@@ -1525,6 +1525,41 @@ def test_thermal_recovery_sample_requires_environment_failure_evidence():
         )
 
 
+def test_timeout_uses_the_deadline_bound_stable_recovery_window():
+    workload = build_canonical_workload()
+    policy = post_exit_recovery_policy(workload)
+    measurement, post_exit, late_recovery_samples = _warning_recovery_sample_chain(
+        workload,
+        pressures=("warning", "normal", "normal", "normal", "normal"),
+        elapsed=(280.0, 285.0, 290.0, 295.0, 300.0),
+    )
+
+    timeout = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=late_recovery_samples,
+        policy=policy,
+        outcome="timeout",
+        duration_seconds=300.0,
+    )
+    assert timeout["outcome"] == "timeout"
+
+    measurement, post_exit, stable_samples = _warning_recovery_sample_chain(
+        workload,
+        pressures=("normal",) * 4,
+        elapsed=(270.0, 280.0, 290.0, 300.0),
+    )
+    with pytest.raises(ValueError, match="recovery outcome"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=stable_samples,
+            policy=policy,
+            outcome="timeout",
+            duration_seconds=300.0,
+        )
+
+
 def _with_observation_changes(
     trial, *, environment_changes=None, software_changes=None, hardware_changes=None
 ):
