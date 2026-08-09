@@ -273,9 +273,9 @@ def _conflicting_run_writer_message(run: Path) -> str:
         return str(error)
 
 
-def _run_access_outcome(run: Path) -> tuple[str, str]:
+def _run_writer_outcome(run: Path) -> tuple[str, str]:
     try:
-        with run_access_lock(run, exclusive=True):
+        with run_writer_lock(run):
             return "acquired", ""
     except SMLArtifactError as error:
         return "conflict", str(error)
@@ -510,7 +510,7 @@ def test_release_transition_never_exposes_empty_owner_diagnostics(
         assert holder_ready.wait(10), "child did not acquire the run writer lock"
         holder_release.set()
         assert transition_started.wait(10), "child did not reach release transition"
-        outcome, message = _run_access_outcome(run)
+        outcome, message = _run_writer_outcome(run)
         if outcome == "conflict":
             assert "owner diagnostics unavailable" not in message
             assert str(process.pid) in message

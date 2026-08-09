@@ -290,6 +290,20 @@ class ResolvedStep:
         return self.checkpoint.step
 
 
+@dataclass(slots=True)
+class _OwnedStep:
+    resolved: ResolvedStep
+    name: str
+    descriptor: int
+    opened_stat: os.stat_result
+
+    def close(self) -> None:
+        descriptor = self.descriptor
+        self.descriptor = -1
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 class _LockUnavailable(SMLArtifactError):
     pass
 
@@ -1321,6 +1335,10 @@ def _validate_checkpoint_owner(
         raise SMLArtifactError(
             "checkpoint logical step does not match its canonical directory"
         )
+    if manifest.scalar_state.logical_path != "state.json":
+        raise SMLArtifactError(
+            "checkpoint scalar state logical path must be exactly 'state.json'"
+        )
 
 
 def _resolved_step(
@@ -1388,7 +1406,7 @@ def _open_checkpoints_directory(
         raise
 
 
-def _resolve_step_from_descriptor(
+def _open_verified_step_from_descriptor(
     run: Path,
     run_manifest: RunManifest,
     checkpoints_descriptor: int,
@@ -1396,7 +1414,7 @@ def _resolve_step_from_descriptor(
     step: int,
     verification: VerificationLevel,
     fs: FilesystemOps,
-) -> ResolvedStep:
+) -> _OwnedStep:
     name = _step_name(step)
     descriptor = -1
     try:
@@ -1433,14 +1451,21 @@ def _resolve_step_from_descriptor(
             directory_descriptor=descriptor,
             context=f"checkpoint step {step}",
         )
-        return _resolved_step(
-            run,
-            run_manifest,
-            manifest,
-            verification,
-            latest_recovered=False,
-            latest_repair_persisted=False,
+        owned = _OwnedStep(
+            resolved=_resolved_step(
+                run,
+                run_manifest,
+                manifest,
+                verification,
+                latest_recovered=False,
+                latest_repair_persisted=False,
+            ),
+            name=name,
+            descriptor=descriptor,
+            opened_stat=opened_stat,
         )
+        descriptor = -1
+        return owned
     except FileNotFoundError as error:
         raise SMLArtifactError(f"checkpoint step does not exist: {step}") from error
     except SMLArtifactError:
@@ -1450,6 +1475,29 @@ def _resolve_step_from_descriptor(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _resolve_step_from_descriptor(
+    run: Path,
+    run_manifest: RunManifest,
+    checkpoints_descriptor: int,
+    *,
+    step: int,
+    verification: VerificationLevel,
+    fs: FilesystemOps,
+) -> ResolvedStep:
+    owned = _open_verified_step_from_descriptor(
+        run,
+        run_manifest,
+        checkpoints_descriptor,
+        step=step,
+        verification=verification,
+        fs=fs,
+    )
+    try:
+        return owned.resolved
+    finally:
+        owned.close()
 
 
 def resolve_exact_step(
@@ -2019,6 +2067,35 @@ def publish_checkpoint(
             directory_descriptor=temporary_descriptor,
             context="committed checkpoint directory",
         )
+        committed_manifest = _read_manifest_from_descriptor(
+            temporary_descriptor,
+            CheckpointManifest,
+            VerificationLevel.FULL,
+            context=str(run / "checkpoints" / target_name),
+        )
+        _validate_checkpoint_owner(
+            run_manifest,
+            committed_manifest,
+            expected_step=manifest.step,
+        )
+        if committed_manifest.identity != manifest.identity:
+            raise SMLArtifactError(
+                "committed checkpoint manifest changed after step rename"
+            )
+        _verify_closed_world(
+            fs,
+            temporary_descriptor,
+            committed_manifest,
+            manifest_present=True,
+            full=True,
+        )
+        _require_named_directory_inode(
+            fs,
+            target_name,
+            parent_descriptor=checkpoints_descriptor,
+            directory_descriptor=temporary_descriptor,
+            context="committed checkpoint after full verification",
+        )
         published = _resolved_step(
             run,
             run_manifest,
@@ -2061,35 +2138,184 @@ def _retention_entries(
     return entries
 
 
-def _delete_owned_step_directory(
+def _delete_directory_contents_durable(
+    fs: FilesystemOps,
+    directory_descriptor: int,
+) -> None:
+    for name in sorted(fs.listdir(directory_descriptor)):
+        if not _safe_child_name(name):
+            raise SMLArtifactError("retention found an invalid directory entry name")
+        entry_stat = fs.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        if stat.S_ISREG(entry_stat.st_mode):
+            if entry_stat.st_nlink != 1:
+                raise SMLArtifactError(f"retention rejects hard-linked file: {name}")
+            descriptor, opened_stat = _opened_entry(
+                fs,
+                name,
+                parent_descriptor=directory_descriptor,
+                flags=_OPEN_PAYLOAD,
+            )
+            try:
+                if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
+                    raise SMLArtifactError(
+                        f"retention rejects non-regular file: {name}"
+                    )
+                current_stat = fs.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if not _same_inode(opened_stat, current_stat):
+                    raise SMLArtifactError(f"retention detected a file swap: {name}")
+                fs.unlink(name, dir_fd=directory_descriptor)
+            finally:
+                os.close(descriptor)
+        elif stat.S_ISDIR(entry_stat.st_mode):
+            descriptor, opened_stat = _opened_entry(
+                fs,
+                name,
+                parent_descriptor=directory_descriptor,
+                flags=_OPEN_DIRECTORY,
+            )
+            try:
+                if not stat.S_ISDIR(opened_stat.st_mode):
+                    raise SMLArtifactError(f"retention rejects non-directory: {name}")
+                _delete_directory_contents_durable(fs, descriptor)
+                current_stat = fs.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+                if not _same_inode(opened_stat, current_stat):
+                    raise SMLArtifactError(
+                        f"retention detected a directory swap: {name}"
+                    )
+                fs.rmdir(name, dir_fd=directory_descriptor)
+            finally:
+                os.close(descriptor)
+        else:
+            raise SMLArtifactError(f"retention rejects symlink or special file: {name}")
+    fs.fsync_directory(directory_descriptor)
+
+
+def _cleanup_retention_temporaries(
     checkpoints_descriptor: int,
     *,
-    name: str,
-    latest_name: str,
     fs: FilesystemOps,
 ) -> None:
-    if name == latest_name or _parse_step_name(name) is None:
-        raise SMLArtifactError("retention refuses to delete latest or malformed step")
-    descriptor, opened_stat = _opened_entry(
-        fs,
-        name,
-        parent_descriptor=checkpoints_descriptor,
-        flags=_OPEN_DIRECTORY,
-    )
-    try:
-        if not stat.S_ISDIR(opened_stat.st_mode):
-            raise SMLArtifactError(f"retention candidate is not a directory: {name}")
-        _delete_directory_contents(fs, descriptor)
-        _require_named_directory_inode(
+    for name in sorted(fs.listdir(checkpoints_descriptor)):
+        if not _is_temporary_step_name(name):
+            continue
+        descriptor, opened_stat = _opened_entry(
             fs,
             name,
             parent_descriptor=checkpoints_descriptor,
-            directory_descriptor=descriptor,
-            context=f"retention candidate {name}",
+            flags=_OPEN_DIRECTORY,
         )
-        fs.rmdir(name, dir_fd=checkpoints_descriptor)
-    finally:
-        os.close(descriptor)
+        try:
+            if not stat.S_ISDIR(opened_stat.st_mode):
+                raise SMLArtifactError(
+                    f"retention temporary is not a directory: {name}"
+                )
+            _delete_directory_contents_durable(fs, descriptor)
+            _require_named_directory_inode(
+                fs,
+                name,
+                parent_descriptor=checkpoints_descriptor,
+                directory_descriptor=descriptor,
+                context=f"retention temporary {name}",
+            )
+            fs.rmdir(name, dir_fd=checkpoints_descriptor)
+            fs.fsync_directory(checkpoints_descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _detach_and_delete_owned_step(
+    checkpoints_descriptor: int,
+    *,
+    candidate: _OwnedStep,
+    latest: _OwnedStep,
+    fs: FilesystemOps,
+) -> None:
+    if candidate.name == latest.name or _parse_step_name(candidate.name) is None:
+        raise SMLArtifactError("retention refuses to delete latest or malformed step")
+    _require_named_directory_inode(
+        fs,
+        candidate.name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=candidate.descriptor,
+        context=f"retention candidate {candidate.name}",
+    )
+    _require_named_directory_inode(
+        fs,
+        latest.name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=latest.descriptor,
+        context="retained latest checkpoint",
+    )
+    temporary_name = _temporary_step_name()
+    try:
+        fs.rename(
+            candidate.name,
+            temporary_name,
+            source_dir_fd=checkpoints_descriptor,
+            destination_dir_fd=checkpoints_descriptor,
+        )
+    except FileExistsError as error:
+        raise SMLArtifactError(
+            f"retention temporary collision for {candidate.name}"
+        ) from error
+    _require_named_directory_inode(
+        fs,
+        temporary_name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=candidate.descriptor,
+        context=f"detached retention candidate {candidate.name}",
+    )
+    _require_named_directory_inode(
+        fs,
+        latest.name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=latest.descriptor,
+        context="retained latest checkpoint after candidate detach",
+    )
+    fs.fsync_directory(checkpoints_descriptor)
+    _require_named_directory_inode(
+        fs,
+        temporary_name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=candidate.descriptor,
+        context=f"durable detached candidate {candidate.name}",
+    )
+    _require_named_directory_inode(
+        fs,
+        latest.name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=latest.descriptor,
+        context="retained latest checkpoint before recursive delete",
+    )
+    _delete_directory_contents_durable(fs, candidate.descriptor)
+    _require_named_directory_inode(
+        fs,
+        temporary_name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=candidate.descriptor,
+        context=f"emptied retention candidate {candidate.name}",
+    )
+    _require_named_directory_inode(
+        fs,
+        latest.name,
+        parent_descriptor=checkpoints_descriptor,
+        directory_descriptor=latest.descriptor,
+        context="retained latest checkpoint before temporary removal",
+    )
+    fs.rmdir(temporary_name, dir_fd=checkpoints_descriptor)
+    fs.fsync_directory(checkpoints_descriptor)
 
 
 def apply_retention(
@@ -2114,15 +2340,6 @@ def apply_retention(
         exclusive=True,
         wait=True,
     ):
-        latest = recover_latest_index(
-            run,
-            writable=True,
-            verification=VerificationLevel.FULL,
-            fs=fs,
-        )
-        if keep_last is None:
-            return latest
-
         run_descriptor = _open_directory(
             run,
             fs,
@@ -2130,13 +2347,40 @@ def apply_retention(
             context="run directory",
         )
         checkpoints_descriptor = -1
+        owned_deletions: list[_OwnedStep] = []
+        owned_latest: _OwnedStep | None = None
         try:
+            run_manifest = _read_manifest_from_descriptor(
+                run_descriptor,
+                RunManifest,
+                VerificationLevel.FULL,
+                context=str(run / RunManifest.MANIFEST_FILENAME),
+            )
             checkpoints_descriptor = _open_checkpoints_directory(
                 run,
                 fs,
                 run_descriptor,
                 writable=True,
             )
+            latest = _recover_latest_open(
+                run,
+                run_manifest,
+                run_descriptor,
+                checkpoints_descriptor,
+                writable=True,
+                verification=VerificationLevel.FULL,
+                fs=fs,
+                allow_empty=False,
+            )
+            if latest is None:
+                raise SMLArtifactError("run has no published checkpoints")
+            _cleanup_retention_temporaries(
+                checkpoints_descriptor,
+                fs=fs,
+            )
+            if keep_last is None:
+                return latest
+
             entries = _retention_entries(checkpoints_descriptor, fs=fs)
             retained_names = {name for _step, name in sorted(entries)[-keep_last:]}
             latest_name = _step_name(latest.step)
@@ -2147,16 +2391,18 @@ def apply_retention(
                 if name not in retained_names and name != latest_name
             ]
             for step, _name in deletions:
-                _resolve_step_from_descriptor(
-                    run,
-                    latest.run,
-                    checkpoints_descriptor,
-                    step=step,
-                    verification=VerificationLevel.FULL,
-                    fs=fs,
+                owned_deletions.append(
+                    _open_verified_step_from_descriptor(
+                        run,
+                        latest.run,
+                        checkpoints_descriptor,
+                        step=step,
+                        verification=VerificationLevel.FULL,
+                        fs=fs,
+                    )
                 )
 
-            latest_proof = _resolve_step_from_descriptor(
+            owned_latest = _open_verified_step_from_descriptor(
                 run,
                 latest.run,
                 checkpoints_descriptor,
@@ -2164,22 +2410,29 @@ def apply_retention(
                 verification=VerificationLevel.FULL,
                 fs=fs,
             )
+            latest_proof = owned_latest.resolved
+            if latest_proof.checkpoint.identity != latest.checkpoint.identity:
+                raise SMLArtifactError(
+                    "fresh retained latest proof changed checkpoint identity"
+                )
             latest = dataclasses.replace(
                 latest_proof,
                 latest_recovered=latest.latest_recovered,
                 latest_repair_persisted=latest.latest_repair_persisted,
             )
-            for _step, name in deletions:
-                _delete_owned_step_directory(
+            for candidate in owned_deletions:
+                _detach_and_delete_owned_step(
                     checkpoints_descriptor,
-                    name=name,
-                    latest_name=latest_name,
+                    candidate=candidate,
+                    latest=owned_latest,
                     fs=fs,
                 )
-            if deletions:
-                fs.fsync_directory(checkpoints_descriptor)
             return latest
         finally:
+            if owned_latest is not None:
+                owned_latest.close()
+            for candidate in owned_deletions:
+                candidate.close()
             if checkpoints_descriptor >= 0:
                 os.close(checkpoints_descriptor)
             os.close(run_descriptor)
