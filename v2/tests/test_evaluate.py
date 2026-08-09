@@ -1,16 +1,10 @@
 import json
-import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from helpers import Spy
-
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_DIR / "src"
-sys.path.insert(0, str(SRC_DIR))
-
 
 try:
     import mlx.core as mx

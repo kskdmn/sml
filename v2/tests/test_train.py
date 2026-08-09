@@ -1,16 +1,11 @@
 import inspect
 import json
-import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from helpers import Spy
-
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_DIR / "src"
-sys.path.insert(0, str(SRC_DIR))
 
 
 def require_mlx():

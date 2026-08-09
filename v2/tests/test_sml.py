@@ -1,12 +1,6 @@
 import sys
-from pathlib import Path
 
 import pytest
-
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_DIR / "src"
-sys.path.insert(0, str(SRC_DIR))
-
 
 try:
     import mlx.core as mx
@@ -170,7 +164,7 @@ class TestSMLModel:
         )
 
     def test_model_uses_per_parameter_initializer_ranges(self, monkeypatch):
-        import sml
+        legacy = sys.modules["sml._legacy"]
         from sml import (
             ParameterInitializerRangeConfig,
             SMLConfig,
@@ -183,7 +177,7 @@ class TestSMLModel:
         def assert_full(array, value):
             assert bool(mx.allclose(array, mx.full(array.shape, value)).item())
 
-        monkeypatch.setattr(sml.mx.random, "normal", fake_normal)
+        monkeypatch.setattr(legacy.mx.random, "normal", fake_normal)
         config = SMLConfig(
             vocab_size=16,
             hidden_size=8,
@@ -323,18 +317,18 @@ class TestSMLModel:
         assert bool(mx.all(prompt == generated[:, : prompt.shape[1]]).item())
 
     def test_generate_preallocates_kv_cache_to_requested_length(self, monkeypatch):
-        import sml
+        legacy = sys.modules["sml._legacy"]
         from sml import SMLLanguageModel
 
         created_cache_lengths = []
-        original_kv_cache = sml.KVCache
+        original_kv_cache = legacy.KVCache
 
         class RecordingKVCache(original_kv_cache):
             def __init__(self, max_seq_len=None):
                 created_cache_lengths.append(max_seq_len)
                 super().__init__(max_seq_len=max_seq_len)
 
-        monkeypatch.setattr(sml, "KVCache", RecordingKVCache)
+        monkeypatch.setattr(legacy, "KVCache", RecordingKVCache)
         config = self.tiny_config()
         model = SMLLanguageModel(config)
         prompt = mx.array([[config.bos_token_id, 5, 6]], dtype=mx.int32)
