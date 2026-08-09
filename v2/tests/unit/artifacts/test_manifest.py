@@ -179,6 +179,30 @@ def _write_manifest(root: Path, manifest: object, filename: str) -> object:
     return identified
 
 
+def _materialize_payloads(root: Path, value: object) -> object:
+    if isinstance(value, PayloadRef):
+        data = f"payload:{value.logical_path}".encode()
+        path = root.joinpath(*value.logical_path.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return replace(
+            value,
+            identity=file_identity(io.BytesIO(data)),
+            byte_size=len(data),
+        )
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return replace(
+            value,
+            **{
+                field.name: _materialize_payloads(root, getattr(value, field.name))
+                for field in dataclasses.fields(value)
+            },
+        )
+    if isinstance(value, tuple):
+        return tuple(_materialize_payloads(root, item) for item in value)
+    return value
+
+
 def test_sml_json_v1_identity_vectors_are_stable():
     """Changing normalization of tuples, Unicode, or signed zero breaks identities."""
     left = {"z": -0.0, "a": ("雪", 1, 1.0)}
@@ -374,6 +398,7 @@ def test_strict_manifest_parser_round_trips_every_schema(tmp_path):
     for index, (manifest, filename) in enumerate(zip(manifest_fixtures(), filenames)):
         root = tmp_path / str(index)
         root.mkdir()
+        manifest = _materialize_payloads(root, manifest)
         expected = _write_manifest(root, manifest, filename)
 
         verified = read_manifest(

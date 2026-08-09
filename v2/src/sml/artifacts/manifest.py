@@ -1,23 +1,75 @@
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import hashlib
 import json
 import math
+import os
 import re
+import stat
+import sys
+import unicodedata
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path, PurePath, PurePosixPath
+from pathlib import Path, PurePath
 from types import MappingProxyType
-from typing import Any, BinaryIO, ClassVar, cast
+from typing import Any, BinaryIO, ClassVar, Self, cast
 
 import numpy as np
 
 from sml.errors import SMLArtifactError
 
 _IDENTITY_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_PORTABLE_COMPONENT_PATTERN = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9_-])?\Z"
+)
 _FILE_READ_SIZE = 1024 * 1024
+_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+_DIRECTORY_OPEN_FLAGS = _OPEN_FLAGS | os.O_DIRECTORY
+_MNT_LOCAL = 0x00001000
+
+
+class _DarwinFsid(ctypes.Structure):
+    _fields_ = [("values", ctypes.c_int32 * 2)]
+
+
+class _DarwinStatfs(ctypes.Structure):
+    _fields_ = [
+        ("f_bsize", ctypes.c_uint32),
+        ("f_iosize", ctypes.c_int32),
+        ("f_blocks", ctypes.c_uint64),
+        ("f_bfree", ctypes.c_uint64),
+        ("f_bavail", ctypes.c_uint64),
+        ("f_files", ctypes.c_uint64),
+        ("f_ffree", ctypes.c_uint64),
+        ("f_fsid", _DarwinFsid),
+        ("f_owner", ctypes.c_uint32),
+        ("f_type", ctypes.c_uint32),
+        ("f_flags", ctypes.c_uint32),
+        ("f_fssubtype", ctypes.c_uint32),
+        ("f_fstypename", ctypes.c_char * 16),
+        ("f_mntonname", ctypes.c_char * 1024),
+        ("f_mntfromname", ctypes.c_char * 1024),
+        ("f_flags_ext", ctypes.c_uint32),
+        ("f_reserved", ctypes.c_uint32 * 7),
+    ]
+
+
+def _descriptor_is_local_apfs(descriptor: int) -> bool:
+    if sys.platform != "darwin":
+        return False
+    filesystem = _DarwinStatfs()
+    libc = ctypes.CDLL(None, use_errno=True)
+    fstatfs = libc.fstatfs
+    fstatfs.argtypes = (ctypes.c_int, ctypes.POINTER(_DarwinStatfs))
+    fstatfs.restype = ctypes.c_int
+    if fstatfs(descriptor, ctypes.byref(filesystem)) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    filesystem_type = bytes(filesystem.f_fstypename).split(b"\0", 1)[0]
+    return filesystem_type == b"apfs" and bool(filesystem.f_flags & _MNT_LOCAL)
 
 
 def _validated_string(value: str) -> str:
@@ -197,6 +249,191 @@ class PayloadRef:
         _require_string(self.logical_path, "logical_path")
         _require_identity(self.identity, "payload identity")
         _require_plain_int(self.byte_size, "byte_size")
+
+
+def parse_logical_path(value: str) -> tuple[str, ...]:
+    """Return a normalized portable artifact path without filesystem access."""
+    if not isinstance(value, str):
+        raise TypeError("logical path must be a string")
+    if not value or value.startswith("/") or "\\" in value:
+        raise SMLArtifactError(f"invalid logical path: {value!r}")
+    raw_components = value.split("/")
+    if any(component in {"", ".", ".."} for component in raw_components):
+        raise SMLArtifactError(f"invalid logical path: {value!r}")
+
+    components = tuple(
+        unicodedata.normalize("NFKC", component) for component in raw_components
+    )
+    if any(
+        "/" in component
+        or "\\" in component
+        or _PORTABLE_COMPONENT_PATTERN.fullmatch(component) is None
+        for component in components
+    ):
+        raise SMLArtifactError(f"invalid logical path: {value!r}")
+    return components
+
+
+class ArtifactRoot:
+    """An artifact directory owned and traversed through open descriptors."""
+
+    def __init__(self, descriptor: int, *, local_apfs: bool) -> None:
+        self._fd = descriptor
+        self._local_apfs = local_apfs
+        self._inode_paths: dict[tuple[int, int], tuple[str, ...]] = {}
+
+    @classmethod
+    def open(cls, path: Path, *, writable: bool) -> ArtifactRoot:
+        if not isinstance(path, Path):
+            raise TypeError("artifact root path must be a Path")
+        if not isinstance(writable, bool):
+            raise TypeError("writable must be a bool")
+        descriptor = -1
+        try:
+            descriptor = os.open(path, _DIRECTORY_OPEN_FLAGS)
+            root_stat = os.fstat(descriptor)
+            if not stat.S_ISDIR(root_stat.st_mode):
+                raise SMLArtifactError("artifact root is not a directory")
+            local_apfs = _descriptor_is_local_apfs(descriptor)
+            if writable and not local_apfs:
+                raise SMLArtifactError(
+                    "writable artifact roots require a local APFS filesystem"
+                )
+            return cls(descriptor, local_apfs=local_apfs)
+        except SMLArtifactError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except OSError as error:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise SMLArtifactError(
+                f"could not open artifact root with no-follow semantics: {path}"
+            ) from error
+
+    @property
+    def local_apfs(self) -> bool:
+        return self._local_apfs
+
+    def close(self) -> None:
+        descriptor = self._fd
+        self._fd = -1
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    def __enter__(self) -> Self:
+        if self._fd < 0:
+            raise SMLArtifactError("artifact root is closed")
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        self.close()
+
+    def open_payload(self, logical_path: str) -> BinaryIO:
+        components = parse_logical_path(logical_path)
+        if self._fd < 0:
+            raise SMLArtifactError("artifact root is closed")
+
+        current_descriptor = -1
+        final_descriptor = -1
+        try:
+            current_descriptor = os.dup(self._fd)
+            for component in components[:-1]:
+                next_descriptor = os.open(
+                    component,
+                    _DIRECTORY_OPEN_FLAGS,
+                    dir_fd=current_descriptor,
+                )
+                try:
+                    component_stat = os.fstat(next_descriptor)
+                    if not stat.S_ISDIR(component_stat.st_mode):
+                        raise SMLArtifactError(
+                            "no-follow traversal found a non-directory component "
+                            f"in payload: {logical_path}"
+                        )
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
+                previous_descriptor = current_descriptor
+                current_descriptor = next_descriptor
+                os.close(previous_descriptor)
+
+            final_descriptor = os.open(
+                components[-1],
+                _OPEN_FLAGS,
+                dir_fd=current_descriptor,
+            )
+            payload_stat = os.fstat(final_descriptor)
+            if not stat.S_ISREG(payload_stat.st_mode):
+                raise SMLArtifactError(f"payload is not a regular file: {logical_path}")
+            if payload_stat.st_nlink != 1:
+                raise SMLArtifactError(
+                    f"payload link count must be exactly one: {logical_path}"
+                )
+
+            inode = (payload_stat.st_dev, payload_stat.st_ino)
+            previous_path = self._inode_paths.get(inode)
+            if previous_path is not None and previous_path != components:
+                raise SMLArtifactError(
+                    "distinct logical paths resolve to one inode alias: "
+                    f"{'/'.join(previous_path)!r} and {logical_path!r}"
+                )
+            self._inode_paths[inode] = components
+
+            stream = cast(BinaryIO, os.fdopen(final_descriptor, "rb"))
+            final_descriptor = -1
+            return stream
+        except SMLArtifactError:
+            raise
+        except OSError as error:
+            raise SMLArtifactError(
+                f"no-follow traversal failed for payload: {logical_path}"
+            ) from error
+        finally:
+            if final_descriptor >= 0:
+                os.close(final_descriptor)
+            if current_descriptor >= 0:
+                os.close(current_descriptor)
+
+    def verify_payloads(self, references: Sequence[PayloadRef], *, full: bool) -> None:
+        if not isinstance(full, bool):
+            raise TypeError("full must be a bool")
+        parsed_references: list[tuple[PayloadRef, tuple[str, ...]]] = []
+        collision_paths: dict[tuple[str, ...], tuple[str, tuple[str, ...]]] = {}
+        for reference in references:
+            if not isinstance(reference, PayloadRef):
+                raise TypeError("references must contain PayloadRef values")
+            components = parse_logical_path(reference.logical_path)
+            collision_key = tuple(component.casefold() for component in components)
+            previous = collision_paths.get(collision_key)
+            if previous is not None and previous[0] != reference.logical_path:
+                category = (
+                    "normalized path collision"
+                    if previous[1] == components
+                    else "case-folded path collision"
+                )
+                raise SMLArtifactError(
+                    f"{category}: {previous[0]!r} and {reference.logical_path!r}"
+                )
+            collision_paths[collision_key] = (reference.logical_path, components)
+            parsed_references.append((reference, components))
+
+        for reference, _components in parsed_references:
+            with self.open_payload(reference.logical_path) as payload:
+                payload_stat = os.fstat(payload.fileno())
+                if payload_stat.st_size != reference.byte_size:
+                    raise SMLArtifactError(
+                        f"payload byte size mismatch: {reference.logical_path}"
+                    )
+                if full and file_identity(payload) != reference.identity:
+                    raise SMLArtifactError(
+                        f"payload identity mismatch: {reference.logical_path}"
+                    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -834,38 +1071,6 @@ def _payload_refs(value: object) -> Iterator[PayloadRef]:
             yield from _payload_refs(item)
 
 
-def _lexical_payload_path(root: Path, logical_path: str) -> Path:
-    path = PurePosixPath(logical_path)
-    if path.is_absolute() or not path.parts or any(part == ".." for part in path.parts):
-        raise SMLArtifactError(f"invalid logical payload path: {logical_path!r}")
-    return root.joinpath(*path.parts)
-
-
-def _verify_payloads(root: Path, manifest: _Manifest) -> None:
-    for reference in _payload_refs(manifest):
-        path = _lexical_payload_path(root, reference.logical_path)
-        try:
-            stat = path.stat()
-            if not path.is_file():
-                raise SMLArtifactError(
-                    f"payload is not a regular file: {reference.logical_path}"
-                )
-            if stat.st_size != reference.byte_size:
-                raise SMLArtifactError(
-                    f"payload byte size mismatch: {reference.logical_path}"
-                )
-            with path.open("rb") as file:
-                actual_identity = file_identity(file)
-        except OSError as error:
-            raise SMLArtifactError(
-                f"could not read payload: {reference.logical_path}"
-            ) from error
-        if actual_identity != reference.identity:
-            raise SMLArtifactError(
-                f"payload identity mismatch: {reference.logical_path}"
-            )
-
-
 def read_manifest[M: _Manifest](
     root: Path, manifest_type: type[M], verification: VerificationLevel
 ) -> Verified[M]:
@@ -877,40 +1082,48 @@ def read_manifest[M: _Manifest](
     if manifest_type not in _MANIFEST_TYPES:
         raise SMLArtifactError(f"unsupported manifest type: {manifest_type!r}")
     manifest_path = root / manifest_type.MANIFEST_FILENAME
-    try:
-        text = manifest_path.read_text(encoding="utf-8")
-        raw = json.loads(
-            text,
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=_json_object_no_duplicates,
-        )
-        manifest = _parse_manifest(raw, manifest_type)
-    except SMLArtifactError:
-        raise
-    except (
-        OSError,
-        UnicodeError,
-        json.JSONDecodeError,
-        TypeError,
-        ValueError,
-    ) as error:
-        raise SMLArtifactError(
-            f"invalid {manifest_type.__name__} at {manifest_path}: {error}"
-        ) from error
+    with ArtifactRoot.open(root, writable=False) as artifact_root:
+        try:
+            with artifact_root.open_payload(
+                manifest_type.MANIFEST_FILENAME
+            ) as manifest_file:
+                text = manifest_file.read().decode("utf-8")
+            raw = json.loads(
+                text,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_json_object_no_duplicates,
+            )
+            manifest = _parse_manifest(raw, manifest_type)
+        except SMLArtifactError:
+            raise
+        except (
+            OSError,
+            UnicodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise SMLArtifactError(
+                f"invalid {manifest_type.__name__} at {manifest_path}: {error}"
+            ) from error
 
-    recomputed = manifest.recompute_identity()
-    if recomputed != manifest.identity:
-        raise SMLArtifactError(
-            f"manifest identity mismatch: stored {manifest.identity}, recomputed {recomputed}"
+        recomputed = manifest.recompute_identity()
+        if recomputed != manifest.identity:
+            raise SMLArtifactError(
+                "manifest identity mismatch: "
+                f"stored {manifest.identity}, recomputed {recomputed}"
+            )
+        artifact_root.verify_payloads(
+            tuple(_payload_refs(manifest)),
+            full=verification is VerificationLevel.FULL,
         )
-    if verification is VerificationLevel.FULL:
-        _verify_payloads(root, manifest)
-    return Verified(manifest=manifest, verification=verification)
+        return Verified(manifest=manifest, verification=verification)
 
 
 __all__ = [
     "ArrayPayloadRef",
     "ArraySpec",
+    "ArtifactRoot",
     "BaseSnapshotManifest",
     "CheckpointManifest",
     "ExportManifest",
@@ -924,6 +1137,7 @@ __all__ = [
     "Verified",
     "canonical_json_bytes",
     "file_identity",
+    "parse_logical_path",
     "read_manifest",
     "row_content_identity",
     "structured_identity",

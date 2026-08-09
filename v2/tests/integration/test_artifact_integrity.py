@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 
 import pytest
@@ -68,3 +69,39 @@ def test_manifest_trusted_verification_does_not_claim_or_perform_full_rehash(tmp
 
     assert verified.manifest == expected
     assert verified.verification is VerificationLevel.MANIFEST_TRUSTED
+
+
+def test_manifest_trusted_verification_still_checks_payload_metadata(tmp_path):
+    """Skipping metadata with the hash would let truncated payloads pass as trusted."""
+    _published_tokenizer_manifest(tmp_path)
+    (tmp_path / "tokenizer.model").write_bytes(b"short")
+
+    with pytest.raises(SMLArtifactError, match="payload byte size"):
+        read_manifest(tmp_path, TokenizerManifest, VerificationLevel.MANIFEST_TRUSTED)
+
+
+def test_read_manifest_rejects_symlinked_manifest(tmp_path):
+    """Opening the manifest by path would follow an attacker-controlled symlink."""
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    _published_tokenizer_manifest(external)
+    (bundle / "manifest.json").symlink_to(external / "manifest.json")
+
+    with pytest.raises(SMLArtifactError, match="symlink|no-follow"):
+        read_manifest(bundle, TokenizerManifest, VerificationLevel.FULL)
+
+
+def test_full_verification_rejects_external_hard_link(tmp_path):
+    """Accepting multi-link payloads would allow bytes outside the artifact to mutate."""
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    expected = _published_tokenizer_manifest(bundle)
+    external_payload = tmp_path / "external.model"
+    external_payload.write_bytes(b"model bytes")
+    (bundle / "tokenizer.model").unlink()
+    os.link(external_payload, bundle / "tokenizer.model")
+
+    with pytest.raises(SMLArtifactError, match="link count"):
+        read_manifest(bundle, type(expected), VerificationLevel.FULL)
