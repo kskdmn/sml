@@ -1223,6 +1223,34 @@ def _valid_recovered_raw_trial(workload):
     )[4]
 
 
+def _warning_recovery_sample_chain(workload, pressures, elapsed, status_changes=()):
+    measurement = _valid_child_measurement(workload)
+    immediate = _valid_observation("2026-08-09T00:00:02+00:00")
+    immediate["environment_status"]["memory_pressure"] = "warning"
+    post_exit = build_post_exit_observation(measurement=measurement, **immediate)
+    changes = status_changes or ({},) * len(pressures)
+    samples = []
+    previous_identity = None
+    for index, (pressure, elapsed_seconds, changes_for_sample) in enumerate(
+        zip(pressures, elapsed, changes, strict=True)
+    ):
+        observation = _valid_observation("2026-08-09T00:00:03+00:00")
+        observation["environment_status"].update(
+            memory_pressure=pressure, **changes_for_sample
+        )
+        sample = build_post_exit_recovery_sample(
+            measurement=measurement,
+            post_exit=post_exit,
+            sample_index=index,
+            previous_sample_identity=previous_identity,
+            elapsed_seconds=elapsed_seconds,
+            **observation,
+        )
+        samples.append(sample)
+        previous_identity = sample["identity"]
+    return measurement, post_exit, tuple(samples)
+
+
 def _evidence_for_recovery_outcome(outcome, pressure, failure_fields):
     kwargs = {
         "immediate_pressure": pressure,
@@ -1414,6 +1442,86 @@ def test_recovery_summary_rejects_incompatible_outcome_evidence(
             measurement=measurement,
             post_exit=post_exit,
             samples=samples,
+        )
+
+
+def test_critical_recovery_sample_requires_a_critical_outcome():
+    workload = build_canonical_workload()
+    measurement, post_exit, samples = _warning_recovery_sample_chain(
+        workload,
+        pressures=("critical",) + ("normal",) * 7,
+        elapsed=(5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0),
+    )
+    policy = post_exit_recovery_policy(workload)
+
+    with pytest.raises(ValueError, match="recovery outcome"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+            policy=policy,
+            outcome="recovered",
+            duration_seconds=40.0,
+        )
+
+    critical = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=samples,
+        policy=policy,
+        outcome="critical",
+        duration_seconds=40.0,
+    )
+    assert critical["outcome"] == "critical"
+    with pytest.raises(ValueError, match="recovery outcome"):
+        validate_post_exit_recovery(
+            {**critical, "outcome": "recovered"},
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+        )
+
+
+def test_thermal_recovery_sample_requires_environment_failure_evidence():
+    workload = build_canonical_workload()
+    measurement, post_exit, samples = _warning_recovery_sample_chain(
+        workload,
+        pressures=("normal",) * 8,
+        elapsed=(5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0),
+        status_changes=({"thermal_state": "fair", "thermal_state_raw_value": 1},)
+        + ({},) * 7,
+    )
+    policy = post_exit_recovery_policy(workload)
+
+    with pytest.raises(ValueError, match="recovery outcome"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+            policy=policy,
+            outcome="recovered",
+            duration_seconds=40.0,
+        )
+
+    environment_failure = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=samples,
+        policy=policy,
+        outcome="environment-failure",
+        duration_seconds=40.0,
+        failure_fields=("thermal_state",),
+    )
+    assert environment_failure["failure_fields"] == ["thermal_state"]
+    with pytest.raises(ValueError, match="recovery failure_fields"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+            policy=policy,
+            outcome="environment-failure",
+            duration_seconds=40.0,
+            failure_fields=("power_connected",),
         )
 
 

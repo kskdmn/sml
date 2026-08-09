@@ -564,6 +564,20 @@ def _environment_matches_recovery_policy(
     )
 
 
+def _recovery_environment_failure_fields(
+    samples: Sequence[Mapping[str, object]], policy: Mapping[str, object]
+) -> list[str]:
+    required = policy["required_environment"]
+    return sorted(
+        {
+            name
+            for sample in samples
+            for name, expected_value in required.items()
+            if sample["environment_status"][name] != expected_value
+        }
+    )
+
+
 def _validate_recovery_outcome(
     *,
     outcome: object,
@@ -588,6 +602,19 @@ def _validate_recovery_outcome(
         if samples
         else immediate["environment_status"]
     )
+    has_critical_sample = any(
+        sample["environment_status"]["memory_pressure"] == "critical"
+        for sample in samples
+    )
+    requires_critical_outcome = immediate_pressure == "critical" or has_critical_sample
+    environment_failure_fields = _recovery_environment_failure_fields(samples, policy)
+    if (
+        outcome == "environment-failure"
+        and failure_fields != environment_failure_fields
+    ):
+        raise ValueError(
+            "recovery failure_fields do not match environment failure evidence"
+        )
     if outcome == "not-required":
         valid = (
             immediate_pressure == "normal" and not samples and duration_seconds == 0.0
@@ -614,6 +641,8 @@ def _validate_recovery_outcome(
         valid = (
             immediate_pressure == "warning"
             and bool(samples)
+            and not requires_critical_outcome
+            and not environment_failure_fields
             and _environment_matches_recovery_policy(terminal, policy)
             and stable_samples
             and duration_seconds - stable_samples[0]["elapsed_seconds"]
@@ -623,24 +652,25 @@ def _validate_recovery_outcome(
         valid = (
             immediate_pressure == "warning"
             and duration_seconds == policy["timeout_seconds"]
+            and not requires_critical_outcome
+            and not environment_failure_fields
             and not _environment_matches_recovery_policy(terminal, policy)
         )
     elif outcome == "critical":
-        valid = immediate_pressure == "critical"
+        valid = requires_critical_outcome
     elif outcome == "environment-failure":
         valid = (
             immediate_pressure == "warning"
             and bool(samples)
-            and bool(failure_fields)
-            and any(
-                not _environment_matches_recovery_policy(
-                    sample["environment_status"], policy
-                )
-                for sample in samples
-            )
+            and not requires_critical_outcome
+            and bool(environment_failure_fields)
         )
     else:
-        valid = immediate_pressure == "warning"
+        valid = (
+            immediate_pressure == "warning"
+            and not requires_critical_outcome
+            and not environment_failure_fields
+        )
     if outcome != "environment-failure" and failure_fields:
         valid = False
     if not valid:
