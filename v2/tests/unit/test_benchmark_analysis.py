@@ -2961,39 +2961,7 @@ def _session_document(
 
 
 def _persist_journal_trial(journal, attempt, trial):
-    measurement = json.loads(json.dumps(trial.child_measurement))
-    measurement["session_identity"] = journal.session["identity"]
-    measurement["journal_attempt_index"] = attempt.journal_attempt_index
-    measurement_body = {
-        key: value for key, value in measurement.items() if key != "identity"
-    }
-    measurement["identity"] = structured_identity(
-        "sml-child-trial-measurement-v1", measurement_body
-    )
-    post_exit = json.loads(json.dumps(trial.post_exit_observation))
-    post_exit["session_identity"] = journal.session["identity"]
-    post_exit["journal_attempt_index"] = attempt.journal_attempt_index
-    post_exit["child_measurement_identity"] = measurement["identity"]
-    post_exit_body = {
-        key: value for key, value in post_exit.items() if key != "identity"
-    }
-    post_exit["identity"] = structured_identity(
-        "sml-parent-post-exit-observation-v1", post_exit_body
-    )
-    recovery = _valid_post_exit_recovery(measurement, post_exit)
-    persisted = finalize_raw_trial(measurement, post_exit, (), recovery)
-    atomic_write_json(
-        journal.measurement_path(attempt.slot, attempt.journal_attempt_index),
-        measurement,
-        create_only=True,
-    )
-    atomic_write_json(
-        journal.post_exit_path(attempt.slot, attempt.journal_attempt_index),
-        post_exit,
-        create_only=True,
-    )
-    atomic_write_json(attempt.path, persisted.to_dict(), create_only=True)
-    return persisted
+    return _persist_journal_evidence(journal, attempt, trial)[4]
 
 
 def _preflight_from_trial(trial):
@@ -3187,7 +3155,7 @@ def test_capture_rejects_measurement_only_crash_then_launches_a_new_attempt(tmp_
     slot = BaselineSlot("prepared-data", 0)
     normal = _valid_raw_trial(workload)
     attempt = journal.next_attempt(slot)
-    measurement, _post_exit, _persisted = _journal_trial_evidence(
+    measurement, _post_exit, _samples, _recovery, _persisted = _journal_trial_evidence(
         journal, attempt, normal
     )
     atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
@@ -3269,7 +3237,7 @@ def test_capture_reconstructs_measurement_and_post_exit_before_replacement_launc
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, post_exit, expected = _journal_trial_evidence(
+    measurement, post_exit, _samples, _recovery, expected = _journal_trial_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
     atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
@@ -3619,7 +3587,7 @@ def test_capture_replays_post_exit_only_thermal_rejection_before_preflight(tmp_p
     post_exit_fair.update(thermal_state="fair", thermal_state_raw_value=1)
     rejected = _with_environment_observations(nominal, post_exit=post_exit_fair)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, rejected = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, rejected = _persist_journal_evidence(
         journal, attempt, rejected
     )
     journal.reject_inflight(attempt, rejected, reason="non-nominal-thermal")
@@ -4082,8 +4050,8 @@ def _accepted_complete_journal(
     for trial in trials:
         slot = BaselineSlot(trial.metric, trial.pair_index)
         attempt = journal.next_attempt(slot)
-        _measurement, _post_exit, persisted = _persist_journal_evidence(
-            journal, attempt, trial
+        _measurement, _post_exit, _samples, _recovery, persisted = (
+            _persist_journal_evidence(journal, attempt, trial)
         )
         journal.accept_inflight(attempt, persisted)
         persisted_trials.append(persisted)
@@ -4696,6 +4664,8 @@ def test_locked_resume_removes_every_recognized_journal_orphan_and_fsyncs_parent
         state / "accepted" / "prepared-data" / "0.json",
         state / "measurements" / "prepared-data" / "0" / "0.json",
         state / "post-exit" / "prepared-data" / "0" / "0.json",
+        state / "recovery-samples" / "prepared-data" / "0" / "0" / "0.json",
+        state / "recovery" / "prepared-data" / "0" / "0.json",
         state / "inflight" / "prepared-data" / "0" / "0.json",
         state / "rejected" / "prepared-data" / "0" / "0.json",
         state / "preflight" / "prepared-data" / "0" / "0.json",
@@ -4721,7 +4691,11 @@ def test_locked_resume_removes_every_recognized_journal_orphan_and_fsyncs_parent
     assert not marker.exists()
     assert not any(path.exists() for path in temporaries)
     assert {path.parent.resolve() for path in temporaries} <= set(synced)
-    BaselineJournal.open(state, expected_session)
+    resumed = BaselineJournal.open(state, expected_session)
+    assert (
+        resumed.next_attempt(BaselineSlot("prepared-data", 0)).journal_attempt_index
+        == 0
+    )
 
 
 def test_locked_resume_recovers_an_interrupted_root_initialization(tmp_path):
@@ -5853,39 +5827,58 @@ def test_baseline_launch_routes_recovery_paths_when_journal_supports_them(
 def _journal_trial_evidence(journal, attempt, trial=None):
     workload = build_canonical_workload()
     if trial is None:
-        measurement = _valid_child_measurement(
-            workload,
-            metric=attempt.slot.metric,
-            pair_index=attempt.slot.pair_index,
-            session_identity=journal.session["identity"],
-            journal_attempt_index=attempt.journal_attempt_index,
+        trial = _valid_recovered_raw_trial(workload)
+    measurement = json.loads(json.dumps(trial.child_measurement))
+    measurement["session_identity"] = journal.session["identity"]
+    measurement["journal_attempt_index"] = attempt.journal_attempt_index
+    measurement_body = {
+        key: value for key, value in measurement.items() if key != "identity"
+    }
+    measurement["identity"] = structured_identity(
+        "sml-child-trial-measurement-v1", measurement_body
+    )
+    post_exit = json.loads(json.dumps(trial.post_exit_observation))
+    post_exit["session_identity"] = journal.session["identity"]
+    post_exit["journal_attempt_index"] = attempt.journal_attempt_index
+    post_exit["child_measurement_identity"] = measurement["identity"]
+    post_exit_body = {
+        key: value for key, value in post_exit.items() if key != "identity"
+    }
+    post_exit["identity"] = structured_identity(
+        "sml-parent-post-exit-observation-v1", post_exit_body
+    )
+    samples = []
+    previous_identity = None
+    for raw_sample in trial.post_exit_recovery_samples:
+        sample = build_post_exit_recovery_sample(
+            measurement=measurement,
+            post_exit=post_exit,
+            sample_index=raw_sample["sample_index"],
+            previous_sample_identity=previous_identity,
+            observed_at_utc=raw_sample["observed_at_utc"],
+            elapsed_seconds=raw_sample["elapsed_seconds"],
+            hardware=raw_sample["hardware"],
+            environment_status=raw_sample["environment_status"],
+            software_versions=raw_sample["software_versions"],
         )
-        post_exit = _valid_post_exit_observation(measurement)
-    else:
-        measurement = json.loads(json.dumps(trial.child_measurement))
-        measurement["session_identity"] = journal.session["identity"]
-        measurement["journal_attempt_index"] = attempt.journal_attempt_index
-        measurement_body = {
-            key: value for key, value in measurement.items() if key != "identity"
-        }
-        measurement["identity"] = structured_identity(
-            "sml-child-trial-measurement-v1", measurement_body
-        )
-        post_exit = json.loads(json.dumps(trial.post_exit_observation))
-        post_exit["session_identity"] = journal.session["identity"]
-        post_exit["journal_attempt_index"] = attempt.journal_attempt_index
-        post_exit["child_measurement_identity"] = measurement["identity"]
-        post_exit_body = {
-            key: value for key, value in post_exit.items() if key != "identity"
-        }
-        post_exit["identity"] = structured_identity(
-            "sml-parent-post-exit-observation-v1", post_exit_body
-        )
-    recovery = _valid_post_exit_recovery(measurement, post_exit)
+        samples.append(sample)
+        previous_identity = sample["identity"]
+    raw_recovery = trial.post_exit_recovery
+    recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=samples,
+        policy=raw_recovery["policy"],
+        outcome=raw_recovery["outcome"],
+        duration_seconds=raw_recovery["duration_seconds"],
+        failure_fields=raw_recovery["failure_fields"],
+    )
     return (
         measurement,
         post_exit,
-        finalize_raw_trial(measurement, post_exit, (), recovery),
+        tuple(samples),
+        recovery,
+        finalize_raw_trial(measurement, post_exit, samples, recovery),
     )
 
 
@@ -5896,9 +5889,12 @@ def _persist_journal_evidence(
     *,
     measurement=True,
     post_exit=True,
+    recovery=True,
     inflight=True,
 ):
-    child, parent, persisted = _journal_trial_evidence(journal, attempt, trial)
+    child, parent, samples, summary, persisted = _journal_trial_evidence(
+        journal, attempt, trial
+    )
     if measurement:
         atomic_write_json(
             journal.measurement_path(attempt.slot, attempt.journal_attempt_index),
@@ -5911,30 +5907,59 @@ def _persist_journal_evidence(
             parent,
             create_only=True,
         )
+    if post_exit and recovery:
+        for index, sample in enumerate(samples):
+            atomic_write_json(
+                journal.recovery_sample_path(
+                    attempt.slot, attempt.journal_attempt_index, index
+                ),
+                sample,
+                create_only=True,
+            )
+        atomic_write_json(
+            journal.recovery_path(attempt.slot, attempt.journal_attempt_index),
+            summary,
+            create_only=True,
+        )
     if inflight:
         atomic_write_json(attempt.path, persisted.to_dict(), create_only=True)
-    return child, parent, persisted
+    return child, parent, samples, summary, persisted
 
 
-def test_journal_retains_identity_bound_measurement_and_post_exit_stages(tmp_path):
+def test_journal_retains_the_complete_recovery_chain_after_acceptance(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, trial = _persist_journal_evidence(journal, attempt)
+    measurement, post_exit, samples, recovery, trial = _persist_journal_evidence(
+        journal, attempt
+    )
 
     journal.accept_inflight(attempt, trial)
 
     assert journal.measurement_path(slot, 0).is_file()
     assert journal.post_exit_path(slot, 0).is_file()
-    assert not attempt.path.exists()
+    assert journal.recovery_path(slot, 0).is_file()
+    assert tuple(
+        journal.recovery_sample_path(slot, 0, index).is_file()
+        for index in range(len(samples))
+    ) == (True,) * len(samples)
     assert journal.load_accepted((slot,)) == {slot: trial}
+    assert read_json_object(journal.measurement_path(slot, 0), label="measurement") == (
+        measurement
+    )
+    assert read_json_object(journal.post_exit_path(slot, 0), label="post-exit") == (
+        post_exit
+    )
+    assert read_json_object(journal.recovery_path(slot, 0), label="recovery") == (
+        recovery
+    )
 
 
 def test_journal_reports_measurement_only_as_pending_immediate_evidence(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, _post_exit, _trial = _persist_journal_evidence(
+    measurement, _post_exit, _samples, _recovery, _trial = _persist_journal_evidence(
         journal, attempt, post_exit=False, inflight=False
     )
 
@@ -5945,6 +5970,8 @@ def test_journal_reports_measurement_only_as_pending_immediate_evidence(tmp_path
             attempt=attempt,
             measurement=measurement,
             post_exit=None,
+            recovery_samples=(),
+            recovery=None,
             trial=None,
         ),
     )
@@ -5954,19 +5981,21 @@ def test_journal_rejects_post_exit_without_its_exact_measurement(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, post_exit, _trial = _journal_trial_evidence(journal, attempt)
+    _measurement, post_exit, _samples, _recovery, _trial = _journal_trial_evidence(
+        journal, attempt
+    )
     atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
 
     with pytest.raises(ValueError, match="post-exit evidence has no measurement"):
         journal.load_pending_attempts((slot,))
 
 
-def test_journal_reports_measurement_and_post_exit_as_pending_finalization(tmp_path):
+def test_journal_reports_post_exit_without_recovery_as_pending(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, post_exit, _trial = _persist_journal_evidence(
-        journal, attempt, inflight=False
+    measurement, post_exit, _samples, _recovery, _trial = _persist_journal_evidence(
+        journal, attempt, recovery=False, inflight=False
     )
 
     assert journal.load_pending_attempts((slot,)) == (
@@ -5974,9 +6003,197 @@ def test_journal_reports_measurement_and_post_exit_as_pending_finalization(tmp_p
             attempt=attempt,
             measurement=measurement,
             post_exit=post_exit,
+            recovery_samples=(),
+            recovery=None,
             trial=None,
         ),
     )
+
+
+def test_journal_rejects_recovery_sample_without_post_exit(tmp_path):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, _post_exit, samples, _recovery, _trial = _journal_trial_evidence(
+        journal, attempt
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(
+        journal.recovery_sample_path(slot, 0, 0), samples[0], create_only=True
+    )
+
+    with pytest.raises(ValueError, match="recovery sample has no post-exit evidence"):
+        journal.load_pending_attempts((slot,))
+
+
+def test_journal_rejects_recovery_sample_bound_to_another_immediate_identity(
+    tmp_path,
+):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, _samples, _recovery, _trial = _journal_trial_evidence(
+        journal, attempt
+    )
+    other_post_exit = json.loads(json.dumps(post_exit))
+    other_post_exit["observed_at_utc"] = "2026-08-09T00:00:04+00:00"
+    other_body = {
+        key: value for key, value in other_post_exit.items() if key != "identity"
+    }
+    other_post_exit["identity"] = structured_identity(
+        "sml-parent-post-exit-observation-v1", other_body
+    )
+    observation = _valid_observation("2026-08-09T00:00:03+00:00")
+    foreign_sample = build_post_exit_recovery_sample(
+        measurement=measurement,
+        post_exit=other_post_exit,
+        sample_index=0,
+        previous_sample_identity=None,
+        elapsed_seconds=5.0,
+        **observation,
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    atomic_write_json(
+        journal.recovery_sample_path(slot, 0, 0), foreign_sample, create_only=True
+    )
+
+    with pytest.raises(ValueError, match="recovery .* does not match bound evidence"):
+        journal.load_pending_attempts((slot,))
+
+
+def test_journal_rejects_recovery_sample_index_gap(tmp_path):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, samples, _recovery, _trial = _journal_trial_evidence(
+        journal, attempt
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    atomic_write_json(
+        journal.recovery_sample_path(slot, 0, 1), samples[1], create_only=True
+    )
+
+    with pytest.raises(ValueError, match="recovery sample indices have a gap"):
+        journal.load_pending_attempts((slot,))
+
+
+def test_journal_rejects_recovery_sample_previous_identity_fork(tmp_path):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, samples, _recovery, _trial = _journal_trial_evidence(
+        journal, attempt
+    )
+    forked = {
+        **samples[1],
+        "previous_sample_identity": "sha256:" + "0" * 64,
+    }
+    forked_body = {key: value for key, value in forked.items() if key != "identity"}
+    forked["identity"] = structured_identity(
+        "sml-parent-post-exit-recovery-sample-v1", forked_body
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    atomic_write_json(
+        journal.recovery_sample_path(slot, 0, 0), samples[0], create_only=True
+    )
+    atomic_write_json(
+        journal.recovery_sample_path(slot, 0, 1), forked, create_only=True
+    )
+
+    with pytest.raises(ValueError, match="previous sample identity"):
+        journal.load_pending_attempts((slot,))
+
+
+def test_journal_rejects_nonincreasing_pending_recovery_sample_elapsed_time(tmp_path):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, samples, _recovery, _trial = _journal_trial_evidence(
+        journal, attempt
+    )
+    nonincreasing = {
+        **samples[1],
+        "elapsed_seconds": samples[0]["elapsed_seconds"],
+    }
+    nonincreasing_body = {
+        key: value for key, value in nonincreasing.items() if key != "identity"
+    }
+    nonincreasing["identity"] = structured_identity(
+        "sml-parent-post-exit-recovery-sample-v1", nonincreasing_body
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    atomic_write_json(
+        journal.recovery_sample_path(slot, 0, 0), samples[0], create_only=True
+    )
+    atomic_write_json(
+        journal.recovery_sample_path(slot, 0, 1), nonincreasing, create_only=True
+    )
+
+    with pytest.raises(ValueError, match="elapsed_seconds must be increasing"):
+        journal.load_pending_attempts((slot,))
+
+
+def test_journal_rejects_recovery_summary_without_its_exact_samples(tmp_path):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, samples, recovery, _trial = _journal_trial_evidence(
+        journal, attempt
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    for index, sample in enumerate(samples[:-1]):
+        atomic_write_json(
+            journal.recovery_sample_path(slot, 0, index), sample, create_only=True
+        )
+    atomic_write_json(journal.recovery_path(slot, 0), recovery, create_only=True)
+
+    with pytest.raises(ValueError, match="sample identities do not match samples"):
+        journal.load_pending_attempts((slot,))
+
+
+def test_journal_rejects_inflight_without_recovery_summary(tmp_path):
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    _persist_journal_evidence(journal, attempt, recovery=False)
+
+    with pytest.raises(ValueError, match="inflight trial has no recovery summary"):
+        journal.load_pending_attempts((slot,))
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "rejected"])
+def test_journal_rejects_terminal_evidence_missing_recovery_summary(tmp_path, outcome):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    source_trial = _valid_raw_trial(workload)
+    if outcome == "rejected":
+        source_trial = _with_thermal_state(source_trial, "fair", 1)
+    _measurement, _post_exit, _samples, _recovery, trial = _persist_journal_evidence(
+        journal, attempt, source_trial
+    )
+    if outcome == "accepted":
+        accepted_path = journal.accepted_path(slot)
+        accepted_path.parent.mkdir(parents=True)
+        os.link(attempt.path, accepted_path)
+    else:
+        journal.reject_inflight(attempt, trial, reason="non-nominal-thermal")
+    journal.recovery_path(slot, 0).unlink()
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "incomplete staged evidence|no recovery summary|"
+            "does not match its post-exit recovery"
+        ),
+    ):
+        journal.load_pending_attempts((slot,))
 
 
 def test_journal_rejects_measurement_from_another_session(tmp_path):
@@ -5993,7 +6210,9 @@ def test_journal_rejects_post_exit_bound_to_another_measurement(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, _post_exit, _trial = _journal_trial_evidence(journal, attempt)
+    measurement, _post_exit, _samples, _recovery, _trial = _journal_trial_evidence(
+        journal, attempt
+    )
     other_measurement = json.loads(json.dumps(measurement))
     other_measurement["trial"]["value"] += 1.0
     other_body = {
@@ -6032,7 +6251,7 @@ def test_journal_rejects_measurement_only_and_preserves_its_evidence(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, _post_exit, _trial = _persist_journal_evidence(
+    measurement, _post_exit, _samples, _recovery, _trial = _persist_journal_evidence(
         journal, attempt, post_exit=False, inflight=False
     )
 
@@ -6045,11 +6264,12 @@ def test_journal_rejects_measurement_only_and_preserves_its_evidence(tmp_path):
     rejected = read_json_object(journal.rejected_path(slot, 0), label="rejected trial")
     assert rejected == {
         "kind": "sml-baseline-rejected-trial",
-        "version": 2,
+        "version": 3,
         "journal_attempt_index": 0,
         "reason": "missing-immediate-post-exit-evidence",
         "child_measurement_identity": measurement["identity"],
         "post_exit_observation_identity": None,
+        "post_exit_recovery_identity": None,
         "trial": None,
         "identity": rejected["identity"],
     }
@@ -6062,7 +6282,7 @@ def test_journal_reject_unfinalized_requires_measurement_only_evidence(tmp_path)
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, _post_exit, _trial = _persist_journal_evidence(
+    measurement, _post_exit, _samples, _recovery, _trial = _persist_journal_evidence(
         journal, attempt, inflight=False
     )
 
@@ -6078,7 +6298,7 @@ def test_journal_reject_unfinalized_requires_the_exact_reason(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, _post_exit, _trial = _persist_journal_evidence(
+    measurement, _post_exit, _samples, _recovery, _trial = _persist_journal_evidence(
         journal, attempt, post_exit=False, inflight=False
     )
 
@@ -6095,7 +6315,7 @@ def test_journal_memory_rejection_needs_no_thermal_trigger(tmp_path):
     warning = dict(nominal.environment_status["post_exit"])
     warning["memory_pressure"] = "warning"
     memory_trial = _with_environment_observations(nominal, post_exit=warning)
-    measurement, post_exit, persisted = _persist_journal_evidence(
+    measurement, post_exit, _samples, _recovery, persisted = _persist_journal_evidence(
         journal, attempt, memory_trial
     )
 
@@ -6104,9 +6324,13 @@ def test_journal_memory_rejection_needs_no_thermal_trigger(tmp_path):
     )
 
     rejected = read_json_object(journal.rejected_path(slot, 0), label="rejected trial")
-    assert rejected["version"] == 2
+    assert rejected["version"] == 3
     assert rejected["child_measurement_identity"] == measurement["identity"]
     assert rejected["post_exit_observation_identity"] == post_exit["identity"]
+    assert (
+        rejected["post_exit_recovery_identity"]
+        == persisted.post_exit_recovery["identity"]
+    )
     assert journal.measurement_path(slot, 0).is_file()
     assert journal.post_exit_path(slot, 0).is_file()
     assert not (journal.root / "thermal-waits").exists()
@@ -6119,10 +6343,37 @@ def test_journal_reject_inflight_rejects_an_unknown_reason_before_writing(tmp_pa
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
     fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
-    _measurement, _post_exit, fair = _persist_journal_evidence(journal, attempt, fair)
+    _measurement, _post_exit, _samples, _recovery, fair = _persist_journal_evidence(
+        journal, attempt, fair
+    )
 
     with pytest.raises(ValueError, match="rejected trial reason is invalid"):
         journal.reject_inflight(attempt, fair, reason="retry-environment-later")
+
+    assert attempt.path.is_file()
+    assert not journal.rejected_path(slot, 0).exists()
+
+
+@pytest.mark.parametrize(
+    "reason",
+    (
+        "critical-post-exit-memory-pressure",
+        "post-exit-recovery-environment-violation",
+        "interrupted-post-exit-recovery",
+    ),
+)
+def test_journal_recognizes_every_schema_v3_recovery_rejection_reason(tmp_path, reason):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
+    _measurement, _post_exit, _samples, _recovery, trial = _persist_journal_evidence(
+        journal, attempt, fair
+    )
+
+    with pytest.raises(ValueError, match="expected non-nominal-thermal"):
+        journal.reject_inflight(attempt, trial, reason=reason)
 
     assert attempt.path.is_file()
     assert not journal.rejected_path(slot, 0).exists()
@@ -6133,7 +6384,7 @@ def test_journal_reject_inflight_refuses_an_accept_disposition(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, nominal = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, nominal = _persist_journal_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
 
@@ -6200,7 +6451,7 @@ def test_journal_reject_inflight_requires_the_ordered_evidence_reason(
         post_exit=post_exit,
     )
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, rejected = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, rejected = _persist_journal_evidence(
         journal, attempt, rejected
     )
 
@@ -6223,7 +6474,7 @@ def _rewrite_rejected_reason(journal, slot, reason):
         path,
         {
             **body,
-            "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
+            "identity": structured_identity("sml-baseline-rejected-trial-v3", body),
         },
         create_only=True,
     )
@@ -6245,7 +6496,9 @@ def test_journal_load_rejects_a_resigned_wrong_finalized_reason(
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
     fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
-    _measurement, _post_exit, fair = _persist_journal_evidence(journal, attempt, fair)
+    _measurement, _post_exit, _samples, _recovery, fair = _persist_journal_evidence(
+        journal, attempt, fair
+    )
     journal.reject_inflight(attempt, fair, reason="non-nominal-thermal")
     _rewrite_rejected_reason(journal, slot, mutated_reason)
 
@@ -6258,16 +6511,17 @@ def test_journal_load_refuses_a_rejected_accept_disposition(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, post_exit, nominal = _persist_journal_evidence(
+    measurement, post_exit, _samples, recovery, nominal = _persist_journal_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
     body = {
         "kind": "sml-baseline-rejected-trial",
-        "version": 2,
+        "version": 3,
         "journal_attempt_index": 0,
         "reason": "non-nominal-thermal",
         "child_measurement_identity": measurement["identity"],
         "post_exit_observation_identity": post_exit["identity"],
+        "post_exit_recovery_identity": recovery["identity"],
         "trial": nominal.to_dict(),
     }
     attempt.path.unlink()
@@ -6275,7 +6529,7 @@ def test_journal_load_refuses_a_rejected_accept_disposition(tmp_path):
         journal.rejected_path(slot, 0),
         {
             **body,
-            "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
+            "identity": structured_identity("sml-baseline-rejected-trial-v3", body),
         },
         create_only=True,
     )
@@ -6289,7 +6543,7 @@ def test_journal_rejects_both_outcomes_for_one_attempt(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    measurement, post_exit, trial = _persist_journal_evidence(
+    measurement, post_exit, _samples, recovery, trial = _persist_journal_evidence(
         journal,
         attempt,
         _with_thermal_state(_valid_raw_trial(workload), "fair", 1),
@@ -6299,18 +6553,19 @@ def test_journal_rejects_both_outcomes_for_one_attempt(tmp_path):
     os.link(attempt.path, accepted_path)
     body = {
         "kind": "sml-baseline-rejected-trial",
-        "version": 2,
+        "version": 3,
         "journal_attempt_index": 0,
         "reason": "non-nominal-thermal",
         "child_measurement_identity": measurement["identity"],
         "post_exit_observation_identity": post_exit["identity"],
+        "post_exit_recovery_identity": recovery["identity"],
         "trial": trial.to_dict(),
     }
     atomic_write_json(
         journal.rejected_path(slot, 0),
         {
             **body,
-            "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
+            "identity": structured_identity("sml-baseline-rejected-trial-v3", body),
         },
         create_only=True,
     )
@@ -6331,7 +6586,9 @@ def test_journal_rejects_an_attempt_index_gap_in_staged_evidence(tmp_path):
         journal.load_pending_attempts((slot,))
 
 
-@pytest.mark.parametrize("category", ["measurements", "post-exit"])
+@pytest.mark.parametrize(
+    "category", ["measurements", "post-exit", "recovery-samples", "recovery"]
+)
 def test_journal_rejects_unsupported_stage_paths(tmp_path, category):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     unsupported = journal.root / category / "unsupported" / "0" / "0.json"
@@ -6341,7 +6598,9 @@ def test_journal_rejects_unsupported_stage_paths(tmp_path, category):
         journal.load_pending_attempts((BaselineSlot("prepared-data", 0),))
 
 
-@pytest.mark.parametrize("category", ["measurements", "post-exit"])
+@pytest.mark.parametrize(
+    "category", ["measurements", "post-exit", "recovery-samples", "recovery"]
+)
 def test_journal_refuses_symlinked_stage_ancestors(tmp_path, category):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     outside = tmp_path / f"outside-{category}"
@@ -6359,7 +6618,7 @@ def test_journal_promotes_an_inflight_trial_and_resumes_the_slot(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, trial = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, trial = _persist_journal_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
 
@@ -6379,7 +6638,7 @@ def test_journal_preserves_rejected_trial_and_uses_a_new_attempt_number(tmp_path
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, trial = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, trial = _persist_journal_evidence(
         journal,
         attempt,
         _with_thermal_state(_valid_raw_trial(workload), "fair", 1),
@@ -6456,7 +6715,7 @@ def test_journal_replays_an_accepted_inflight_crash_split(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, trial = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, trial = _persist_journal_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
     accepted_path = journal.accepted_path(slot)
@@ -6474,7 +6733,7 @@ def test_journal_load_inflight_replays_an_accepted_crash_split(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, _trial = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, _trial = _persist_journal_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
     accepted_path = journal.accepted_path(slot)
@@ -6491,7 +6750,9 @@ def test_journal_replays_a_rejected_inflight_crash_split(tmp_path):
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
     fair = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
-    _measurement, _post_exit, trial = _persist_journal_evidence(journal, attempt, fair)
+    _measurement, _post_exit, _samples, _recovery, trial = _persist_journal_evidence(
+        journal, attempt, fair
+    )
     journal.reject_inflight(attempt, trial, reason="non-nominal-thermal")
     atomic_write_json(attempt.path, trial.to_dict(), create_only=True)
 
@@ -6507,7 +6768,7 @@ def test_journal_rejects_a_mutation_that_skips_an_attempt_index(tmp_path, operat
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     forged = JournalAttempt(slot, 1, journal.inflight_path(slot, 1))
-    _measurement, _post_exit, trial = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, trial = _persist_journal_evidence(
         journal, forged, _valid_raw_trial(workload)
     )
 
@@ -6600,8 +6861,8 @@ def _persist_rejected_trial_for_recovery_test(journal, slot, reason):
     attempt = journal.next_attempt(slot)
     workload = build_canonical_workload()
     if reason == "missing-immediate-post-exit-evidence":
-        measurement, _post_exit, _trial = _persist_journal_evidence(
-            journal, attempt, post_exit=False, inflight=False
+        measurement, _post_exit, _samples, _recovery, _trial = (
+            _persist_journal_evidence(journal, attempt, post_exit=False, inflight=False)
         )
         journal.reject_unfinalized(attempt, measurement, reason=reason)
     else:
@@ -6612,8 +6873,8 @@ def _persist_rejected_trial_for_recovery_test(journal, slot, reason):
             trial = _with_environment_observations(trial, post_exit=warning)
         elif reason == "non-nominal-thermal":
             trial = _with_thermal_state(trial, "fair", 1)
-        _measurement, _post_exit, persisted = _persist_journal_evidence(
-            journal, attempt, trial
+        _measurement, _post_exit, _samples, _recovery, persisted = (
+            _persist_journal_evidence(journal, attempt, trial)
         )
         journal.reject_inflight(attempt, persisted, reason=reason)
     return read_json_object(
@@ -6704,19 +6965,20 @@ def test_journal_rejects_boolean_rejected_attempt_index(tmp_path):
     slot = BaselineSlot("prepared-data", 0)
     first = JournalAttempt(slot, 0, journal.inflight_path(slot, 0))
     second = JournalAttempt(slot, 1, journal.inflight_path(slot, 1))
-    first_measurement, _post_exit, _trial = _persist_journal_evidence(
-        journal, first, post_exit=False, inflight=False
+    first_measurement, _post_exit, _samples, _recovery, _trial = (
+        _persist_journal_evidence(journal, first, post_exit=False, inflight=False)
     )
-    second_measurement, _post_exit, _trial = _persist_journal_evidence(
-        journal, second, post_exit=False, inflight=False
+    second_measurement, _post_exit, _samples, _recovery, _trial = (
+        _persist_journal_evidence(journal, second, post_exit=False, inflight=False)
     )
     zero_body = {
         "kind": "sml-baseline-rejected-trial",
-        "version": 2,
+        "version": 3,
         "journal_attempt_index": 0,
         "reason": "missing-immediate-post-exit-evidence",
         "child_measurement_identity": first_measurement["identity"],
         "post_exit_observation_identity": None,
+        "post_exit_recovery_identity": None,
         "trial": None,
     }
     one_body = {
@@ -6729,7 +6991,7 @@ def test_journal_rejects_boolean_rejected_attempt_index(tmp_path):
         {
             **zero_body,
             "identity": structured_identity(
-                "sml-baseline-rejected-trial-v2", zero_body
+                "sml-baseline-rejected-trial-v3", zero_body
             ),
         },
         create_only=True,
@@ -6738,7 +7000,7 @@ def test_journal_rejects_boolean_rejected_attempt_index(tmp_path):
         journal.rejected_path(slot, 1),
         {
             **one_body,
-            "identity": structured_identity("sml-baseline-rejected-trial-v2", one_body),
+            "identity": structured_identity("sml-baseline-rejected-trial-v3", one_body),
         },
         create_only=True,
     )
@@ -6752,7 +7014,7 @@ def test_journal_load_accepted_replays_only_a_hard_linked_crash_split(tmp_path):
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, trial = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, trial = _persist_journal_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
     accepted_path = journal.accepted_path(slot)
@@ -6768,7 +7030,7 @@ def test_journal_does_not_replay_independently_serialized_accepted_content(tmp_p
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     attempt = journal.next_attempt(slot)
-    _measurement, _post_exit, trial = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, trial = _persist_journal_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
     accepted_path = journal.accepted_path(slot)
@@ -6789,7 +7051,7 @@ def test_journal_preserves_a_gapped_inflight_split_before_reconciliation(tmp_pat
     journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
     slot = BaselineSlot("prepared-data", 0)
     forged = JournalAttempt(slot, 1, journal.inflight_path(slot, 1))
-    _measurement, _post_exit, _trial = _persist_journal_evidence(
+    _measurement, _post_exit, _samples, _recovery, _trial = _persist_journal_evidence(
         journal, forged, _valid_raw_trial(workload)
     )
     accepted_path = journal.accepted_path(slot)
@@ -6808,8 +7070,8 @@ def test_journal_preserves_multiple_inflight_split_candidates(tmp_path):
     slot = BaselineSlot("prepared-data", 0)
     first = JournalAttempt(slot, 0, journal.inflight_path(slot, 0))
     second = JournalAttempt(slot, 1, journal.inflight_path(slot, 1))
-    _measurement, _post_exit, _first_trial = _persist_journal_evidence(
-        journal, first, _valid_raw_trial(workload)
+    _measurement, _post_exit, _samples, _recovery, _first_trial = (
+        _persist_journal_evidence(journal, first, _valid_raw_trial(workload))
     )
     _persist_journal_evidence(journal, second, _valid_raw_trial(workload))
     accepted_path = journal.accepted_path(slot)

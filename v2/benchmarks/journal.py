@@ -23,6 +23,8 @@ from v2.benchmarks.evidence import (
     finalized_trial_rejection_reason,
     validate_child_trial_measurement,
     validate_post_exit_observation,
+    validate_post_exit_recovery,
+    validate_post_exit_recovery_samples,
     validate_raw_trial_evidence,
 )
 from v2.benchmarks.schema import (
@@ -59,6 +61,8 @@ STATE_DIRECTORY_NAMES = frozenset(
         "inflight",
         "measurements",
         "post-exit",
+        "recovery",
+        "recovery-samples",
         "preflight",
         "thermal-waits",
     }
@@ -66,6 +70,13 @@ STATE_DIRECTORY_NAMES = frozenset(
 STATE_FILE_NAMES = frozenset({"session.json", "completed.json"})
 DECIMAL_INDEX = re.compile(r"(?:0|[1-9][0-9]*)")
 IDENTITY = re.compile(r"sha256:[0-9a-f]{64}")
+JOURNAL_REJECTION_REASONS = REJECTION_REASONS | frozenset(
+    {
+        "critical-post-exit-memory-pressure",
+        "post-exit-recovery-environment-violation",
+        "interrupted-post-exit-recovery",
+    }
+)
 ATOMIC_TEMPORARY = re.compile(
     r"^\.(?P<destination>.+)\.sml-atomic-(?P<token>[0-9a-f]{32})\.tmp$"
 )
@@ -327,6 +338,7 @@ def _is_journal_destination(root: Path, destination: Path) -> bool:
         "inflight",
         "measurements",
         "post-exit",
+        "recovery",
         "rejected",
         "preflight",
     }:
@@ -335,6 +347,14 @@ def _is_journal_destination(root: Path, destination: Path) -> bool:
             and DECIMAL_INDEX.fullmatch(parts[2]) is not None
             and parts[3].endswith(".json")
             and DECIMAL_INDEX.fullmatch(parts[3][:-5]) is not None
+        )
+    if len(parts) == 5 and parts[0] == "recovery-samples":
+        return (
+            parts[1] in METRIC_NAMES
+            and DECIMAL_INDEX.fullmatch(parts[2]) is not None
+            and DECIMAL_INDEX.fullmatch(parts[3]) is not None
+            and parts[4].endswith(".json")
+            and DECIMAL_INDEX.fullmatch(parts[4][:-5]) is not None
         )
     if len(parts) == 5 and parts[0] == "thermal-waits":
         final_name = parts[4]
@@ -567,6 +587,7 @@ def _validate_rejected_document(
             "reason",
             "child_measurement_identity",
             "post_exit_observation_identity",
+            "post_exit_recovery_identity",
             "trial",
             "identity",
         },
@@ -575,9 +596,9 @@ def _validate_rejected_document(
     body = _validate_identity_document(
         document,
         kind="sml-baseline-rejected-trial",
-        identity_domain="sml-baseline-rejected-trial-v2",
+        identity_domain="sml-baseline-rejected-trial-v3",
         label="rejected trial",
-        expected_version=2,
+        expected_version=3,
     )
     _require_non_negative_index(
         body["journal_attempt_index"], label="journal attempt index"
@@ -586,7 +607,7 @@ def _validate_rejected_document(
         raise ValueError("rejected trial attempt index does not match its filename")
     reason = body["reason"]
     _require_nonempty_string(reason, label="rejected trial reason")
-    if reason not in REJECTION_REASONS:
+    if reason not in JOURNAL_REJECTION_REASONS:
         raise ValueError("rejected trial reason is invalid")
     if (
         not isinstance(body["child_measurement_identity"], str)
@@ -599,14 +620,24 @@ def _validate_rejected_document(
         or IDENTITY.fullmatch(post_exit_identity) is None
     ):
         raise ValueError("rejected trial post-exit observation identity is invalid")
+    recovery_identity = body["post_exit_recovery_identity"]
+    if recovery_identity is not None and (
+        not isinstance(recovery_identity, str)
+        or IDENTITY.fullmatch(recovery_identity) is None
+    ):
+        raise ValueError("rejected trial post-exit recovery identity is invalid")
     raw_trial = body["trial"]
     if raw_trial is None:
         if reason != MISSING_POST_EXIT_REASON:
             raise ValueError("unfinalized rejection has an invalid reason")
+        if post_exit_identity is not None or recovery_identity is not None:
+            raise ValueError("unfinalized rejection contains finalized identities")
         return body, None
     if not isinstance(raw_trial, dict):
         raise ValueError("rejected trial must contain a raw trial object or null")
     trial = _parse_trial_for_slot(raw_trial, slot=slot, label="rejected trial")
+    if post_exit_identity is None or recovery_identity is None:
+        raise ValueError("finalized rejection is missing staged identities")
     expected_reason = finalized_trial_rejection_reason(trial, required_environment)
     if expected_reason is None:
         raise ValueError("accepted trial cannot be rejected")
@@ -844,6 +875,8 @@ class JournalAttemptEvidence:
     attempt: JournalAttempt
     measurement: dict
     post_exit: dict | None
+    recovery_samples: tuple[dict, ...]
+    recovery: dict | None
     trial: RawTrial | None
 
 
@@ -1020,6 +1053,46 @@ class BaselineJournal:
             / f"{journal_attempt_index}.json"
         )
 
+    def recovery_samples_path(
+        self, slot: BaselineSlot, journal_attempt_index: int
+    ) -> Path:
+        self._require_slot(slot)
+        _require_non_negative_index(
+            journal_attempt_index, label="journal attempt index"
+        )
+        return (
+            self.root
+            / "recovery-samples"
+            / slot.metric
+            / str(slot.pair_index)
+            / str(journal_attempt_index)
+        )
+
+    def recovery_sample_path(
+        self,
+        slot: BaselineSlot,
+        journal_attempt_index: int,
+        sample_index: int,
+    ) -> Path:
+        _require_non_negative_index(sample_index, label="recovery sample index")
+        return (
+            self.recovery_samples_path(slot, journal_attempt_index)
+            / f"{sample_index}.json"
+        )
+
+    def recovery_path(self, slot: BaselineSlot, journal_attempt_index: int) -> Path:
+        self._require_slot(slot)
+        _require_non_negative_index(
+            journal_attempt_index, label="journal attempt index"
+        )
+        return (
+            self.root
+            / "recovery"
+            / slot.metric
+            / str(slot.pair_index)
+            / f"{journal_attempt_index}.json"
+        )
+
     def rejected_path(self, slot: BaselineSlot, journal_attempt_index: int) -> Path:
         self._require_slot(slot)
         _require_non_negative_index(
@@ -1106,6 +1179,7 @@ class BaselineJournal:
             "inflight": self.inflight_path,
             "measurements": self.measurement_path,
             "post-exit": self.post_exit_path,
+            "recovery": self.recovery_path,
             "rejected": self.rejected_path,
         }
         try:
@@ -1143,6 +1217,71 @@ class BaselineJournal:
                         )
                     )
         return tuple(records)
+
+    def _recovery_sample_records(
+        self,
+        *,
+        measurements: dict[tuple[BaselineSlot, int], dict],
+        post_exit: dict[tuple[BaselineSlot, int], dict],
+    ) -> dict[tuple[BaselineSlot, int], tuple[dict, ...]]:
+        records: dict[tuple[BaselineSlot, int], tuple[dict, ...]] = {}
+        for metric, metric_path in self._category_metric_directories(
+            "recovery-samples"
+        ):
+            for pair_path in metric_path.iterdir():
+                _require_directory(pair_path, label="recovery-samples slot state")
+                slot = BaselineSlot(
+                    metric,
+                    _parse_decimal_index(
+                        pair_path.name, label="recovery-samples pair index"
+                    ),
+                )
+                for attempt_path in pair_path.iterdir():
+                    _require_directory(
+                        attempt_path, label="recovery-samples attempt state"
+                    )
+                    attempt_index = _parse_decimal_index(
+                        attempt_path.name, label="recovery-samples attempt index"
+                    )
+                    if attempt_path != self.recovery_samples_path(slot, attempt_index):
+                        raise ValueError(
+                            "recovery-samples attempt has a non-canonical path"
+                        )
+                    key = (slot, attempt_index)
+                    paths: dict[int, Path] = {}
+                    for path in attempt_path.iterdir():
+                        _require_file(path, label="recovery sample")
+                        if path.suffix != ".json":
+                            raise ValueError(
+                                "recovery sample filename must end in .json"
+                            )
+                        sample_index = _parse_decimal_index(
+                            path.stem, label="recovery sample filename"
+                        )
+                        if path != self.recovery_sample_path(
+                            slot, attempt_index, sample_index
+                        ):
+                            raise ValueError("recovery sample has a non-canonical path")
+                        paths[sample_index] = path
+                    if not paths:
+                        continue
+                    if sorted(paths) != list(range(len(paths))):
+                        raise ValueError("recovery sample indices have a gap")
+                    measurement = measurements.get(key)
+                    parent = post_exit.get(key)
+                    if measurement is None:
+                        raise ValueError("recovery sample has no measurement")
+                    if parent is None:
+                        raise ValueError("recovery sample has no post-exit evidence")
+                    records[key] = validate_post_exit_recovery_samples(
+                        tuple(
+                            read_json_object(paths[index], label="recovery sample")
+                            for index in range(len(paths))
+                        ),
+                        measurement=measurement,
+                        post_exit=parent,
+                    )
+        return records
 
     def _validate_attempt_history(
         self,
@@ -1190,16 +1329,50 @@ class BaselineJournal:
             )
             attempts[key] = attempt
 
+        recovery_samples = self._recovery_sample_records(
+            measurements=measurements, post_exit=post_exit
+        )
+        for slot, attempt_index in recovery_samples:
+            attempts[(slot, attempt_index)] = JournalAttempt(
+                slot,
+                attempt_index,
+                self.inflight_path(slot, attempt_index),
+            )
+
+        recoveries: dict[tuple[BaselineSlot, int], dict] = {}
+        for attempt, path in self._attempt_records("recovery"):
+            key = (attempt.slot, attempt.journal_attempt_index)
+            measurement = measurements.get(key)
+            parent = post_exit.get(key)
+            if measurement is None:
+                raise ValueError("recovery summary has no measurement")
+            if parent is None:
+                raise ValueError("recovery summary has no post-exit evidence")
+            recoveries[key] = validate_post_exit_recovery(
+                read_json_object(path, label="post-exit recovery"),
+                measurement=measurement,
+                post_exit=parent,
+                samples=recovery_samples.get(key, ()),
+            )
+            attempts[key] = attempt
+
         inflight: dict[tuple[BaselineSlot, int], tuple[dict, RawTrial]] = {}
         for attempt, path in self._attempt_records("inflight"):
             key = (attempt.slot, attempt.journal_attempt_index)
             if key not in post_exit:
                 raise ValueError("inflight trial has no post-exit evidence")
+            if key not in recoveries:
+                raise ValueError("inflight trial has no recovery summary")
             raw = read_json_object(path, label="inflight trial")
             trial = _parse_trial_for_slot(
                 raw, slot=attempt.slot, label="inflight trial"
             )
-            expected_trial = finalize_raw_trial(measurements[key], post_exit[key])
+            expected_trial = finalize_raw_trial(
+                measurements[key],
+                post_exit[key],
+                recovery_samples.get(key, ()),
+                recoveries[key],
+            )
             if raw != expected_trial.to_dict() or trial != expected_trial:
                 raise ValueError("inflight trial does not match its staged evidence")
             inflight[key] = (raw, trial)
@@ -1230,17 +1403,35 @@ class BaselineJournal:
                 raise ValueError(
                     "rejected trial does not match its post-exit observation"
                 )
+            recovery = recoveries.get(key)
+            expected_recovery_identity = (
+                None if recovery is None else recovery["identity"]
+            )
+            if body["post_exit_recovery_identity"] != expected_recovery_identity:
+                raise ValueError("rejected trial does not match its post-exit recovery")
             if trial is None:
                 if body["reason"] != "missing-immediate-post-exit-evidence":
                     raise ValueError("unfinalized rejection has an invalid reason")
-                if parent is not None or key in inflight:
+                if (
+                    parent is not None
+                    or key in recovery_samples
+                    or recovery is not None
+                    or key in inflight
+                ):
                     raise ValueError(
                         "unfinalized rejection contains finalized stage evidence"
                     )
             else:
                 if parent is None:
                     raise ValueError("rejected trial has no post-exit evidence")
-                expected_trial = finalize_raw_trial(measurement, parent)
+                if recovery is None:
+                    raise ValueError("rejected trial has no recovery summary")
+                expected_trial = finalize_raw_trial(
+                    measurement,
+                    parent,
+                    recovery_samples.get(key, ()),
+                    recovery,
+                )
                 if body["trial"] != expected_trial.to_dict() or trial != expected_trial:
                     raise ValueError(
                         "rejected trial does not match its staged evidence"
@@ -1257,9 +1448,15 @@ class BaselineJournal:
                 raise ValueError("accepted attempt is duplicated")
             measurement = measurements.get(key)
             parent = post_exit.get(key)
-            if measurement is None or parent is None:
+            recovery = recoveries.get(key)
+            if measurement is None or parent is None or recovery is None:
                 raise ValueError("accepted trial has incomplete staged evidence")
-            expected_trial = finalize_raw_trial(measurement, parent)
+            expected_trial = finalize_raw_trial(
+                measurement,
+                parent,
+                recovery_samples.get(key, ()),
+                recovery,
+            )
             if raw != expected_trial.to_dict() or trial != expected_trial:
                 raise ValueError("accepted trial does not match its staged evidence")
             accepted[key] = (
@@ -1293,6 +1490,8 @@ class BaselineJournal:
         all_keys = (
             set(measurements)
             | set(post_exit)
+            | set(recovery_samples)
+            | set(recoveries)
             | set(inflight)
             | set(rejected)
             | set(accepted)
@@ -1342,6 +1541,8 @@ class BaselineJournal:
                 attempt=attempts[key],
                 measurement=measurements[key],
                 post_exit=post_exit.get(key),
+                recovery_samples=recovery_samples.get(key, ()),
+                recovery=recoveries.get(key),
                 trial=None if key not in inflight else inflight[key][1],
             )
             for key in all_keys - set(accepted) - set(rejected)
@@ -1613,18 +1814,20 @@ class BaselineJournal:
         histories, _inflight = self._validate_attempt_history()
         measurement = validated_trial.child_measurement
         post_exit = validated_trial.post_exit_observation
+        recovery = validated_trial.post_exit_recovery
         body = {
             "kind": "sml-baseline-rejected-trial",
-            "version": 2,
+            "version": 3,
             "journal_attempt_index": attempt.journal_attempt_index,
             "reason": reason,
             "child_measurement_identity": measurement["identity"],
             "post_exit_observation_identity": post_exit["identity"],
+            "post_exit_recovery_identity": recovery["identity"],
             "trial": validated_trial.to_dict(),
         }
         document = {
             **body,
-            "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
+            "identity": structured_identity("sml-baseline-rejected-trial-v3", body),
         }
         _validate_rejected_document(
             document,
@@ -1691,6 +1894,8 @@ class BaselineJournal:
             if (
                 state.measurement != validated_measurement
                 or state.post_exit is not None
+                or state.recovery_samples
+                or state.recovery is not None
                 or state.trial is not None
             ):
                 raise ValueError(
@@ -1701,16 +1906,17 @@ class BaselineJournal:
                 raise ValueError("journal attempt indices have a gap")
         body = {
             "kind": "sml-baseline-rejected-trial",
-            "version": 2,
+            "version": 3,
             "journal_attempt_index": attempt.journal_attempt_index,
             "reason": reason,
             "child_measurement_identity": validated_measurement["identity"],
             "post_exit_observation_identity": None,
+            "post_exit_recovery_identity": None,
             "trial": None,
         }
         document = {
             **body,
-            "identity": structured_identity("sml-baseline-rejected-trial-v2", body),
+            "identity": structured_identity("sml-baseline-rejected-trial-v3", body),
         }
         _validate_rejected_document(
             document,
