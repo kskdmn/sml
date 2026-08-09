@@ -973,8 +973,8 @@
       "shape": []
     }
   },
-  "capture_tool_commit": "a144efa8344e894f4ea838dc831de6bd49e7c75d",
-  "capture_tool_identity": "sha256:086e25d6bf88a06dad1861b941a45f7da445c96688a8e8b3d116a2f3d1f865ec",
+  "capture_tool_commit": "387d53d85966f07ef3e925f1ffa3f05a0edde6ca",
+  "capture_tool_identity": "sha256:77fed23223fab2ec51c05fb4f36d3518da63ea12d9a2db25ed162be5d70bb37c",
   "capture_tool_identity_files": [
     "v2/tests/equivalence/capture_legacy.py",
     "v2/tests/equivalence/test_legacy_fixture_integrity.py"
@@ -1029,34 +1029,55 @@
       ],
       "configurations": {
         "greedy": {
-          "max_new_tokens": 3,
-          "no_repeat_ngram_size": 0,
-          "repetition_penalty": 1.0,
-          "seed": null,
-          "temperature": 0.0,
-          "top_p": 1.0,
-          "winning_margins": [
-            [
-              0.166015625,
-              0.16796875,
-              0.16796875
-            ]
-          ]
+          "generation_config": {
+            "no_repeat_ngram_size": 0,
+            "repetition_penalty": 1.0,
+            "seed": null,
+            "temperature": 0.0,
+            "top_p": 1.0
+          },
+          "max_new_tokens": 3
+        },
+        "padded_unequal": {
+          "generation_config": {
+            "no_repeat_ngram_size": 0,
+            "repetition_penalty": 1.0,
+            "seed": null,
+            "temperature": 0.0,
+            "top_p": 1.0
+          },
+          "max_new_tokens": 3
+        },
+        "primitive_sampling": {
+          "generation_config": {
+            "no_repeat_ngram_size": 0,
+            "repetition_penalty": 1.0,
+            "seed": null,
+            "temperature": 0.8,
+            "top_p": 0.9
+          },
+          "key_seed": 1234,
+          "max_new_tokens": 1
         },
         "seeded": {
-          "max_new_tokens": 3,
-          "no_repeat_ngram_size": 2,
-          "repetition_penalty": 1.1,
-          "seed": 1234,
-          "temperature": 0.8,
-          "top_p": 0.9,
-          "winning_margins": [
-            [
-              0.16796875,
-              0.0634765625,
-              0.0078125
-            ]
-          ]
+          "generation_config": {
+            "no_repeat_ngram_size": 2,
+            "repetition_penalty": 1.1,
+            "seed": 1234,
+            "temperature": 0.8,
+            "top_p": 0.9
+          },
+          "max_new_tokens": 3
+        },
+        "serial_unequal": {
+          "generation_config": {
+            "no_repeat_ngram_size": 0,
+            "repetition_penalty": 1.0,
+            "seed": null,
+            "temperature": 0.0,
+            "top_p": 1.0
+          },
+          "max_new_tokens": 3
         }
       },
       "padded_unequal_prompts": [
@@ -1071,7 +1092,50 @@
           3
         ]
       ],
-      "primitive_sampling_seed": 1234,
+      "references": {
+        "greedy": {
+          "arrays": [
+            "generation.greedy_prompt",
+            "generation.greedy_tokens",
+            "generation.greedy_winning_margins"
+          ],
+          "configuration": "greedy"
+        },
+        "padded_unequal": {
+          "arrays": [
+            "generation.padded_unequal_prompts",
+            "generation.padded_unequal_tokens",
+            "generation.padded_unequal_winning_margins"
+          ],
+          "configuration": "padded_unequal"
+        },
+        "primitive_sampling": {
+          "arrays": [
+            "generation.logits",
+            "generation.sampled_token"
+          ],
+          "configuration": "primitive_sampling"
+        },
+        "seeded": {
+          "arrays": [
+            "generation.seeded_prompt",
+            "generation.seeded_tokens",
+            "generation.seeded_winning_margins"
+          ],
+          "configuration": "seeded"
+        },
+        "serial_unequal": {
+          "arrays": [
+            "generation.serial_prompt.0",
+            "generation.serial_prompt.1",
+            "generation.serial_tokens.0",
+            "generation.serial_tokens.1",
+            "generation.serial_winning_margins.0",
+            "generation.serial_winning_margins.1"
+          ],
+          "configuration": "serial_unequal"
+        }
+      },
       "unequal_prompts": [
         [
           1,
