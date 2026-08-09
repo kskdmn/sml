@@ -2457,11 +2457,11 @@ def test_raw_trial_evidence_rejects_a_cached_only_environment_change():
         validate_raw_trial_evidence(mismatched)
 
 
-def test_raw_trial_identity_uses_version_two_domain():
+def test_raw_trial_identity_uses_version_three_domain():
     trial = _valid_raw_trial(build_canonical_workload())
 
     assert benchmark_runner._raw_trial_identity(trial) == structured_identity(
-        "sml-raw-benchmark-trial-v2", trial.to_dict()
+        "sml-raw-benchmark-trial-v3", trial.to_dict()
     )
 
 
@@ -2471,6 +2471,33 @@ def test_raw_trial_identity_rejects_tampered_embedded_evidence():
 
     with pytest.raises(ValueError, match="embedded evidence"):
         benchmark_runner._raw_trial_identity(tampered)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda raw: raw["post_exit_recovery"].update(identity="sha256:" + "0" * 64),
+        lambda raw: raw["post_exit_recovery_samples"][0].update(elapsed_seconds=31.0),
+        lambda raw: raw["post_exit_recovery_samples"][0].update(
+            previous_sample_identity="sha256:" + "0" * 64
+        ),
+    ),
+)
+def test_baseline_rejects_tampered_recovery_evidence(mutate):
+    workload = build_canonical_workload()
+    raw = _valid_recovered_raw_trial(workload).to_dict()
+    mutate(raw)
+
+    with pytest.raises(ValueError, match="evidence|recovery|identity"):
+        validate_baseline_trial(
+            RawTrial.from_dict(raw),
+            workload=workload,
+            source_commit=raw["source_commit"],
+            harness_commit=raw["harness_commit"],
+            harness_identity=raw["harness_identity"],
+            expected_hardware=raw["hardware"],
+            expected_software_versions=raw["software_versions"],
+        )
 
 
 def test_raw_trial_jsonl_rejects_tampered_embedded_evidence(tmp_path):
@@ -2524,6 +2551,52 @@ def test_comparison_rejects_raw_trial_without_valid_post_exit_evidence():
     report["identity"] = structured_identity("sml-performance-comparison-v1", body)
 
     with pytest.raises(ValueError, match="post-exit observation identity"):
+        validate_comparison_report(report, baseline, None)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda raw: raw["post_exit_recovery"].update(identity="sha256:" + "0" * 64),
+        lambda raw: raw["post_exit_recovery_samples"][0].update(
+            previous_sample_identity="sha256:" + "0" * 64
+        ),
+    ),
+)
+def test_comparison_rejects_tampered_recovery_evidence_after_resigning(mutate):
+    workload, baseline, prepared = _valid_prepared_comparison()
+    trials = _comparison_trials(
+        workload,
+        prepared["candidate_commit"],
+        [100.0] * 5,
+        attempt_index=0,
+    )
+    trials[0] = _with_trial_payload(
+        _valid_recovered_raw_trial(workload),
+        metric="prepared-data",
+        pair_index=0,
+        attempt_index=0,
+        side="reference",
+        process_order=0,
+        comparison_target="baseline",
+        value=100.0,
+    )
+    report = build_comparison_report(
+        baseline=baseline,
+        trials=trials,
+        candidate_commit=prepared["candidate_commit"],
+        minimum_ratio=0.97,
+        pretraining_minimum_ratio=None,
+        maximum_dispersion=0.02,
+        require_lower_bound=False,
+        bootstrap_resamples=10_000,
+        predecessor_metrics={},
+    )
+    mutate(report["raw_trials"][0])
+    body = {key: value for key, value in report.items() if key != "identity"}
+    report["identity"] = structured_identity("sml-performance-comparison-v1", body)
+
+    with pytest.raises(ValueError, match="evidence|recovery|identity"):
         validate_comparison_report(report, baseline, None)
 
 

@@ -155,7 +155,7 @@ class ProcessMeasurement:
 
 def _raw_trial_identity(trial: RawTrial) -> str:
     validate_raw_trial_evidence(trial)
-    return structured_identity("sml-raw-benchmark-trial-v2", trial.to_dict())
+    return structured_identity("sml-raw-benchmark-trial-v3", trial.to_dict())
 
 
 def _validate_raw_trials_evidence(trials: Sequence[RawTrial]) -> None:
@@ -573,6 +573,7 @@ def _validate_preflight_environment(
 def classify_trial_environment(
     workload: CanonicalWorkload, trial: RawTrial
 ) -> TrialEnvironmentDisposition:
+    validate_raw_trial_evidence(trial)
     reason = finalized_trial_rejection_reason(trial, workload.required_environment)
     if reason is None:
         return TrialEnvironmentDisposition("accept", None)
@@ -2753,6 +2754,7 @@ def publish_baseline_from_journal(
     manifest_path: Path,
     raw_output_path: Path,
 ) -> dict:
+    _validate_raw_trials_evidence(trials)
     manifest_path, raw_output_path = _resolve_baseline_output_paths(
         state_root=journal.root,
         manifest_path=manifest_path,
@@ -3333,6 +3335,7 @@ def _analyze_previous_pairs(
     predecessor_result_identity: str,
     attempt_index: int,
 ) -> dict:
+    _validate_raw_trials_evidence(trials)
     reference = sorted(
         (
             trial

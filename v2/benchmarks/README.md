@@ -33,14 +33,20 @@ Each process publishes an identity-bound child measurement containing separate
 start and end observations recorded while MLX is alive; the child never
 publishes a final trial. Immediately after the child exits, the parent samples
 memory pressure and free-memory percentage before any slower hardware or
-software probe. It then publishes an identity-bound post-exit observation and
-finalizes a self-contained `RawTrial` schema version 2. Raw-trial identities use
-the `sml-raw-benchmark-trial-v2` domain. Baseline manifests, raw JSONL,
-comparison reports, predecessor replay, phase validation, and final validation
-all revalidate the embedded child and post-exit evidence before accepting its
-identity or measured value. Version 1 raw trials and evidence whose nested
-identities were changed are incompatible diagnostic records, not current
-benchmark evidence.
+software probe. This immediate memory observation remains a version-1,
+identity-bound observation. Immediate normal memory writes the `not-required`
+recovery summary with zero samples. Immediate warning memory samples the
+complete environment every five seconds for at most five minutes and requires
+30 continuous normal seconds before recovery; every sample is written before
+classification, a warning resets only the stability window, and a critical or
+non-memory failure terminates immediately. Schema-v3 raw trials embed the
+ordered recovery-sample identity chain and its recovery summary. Raw-trial
+identities use the `sml-raw-benchmark-trial-v3` domain. Baseline manifests, raw
+JSONL, comparison reports, predecessor replay, phase validation, and final
+validation all revalidate the complete embedded recovery evidence before
+accepting a raw identity or measured value. Schema-v2 (and older) raw trials,
+and evidence whose nested identities were changed, are incompatible diagnostic
+records, not current benchmark evidence.
 
 Baseline capture also requires `--state-directory PATH`. The path is resolved
 before use and must be outside both the harness checkout and the detached pinned
@@ -57,6 +63,8 @@ journal that remains after success or failure:
 ├── rejected/<metric>/<pair-index>/<attempt-index>.json
 ├── measurements/<metric>/<pair-index>/<attempt-index>.json
 ├── post-exit/<metric>/<pair-index>/<attempt-index>.json
+├── recovery-samples/<metric>/<pair-index>/<attempt-index>/<sample-index>.json
+├── recovery/<metric>/<pair-index>/<attempt-index>.json
 ├── inflight/<metric>/<pair-index>/<attempt-index>.json
 ├── preflight/<metric>/<pair-index>/<preflight-index>.json
 ├── thermal-waits/<metric>/<pair-index>/<recovery-index>/
@@ -85,7 +93,7 @@ must be `normal`. Child-end `warning` is diagnostic and may pass only when
 child-start and immediate parent post-exit pressure are both `normal` and every
 other strict check passes. Any non-normal child-start pressure, child-end
 `critical`, or any non-normal post-exit memory pressure is classified as a
-memory rejection: the version 2 rejected-trial record is written durably and
+memory rejection: the version 3 rejected-trial record is written durably and
 the invocation stops without a same-run retry. The accepted slots remain in
 place, and the rejected attempt index remains part of the journal's retry
 accounting.
@@ -114,23 +122,30 @@ a nominal window.
 Resume requires the exact same harness commit and content identity, pinned
 source commit, canonical workload, immutable protocol, hardware, software,
 paired representations, and resolved final output paths. A session created
-before the post-exit memory policy is incompatible and is never migrated.
+before the schema-v3 post-exit memory policy is incompatible and is never
+migrated. In particular, retained schema-v2 state at
+`/private/tmp/sml-v2-baseline-post-exit-state-aa6bb43` is diagnostic only.
 Compatible accepted slots are validated and reused. Measurement-only crash
 evidence is durably rejected as `missing-immediate-post-exit-evidence`; a later
 invocation never fabricates a new post-exit observation for an old process. A
-matching child measurement plus post-exit observation reconstructs the final
-version 2 trial deterministically before classification. A complete in-flight
-trial is likewise classified before any replacement is launched.
+matching child measurement, immediate observation, ordered recovery samples,
+and recovery summary reconstruct the final schema-v3 trial deterministically
+before classification. A complete in-flight trial is likewise classified before
+any replacement is launched. A crash during warning recovery is `interrupted`
+and never continues its old stability window.
 
-After a memory rejection, the operator resumes by running the same canonical
+Timeout, critical, and interrupted post-exit memory outcomes stop for manual
+resume; only a thermal-only failure retains automatic thermal recovery. After a
+memory rejection, the operator resumes by running the same canonical
 `record-baseline` command against the same state directory. The later manual
 resume revalidates the complete journal, performs a new strict preflight, and
 launches only the still-missing slot with the next journal attempt index; it
 does not rerun accepted slots. Persisted non-nominal preflights, thermally
-rejected trials, unfinished recovery episodes, and timed-out recovery episodes
-resume with a fresh five-continuous-minute nominal window before a new preflight
-or trial can run. Only the same thermally rejected slot is retried. The final
-raw JSONL and manifest remain absent until all 45 canonical slots validate.
+rejected trials, unfinished thermal recovery episodes, and timed-out thermal
+recovery episodes resume with a fresh five-continuous-minute nominal window
+before a new preflight or trial can run. Only the same thermally rejected slot
+is retried. No baseline starts automatically after implementation. The final raw
+JSONL and manifest remain absent until all 45 canonical slots validate.
 Publication creates the raw JSONL first, the manifest second, and
 `completed.json` last; existing identical bytes are accepted for crash resume,
 while different final content is never overwritten. The external journal is
