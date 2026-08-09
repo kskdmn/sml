@@ -53,54 +53,47 @@ def append_kv_state(
 
     in_bounds = (positions >= 0) & (positions < capacity)
     write_mask = valid_mask & in_bounds
-    has_valid_write = mx.any(write_mask, axis=1)
-    fallback_token = mx.argmax(write_mask.astype(mx.int32), axis=1)
-    fallback_position = mx.take_along_axis(
-        positions,
-        fallback_token[:, None],
-        axis=1,
+    batch_size, query_length = positions.shape
+    safe_positions = mx.where(in_bounds, positions, mx.zeros_like(positions))
+    batch_indices = mx.broadcast_to(
+        mx.arange(batch_size, dtype=mx.int32)[:, None],
+        positions.shape,
     )
-    fallback_position = mx.where(
-        has_valid_write[:, None],
-        fallback_position,
-        mx.zeros_like(fallback_position),
+    token_indices = mx.broadcast_to(
+        mx.arange(query_length, dtype=mx.int32)[None, :],
+        positions.shape,
     )
-    scatter_positions = mx.where(write_mask, positions, fallback_position)
-    scatter_indices = mx.broadcast_to(
-        scatter_positions[:, None, :, None],
-        keys.shape,
+    priorities = mx.where(
+        write_mask,
+        token_indices,
+        mx.full(positions.shape, -1, dtype=mx.int32),
     )
-    fallback_indices = mx.broadcast_to(
-        fallback_token[:, None, None, None],
-        (*keys.shape[:2], 1, keys.shape[3]),
+    last_valid_token = (
+        mx.full(
+            (batch_size, capacity),
+            -1,
+            dtype=mx.int32,
+        )
+        .at[batch_indices, safe_positions]
+        .maximum(priorities)
     )
-    fallback_keys = mx.take_along_axis(keys, fallback_indices, axis=2)
-    fallback_values = mx.take_along_axis(values, fallback_indices, axis=2)
-    key_updates = mx.where(write_mask[:, None, :, None], keys, fallback_keys)
-    value_updates = mx.where(write_mask[:, None, :, None], values, fallback_values)
-    prior_keys = mx.take_along_axis(cached_keys, scatter_indices, axis=2)
-    prior_values = mx.take_along_axis(cached_values, scatter_indices, axis=2)
-    key_updates = mx.where(
-        has_valid_write[:, None, None, None],
-        key_updates,
-        prior_keys,
+    selected_token = mx.maximum(last_valid_token, 0)
+    selected_indices = mx.broadcast_to(
+        selected_token[:, None, :, None],
+        cached_keys.shape,
     )
-    value_updates = mx.where(
-        has_valid_write[:, None, None, None],
-        value_updates,
-        prior_values,
-    )
-    updated_keys = mx.put_along_axis(
+    selected_keys = mx.take_along_axis(keys, selected_indices, axis=2)
+    selected_values = mx.take_along_axis(values, selected_indices, axis=2)
+    written_slots = last_valid_token[:, None, :, None] >= 0
+    updated_keys = mx.where(
+        written_slots,
+        selected_keys,
         cached_keys,
-        scatter_indices,
-        key_updates,
-        axis=2,
     )
-    updated_values = mx.put_along_axis(
+    updated_values = mx.where(
+        written_slots,
+        selected_values,
         cached_values,
-        scatter_indices,
-        value_updates,
-        axis=2,
     )
 
     written_lengths = mx.max(
@@ -151,4 +144,8 @@ class KVCache:
 
     def reset(self) -> None:
         keys, values, lengths = self._state
-        self._state = keys, values, mx.zeros_like(lengths)
+        self._state = (
+            tuple(mx.zeros_like(layer) for layer in keys),
+            tuple(mx.zeros_like(layer) for layer in values),
+            mx.zeros_like(lengths),
+        )
