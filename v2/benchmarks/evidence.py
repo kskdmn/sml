@@ -564,16 +564,45 @@ def _environment_matches_recovery_policy(
     )
 
 
-def _recovery_environment_failure_fields(
-    samples: Sequence[Mapping[str, object]], policy: Mapping[str, object]
+def _observation_environment_failure_fields(
+    observation: Mapping[str, object],
+    *,
+    policy: Mapping[str, object],
+    expected_hardware: Mapping[str, object],
+    expected_software_versions: Mapping[str, object],
 ) -> list[str]:
     required = policy["required_environment"]
+    status = observation["environment_status"]
+    failures = {
+        name
+        for name, expected_value in required.items()
+        if status[name] != expected_value
+    }
+    if policy["require_same_hardware_and_software"]:
+        if observation["hardware"] != expected_hardware:
+            failures.add("hardware")
+        if observation["software_versions"] != expected_software_versions:
+            failures.add("software_versions")
+    return sorted(failures)
+
+
+def _recovery_environment_failure_fields(
+    samples: Sequence[Mapping[str, object]],
+    *,
+    policy: Mapping[str, object],
+    expected_hardware: Mapping[str, object],
+    expected_software_versions: Mapping[str, object],
+) -> list[str]:
     return sorted(
         {
-            name
+            field
             for sample in samples
-            for name, expected_value in required.items()
-            if sample["environment_status"][name] != expected_value
+            for field in _observation_environment_failure_fields(
+                sample,
+                policy=policy,
+                expected_hardware=expected_hardware,
+                expected_software_versions=expected_software_versions,
+            )
         }
     )
 
@@ -586,6 +615,8 @@ def _validate_recovery_outcome(
     policy: Mapping[str, object],
     duration_seconds: float,
     failure_fields: list[str],
+    expected_hardware: Mapping[str, object],
+    expected_software_versions: Mapping[str, object],
 ) -> str:
     if outcome not in {
         "not-required",
@@ -607,7 +638,19 @@ def _validate_recovery_outcome(
         for sample in samples
     )
     requires_critical_outcome = immediate_pressure == "critical" or has_critical_sample
-    environment_failure_fields = _recovery_environment_failure_fields(samples, policy)
+    immediate_failure_fields = _observation_environment_failure_fields(
+        immediate,
+        policy=policy,
+        expected_hardware=expected_hardware,
+        expected_software_versions=expected_software_versions,
+    )
+    sample_failure_fields = _recovery_environment_failure_fields(
+        samples,
+        policy=policy,
+        expected_hardware=expected_hardware,
+        expected_software_versions=expected_software_versions,
+    )
+    environment_failure_fields = immediate_failure_fields or sample_failure_fields
     if (
         outcome == "environment-failure"
         and failure_fields != environment_failure_fields
@@ -638,7 +681,10 @@ def _validate_recovery_outcome(
     )
     if outcome == "not-required":
         valid = (
-            immediate_pressure == "normal" and not samples and duration_seconds == 0.0
+            immediate_pressure == "normal"
+            and not immediate_failure_fields
+            and not samples
+            and duration_seconds == 0.0
         )
     elif outcome == "recovered":
         valid = (
@@ -658,13 +704,17 @@ def _validate_recovery_outcome(
             and not has_stable_recovery_window
         )
     elif outcome == "critical":
-        valid = requires_critical_outcome
+        valid = requires_critical_outcome and not immediate_failure_fields
     elif outcome == "environment-failure":
         valid = (
-            immediate_pressure == "warning"
+            bool(immediate_failure_fields) and not samples and duration_seconds == 0.0
+        )
+        valid = valid or (
+            not immediate_failure_fields
+            and immediate_pressure == "warning"
             and bool(samples)
             and not requires_critical_outcome
-            and bool(environment_failure_fields)
+            and bool(sample_failure_fields)
         )
     else:
         valid = (
@@ -712,6 +762,8 @@ def build_post_exit_recovery(
         policy=normalized_policy,
         duration_seconds=normalized_duration,
         failure_fields=normalized_failure_fields,
+        expected_hardware=child["start"]["hardware"],
+        expected_software_versions=child["start"]["software_versions"],
     )
     terminal_environment = (
         parent["environment_status"]
@@ -793,6 +845,8 @@ def validate_post_exit_recovery(
         policy=normalized_policy,
         duration_seconds=duration_seconds,
         failure_fields=raw_failure_fields,
+        expected_hardware=child["start"]["hardware"],
+        expected_software_versions=child["start"]["software_versions"],
     )
     terminal_identity = (
         None if not validated_samples else validated_samples[-1]["identity"]

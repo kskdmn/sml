@@ -1192,19 +1192,41 @@ def _recovery_evidence(
 
 
 def _valid_post_exit_recovery(measurement, post_exit, samples=()):
+    workload = build_canonical_workload()
+    start = measurement["start"]
+    status = post_exit["environment_status"]
+    failure_fields = set()
+    if post_exit["hardware"] != start["hardware"]:
+        failure_fields.add("hardware")
+    if post_exit["software_versions"] != start["software_versions"]:
+        failure_fields.add("software_versions")
+    for field in (
+        "power_connected",
+        "power_mode",
+        "low_power_mode",
+        "thermal_state",
+        "competing_gpu_workload",
+    ):
+        if status[field] != workload.required_environment[field]:
+            failure_fields.add(field)
     immediate_pressure = post_exit["environment_status"]["memory_pressure"]
-    outcome = {
-        "normal": "not-required",
-        "warning": "interrupted",
-        "critical": "critical",
-    }[immediate_pressure]
+    outcome = (
+        "environment-failure"
+        if failure_fields
+        else {
+            "normal": "not-required",
+            "warning": "interrupted",
+            "critical": "critical",
+        }[immediate_pressure]
+    )
     return build_post_exit_recovery(
         measurement=measurement,
         post_exit=post_exit,
         samples=samples,
-        policy=post_exit_recovery_policy(build_canonical_workload()),
+        policy=post_exit_recovery_policy(workload),
         outcome=outcome if not samples else "recovered",
         duration_seconds=0.0 if not samples else samples[-1]["elapsed_seconds"],
+        failure_fields=tuple(sorted(failure_fields)),
     )
 
 
@@ -1562,6 +1584,59 @@ def test_timeout_uses_the_deadline_bound_stable_recovery_window():
             policy=policy,
             outcome="timeout",
             duration_seconds=300.0,
+        )
+
+
+@pytest.mark.parametrize("pressure", ("normal", "critical"))
+def test_immediate_identity_drift_is_a_zero_sample_environment_failure(pressure):
+    workload = build_canonical_workload()
+    measurement = _valid_child_measurement(workload)
+    immediate = _valid_observation("2026-08-09T00:00:02+00:00")
+    immediate["hardware"] = {**immediate["hardware"], "chip": "Other"}
+    immediate["environment_status"]["memory_pressure"] = pressure
+    post_exit = build_post_exit_observation(measurement=measurement, **immediate)
+    policy = post_exit_recovery_policy(workload)
+
+    recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=(),
+        policy=policy,
+        outcome="environment-failure",
+        duration_seconds=0.0,
+        failure_fields=("hardware",),
+    )
+
+    assert recovery["outcome"] == "environment-failure"
+    assert recovery["failure_fields"] == ["hardware"]
+    assert (
+        validate_post_exit_recovery(
+            recovery,
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=(),
+        )
+        == recovery
+    )
+    for failure_fields in ((), ("software_versions",), ("hardware", "thermal_state")):
+        with pytest.raises(ValueError, match="recovery failure_fields"):
+            build_post_exit_recovery(
+                measurement=measurement,
+                post_exit=post_exit,
+                samples=(),
+                policy=policy,
+                outcome="environment-failure",
+                duration_seconds=0.0,
+                failure_fields=failure_fields,
+            )
+    with pytest.raises(ValueError, match="recovery outcome"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=(),
+            policy=policy,
+            outcome="critical" if pressure == "critical" else "not-required",
+            duration_seconds=0.0,
         )
 
 
@@ -5266,6 +5341,51 @@ def test_parent_records_immediate_warning_then_every_recovery_sample_before_fina
     assert events.index("write:6.json") < events.index("write:recovery.json")
     assert events.index("write:recovery.json") < events.index("write:trial.json")
     assert trial == RawTrial.from_dict(read_json_object(trial_path, label="trial"))
+
+
+def test_parent_finalizes_immediate_hardware_drift_without_recovery_samples(
+    tmp_path, monkeypatch
+):
+    workload = build_canonical_workload()
+    measurement = _valid_child_measurement(workload)
+    measurement_path = tmp_path / "measurement.json"
+    post_exit_path = tmp_path / "post-exit.json"
+    recovery_samples_directory = tmp_path / "recovery-samples"
+    recovery_path = tmp_path / "recovery.json"
+    trial_path = tmp_path / "trial.json"
+    immediate = _observation_with_memory("normal", 67)
+    immediate["hardware"] = {**immediate["hardware"], "chip": "Other"}
+
+    def run_child(command, *, cwd, check):
+        atomic_write_json(measurement_path, measurement, create_only=True)
+
+    monkeypatch.setattr(benchmark_runner.subprocess, "run", run_child)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "collect_post_exit_environment",
+        lambda **kwargs: (0.0, immediate),
+    )
+
+    trial = benchmark_runner._launch_trial(
+        **_launch_trial_arguments(tmp_path),
+        evidence_session_identity=measurement["session_identity"],
+        journal_attempt_index=0,
+        measurement_output=measurement_path,
+        post_exit_output=post_exit_path,
+        recovery_samples_directory=recovery_samples_directory,
+        recovery_output=recovery_path,
+        output=trial_path,
+        clock=lambda: 0.0,
+        sleep=lambda seconds: pytest.fail("immediate failure must not sleep"),
+    )
+
+    assert trial.schema_version == 3
+    assert trial.post_exit_recovery_samples == ()
+    assert trial.post_exit_recovery["outcome"] == "environment-failure"
+    assert trial.post_exit_recovery["duration_seconds"] == 0.0
+    assert trial.post_exit_recovery["failure_fields"] == ["hardware"]
+    assert not recovery_samples_directory.exists()
+    validate_raw_trial_evidence(trial)
 
 
 def _stub_parent_observation(monkeypatch, observation):
