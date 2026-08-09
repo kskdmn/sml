@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import io
+import multiprocessing
 import os
+from pathlib import Path
 
 import pytest
 from sml.artifacts import manifest as artifacts
@@ -14,6 +16,27 @@ def _payload_ref(logical_path: str, data: bytes) -> artifacts.PayloadRef:
         identity=artifacts.file_identity(io.BytesIO(data)),
         byte_size=len(data),
     )
+
+
+def _open_payload_in_child(
+    root_path: str,
+    logical_path: str,
+    connection,
+) -> None:
+    try:
+        with (
+            artifacts.ArtifactRoot.open(
+                Path(root_path), writable=False
+            ) as artifact_root,
+            artifact_root.open_payload(logical_path),
+        ):
+            pass
+    except SMLArtifactError as error:
+        connection.send((type(error).__name__, str(error)))
+    else:
+        connection.send(("opened", ""))
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(
@@ -143,6 +166,58 @@ def test_root_descriptor_lives_until_context_exit(tmp_path):
 
     with pytest.raises(OSError):
         os.fstat(descriptor)
+
+
+def test_probe_failure_closes_root_descriptor(tmp_path, monkeypatch):
+    """Letting an unexpected probe failure escape must not leak the opened root."""
+    probed_descriptors: list[int] = []
+
+    def failing_probe(descriptor: int) -> bool:
+        probed_descriptors.append(descriptor)
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(artifacts, "_descriptor_is_local_apfs", failing_probe)
+
+    with pytest.raises(RuntimeError, match="probe failed"):
+        artifacts.ArtifactRoot.open(tmp_path, writable=False)
+
+    assert len(probed_descriptors) == 1
+    descriptor = probed_descriptors[0]
+    try:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def test_fifo_payload_is_rejected_without_blocking(tmp_path):
+    """Opening a named pipe must reach regular-file rejection without hanging."""
+    os.mkfifo(tmp_path / "payload.fifo")
+    context = multiprocessing.get_context("spawn")
+    receiving_connection, sending_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_open_payload_in_child,
+        args=(str(tmp_path), "payload.fifo", sending_connection),
+    )
+    process.start()
+    sending_connection.close()
+
+    try:
+        process.join(timeout=5)
+        assert not process.is_alive(), "opening a FIFO blocked the payload reader"
+        assert receiving_connection.poll(), "child exited without reporting its result"
+        error_type, message = receiving_connection.recv()
+        assert error_type == "SMLArtifactError"
+        assert "regular file" in message
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        receiving_connection.close()
+        process.close()
 
 
 def test_payload_descriptor_is_owned_by_returned_stream(tmp_path):

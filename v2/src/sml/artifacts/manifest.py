@@ -28,6 +28,7 @@ _PORTABLE_COMPONENT_PATTERN = re.compile(
 _FILE_READ_SIZE = 1024 * 1024
 _OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_OPEN_FLAGS = _OPEN_FLAGS | os.O_DIRECTORY
+_PAYLOAD_OPEN_FLAGS = _OPEN_FLAGS | os.O_NONBLOCK
 _MNT_LOCAL = 0x00001000
 
 
@@ -299,17 +300,18 @@ class ArtifactRoot:
                 raise SMLArtifactError(
                     "writable artifact roots require a local APFS filesystem"
                 )
-            return cls(descriptor, local_apfs=local_apfs)
+            root = cls(descriptor, local_apfs=local_apfs)
+            descriptor = -1
+            return root
         except SMLArtifactError:
-            if descriptor >= 0:
-                os.close(descriptor)
             raise
         except OSError as error:
-            if descriptor >= 0:
-                os.close(descriptor)
             raise SMLArtifactError(
                 f"could not open artifact root with no-follow semantics: {path}"
             ) from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     @property
     def local_apfs(self) -> bool:
@@ -365,7 +367,7 @@ class ArtifactRoot:
 
             final_descriptor = os.open(
                 components[-1],
-                _OPEN_FLAGS,
+                _PAYLOAD_OPEN_FLAGS,
                 dir_fd=current_descriptor,
             )
             payload_stat = os.fstat(final_descriptor)
