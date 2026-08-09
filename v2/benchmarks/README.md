@@ -91,12 +91,17 @@ fail the strict topology or checkout checks.
 Every preflight is persisted before validation. Child-start memory pressure
 must be `normal`. Child-end `warning` is diagnostic and may pass only when
 child-start and immediate parent post-exit pressure are both `normal` and every
-other strict check passes. Any non-normal child-start pressure, child-end
-`critical`, or any non-normal post-exit memory pressure is classified as a
-memory rejection: the version 3 rejected-trial record is written durably and
-the invocation stops without a same-run retry. The accepted slots remain in
-place, and the rejected attempt index remains part of the journal's retry
-accounting.
+other strict check passes. Non-normal child-start pressure and child-end
+`critical` are memory rejections. An immediate parent post-exit `warning` is
+accepted only when its ordered recovery evidence reaches 30 continuous normal
+seconds and therefore has the `recovered` outcome, subject to every other strict
+check. `timeout` (persistent warning), `critical`, and `interrupted` recovery
+outcomes are memory rejections that stop for manual resume. A thermal-only
+recovery failure is the `non-nominal-thermal` disposition and retains the
+automatic thermal-recovery path; a non-thermal recovery environment failure is
+the `post-exit-recovery-environment-violation` disposition. A rejected version
+3 trial record is written durably, accepted slots remain in place, and the
+rejected attempt index remains part of the journal's retry accounting.
 
 Other strict hardware, software, power, competing-workload, protocol,
 identity, subprocess, or schema failures are not classified trial rejections
