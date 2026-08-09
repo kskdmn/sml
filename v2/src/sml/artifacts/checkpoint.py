@@ -364,6 +364,26 @@ def _owner_diagnostics(holders: list[dict[str, object]]) -> str:
     )
 
 
+def _pid_may_be_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _prune_lock_owners(
+    holders: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return [holder for holder in holders if _pid_may_be_alive(holder["pid"])]
+
+
 def _open_lock_sidecar(sidecar: str, parent_descriptor: int) -> int:
     existing_flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
@@ -394,6 +414,7 @@ def _protected_lock(
     lock_descriptor = -1
     diagnostic_descriptor = -1
     acquired = False
+    protected_released = False
     owner_token = uuid.uuid4().hex
     try:
         sidecar = _lock_name(protected_name, category)
@@ -414,6 +435,10 @@ def _protected_lock(
             OS_FILESYSTEM.flock(diagnostic_descriptor, fcntl.LOCK_EX)
             conflict: _LockUnavailable | None = None
             try:
+                stored_holders = _read_lock_owners(diagnostic_descriptor)
+                holders = _prune_lock_owners(stored_holders)
+                if holders != stored_holders:
+                    _write_lock_owners(diagnostic_descriptor, holders)
                 try:
                     OS_FILESYSTEM.flock(
                         lock_descriptor,
@@ -428,12 +453,10 @@ def _protected_lock(
                         raise
                     conflict = _LockUnavailable(
                         f"{category} lock for {protected} is held by "
-                        f"{_owner_diagnostics(_read_lock_owners(diagnostic_descriptor))}"
+                        f"{_owner_diagnostics(holders)}"
                     )
                 else:
-                    holders = (
-                        [] if exclusive else _read_lock_owners(diagnostic_descriptor)
-                    )
+                    holders = [] if exclusive else holders
                     holders.append(
                         {
                             "pid": os.getpid(),
@@ -464,24 +487,46 @@ def _protected_lock(
         ) from error
     finally:
         if acquired and diagnostic_descriptor >= 0:
+            diagnostic_locked = False
             try:
                 OS_FILESYSTEM.flock(diagnostic_descriptor, fcntl.LOCK_EX)
+                diagnostic_locked = True
                 try:
                     remaining = [
                         holder
-                        for holder in _read_lock_owners(diagnostic_descriptor)
+                        for holder in _prune_lock_owners(
+                            _read_lock_owners(diagnostic_descriptor)
+                        )
                         if holder["token"] != owner_token
                     ]
                     _write_lock_owners(diagnostic_descriptor, remaining)
                 finally:
-                    OS_FILESYSTEM.flock(diagnostic_descriptor, fcntl.LOCK_UN)
+                    if lock_descriptor >= 0:
+                        try:
+                            OS_FILESYSTEM.flock(lock_descriptor, fcntl.LOCK_UN)
+                            protected_released = True
+                        except OSError:
+                            try:
+                                os.close(lock_descriptor)
+                            finally:
+                                lock_descriptor = -1
             except OSError:
                 pass
+            finally:
+                if diagnostic_locked:
+                    try:
+                        OS_FILESYSTEM.flock(
+                            diagnostic_descriptor,
+                            fcntl.LOCK_UN,
+                        )
+                    except OSError:
+                        pass
         if lock_descriptor >= 0:
-            try:
-                OS_FILESYSTEM.flock(lock_descriptor, fcntl.LOCK_UN)
-            except OSError:
-                pass
+            if not protected_released:
+                try:
+                    OS_FILESYSTEM.flock(lock_descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
             os.close(lock_descriptor)
         if diagnostic_descriptor >= 0:
             os.close(diagnostic_descriptor)
@@ -522,6 +567,34 @@ def _stat_if_present(
         return fs.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
     except FileNotFoundError:
         return None
+
+
+def _require_named_directory_inode(
+    fs: FilesystemOps,
+    name: str,
+    *,
+    parent_descriptor: int,
+    directory_descriptor: int,
+    context: str,
+) -> None:
+    try:
+        named_directory = fs.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        opened_directory = fs.stat(directory_descriptor)
+    except OSError as error:
+        raise SMLArtifactError(
+            f"{context} is no longer bound to the verified directory inode"
+        ) from error
+    if not stat.S_ISDIR(named_directory.st_mode) or not _same_inode(
+        named_directory,
+        opened_directory,
+    ):
+        raise SMLArtifactError(
+            f"{context} was swapped from the verified directory inode"
+        )
 
 
 def _temporary_prefix(target_name: str) -> str:
@@ -1013,21 +1086,18 @@ def _publish_with_lock[M](
             )
             return _accept_existing(target, manifest)
 
-        named_temporary = fs.stat(
-            temporary_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        opened_temporary = fs.stat(temporary_descriptor)
-        if not stat.S_ISDIR(named_temporary.st_mode) or not _same_inode(
-            named_temporary, opened_temporary
-        ):
-            raise SMLArtifactError("temporary publication directory was swapped")
         _verify_closed_world(
             fs,
             temporary_descriptor,
             manifest,
             manifest_present=True,
+        )
+        _require_named_directory_inode(
+            fs,
+            temporary_name,
+            parent_descriptor=parent_descriptor,
+            directory_descriptor=temporary_descriptor,
+            context="temporary publication directory",
         )
         try:
             fs.rename(
@@ -1042,6 +1112,26 @@ def _publish_with_lock[M](
             ) from error
         committed = True
         fs.fsync_directory(parent_descriptor)
+        _require_named_directory_inode(
+            fs,
+            target_name,
+            parent_descriptor=parent_descriptor,
+            directory_descriptor=temporary_descriptor,
+            context="committed publication target",
+        )
+        _verify_closed_world(
+            fs,
+            temporary_descriptor,
+            manifest,
+            manifest_present=True,
+        )
+        _require_named_directory_inode(
+            fs,
+            target_name,
+            parent_descriptor=parent_descriptor,
+            directory_descriptor=temporary_descriptor,
+            context="committed publication target after full verification",
+        )
         return Published(
             path=target,
             manifest=manifest,

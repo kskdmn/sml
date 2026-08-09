@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import multiprocessing
 import os
@@ -118,6 +119,77 @@ class _DelayedMetadataFilesystemOps(_ForwardingFilesystemOps):
         self._inner.write_all(descriptor, data)
 
 
+class _SignalingLockAttemptFilesystemOps(_ForwardingFilesystemOps):
+    def __init__(self, inner, *, second_attempted: threading.Event) -> None:
+        super().__init__(inner)
+        self._second_attempted = second_attempted
+        self._attempt_count = 0
+        self._attempt_lock = threading.Lock()
+
+    def flock(self, descriptor, operation):
+        try:
+            self._inner.flock(descriptor, operation)
+        finally:
+            if operation & fcntl.LOCK_NB:
+                with self._attempt_lock:
+                    self._attempt_count += 1
+                    if self._attempt_count == 2:
+                        self._second_attempted.set()
+
+
+class _SwappingRenameFilesystemOps(_ForwardingFilesystemOps):
+    def __init__(self, inner, *, private_paths: list[Path]) -> None:
+        super().__init__(inner)
+        self._private_paths = private_paths
+
+    def rename(
+        self,
+        source,
+        destination,
+        *,
+        source_dir_fd,
+        destination_dir_fd,
+    ):
+        private_path = self._private_paths[0]
+        private_path.rename(private_path.with_name(private_path.name + "-verified"))
+        private_path.mkdir()
+        (private_path / "corrupt.bin").write_bytes(b"unverified replacement")
+        self._inner.rename(
+            source,
+            destination,
+            source_dir_fd=source_dir_fd,
+            destination_dir_fd=destination_dir_fd,
+        )
+
+
+class _DelayedReleaseFilesystemOps(_ForwardingFilesystemOps):
+    def __init__(self, inner, *, started, release) -> None:
+        super().__init__(inner)
+        self._started = started
+        self._release = release
+        self._creator_pid = os.getpid()
+        self._empty_metadata_descriptor: int | None = None
+        self._delayed = False
+
+    def write_all(self, descriptor, data):
+        self._inner.write_all(descriptor, data)
+        if data == b'{"holders":[]}':
+            self._empty_metadata_descriptor = descriptor
+
+    def flock(self, descriptor, operation):
+        self._inner.flock(descriptor, operation)
+        if (
+            not self._delayed
+            and os.getpid() != self._creator_pid
+            and descriptor == self._empty_metadata_descriptor
+            and operation == fcntl.LOCK_UN
+        ):
+            self._delayed = True
+            self._started.set()
+            if not self._release.wait(10):
+                raise RuntimeError("timed out delaying release transition")
+
+
 def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
     with path.open("rb") as payload:
         identity = file_identity(payload)
@@ -179,12 +251,34 @@ def _hold_run_writer_with_fs(run: str, ready, release, fs) -> None:
     _hold_run_writer(run, ready, release)
 
 
+def _hold_run_access(run: str, ready, release) -> None:
+    with run_access_lock(Path(run), exclusive=False):
+        ready.set()
+        if not release.wait(10):
+            raise RuntimeError("timed out waiting to release run access")
+
+
+def _acquire_run_access_then_exit(run: str, connection) -> None:
+    with run_access_lock(Path(run), exclusive=False):
+        connection.send("locked")
+        connection.close()
+        os._exit(0)
+
+
 def _conflicting_run_access_message(run: Path) -> str:
     try:
         with run_access_lock(run, exclusive=False):
             raise AssertionError("conflicting accessor entered protected operation")
     except SMLArtifactError as error:
         return str(error)
+
+
+def _run_access_outcome(run: Path) -> tuple[str, str]:
+    try:
+        with run_access_lock(run, exclusive=False):
+            return "acquired", ""
+    except SMLArtifactError as error:
+        return "conflict", str(error)
 
 
 def test_concurrent_identical_publication_is_idempotent(bundle_builder, target):
@@ -212,6 +306,12 @@ def test_contending_identical_publication_waits_until_owner_releases(
     builder_call_count = 0
     builder_call_lock = threading.Lock()
     base_builder = _bundle_builder()
+    second_lock_attempted = threading.Event()
+    signaling_fs = _SignalingLockAttemptFilesystemOps(
+        checkpoint.OS_FILESYSTEM,
+        second_attempted=second_lock_attempted,
+    )
+    monkeypatch.setattr(checkpoint, "OS_FILESYSTEM", signaling_fs)
 
     def coordinated_builder(private_path: Path) -> TokenizerManifest:
         nonlocal builder_call_count
@@ -224,7 +324,6 @@ def test_contending_identical_publication_waits_until_owner_releases(
                 raise RuntimeError("timed out waiting to release first builder")
         return base_builder(private_path)
 
-    monkeypatch.setattr(checkpoint, "_LOCK_RETRY_SECONDS", 0.05, raising=False)
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(
             publish_immutable_bundle,
@@ -238,7 +337,7 @@ def test_contending_identical_publication_waits_until_owner_releases(
             coordinated_builder,
         )
         try:
-            time.sleep(0.15)
+            assert second_lock_attempted.wait(5)
             assert not second.done()
             assert builder_call_count == 1
         finally:
@@ -248,6 +347,28 @@ def test_contending_identical_publication_waits_until_owner_releases(
 
     assert first_result.manifest.identity == second_result.manifest.identity
     assert second_result.verification is VerificationLevel.FULL
+
+
+def test_named_temporary_swap_at_rename_boundary_never_returns_full(target):
+    """The inode verified through the owned fd must be the inode committed by rename."""
+    private_paths: list[Path] = []
+    builder = _bundle_builder()
+
+    def records_private_path(private_path: Path) -> TokenizerManifest:
+        private_paths.append(private_path)
+        return builder(private_path)
+
+    fs = _SwappingRenameFilesystemOps(
+        checkpoint.OS_FILESYSTEM,
+        private_paths=private_paths,
+    )
+
+    with pytest.raises(SMLArtifactError, match="committed|corrupt|inode|swapped"):
+        publish_immutable_bundle(target, records_private_path, fs=fs)
+
+    assert target.is_dir()
+    with pytest.raises(SMLArtifactError):
+        read_manifest(target, TokenizerManifest, VerificationLevel.FULL)
 
 
 def test_different_existing_target_is_collision(target):
@@ -361,6 +482,96 @@ def test_conflict_waits_for_complete_owner_diagnostics(tmp_path, monkeypatch):
             process.terminate()
             process.join(timeout=5)
         process.close()
+
+
+def test_release_transition_never_exposes_empty_owner_diagnostics(
+    tmp_path, monkeypatch
+):
+    """Metadata removal and protected unlock must be one serialized transition."""
+    run = tmp_path / "run-0001"
+    run.mkdir()
+    context = multiprocessing.get_context("spawn")
+    holder_ready = context.Event()
+    holder_release = context.Event()
+    transition_started = context.Event()
+    allow_transition = context.Event()
+    delayed_fs = _DelayedReleaseFilesystemOps(
+        checkpoint.OS_FILESYSTEM,
+        started=transition_started,
+        release=allow_transition,
+    )
+    monkeypatch.setattr(checkpoint, "OS_FILESYSTEM", delayed_fs)
+    process = context.Process(
+        target=_hold_run_writer_with_fs,
+        args=(str(run), holder_ready, holder_release, delayed_fs),
+    )
+    process.start()
+    try:
+        assert holder_ready.wait(10), "child did not acquire the run writer lock"
+        holder_release.set()
+        assert transition_started.wait(10), "child did not reach release transition"
+        outcome, message = _run_access_outcome(run)
+        if outcome == "conflict":
+            assert "owner diagnostics unavailable" not in message
+            assert str(process.pid) in message
+            assert str(run) in message
+        else:
+            assert outcome == "acquired"
+    finally:
+        allow_transition.set()
+        holder_release.set()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        process.close()
+
+
+def test_dead_shared_holder_is_pruned_before_conflict_diagnostics(tmp_path):
+    """An abrupt shared-holder exit must not displace the live holder diagnostic."""
+    run = tmp_path / "run-0001"
+    run.mkdir()
+    context = multiprocessing.get_context("spawn")
+    receiving, sending = context.Pipe(duplex=False)
+    dead_holder = context.Process(
+        target=_acquire_run_access_then_exit,
+        args=(str(run), sending),
+    )
+    dead_holder.start()
+    sending.close()
+    assert receiving.poll(10), "abrupt holder did not acquire shared access"
+    assert receiving.recv() == "locked"
+    dead_pid = dead_holder.pid
+    dead_holder.join(timeout=10)
+    assert dead_holder.exitcode == 0
+    receiving.close()
+    dead_holder.close()
+
+    live_ready = context.Event()
+    live_release = context.Event()
+    live_holder = context.Process(
+        target=_hold_run_access,
+        args=(str(run), live_ready, live_release),
+    )
+    live_holder.start()
+    try:
+        assert live_ready.wait(10), "live holder did not acquire shared access"
+        with (
+            pytest.raises(SMLArtifactError) as conflict,
+            run_access_lock(run, exclusive=True),
+        ):
+            pytest.fail("exclusive contender entered while shared holder was live")
+        message = str(conflict.value)
+        assert str(live_holder.pid) in message
+        assert str(dead_pid) not in message
+        assert str(run) in message
+    finally:
+        live_release.set()
+        live_holder.join(timeout=10)
+        if live_holder.is_alive():
+            live_holder.terminate()
+            live_holder.join(timeout=5)
+        live_holder.close()
 
 
 def test_lock_is_released_on_process_exit(tmp_path):
