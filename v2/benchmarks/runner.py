@@ -27,6 +27,8 @@ from v2.benchmarks.analysis import analyze_pairs
 from v2.benchmarks.evidence import (
     build_child_trial_measurement,
     build_post_exit_observation,
+    build_post_exit_recovery,
+    build_post_exit_recovery_sample,
     finalize_raw_trial,
     finalized_trial_rejection_reason,
     validate_child_trial_measurement,
@@ -49,6 +51,7 @@ from v2.benchmarks.journal import (
 from v2.benchmarks.recovery import (
     ThermalRecoveryTimeout,
     wait_for_nominal_thermal_window,
+    wait_for_post_exit_memory_recovery,
 )
 from v2.benchmarks.schema import METRIC_NAMES, CanonicalWorkload, MetricName, RawTrial
 from v2.benchmarks.workload import (
@@ -63,6 +66,7 @@ from v2.benchmarks.workload import (
     canonical_workload_identity,
     fixed_canonical_rows,
     harness_content_identity,
+    post_exit_recovery_policy,
     structured_identity,
     write_paired_pretraining_representations,
 )
@@ -1779,15 +1783,47 @@ def collect_environment(
     return hardware, environment_status, versions
 
 
-def collect_post_exit_environment() -> tuple[
-    str, dict[str, object], dict[str, object], dict[str, str]
-]:
+def collect_post_exit_environment(
+    *, clock: Callable[[], float] = time.monotonic
+) -> tuple[float, dict[str, object]]:
+    started_at = clock()
     memory_sample = _memory_pressure()
     observed_at_utc = _utc_now_iso()
     hardware, environment_status, software_versions = collect_environment(
         memory_sample=memory_sample
     )
-    return observed_at_utc, hardware, environment_status, software_versions
+    return started_at, {
+        "observed_at_utc": observed_at_utc,
+        "hardware": hardware,
+        "environment_status": environment_status,
+        "software_versions": software_versions,
+    }
+
+
+def _recovery_failure_fields(
+    observation: dict,
+    *,
+    expected_hardware: dict,
+    expected_software_versions: dict[str, str],
+    required_environment: dict,
+) -> tuple[str, ...]:
+    status = observation["environment_status"]
+    validate_thermal_observation(status)
+    failure_fields = set()
+    if observation["hardware"] != expected_hardware:
+        failure_fields.add("hardware")
+    if observation["software_versions"] != expected_software_versions:
+        failure_fields.add("software_versions")
+    for field in (
+        "power_connected",
+        "power_mode",
+        "low_power_mode",
+        "thermal_state",
+        "competing_gpu_workload",
+    ):
+        if status.get(field) != required_environment[field]:
+            failure_fields.add(field)
+    return tuple(sorted(failure_fields))
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -2048,7 +2084,11 @@ def _launch_trial(
     journal_attempt_index: int,
     measurement_output: Path,
     post_exit_output: Path,
+    recovery_samples_directory: Path,
+    recovery_output: Path,
     output: Path,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> RawTrial:
     command = (
         sys.executable,
@@ -2098,21 +2138,62 @@ def _launch_trial(
         raise ValueError("fresh child measurement has the wrong session identity")
     if measurement["journal_attempt_index"] != journal_attempt_index:
         raise ValueError("fresh child measurement has the wrong journal attempt index")
-    (
-        observed_at_utc,
-        hardware,
-        environment_status,
-        software_versions,
-    ) = collect_post_exit_environment()
+    immediate_started_at, observation = collect_post_exit_environment(clock=clock)
     post_exit = build_post_exit_observation(
         measurement=measurement,
-        observed_at_utc=observed_at_utc,
-        hardware=hardware,
-        environment_status=environment_status,
-        software_versions=software_versions,
+        **observation,
     )
     atomic_write_json(post_exit_output, post_exit, create_only=True)
-    trial = finalize_raw_trial(measurement, post_exit)
+    workload = build_canonical_workload()
+    policy = post_exit_recovery_policy(workload)
+
+    def record_sample(
+        index: int,
+        elapsed: float,
+        collected: dict,
+        previous_identity: str | None,
+    ) -> dict:
+        sample = build_post_exit_recovery_sample(
+            measurement=measurement,
+            post_exit=post_exit,
+            sample_index=index,
+            previous_sample_identity=previous_identity,
+            elapsed_seconds=elapsed,
+            **collected,
+        )
+        atomic_write_json(
+            recovery_samples_directory / f"{index}.json",
+            sample,
+            create_only=True,
+        )
+        return sample
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=observation,
+        immediate_started_at=immediate_started_at,
+        recovery_policy=policy,
+        collect=lambda: collect_post_exit_environment(clock=clock)[1],
+        classify_nonmemory=lambda item: _recovery_failure_fields(
+            item,
+            expected_hardware=measurement["start"]["hardware"],
+            expected_software_versions=measurement["start"]["software_versions"],
+            required_environment=workload.required_environment,
+        ),
+        record_sample=record_sample,
+        clock=clock,
+        sleep=sleep,
+    )
+    recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=result.samples,
+        policy=policy,
+        outcome=result.outcome,
+        duration_seconds=result.duration_seconds,
+        failure_fields=result.failure_fields,
+    )
+    atomic_write_json(recovery_output, recovery, create_only=True)
+    trial = finalize_raw_trial(measurement, post_exit, result.samples, recovery)
     atomic_write_json(output, trial.to_dict(), create_only=True)
     return RawTrial.from_dict(read_json_object(output, label="fresh raw trial"))
 
@@ -2777,6 +2858,12 @@ def _record_baseline_locked(
                     post_exit_output=journal.post_exit_path(
                         slot, attempt.journal_attempt_index
                     ),
+                    recovery_samples_directory=journal.recovery_samples_path(
+                        slot, attempt.journal_attempt_index
+                    ),
+                    recovery_output=journal.recovery_path(
+                        slot, attempt.journal_attempt_index
+                    ),
                     output=attempt.path,
                 ),
                 preflight=collect_preflight,
@@ -3076,6 +3163,10 @@ def _run_paired_trials(
                     journal_attempt_index=attempt_index,
                     measurement_output=(output_directory / f"{stem}.measurement.json"),
                     post_exit_output=output_directory / f"{stem}.post-exit.json",
+                    recovery_samples_directory=(
+                        output_directory / f"{stem}.recovery-samples"
+                    ),
+                    recovery_output=output_directory / f"{stem}.recovery.json",
                     output=output_directory / f"{stem}.trial.json",
                 )
                 _validate_acceptance_environment(workload, trial)

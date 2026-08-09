@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -5116,49 +5117,125 @@ def test_completed_child_output_crosses_the_parent_fsync_boundary(
     )
 
 
-def test_parent_samples_memory_then_timestamps_before_slow_post_exit_probes(
+def _observation_with_memory(pressure, free_percentage):
+    observation = _valid_observation("2026-08-09T00:00:03+00:00")
+    observation["environment_status"].update(
+        memory_pressure=pressure,
+        memory_free_percentage=free_percentage,
+    )
+    return observation
+
+
+def test_collect_post_exit_environment_records_monotonic_time_before_memory_probe(
+    monkeypatch,
+):
+    events = []
+    observation = _valid_observation("2026-08-09T00:00:03+00:00")
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_memory_pressure",
+        lambda: events.append("memory") or ("normal", 67),
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_utc_now_iso",
+        lambda: events.append("timestamp") or observation["observed_at_utc"],
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "collect_environment",
+        lambda *, memory_sample: (
+            events.append(("environment", memory_sample))
+            or (
+                observation["hardware"],
+                observation["environment_status"],
+                observation["software_versions"],
+            )
+        ),
+    )
+
+    started_at, collected = benchmark_runner.collect_post_exit_environment(
+        clock=lambda: events.append("clock") or 42.0
+    )
+
+    assert started_at == 42.0
+    assert events == ["clock", "memory", "timestamp", ("environment", ("normal", 67))]
+    assert collected == observation
+
+
+def test_recovery_failure_fields_ignores_memory_and_reports_identity_and_environment_drift():
+    workload = build_canonical_workload()
+    observation = _observation_with_memory("warning", 1)
+    observation["hardware"] = {**observation["hardware"], "chip": "Other"}
+    observation["software_versions"] = {
+        **observation["software_versions"],
+        "python": "3.12.12",
+    }
+    observation["environment_status"]["power_connected"] = False
+    observation["environment_status"]["thermal_state"] = "fair"
+    observation["environment_status"]["thermal_state_raw_value"] = 1
+
+    assert benchmark_runner._recovery_failure_fields(
+        observation,
+        expected_hardware=_valid_observation("2026-08-09T00:00:00+00:00")["hardware"],
+        expected_software_versions=_valid_observation("2026-08-09T00:00:00+00:00")[
+            "software_versions"
+        ],
+        required_environment=workload.required_environment,
+    ) == ("hardware", "power_connected", "software_versions", "thermal_state")
+
+
+def test_recovery_failure_fields_rejects_malformed_thermal_evidence():
+    observation = _valid_observation("2026-08-09T00:00:03+00:00")
+    observation["environment_status"]["thermal_state"] = "fair"
+
+    with pytest.raises(ValueError, match="thermal state and raw value disagree"):
+        benchmark_runner._recovery_failure_fields(
+            observation,
+            expected_hardware=observation["hardware"],
+            expected_software_versions=observation["software_versions"],
+            required_environment=build_canonical_workload().required_environment,
+        )
+
+
+def test_parent_records_immediate_warning_then_every_recovery_sample_before_finalizing(
     tmp_path, monkeypatch
 ):
     workload = build_canonical_workload()
     measurement = _valid_child_measurement(workload)
     measurement_path = tmp_path / "measurement.json"
     post_exit_path = tmp_path / "post-exit.json"
+    recovery_samples_directory = tmp_path / "recovery-samples"
+    recovery_path = tmp_path / "recovery.json"
     trial_path = tmp_path / "trial.json"
+    clock = _RecoveryClock()
     events = []
-    commands = []
+    observations = [
+        _observation_with_memory("warning", 36),
+        *[_observation_with_memory("normal", 67) for _ in range(7)],
+    ]
 
     def run_child(command, *, cwd, check):
         events.append("child-exited")
-        commands.append(command)
         atomic_write_json(measurement_path, measurement, create_only=True)
 
     monkeypatch.setattr(benchmark_runner.subprocess, "run", run_child)
     monkeypatch.setattr(
         benchmark_runner,
-        "_memory_pressure",
-        lambda: events.append("memory") or ("normal", 69),
-    )
-    monkeypatch.setattr(
-        benchmark_runner,
-        "_utc_now_iso",
-        lambda: events.append("timestamp") or "2026-08-08T00:00:02+00:00",
-    )
-    monkeypatch.setattr(
-        benchmark_runner,
-        "collect_environment",
-        lambda *, memory_sample=None: (
-            events.append(("environment", memory_sample))
-            or (
-                measurement["start"]["hardware"],
-                {
-                    **measurement["start"]["environment_status"],
-                    "memory_pressure": memory_sample[0],
-                    "memory_free_percentage": memory_sample[1],
-                },
-                measurement["start"]["software_versions"],
-            )
+        "collect_post_exit_environment",
+        lambda **kwargs: (
+            events.append("memory-first") or 0.0,
+            observations.pop(0),
         ),
     )
+    original_atomic_write_json = benchmark_runner.atomic_write_json
+
+    def record_atomic_write(path, value, *, create_only):
+        events.append(f"write:{path.name}")
+        return original_atomic_write_json(path, value, create_only=create_only)
+
+    monkeypatch.setattr(benchmark_runner, "atomic_write_json", record_atomic_write)
 
     trial = benchmark_runner._launch_trial(
         **_launch_trial_arguments(tmp_path),
@@ -5166,27 +5243,37 @@ def test_parent_samples_memory_then_timestamps_before_slow_post_exit_probes(
         journal_attempt_index=0,
         measurement_output=measurement_path,
         post_exit_output=post_exit_path,
+        recovery_samples_directory=recovery_samples_directory,
+        recovery_output=recovery_path,
         output=trial_path,
+        clock=clock,
+        sleep=clock.sleep,
     )
 
-    assert events == [
-        "child-exited",
-        "memory",
-        "timestamp",
-        ("environment", ("normal", 69)),
-    ]
-    command = commands[0]
+    assert events[:2] == ["child-exited", "memory-first"]
+    assert trial.schema_version == 3
     assert (
-        command[command.index("--evidence-session-identity") + 1]
-        == (measurement["session_identity"])
+        trial.post_exit_observation["environment_status"]["memory_pressure"]
+        == "warning"
     )
-    assert command[command.index("--journal-attempt-index") + 1] == "0"
-    assert command[command.index("--measurement-output") + 1] == str(measurement_path)
-    assert post_exit_path.is_file()
-    assert trial_path.is_file()
+    assert trial.post_exit_recovery["outcome"] == "recovered"
+    assert len(trial.post_exit_recovery_samples) == 7
+    assert sorted(path.name for path in recovery_samples_directory.iterdir()) == [
+        f"{index}.json" for index in range(7)
+    ]
+    assert recovery_path.is_file()
+    assert events.index("write:post-exit.json") < events.index("write:0.json")
+    assert events.index("write:6.json") < events.index("write:recovery.json")
+    assert events.index("write:recovery.json") < events.index("write:trial.json")
     assert trial == RawTrial.from_dict(read_json_object(trial_path, label="trial"))
-    assert trial.environment_status["memory_pressure"] == "normal"
-    assert trial.post_exit_observation["observed_at_utc"] == "2026-08-08T00:00:02+00:00"
+
+
+def _stub_parent_observation(monkeypatch, observation):
+    monkeypatch.setattr(
+        benchmark_runner,
+        "collect_post_exit_environment",
+        lambda **kwargs: (0.0, observation),
+    )
 
 
 def test_parent_post_exit_output_never_overwrites_existing_evidence(
@@ -5195,6 +5282,8 @@ def test_parent_post_exit_output_never_overwrites_existing_evidence(
     measurement = _valid_child_measurement(build_canonical_workload())
     measurement_path = tmp_path / "measurement.json"
     post_exit_path = tmp_path / "post-exit.json"
+    recovery_samples_directory = tmp_path / "recovery-samples"
+    recovery_path = tmp_path / "recovery.json"
     trial_path = tmp_path / "trial.json"
     post_exit_path.write_bytes(b"existing immutable post-exit evidence\n")
 
@@ -5202,15 +5291,8 @@ def test_parent_post_exit_output_never_overwrites_existing_evidence(
         atomic_write_json(measurement_path, measurement, create_only=True)
 
     monkeypatch.setattr(benchmark_runner.subprocess, "run", run_child)
-    monkeypatch.setattr(
-        benchmark_runner,
-        "collect_post_exit_environment",
-        lambda: (
-            "2026-08-08T00:00:02+00:00",
-            measurement["start"]["hardware"],
-            measurement["start"]["environment_status"],
-            measurement["start"]["software_versions"],
-        ),
+    _stub_parent_observation(
+        monkeypatch, _valid_observation("2026-08-08T00:00:02+00:00")
     )
 
     with pytest.raises(FileExistsError):
@@ -5220,10 +5302,14 @@ def test_parent_post_exit_output_never_overwrites_existing_evidence(
             journal_attempt_index=0,
             measurement_output=measurement_path,
             post_exit_output=post_exit_path,
+            recovery_samples_directory=recovery_samples_directory,
+            recovery_output=recovery_path,
             output=trial_path,
         )
 
     assert post_exit_path.read_bytes() == b"existing immutable post-exit evidence\n"
+    assert not recovery_samples_directory.exists()
+    assert not recovery_path.exists()
     assert not trial_path.exists()
 
 
@@ -5231,6 +5317,8 @@ def test_parent_trial_output_never_overwrites_existing_evidence(tmp_path, monkey
     measurement = _valid_child_measurement(build_canonical_workload())
     measurement_path = tmp_path / "measurement.json"
     post_exit_path = tmp_path / "post-exit.json"
+    recovery_samples_directory = tmp_path / "recovery-samples"
+    recovery_path = tmp_path / "recovery.json"
     trial_path = tmp_path / "trial.json"
     trial_path.write_bytes(b"existing immutable trial evidence\n")
 
@@ -5238,15 +5326,8 @@ def test_parent_trial_output_never_overwrites_existing_evidence(tmp_path, monkey
         atomic_write_json(measurement_path, measurement, create_only=True)
 
     monkeypatch.setattr(benchmark_runner.subprocess, "run", run_child)
-    monkeypatch.setattr(
-        benchmark_runner,
-        "collect_post_exit_environment",
-        lambda: (
-            "2026-08-08T00:00:02+00:00",
-            measurement["start"]["hardware"],
-            measurement["start"]["environment_status"],
-            measurement["start"]["software_versions"],
-        ),
+    _stub_parent_observation(
+        monkeypatch, _valid_observation("2026-08-08T00:00:02+00:00")
     )
 
     with pytest.raises(FileExistsError):
@@ -5256,16 +5337,103 @@ def test_parent_trial_output_never_overwrites_existing_evidence(tmp_path, monkey
             journal_attempt_index=0,
             measurement_output=measurement_path,
             post_exit_output=post_exit_path,
+            recovery_samples_directory=recovery_samples_directory,
+            recovery_output=recovery_path,
             output=trial_path,
         )
 
     assert post_exit_path.is_file()
+    assert recovery_path.is_file()
     assert trial_path.read_bytes() == b"existing immutable trial evidence\n"
+
+
+def test_parent_first_recovery_sample_never_overwrites_existing_evidence(
+    tmp_path, monkeypatch
+):
+    measurement = _valid_child_measurement(build_canonical_workload())
+    measurement_path = tmp_path / "measurement.json"
+    post_exit_path = tmp_path / "post-exit.json"
+    recovery_samples_directory = tmp_path / "recovery-samples"
+    recovery_sample_path = recovery_samples_directory / "0.json"
+    recovery_path = tmp_path / "recovery.json"
+    trial_path = tmp_path / "trial.json"
+    recovery_samples_directory.mkdir()
+    recovery_sample_path.write_bytes(b"existing immutable recovery sample\n")
+
+    monkeypatch.setattr(
+        benchmark_runner.subprocess,
+        "run",
+        lambda command, *, cwd, check: atomic_write_json(
+            measurement_path, measurement, create_only=True
+        ),
+    )
+    _stub_parent_observation(monkeypatch, _observation_with_memory("warning", 36))
+
+    with pytest.raises(FileExistsError):
+        benchmark_runner._launch_trial(
+            **_launch_trial_arguments(tmp_path),
+            evidence_session_identity=measurement["session_identity"],
+            journal_attempt_index=0,
+            measurement_output=measurement_path,
+            post_exit_output=post_exit_path,
+            recovery_samples_directory=recovery_samples_directory,
+            recovery_output=recovery_path,
+            output=trial_path,
+            clock=_RecoveryClock(),
+            sleep=lambda seconds: None,
+        )
+
+    assert recovery_sample_path.read_bytes() == b"existing immutable recovery sample\n"
+    assert post_exit_path.is_file()
+    assert not recovery_path.exists()
+    assert not trial_path.exists()
+
+
+def test_parent_recovery_output_never_overwrites_existing_evidence(
+    tmp_path, monkeypatch
+):
+    measurement = _valid_child_measurement(build_canonical_workload())
+    measurement_path = tmp_path / "measurement.json"
+    post_exit_path = tmp_path / "post-exit.json"
+    recovery_samples_directory = tmp_path / "recovery-samples"
+    recovery_path = tmp_path / "recovery.json"
+    trial_path = tmp_path / "trial.json"
+    recovery_path.write_bytes(b"existing immutable recovery summary\n")
+
+    monkeypatch.setattr(
+        benchmark_runner.subprocess,
+        "run",
+        lambda command, *, cwd, check: atomic_write_json(
+            measurement_path, measurement, create_only=True
+        ),
+    )
+    _stub_parent_observation(
+        monkeypatch, _valid_observation("2026-08-08T00:00:02+00:00")
+    )
+
+    with pytest.raises(FileExistsError):
+        benchmark_runner._launch_trial(
+            **_launch_trial_arguments(tmp_path),
+            evidence_session_identity=measurement["session_identity"],
+            journal_attempt_index=0,
+            measurement_output=measurement_path,
+            post_exit_output=post_exit_path,
+            recovery_samples_directory=recovery_samples_directory,
+            recovery_output=recovery_path,
+            output=trial_path,
+        )
+
+    assert recovery_path.read_bytes() == b"existing immutable recovery summary\n"
+    assert post_exit_path.is_file()
+    assert not recovery_samples_directory.exists()
+    assert not trial_path.exists()
 
 
 def test_nonzero_child_exit_does_not_publish_parent_evidence(tmp_path, monkeypatch):
     measurement_path = tmp_path / "measurement.json"
     post_exit_path = tmp_path / "post-exit.json"
+    recovery_samples_directory = tmp_path / "recovery-samples"
+    recovery_path = tmp_path / "recovery.json"
     trial_path = tmp_path / "trial.json"
 
     def fail_child(command, *, cwd, check):
@@ -5280,11 +5448,15 @@ def test_nonzero_child_exit_does_not_publish_parent_evidence(tmp_path, monkeypat
             journal_attempt_index=0,
             measurement_output=measurement_path,
             post_exit_output=post_exit_path,
+            recovery_samples_directory=recovery_samples_directory,
+            recovery_output=recovery_path,
             output=trial_path,
         )
 
     assert not measurement_path.exists()
     assert not post_exit_path.exists()
+    assert not recovery_samples_directory.exists()
+    assert not recovery_path.exists()
     assert not trial_path.exists()
 
 
@@ -5372,9 +5544,118 @@ def test_paired_trials_share_one_identity_bound_evidence_session(tmp_path, monke
     assert {tuple(launch["post_exit_output"].suffixes[-2:]) for launch in launches} == {
         (".post-exit", ".json")
     }
+    assert {tuple(launch["recovery_output"].suffixes[-2:]) for launch in launches} == {
+        (".recovery", ".json")
+    }
+    assert len({launch["recovery_samples_directory"] for launch in launches}) == 2
+    assert all(
+        path.name.endswith(".recovery-samples")
+        for path in (launch["recovery_samples_directory"] for launch in launches)
+    )
     assert {tuple(launch["output"].suffixes[-2:]) for launch in launches} == {
         (".trial", ".json")
     }
+
+
+def test_baseline_launch_routes_recovery_paths_when_journal_supports_them(
+    tmp_path, monkeypatch
+):
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = SimpleNamespace(journal_attempt_index=0, path=tmp_path / "trial.json")
+    journal = SimpleNamespace(
+        session={"identity": "sha256:" + "9" * 64},
+        measurement_path=lambda current_slot, index: (
+            tmp_path / f"{current_slot.metric}-{index}.measurement.json"
+        ),
+        post_exit_path=lambda current_slot, index: (
+            tmp_path / f"{current_slot.metric}-{index}.post-exit.json"
+        ),
+        recovery_samples_path=lambda current_slot, index: (
+            tmp_path / f"{current_slot.metric}-{index}.recovery-samples"
+        ),
+        recovery_path=lambda current_slot, index: (
+            tmp_path / f"{current_slot.metric}-{index}.recovery.json"
+        ),
+    )
+    captured = {}
+    observation = _valid_observation("2026-08-09T00:00:00+00:00")
+    arguments = SimpleNamespace(
+        source_commit=benchmark_runner.PINNED_BASELINE_SOURCE_COMMIT,
+        metrics=METRIC_NAMES,
+        pairs=benchmark_runner.SCREEN_PAIRS,
+        warmup=benchmark_runner.WARMUP_UNITS,
+        measure=benchmark_runner.DEFAULT_MEASURED_UNITS,
+    )
+
+    class FakeBaselineJournal:
+        @staticmethod
+        def open(*unused):
+            return journal
+
+        @staticmethod
+        def expected_slots(*unused):
+            return (slot,)
+
+    @contextmanager
+    def managed_worktree(*unused):
+        yield tmp_path / "source"
+
+    monkeypatch.setattr(benchmark_runner, "BaselineJournal", FakeBaselineJournal)
+    monkeypatch.setattr(benchmark_runner, "_run_command", lambda *unused, **kwargs: "")
+    monkeypatch.setattr(
+        benchmark_runner, "_git_commit", lambda *unused: arguments.source_commit
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "harness_content_identity", lambda path: "harness"
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "collect_environment",
+        lambda: (
+            observation["hardware"],
+            observation["environment_status"],
+            observation["software_versions"],
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "write_paired_pretraining_representations",
+        lambda *unused: {},
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "build_session_document",
+        lambda **unused: journal.session,
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "_managed_detached_worktree", managed_worktree
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "capture_baseline_trials",
+        lambda **kwargs: (kwargs["launch_trial"](slot, attempt),),
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "_launch_trial", lambda **kwargs: captured.update(kwargs)
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "publish_baseline_from_journal", lambda **kwargs: {}
+    )
+
+    assert (
+        benchmark_runner._record_baseline_locked(
+            arguments,
+            harness_root=tmp_path / "harness",
+            state_root=tmp_path / "state",
+            manifest_path=tmp_path / "baseline.json",
+            raw_output_path=tmp_path / "baseline.jsonl",
+        )
+        == 0
+    )
+    assert captured["recovery_samples_directory"] == (
+        tmp_path / "prepared-data-0.recovery-samples"
+    )
+    assert captured["recovery_output"] == tmp_path / "prepared-data-0.recovery.json"
 
 
 def _journal_trial_evidence(journal, attempt, trial=None):
