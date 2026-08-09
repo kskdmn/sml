@@ -53,9 +53,11 @@ from v2.benchmarks.journal import (
     require_external_state_directory,
 )
 from v2.benchmarks.recovery import (
+    PostExitMemoryRecoveryResult,
     ThermalRecoveryResult,
     ThermalRecoveryTimeout,
     wait_for_nominal_thermal_window,
+    wait_for_post_exit_memory_recovery,
 )
 from v2.benchmarks.runner import (
     _resolve_comparison_mode,
@@ -109,11 +111,13 @@ from v2.benchmarks.workload import (
 class _RecoveryClock:
     def __init__(self):
         self.now = 0.0
+        self.sleeps = []
 
     def __call__(self):
         return self.now
 
     def sleep(self, seconds):
+        self.sleeps.append(seconds)
         self.now += seconds
 
 
@@ -6488,6 +6492,280 @@ def test_thermal_recovery_enforces_a_deadline_at_a_nominal_window_boundary():
 
     assert raised.value.result.duration_seconds == 324.0
     assert samples[-1][1]["elapsed_seconds"] == 324.0
+
+
+def test_post_exit_recovery_returns_immediately_for_normal_memory():
+    clock = _RecoveryClock()
+    collected = []
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=_valid_observation("2026-08-09T00:00:00+00:00"),
+        immediate_started_at=clock(),
+        recovery_policy=_valid_recovery_policy(build_canonical_workload()),
+        collect=lambda: collected.append(True),
+        classify_nonmemory=lambda observation: (),
+        record_sample=lambda *args: pytest.fail("normal memory must not sample"),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result == PostExitMemoryRecoveryResult("not-required", 0.0, (), ())
+    assert collected == []
+    assert clock.sleeps == []
+
+
+@pytest.mark.parametrize(
+    ("pressure", "failure_fields", "outcome"),
+    (
+        ("critical", (), "critical"),
+        ("normal", ("hardware",), "environment-failure"),
+    ),
+)
+def test_post_exit_recovery_returns_immediately_for_terminal_immediate_observation(
+    pressure, failure_fields, outcome
+):
+    clock = _RecoveryClock()
+    immediate = _valid_observation("2026-08-09T00:00:00+00:00")
+    immediate["environment_status"]["memory_pressure"] = pressure
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=immediate,
+        immediate_started_at=clock(),
+        recovery_policy=_valid_recovery_policy(build_canonical_workload()),
+        collect=lambda: pytest.fail("terminal immediate observation must not collect"),
+        classify_nonmemory=lambda observation: tuple(failure_fields),
+        record_sample=lambda *args: pytest.fail(
+            "terminal immediate observation must not sample"
+        ),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result == PostExitMemoryRecoveryResult(outcome, 0.0, (), failure_fields)
+    assert clock.sleeps == []
+
+
+def test_post_exit_recovery_requires_thirty_continuous_normal_seconds():
+    clock = _RecoveryClock()
+    immediate = _valid_observation("2026-08-09T00:00:00+00:00")
+    immediate["environment_status"]["memory_pressure"] = "warning"
+    observations = [
+        _valid_observation(f"2026-08-09T00:00:{second:02d}+00:00")
+        for second in (5, 10, 15, 20, 25, 30, 35)
+    ]
+    persisted = []
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=immediate,
+        immediate_started_at=0.0,
+        recovery_policy=_valid_recovery_policy(build_canonical_workload()),
+        collect=iter(observations).__next__,
+        classify_nonmemory=lambda observation: (),
+        record_sample=lambda index, elapsed, observation, previous: (
+            persisted.append(
+                {
+                    "sample_index": index,
+                    "elapsed_seconds": elapsed,
+                    "identity": str(index),
+                }
+            )
+            or persisted[-1]
+        ),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.outcome == "recovered"
+    assert result.duration_seconds == 35.0
+    assert len(result.samples) == 7
+    assert clock.sleeps == [5.0] * 7
+
+
+def _run_scripted_memory_recovery(*, pressures, failure_fields=()):
+    clock = _RecoveryClock()
+    immediate = _valid_observation("2026-08-09T00:00:00+00:00")
+    immediate["environment_status"]["memory_pressure"] = "warning"
+    scripted = []
+    for index, pressure in enumerate(pressures, 1):
+        observation = _valid_observation(
+            f"2026-08-09T00:00:{min(index * 5, 59):02d}+00:00"
+        )
+        observation["environment_status"]["memory_pressure"] = pressure
+        scripted.append(observation)
+    persisted = []
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=immediate,
+        immediate_started_at=0.0,
+        recovery_policy=_valid_recovery_policy(build_canonical_workload()),
+        collect=iter(scripted).__next__,
+        classify_nonmemory=lambda observation: (
+            () if observation is immediate else tuple(failure_fields)
+        ),
+        record_sample=lambda index, elapsed, observation, previous: (
+            persisted.append(
+                {
+                    "sample_index": index,
+                    "elapsed_seconds": elapsed,
+                    "identity": f"sample-{index}",
+                }
+            )
+            or persisted[-1]
+        ),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+    return result, persisted
+
+
+def test_post_exit_recovery_warning_resets_the_normal_stability_window():
+    result, persisted = _run_scripted_memory_recovery(
+        pressures=("normal", "normal", "normal", "warning") + ("normal",) * 7
+    )
+
+    assert result.outcome == "recovered"
+    assert result.duration_seconds == 55.0
+    assert len(persisted) == 11
+
+
+def test_post_exit_recovery_records_the_deadline_sample_without_extending_deadline():
+    pressures = tuple(
+        "warning" if elapsed % 30 == 25 else "normal" for elapsed in range(5, 301, 5)
+    )
+
+    result, persisted = _run_scripted_memory_recovery(pressures=pressures)
+
+    assert result.outcome == "timeout"
+    assert result.duration_seconds == 300.0
+    assert len(persisted) == 60
+    assert persisted[-1]["elapsed_seconds"] == 300.0
+
+
+@pytest.mark.parametrize(
+    ("terminal_pressure", "failure_fields", "expected"),
+    (
+        ("critical", (), "critical"),
+        ("normal", ("power_connected",), "environment-failure"),
+        ("normal", ("thermal_state",), "environment-failure"),
+        ("normal", ("hardware",), "environment-failure"),
+        ("normal", ("software_versions",), "environment-failure"),
+    ),
+)
+def test_post_exit_recovery_stops_on_terminal_failure(
+    terminal_pressure, failure_fields, expected
+):
+    result, persisted = _run_scripted_memory_recovery(
+        pressures=(terminal_pressure,), failure_fields=failure_fields
+    )
+
+    assert result.outcome == expected
+    assert len(persisted) == 1
+    assert result.failure_fields == failure_fields
+
+
+def test_post_exit_recovery_persists_before_classifying_a_sample():
+    clock = _RecoveryClock()
+    immediate = _valid_observation("2026-08-09T00:00:00+00:00")
+    immediate["environment_status"]["memory_pressure"] = "warning"
+    observation = _valid_observation("2026-08-09T00:00:05+00:00")
+    persisted = []
+
+    def classify_nonmemory(candidate):
+        if candidate is immediate:
+            return ()
+        assert persisted == [candidate]
+        return ("power_connected",)
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=immediate,
+        immediate_started_at=clock(),
+        recovery_policy=_valid_recovery_policy(build_canonical_workload()),
+        collect=lambda: observation,
+        classify_nonmemory=classify_nonmemory,
+        record_sample=lambda index, elapsed, candidate, previous: (
+            persisted.append(candidate) or {"identity": "sample-0"}
+        ),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.outcome == "environment-failure"
+    assert result.samples == ({"identity": "sample-0"},)
+
+
+def test_post_exit_recovery_does_not_overlap_a_slow_collector():
+    clock = _RecoveryClock()
+    immediate = _valid_observation("2026-08-09T00:00:00+00:00")
+    immediate["environment_status"]["memory_pressure"] = "warning"
+    pressures = iter(("normal", "critical"))
+    collection_starts = []
+
+    def collect():
+        collection_starts.append(clock())
+        clock.now += 7.0
+        observation = _valid_observation("2026-08-09T00:00:05+00:00")
+        observation["environment_status"]["memory_pressure"] = next(pressures)
+        return observation
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=immediate,
+        immediate_started_at=clock(),
+        recovery_policy=_valid_recovery_policy(build_canonical_workload()),
+        collect=collect,
+        classify_nonmemory=lambda observation: (),
+        record_sample=lambda index, elapsed, observation, previous: {
+            "identity": f"sample-{index}"
+        },
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.outcome == "critical"
+    assert collection_starts == [5.0, 12.0]
+    assert clock.sleeps == [5.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    ("policy_change", "message"),
+    (
+        (("sample_interval_seconds", 0.0), "sample interval"),
+        (("timeout_seconds", float("inf")), "timeout"),
+        (("stability_seconds", -1.0), "stability"),
+        (("stability_seconds", 301.0), "must not exceed"),
+    ),
+)
+def test_post_exit_recovery_validates_time_policy(policy_change, message):
+    policy = _valid_recovery_policy(build_canonical_workload())
+    policy[policy_change[0]] = policy_change[1]
+
+    with pytest.raises(ValueError, match=message):
+        wait_for_post_exit_memory_recovery(
+            immediate_observation=_valid_observation("2026-08-09T00:00:00+00:00"),
+            immediate_started_at=0.0,
+            recovery_policy=policy,
+            collect=lambda: pytest.fail("invalid policy must not collect"),
+            classify_nonmemory=lambda observation: (),
+            record_sample=lambda *args: pytest.fail("invalid policy must not sample"),
+            clock=lambda: 0.0,
+            sleep=lambda seconds: pytest.fail("invalid policy must not sleep"),
+        )
+
+
+@pytest.mark.parametrize("started_at", (-1.0, float("inf"), float("nan")))
+def test_post_exit_recovery_validates_immediate_start_time(started_at):
+    with pytest.raises(ValueError, match="immediate_started_at"):
+        wait_for_post_exit_memory_recovery(
+            immediate_observation=_valid_observation("2026-08-09T00:00:00+00:00"),
+            immediate_started_at=started_at,
+            recovery_policy=_valid_recovery_policy(build_canonical_workload()),
+            collect=lambda: pytest.fail("invalid start time must not collect"),
+            classify_nonmemory=lambda observation: (),
+            record_sample=lambda *args: pytest.fail(
+                "invalid start time must not sample"
+            ),
+            clock=lambda: 0.0,
+            sleep=lambda seconds: pytest.fail("invalid start time must not sleep"),
+        )
 
 
 def test_recovery_import_does_not_eagerly_import_runner():
