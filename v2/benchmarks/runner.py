@@ -603,10 +603,25 @@ def _validate_acceptance_environment(
     }
     if disposition.outcome not in valid_outcomes:
         raise ValueError("raw environment has an unknown disposition")
-    recovery_failures = (
+    documented_recovery_failures = (
         frozenset(trial.post_exit_recovery["failure_fields"])
         if allow_rejected_environment
         and trial.post_exit_recovery["outcome"] == "environment-failure"
+        else frozenset()
+    )
+    interrupted_sample_failures = (
+        frozenset(
+            field
+            for sample in trial.post_exit_recovery_samples
+            for field in _recovery_failure_fields(
+                sample,
+                expected_hardware=trial.hardware,
+                expected_software_versions=trial.software_versions,
+                required_environment=required,
+            )
+        )
+        if allow_rejected_environment
+        and trial.post_exit_recovery["outcome"] == "interrupted"
         else frozenset()
     )
     thermal_rejection = (
@@ -619,9 +634,13 @@ def _validate_acceptance_environment(
     observations = (
         ("start", trial.child_measurement["start"], frozenset()),
         ("end", trial.child_measurement["end"], frozenset()),
-        ("post_exit", trial.post_exit_observation, recovery_failures),
+        ("post_exit", trial.post_exit_observation, documented_recovery_failures),
         *(
-            (f"recovery sample {index}", sample, recovery_failures)
+            (
+                f"recovery sample {index}",
+                sample,
+                documented_recovery_failures | interrupted_sample_failures,
+            )
             for index, sample in enumerate(trial.post_exit_recovery_samples)
         ),
     )
@@ -664,7 +683,7 @@ def _validate_acceptance_environment(
     expected_thermal_raw = max(status["thermal_state_raw_value"] for status in statuses)
     if summary["thermal_state_raw_value"] != expected_thermal_raw:
         raise ValueError("merged thermal state is not the worse observation")
-    summary_failures = recovery_failures | (
+    summary_failures = (documented_recovery_failures | interrupted_sample_failures) | (
         frozenset({"thermal_state"}) if thermal_rejection else frozenset()
     )
     _validate_observation_power(
@@ -1941,6 +1960,7 @@ def _reconstruct_missing_recovery(state, workload):
             else state.recovery_samples[-1]["elapsed_seconds"]
         ),
         failure_fields=failures,
+        completion_source="crash-reconstruction",
     )
 
 
@@ -2290,7 +2310,7 @@ def _launch_trial(
         immediate_observation=observation,
         immediate_started_at=immediate_started_at,
         recovery_policy=policy,
-        collect=lambda: collect_post_exit_environment(clock=clock)[1],
+        collect=lambda: collect_post_exit_environment(clock=clock),
         classify_nonmemory=lambda item: _recovery_failure_fields(
             item,
             expected_hardware=measurement["start"]["hardware"],
@@ -2309,6 +2329,7 @@ def _launch_trial(
         outcome=result.outcome,
         duration_seconds=result.duration_seconds,
         failure_fields=result.failure_fields,
+        completion_source="live",
     )
     atomic_write_json(recovery_output, recovery, create_only=True)
     trial = finalize_raw_trial(measurement, post_exit, result.samples, recovery)

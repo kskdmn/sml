@@ -137,8 +137,14 @@ environment probes, exactly as in the current protocol.
 Each recovery sample uses the existing complete environment collector. Memory
 pressure and free-memory percentage are sampled first and timestamped before
 the slower hardware, software, thermal, power, and competing-workload probes.
-The five-second cadence is measured between memory-sample start times; a slow
-collector cannot cause overlapping probes or extend the original deadline.
+That captured memory-probe start is the authoritative elapsed-time input to a
+shared first-terminal reducer used by both live collection and evidence
+validation. The first recovery probe starts at least five seconds after the
+immediate probe, every later probe starts at least five seconds after its
+predecessor, and non-memory failure precedes critical pressure when both occur
+in one sample. The five-second cadence is measured between memory-sample start
+times; a slow collector cannot cause overlapping probes or extend the original
+deadline.
 Recovery collection must not run unrelated work between samples.
 
 The recovery branch and every disposition depend only on environment evidence,
@@ -168,14 +174,18 @@ Each recovery sample is a create-only versioned document containing:
 - a structured SHA-256 identity over its canonical content.
 
 The prior-sample binding makes the ordered sequence an immutable chain. Sample
-indices must be contiguous, identities unique, elapsed times strictly
-increasing, and elapsed time must not exceed the canonical timeout.
+indices must be contiguous, identities unique, elapsed times satisfy the
+canonical minimum cadence, and elapsed time must not exceed the canonical
+timeout. No identity-valid chain may contain a sample after the shared
+reducer's first terminal event.
 
 ### Recovery summary
 
-Every attempt receives a create-only versioned `PostExitRecovery` summary. It
+Every attempt receives a create-only version-2 `PostExitRecovery` summary using
+the `sml-parent-post-exit-recovery-v2` identity domain. It
 binds the child measurement, immediate post-exit observation, canonical
-recovery policy, and ordered recovery-sample identities. Its outcome is exactly
+recovery policy, ordered recovery-sample identities, and required
+`completion_source` (`live` or `crash-reconstruction`). Its outcome is exactly
 one of:
 
 - `not-required`: the immediate observation was `normal` and the sample list is
@@ -189,10 +199,22 @@ one of:
 - `interrupted`: the process stopped after an immediate warning but before a
   terminal recovery summary existed.
 
+For `completion_source: live`, the outcome, duration, and failure fields match
+the shared reducer's first terminal result. For
+`completion_source: crash-reconstruction`, immediate normal, critical, and
+non-memory failure with zero samples reconstruct `not-required`, `critical`,
+and `environment-failure` respectively. An immediate warning with no summary
+always reconstructs `interrupted`, with or without partial samples. Its final
+sample may itself be the first decisive critical, non-memory-failure,
+stable-completion, or deadline event because the crash may occur between the
+durable sample write and summary publication; no sample may follow that event.
+
 The summary records its terminal sample identity when samples exist, terminal
 environment observation, elapsed duration, and structured content identity.
-Validation recomputes the outcome from the immutable immediate observation,
-sample chain, and canonical policy rather than trusting cached fields.
+Validation recomputes live completion from the immutable immediate observation,
+sample chain, and canonical policy, and validates crash completion against its
+explicit provenance rather than trusting cached fields. Version-1 recovery
+summaries are incompatible.
 
 ### Final raw trial
 
@@ -263,6 +285,10 @@ Resume validates the full topology before preflight or process launch:
   partial samples, cannot resume a continuous window after an unknown gap. It
   creates an `interrupted` summary and rejects the attempt as
   `interrupted-post-exit-recovery`.
+- That immediate-warning reconstruction remains `interrupted` when its last
+  partial sample is the first decisive live terminal event (critical,
+  non-memory failure, stable completion, or deadline); later samples are
+  corruption.
 - A complete admissible recovery summary without a final raw trial
   deterministically reconstructs schema-v3 finalization.
 - A complete non-admissible recovery summary without a final raw trial
@@ -286,6 +312,8 @@ identity, evidence session, and raw-trial schema. The retained schema-v2 state
 at `/private/tmp/sml-v2-baseline-post-exit-state-aa6bb43` remains diagnostic
 evidence only. Its seven accepted trials and three rejected attempts must not be
 copied, upgraded, or resumed under the new protocol.
+Recovery-summary-v1 documents likewise cannot enter the current evidence
+session; summary provenance begins at version 2.
 
 After implementation and verification, a new baseline begins in a new empty
 external state directory using a clean detached checkout at the verified

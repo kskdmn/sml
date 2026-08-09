@@ -8,6 +8,26 @@
 
 **Tech Stack:** Python 3.12.13, MLX/Metal, immutable dataclasses, canonical JSON with structured SHA-256 identities, monotonic clocks, macOS environment probes, durable atomic files, pytest, Ruff, Git worktrees
 
+## Whole-review fix amendment
+
+The deterministic-termination review advances recovery summaries to version 2
+and identity domain `sml-parent-post-exit-recovery-v2`. Every summary requires
+identity-bound `completion_source: live | crash-reconstruction`. Live summaries
+match one shared first-terminal reducer used by runtime and evidence validation;
+that reducer enforces minimum sample-start cadence, non-memory-before-critical
+precedence, and no samples after its first terminal event. A deadline timeout
+has duration exactly 300 seconds even when its last persisted sample precedes
+the deadline.
+
+Missing-summary reconstruction is provenance-based rather than purely
+sample-derived. Immediate normal, critical, and non-memory failure with zero
+samples reconstruct their matching outcomes. Immediate warning always
+reconstructs `interrupted`, even if its final durable sample is the first live
+critical, non-memory-failure, stable-completion, or deadline event; a later
+sample is invalid. This amendment supersedes the older version-1 domain and
+sample-derived `interrupted` snippets below. Raw trials remain version 3;
+child, immediate, and recovery-sample documents remain version 1.
+
 ## Global Constraints
 
 - Preserve the full 12-layer, hidden-size-768 model and training sequence length 1,024.
@@ -22,7 +42,7 @@
 - Never inspect metric values, elapsed time, throughput, compilation time, or peak memory when deciding recovery or trial disposition.
 - Do not clear MLX caches, invoke garbage collection, change the child workload, add an in-child cooldown, or launch a second child during memory recovery.
 - Persistent or critical memory pressure stops the invocation without a same-run retry. Thermal-only failure retains the existing five-continuous-minute automatic recovery and two-hour slot deadline.
-- A crash during an unfinished warning recovery creates an `interrupted` outcome on resume and requires a new journal attempt; do not continue a stability window across the gap.
+- A missing-summary immediate-warning recovery creates an `interrupted` outcome on resume regardless of its partial samples and requires a new journal attempt; do not continue a stability window across the gap.
 - `RawTrial` schema version 2, old workload identities, and old journals remain incompatible diagnostic evidence; do not migrate or modify them.
 - Preserve `/private/tmp/sml-v2-baseline-post-exit-state-aa6bb43` with its seven accepted and three rejected schema-v2 attempts, and preserve `/private/tmp/sml-v2-baseline-short-state`.
 - Do not edit top-level project files such as `pyproject.toml` or `uv.lock`.
@@ -59,7 +79,7 @@
 - Produces: `post_exit_recovery_policy(workload: CanonicalWorkload) -> dict[str, JsonValue]`, containing the four recovery values, required thermal/power/competing-workload values, and `require_same_hardware_and_software: true`; actual hardware and software references come from the bound child-start observation.
 - Produces: `build_post_exit_recovery_sample(*, measurement: Mapping[str, object], post_exit: Mapping[str, object], sample_index: int, previous_sample_identity: str | None, observed_at_utc: str, elapsed_seconds: float, hardware: Mapping[str, object], environment_status: Mapping[str, object], software_versions: Mapping[str, object]) -> dict[str, JsonValue]`.
 - Produces: `validate_post_exit_recovery_sample(document: Mapping[str, object], *, measurement: Mapping[str, object], post_exit: Mapping[str, object], previous_sample: Mapping[str, object] | None) -> dict[str, JsonValue]` and `validate_post_exit_recovery_samples(documents: Sequence[Mapping[str, object]], *, measurement: Mapping[str, object], post_exit: Mapping[str, object]) -> tuple[dict[str, JsonValue], ...]`.
-- Produces: `build_post_exit_recovery(*, measurement: Mapping[str, object], post_exit: Mapping[str, object], samples: Sequence[Mapping[str, object]], policy: Mapping[str, object], outcome: str, duration_seconds: float, failure_fields: Sequence[str] = ()) -> dict[str, JsonValue]` and `validate_post_exit_recovery(document: Mapping[str, object], *, measurement: Mapping[str, object], post_exit: Mapping[str, object], samples: Sequence[Mapping[str, object]]) -> dict[str, JsonValue]`.
+- Produces: `build_post_exit_recovery(*, measurement: Mapping[str, object], post_exit: Mapping[str, object], samples: Sequence[Mapping[str, object]], policy: Mapping[str, object], outcome: str, duration_seconds: float, failure_fields: Sequence[str] = (), completion_source: str = "live") -> dict[str, JsonValue]` and `validate_post_exit_recovery(document: Mapping[str, object], *, measurement: Mapping[str, object], post_exit: Mapping[str, object], samples: Sequence[Mapping[str, object]]) -> dict[str, JsonValue]`.
 - Produces: `finalize_raw_trial(measurement, post_exit, recovery_samples, recovery) -> RawTrial`, `validate_raw_trial_evidence(trial) -> None`, and schema-v3 fields `post_exit_recovery_samples` and `post_exit_recovery`.
 
 - [ ] **Step 1: Write failing canonical-policy and schema-v3 tests**
@@ -353,7 +373,7 @@ def test_recovery_summary_rejects_incompatible_outcome_evidence(
         )
 ```
 
-Use `failure_fields` as a sorted, duplicate-free list. Require exact bindings to session, journal attempt, metric, pair, child identity, and immediate post-exit identity. Reject boolean indices, non-finite/negative elapsed values, duplicate identities, non-contiguous indices, non-increasing elapsed time, samples past 300 seconds, policy drift, and any outcome that conflicts with its immediate/sample evidence. `interrupted` is valid only for an immediate warning and is never admissible.
+Use `failure_fields` as a sorted, duplicate-free list. Require exact bindings to session, journal attempt, metric, pair, child identity, and immediate post-exit identity. Reject boolean indices, non-finite/negative elapsed values, duplicate identities, non-contiguous indices, cadence-infeasible elapsed time, samples past 300 seconds, policy drift, and any outcome that conflicts with its immediate/sample evidence. `interrupted` is valid only for an immediate warning with `completion_source: crash-reconstruction`, is unconditional on the terminal meaning of its final partial sample, and is never admissible. Samples after that first decisive event remain invalid.
 
 - [ ] **Step 5: Implement recovery evidence and deterministic schema-v3 finalization**
 
@@ -363,7 +383,7 @@ Use these domains and summary skeletons in `evidence.py`:
 RECOVERY_SAMPLE_KIND = "sml-parent-post-exit-recovery-sample"
 RECOVERY_SAMPLE_IDENTITY_DOMAIN = "sml-parent-post-exit-recovery-sample-v1"
 RECOVERY_KIND = "sml-parent-post-exit-recovery"
-RECOVERY_IDENTITY_DOMAIN = "sml-parent-post-exit-recovery-v1"
+RECOVERY_IDENTITY_DOMAIN = "sml-parent-post-exit-recovery-v2"
 
 
 def _recovery_binding(child, parent):
@@ -455,9 +475,9 @@ git commit -m "feat(v2): define post-exit recovery evidence"
 - Test: `v2/tests/unit/test_benchmark_analysis.py`
 
 **Interfaces:**
-- Consumes: complete observation dictionaries, fixed recovery policy, injected `clock`, injected `sleep`, and injected durable `record_sample` callback.
+- Consumes: `(memory_probe_started_at, complete_observation)` collector results, fixed recovery policy, injected `clock`, injected `sleep`, and injected durable `record_sample` callback.
 - Produces: `PostExitMemoryRecoveryResult(outcome: Literal["not-required", "recovered", "timeout", "critical", "environment-failure"], duration_seconds: float, samples: tuple[dict, ...], failure_fields: tuple[str, ...])`.
-- Produces: `wait_for_post_exit_memory_recovery(*, immediate_observation: dict, immediate_started_at: float, recovery_policy: dict, collect: Callable[[], dict], classify_nonmemory: Callable[[dict], tuple[str, ...]], record_sample: Callable[[int, float, dict, str | None], dict], clock: Callable[[], float], sleep: Callable[[float], None]) -> PostExitMemoryRecoveryResult`.
+- Produces: `wait_for_post_exit_memory_recovery(*, immediate_observation: dict, immediate_started_at: float, recovery_policy: dict, collect: Callable[[], tuple[float, dict]], classify_nonmemory: Callable[[dict], tuple[str, ...]], record_sample: Callable[[int, float, dict, str | None], dict], clock: Callable[[], float], sleep: Callable[[float], None]) -> PostExitMemoryRecoveryResult`, sharing its reducer with evidence validation.
 - Preserves: `wait_for_nominal_thermal_window` behavior and constants unchanged.
 
 - [ ] **Step 1: Write failing immediate and stable-recovery tests with a fake clock**
@@ -1409,10 +1429,14 @@ def _reconstruct_missing_recovery(state, workload):
             else state.recovery_samples[-1]["elapsed_seconds"]
         ),
         failure_fields=failures,
+        completion_source="crash-reconstruction",
     )
 ```
 
 In pending replay, measurement-only still becomes `missing-immediate-post-exit-evidence`; post-exit without summary calls this helper and writes the summary create-only; summary without inflight finalizes schema v3; inflight classifies directly. Memory rejection calls `journal.reject_inflight` then raises `MemoryPressureTrialRejected`. Environment rejection calls `journal.reject_inflight` then raises `EnvironmentTrialRejected`. Thermal-only rejection retains the current trigger, five-minute nominal recovery, and retry loop.
+For immediate warning, the reconstruction outcome is `interrupted` even when
+the final partial sample is decisive under live semantics; only a sample after
+that first decisive sample is invalid.
 
 - [ ] **Step 6: Run capture, replay, thermal, and disposition tests**
 

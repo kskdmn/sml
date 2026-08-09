@@ -5,6 +5,7 @@ import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 
+from v2.benchmarks.recovery import reduce_post_exit_memory_recovery
 from v2.benchmarks.schema import JsonValue, RawTrial, validate_trial_payload
 from v2.benchmarks.workload import structured_identity
 
@@ -15,7 +16,7 @@ POST_EXIT_IDENTITY_DOMAIN = "sml-parent-post-exit-observation-v1"
 RECOVERY_SAMPLE_KIND = "sml-parent-post-exit-recovery-sample"
 RECOVERY_SAMPLE_IDENTITY_DOMAIN = "sml-parent-post-exit-recovery-sample-v1"
 RECOVERY_KIND = "sml-parent-post-exit-recovery"
-RECOVERY_IDENTITY_DOMAIN = "sml-parent-post-exit-recovery-v1"
+RECOVERY_IDENTITY_DOMAIN = "sml-parent-post-exit-recovery-v2"
 MISSING_POST_EXIT_REASON = "missing-immediate-post-exit-evidence"
 FINALIZED_REJECTION_REASONS = frozenset(
     {
@@ -555,15 +556,6 @@ def validate_post_exit_recovery_samples(
     return tuple(samples)
 
 
-def _environment_matches_recovery_policy(
-    environment: Mapping[str, object], policy: Mapping[str, object]
-) -> bool:
-    required = policy["required_environment"]
-    return environment["memory_pressure"] == policy["required_memory_pressure"] and all(
-        environment[name] == value for name, value in required.items()
-    )
-
-
 def _observation_environment_failure_fields(
     observation: Mapping[str, object],
     *,
@@ -586,30 +578,10 @@ def _observation_environment_failure_fields(
     return sorted(failures)
 
 
-def _recovery_environment_failure_fields(
-    samples: Sequence[Mapping[str, object]],
-    *,
-    policy: Mapping[str, object],
-    expected_hardware: Mapping[str, object],
-    expected_software_versions: Mapping[str, object],
-) -> list[str]:
-    return sorted(
-        {
-            field
-            for sample in samples
-            for field in _observation_environment_failure_fields(
-                sample,
-                policy=policy,
-                expected_hardware=expected_hardware,
-                expected_software_versions=expected_software_versions,
-            )
-        }
-    )
-
-
 def _validate_recovery_outcome(
     *,
     outcome: object,
+    completion_source: str,
     immediate: Mapping[str, object],
     samples: Sequence[Mapping[str, object]],
     policy: Mapping[str, object],
@@ -627,103 +599,50 @@ def _validate_recovery_outcome(
         "interrupted",
     }:
         raise ValueError("recovery outcome is invalid")
-    immediate_pressure = immediate["environment_status"]["memory_pressure"]
-    terminal = (
-        samples[-1]["environment_status"]
-        if samples
-        else immediate["environment_status"]
+
+    def classify_nonmemory(observation: Mapping[str, object]) -> list[str]:
+        return _observation_environment_failure_fields(
+            observation,
+            policy=policy,
+            expected_hardware=expected_hardware,
+            expected_software_versions=expected_software_versions,
+        )
+
+    terminal = reduce_post_exit_memory_recovery(
+        immediate_observation=immediate,
+        samples=samples,
+        recovery_policy=policy,
+        classify_nonmemory=classify_nonmemory,
+        deadline_reached=duration_seconds == policy["timeout_seconds"],
     )
-    has_critical_sample = any(
-        sample["environment_status"]["memory_pressure"] == "critical"
-        for sample in samples
-    )
-    requires_critical_outcome = immediate_pressure == "critical" or has_critical_sample
-    immediate_failure_fields = _observation_environment_failure_fields(
-        immediate,
-        policy=policy,
-        expected_hardware=expected_hardware,
-        expected_software_versions=expected_software_versions,
-    )
-    sample_failure_fields = _recovery_environment_failure_fields(
-        samples,
-        policy=policy,
-        expected_hardware=expected_hardware,
-        expected_software_versions=expected_software_versions,
-    )
-    environment_failure_fields = immediate_failure_fields or sample_failure_fields
     if (
         outcome == "environment-failure"
-        and failure_fields != environment_failure_fields
+        and terminal is not None
+        and terminal.outcome == "environment-failure"
+        and failure_fields != list(terminal.failure_fields)
     ):
         raise ValueError(
             "recovery failure_fields do not match environment failure evidence"
         )
-    last_nonmatching = max(
-        (
-            sample["elapsed_seconds"]
-            for sample in samples
-            if not _environment_matches_recovery_policy(
-                sample["environment_status"], policy
+    if completion_source == "crash-reconstruction":
+        immediate_pressure = immediate["environment_status"]["memory_pressure"]
+        if immediate_pressure == "warning":
+            valid = outcome == "interrupted" and not failure_fields
+        else:
+            valid = (
+                not samples
+                and terminal is not None
+                and outcome == terminal.outcome
+                and duration_seconds == terminal.duration_seconds
+                and failure_fields == list(terminal.failure_fields)
             )
-        ),
-        default=0.0,
-    )
-    stable_samples = [
-        sample
-        for sample in samples
-        if sample["elapsed_seconds"] >= last_nonmatching
-        and _environment_matches_recovery_policy(sample["environment_status"], policy)
-    ]
-    has_stable_recovery_window = (
-        bool(stable_samples)
-        and duration_seconds - stable_samples[0]["elapsed_seconds"]
-        >= policy["stability_seconds"]
-    )
-    if outcome == "not-required":
-        valid = (
-            immediate_pressure == "normal"
-            and not immediate_failure_fields
-            and not samples
-            and duration_seconds == 0.0
-        )
-    elif outcome == "recovered":
-        valid = (
-            immediate_pressure == "warning"
-            and bool(samples)
-            and not requires_critical_outcome
-            and not environment_failure_fields
-            and _environment_matches_recovery_policy(terminal, policy)
-            and has_stable_recovery_window
-        )
-    elif outcome == "timeout":
-        valid = (
-            immediate_pressure == "warning"
-            and duration_seconds == policy["timeout_seconds"]
-            and not requires_critical_outcome
-            and not environment_failure_fields
-            and not has_stable_recovery_window
-        )
-    elif outcome == "critical":
-        valid = requires_critical_outcome and not immediate_failure_fields
-    elif outcome == "environment-failure":
-        valid = (
-            bool(immediate_failure_fields) and not samples and duration_seconds == 0.0
-        )
-        valid = valid or (
-            not immediate_failure_fields
-            and immediate_pressure == "warning"
-            and bool(samples)
-            and not requires_critical_outcome
-            and bool(sample_failure_fields)
-        )
     else:
         valid = (
-            immediate_pressure == "warning"
-            and not requires_critical_outcome
-            and not environment_failure_fields
+            terminal is not None
+            and outcome == terminal.outcome
+            and duration_seconds == terminal.duration_seconds
+            and failure_fields == list(terminal.failure_fields)
         )
-    if outcome != "environment-failure" and failure_fields:
-        valid = False
     if not valid:
         raise ValueError("recovery outcome conflicts with the evidence")
     return outcome
@@ -738,6 +657,7 @@ def build_post_exit_recovery(
     outcome: str,
     duration_seconds: float,
     failure_fields: Sequence[str] = (),
+    completion_source: str = "live",
 ) -> dict[str, JsonValue]:
     child = validate_child_trial_measurement(measurement)
     parent = validate_post_exit_observation(post_exit, measurement=child)
@@ -748,15 +668,24 @@ def build_post_exit_recovery(
     if any(not isinstance(field, str) or not field for field in failure_fields):
         raise ValueError("recovery failure_fields must be non-empty strings")
     normalized_failure_fields = sorted(set(failure_fields))
+    if completion_source not in {"live", "crash-reconstruction"}:
+        raise ValueError("recovery completion_source is invalid")
     normalized_duration = _validate_elapsed_seconds(
         duration_seconds, label="recovery duration_seconds"
     )
-    if normalized_duration != (
+    terminal_duration = (
         0.0 if not validated_samples else validated_samples[-1]["elapsed_seconds"]
-    ):
+    )
+    is_deadline_timeout = (
+        outcome == "timeout"
+        and normalized_duration == normalized_policy["timeout_seconds"]
+        and terminal_duration <= normalized_duration
+    )
+    if normalized_duration != terminal_duration and not is_deadline_timeout:
         raise ValueError("recovery duration_seconds must match the terminal sample")
     outcome = _validate_recovery_outcome(
         outcome=outcome,
+        completion_source=completion_source,
         immediate=parent,
         samples=validated_samples,
         policy=normalized_policy,
@@ -772,11 +701,12 @@ def build_post_exit_recovery(
     )
     body = {
         "kind": RECOVERY_KIND,
-        "version": 1,
+        "version": 2,
         **_recovery_binding(child, parent),
         "policy": normalized_policy,
         "sample_identities": [sample["identity"] for sample in validated_samples],
         "outcome": outcome,
+        "completion_source": completion_source,
         "duration_seconds": normalized_duration,
         "failure_fields": normalized_failure_fields,
         "terminal_sample_identity": (
@@ -806,6 +736,7 @@ def validate_post_exit_recovery(
         "policy",
         "sample_identities",
         "outcome",
+        "completion_source",
         "duration_seconds",
         "failure_fields",
         "terminal_sample_identity",
@@ -814,7 +745,7 @@ def validate_post_exit_recovery(
     }
     if set(document) != expected:
         raise ValueError("post-exit recovery has an invalid field set")
-    if document["kind"] != RECOVERY_KIND or document["version"] != 1:
+    if document["kind"] != RECOVERY_KIND or document["version"] != 2:
         raise ValueError("unsupported post-exit recovery kind or version")
     policy = document["policy"]
     if not isinstance(policy, dict):
@@ -834,12 +765,22 @@ def validate_post_exit_recovery(
     duration_seconds = _validate_elapsed_seconds(
         document["duration_seconds"], label="recovery duration_seconds"
     )
-    if duration_seconds != (
+    completion_source = document["completion_source"]
+    if completion_source not in {"live", "crash-reconstruction"}:
+        raise ValueError("recovery completion_source is invalid")
+    terminal_duration = (
         0.0 if not validated_samples else validated_samples[-1]["elapsed_seconds"]
-    ):
+    )
+    is_deadline_timeout = (
+        document["outcome"] == "timeout"
+        and duration_seconds == normalized_policy["timeout_seconds"]
+        and terminal_duration <= duration_seconds
+    )
+    if duration_seconds != terminal_duration and not is_deadline_timeout:
         raise ValueError("recovery duration_seconds must match the terminal sample")
     _validate_recovery_outcome(
         outcome=document["outcome"],
+        completion_source=completion_source,
         immediate=parent,
         samples=validated_samples,
         policy=normalized_policy,
@@ -862,11 +803,12 @@ def validate_post_exit_recovery(
         raise ValueError("recovery terminal environment does not match")
     body = {
         "kind": RECOVERY_KIND,
-        "version": 1,
+        "version": 2,
         **_validate_recovery_binding(document, child, parent),
         "policy": normalized_policy,
         "sample_identities": expected_sample_identities,
         "outcome": document["outcome"],
+        "completion_source": completion_source,
         "duration_seconds": duration_seconds,
         "failure_fields": raw_failure_fields,
         "terminal_sample_identity": terminal_identity,

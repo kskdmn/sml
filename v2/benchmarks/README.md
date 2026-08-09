@@ -40,7 +40,12 @@ complete environment every five seconds for at most five minutes and requires
 30 continuous normal seconds before recovery; every sample is written before
 classification, a warning resets only the stability window, and a critical or
 non-memory failure terminates immediately. Schema-v3 raw trials embed the
-ordered recovery-sample identity chain and its recovery summary. Raw-trial
+ordered recovery-sample identity chain and its version-2 recovery summary.
+Recovery summaries use the `sml-parent-post-exit-recovery-v2` identity domain
+and bind `completion_source` as either `live` or `crash-reconstruction`. Live
+collection and evidence validation use the same first-terminal reducer:
+non-memory failure precedes critical pressure, sample starts are at least five
+seconds apart, and no sample may follow the first terminal event. Raw-trial
 identities use the `sml-raw-benchmark-trial-v3` domain. Baseline manifests, raw
 JSONL, comparison reports, predecessor replay, phase validation, and final
 validation all revalidate the complete embedded recovery evidence before
@@ -90,8 +95,9 @@ fail the strict topology or checkout checks.
 
 Every preflight is persisted before validation. Child-start memory pressure
 must be `normal`. Child-end `warning` is diagnostic and may pass only when
-child-start and immediate parent post-exit pressure are both `normal` and every
-other strict check passes. Non-normal child-start pressure and child-end
+child-start pressure is `normal` and either immediate parent post-exit pressure
+is `normal` or immediate `warning` completes valid recovery, while every other
+strict check passes. Non-normal child-start pressure and child-end
 `critical` are memory rejections. An immediate parent post-exit `warning` is
 accepted only when its ordered recovery evidence reaches 30 continuous normal
 seconds and therefore has the `recovered` outcome, subject to every other strict
@@ -137,7 +143,12 @@ matching child measurement, immediate observation, ordered recovery samples,
 and recovery summary reconstruct the final schema-v3 trial deterministically
 before classification. A complete in-flight trial is likewise classified before
 any replacement is launched. A crash during warning recovery is `interrupted`
-and never continues its old stability window.
+and never continues its old stability window. This missing-summary rule is
+provenance-based: it remains `interrupted` even when the last durable sample
+would have completed live recovery, reached critical pressure, reported a
+non-memory failure, or reached the deadline. Such a chain may end at that first
+decisive sample but may not contain a later sample. Recovery-summary-v1
+documents are incompatible with the current protocol.
 
 Timeout, critical, and interrupted post-exit memory outcomes stop for manual
 resume; only a thermal-only failure retains automatic thermal recovery. After a

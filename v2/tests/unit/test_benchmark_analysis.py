@@ -1186,6 +1186,9 @@ def _recovery_evidence(
         outcome=resolved_outcome,
         duration_seconds=0.0 if not samples else samples[-1]["elapsed_seconds"],
         failure_fields=failure_fields,
+        completion_source=(
+            "crash-reconstruction" if resolved_outcome == "interrupted" else "live"
+        ),
     )
     trial = finalize_raw_trial(measurement, post_exit, samples, recovery)
     return measurement, post_exit, tuple(samples), recovery, trial
@@ -1227,6 +1230,9 @@ def _valid_post_exit_recovery(measurement, post_exit, samples=()):
         outcome=outcome if not samples else "recovered",
         duration_seconds=0.0 if not samples else samples[-1]["elapsed_seconds"],
         failure_fields=tuple(sorted(failure_fields)),
+        completion_source=(
+            "crash-reconstruction" if outcome == "interrupted" else "live"
+        ),
     )
 
 
@@ -1351,6 +1357,7 @@ def _with_trial_payload(trial, **changes):
         outcome=raw_recovery["outcome"],
         duration_seconds=raw_recovery["duration_seconds"],
         failure_fields=raw_recovery["failure_fields"],
+        completion_source=raw_recovery["completion_source"],
     )
     return finalize_raw_trial(measurement, post_exit, samples, recovery)
 
@@ -1420,6 +1427,75 @@ def test_raw_trial_v3_embeds_and_revalidates_the_recovery_chain():
         RawTrial.from_dict(version_two)
 
 
+def test_recovery_summary_v2_requires_identity_bound_completion_source():
+    measurement = _valid_child_measurement(build_canonical_workload())
+    post_exit = _valid_post_exit_observation(measurement)
+    recovery = _valid_post_exit_recovery(measurement, post_exit)
+
+    assert recovery["version"] == 2
+    assert recovery["completion_source"] == "live"
+    recovery_body = {key: value for key, value in recovery.items() if key != "identity"}
+    assert recovery["identity"] == structured_identity(
+        "sml-parent-post-exit-recovery-v2", recovery_body
+    )
+
+    changed_source = {**recovery, "completion_source": "crash-reconstruction"}
+    with pytest.raises(ValueError, match="recovery identity"):
+        validate_post_exit_recovery(
+            changed_source,
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=(),
+        )
+
+    version_one_body = {
+        key: value
+        for key, value in recovery.items()
+        if key not in {"completion_source", "identity"}
+    }
+    version_one_body["version"] = 1
+    version_one = {
+        **version_one_body,
+        "identity": structured_identity(
+            "sml-parent-post-exit-recovery-v1", version_one_body
+        ),
+    }
+    with pytest.raises(ValueError, match="field set|kind or version"):
+        validate_post_exit_recovery(
+            version_one,
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=(),
+        )
+
+
+def test_recovery_summary_rejects_invalid_completion_source_outcome_pairs():
+    workload = build_canonical_workload()
+    measurement, post_exit, samples, _recovery = _valid_recovered_evidence()
+    policy = post_exit_recovery_policy(workload)
+
+    with pytest.raises(ValueError, match="recovery outcome"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+            policy=policy,
+            outcome="recovered",
+            duration_seconds=35.0,
+            completion_source="crash-reconstruction",
+        )
+    with pytest.raises(ValueError, match="recovery outcome"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=(),
+            policy=policy,
+            outcome="interrupted",
+            duration_seconds=0.0,
+            completion_source="live",
+        )
+
+
 def test_recovery_samples_form_an_exact_ordered_identity_chain():
     measurement, post_exit, samples, recovery = _valid_recovered_evidence()
 
@@ -1482,6 +1558,9 @@ def test_recovery_summary_rejects_incompatible_outcome_evidence(
         outcome=outcome,
         duration_seconds=0.0 if not samples else samples[-1]["elapsed_seconds"],
         failure_fields=failure_fields,
+        completion_source=(
+            "crash-reconstruction" if outcome == "interrupted" else "live"
+        ),
     )
     changed = {
         **recovery,
@@ -1501,8 +1580,8 @@ def test_critical_recovery_sample_requires_a_critical_outcome():
     workload = build_canonical_workload()
     measurement, post_exit, samples = _warning_recovery_sample_chain(
         workload,
-        pressures=("critical",) + ("normal",) * 7,
-        elapsed=(5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0),
+        pressures=("critical",),
+        elapsed=(5.0,),
     )
     policy = post_exit_recovery_policy(workload)
 
@@ -1513,7 +1592,7 @@ def test_critical_recovery_sample_requires_a_critical_outcome():
             samples=samples,
             policy=policy,
             outcome="recovered",
-            duration_seconds=40.0,
+            duration_seconds=5.0,
         )
 
     critical = build_post_exit_recovery(
@@ -1522,7 +1601,7 @@ def test_critical_recovery_sample_requires_a_critical_outcome():
         samples=samples,
         policy=policy,
         outcome="critical",
-        duration_seconds=40.0,
+        duration_seconds=5.0,
     )
     assert critical["outcome"] == "critical"
     with pytest.raises(ValueError, match="recovery outcome"):
@@ -1538,10 +1617,9 @@ def test_thermal_recovery_sample_requires_environment_failure_evidence():
     workload = build_canonical_workload()
     measurement, post_exit, samples = _warning_recovery_sample_chain(
         workload,
-        pressures=("normal",) * 8,
-        elapsed=(5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0),
-        status_changes=({"thermal_state": "fair", "thermal_state_raw_value": 1},)
-        + ({},) * 7,
+        pressures=("normal",),
+        elapsed=(5.0,),
+        status_changes=({"thermal_state": "fair", "thermal_state_raw_value": 1},),
     )
     policy = post_exit_recovery_policy(workload)
 
@@ -1552,7 +1630,7 @@ def test_thermal_recovery_sample_requires_environment_failure_evidence():
             samples=samples,
             policy=policy,
             outcome="recovered",
-            duration_seconds=40.0,
+            duration_seconds=5.0,
         )
 
     environment_failure = build_post_exit_recovery(
@@ -1561,7 +1639,7 @@ def test_thermal_recovery_sample_requires_environment_failure_evidence():
         samples=samples,
         policy=policy,
         outcome="environment-failure",
-        duration_seconds=40.0,
+        duration_seconds=5.0,
         failure_fields=("thermal_state",),
     )
     assert environment_failure["failure_fields"] == ["thermal_state"]
@@ -1572,7 +1650,7 @@ def test_thermal_recovery_sample_requires_environment_failure_evidence():
             samples=samples,
             policy=policy,
             outcome="environment-failure",
-            duration_seconds=40.0,
+            duration_seconds=5.0,
             failure_fields=("power_connected",),
         )
 
@@ -1609,6 +1687,142 @@ def test_timeout_uses_the_deadline_bound_stable_recovery_window():
             policy=policy,
             outcome="timeout",
             duration_seconds=300.0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("pressure", "status_changes"),
+    (
+        ("critical", {}),
+        ("normal", {"power_connected": False}),
+    ),
+)
+def test_timeout_cannot_override_an_earlier_terminal_sample(pressure, status_changes):
+    workload = build_canonical_workload()
+    measurement, post_exit, samples = _warning_recovery_sample_chain(
+        workload,
+        pressures=(pressure,),
+        elapsed=(5.0,),
+        status_changes=(status_changes,),
+    )
+
+    with pytest.raises(ValueError, match="recovery outcome"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+            policy=post_exit_recovery_policy(workload),
+            outcome="timeout",
+            duration_seconds=300.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "elapsed",
+    (
+        (4.0, 9.0, 14.0, 19.0, 24.0, 29.0, 34.0),
+        (5.0, 10.0, 14.0, 19.0, 24.0, 29.0, 35.0),
+    ),
+)
+def test_recovery_summary_rejects_cadence_infeasible_samples(elapsed):
+    workload = build_canonical_workload()
+    measurement, post_exit, samples = _warning_recovery_sample_chain(
+        workload,
+        pressures=("normal",) * 7,
+        elapsed=elapsed,
+    )
+
+    with pytest.raises(ValueError, match="recovery sample cadence"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+            policy=post_exit_recovery_policy(workload),
+            outcome="recovered",
+            duration_seconds=elapsed[-1],
+        )
+
+
+@pytest.mark.parametrize(
+    ("pressures", "elapsed", "status_changes", "outcome", "failure_fields"),
+    (
+        (("critical", "normal"), (5.0, 10.0), (), "critical", ()),
+        (
+            ("normal", "normal"),
+            (5.0, 10.0),
+            ({"power_connected": False}, {}),
+            "environment-failure",
+            ("power_connected",),
+        ),
+        (
+            ("normal",) * 8,
+            tuple(float(value) for value in range(5, 45, 5)),
+            (),
+            "recovered",
+            (),
+        ),
+        (
+            ("normal",) * 7 + ("warning",),
+            (5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 300.0),
+            (),
+            "timeout",
+            (),
+        ),
+    ),
+)
+def test_recovery_summary_rejects_samples_after_first_terminal_event(
+    pressures, elapsed, status_changes, outcome, failure_fields
+):
+    workload = build_canonical_workload()
+    measurement, post_exit, samples = _warning_recovery_sample_chain(
+        workload,
+        pressures=pressures,
+        elapsed=elapsed,
+        status_changes=status_changes,
+    )
+
+    with pytest.raises(ValueError, match="samples after the first terminal event"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+            policy=post_exit_recovery_policy(workload),
+            outcome=outcome,
+            duration_seconds=elapsed[-1],
+            failure_fields=failure_fields,
+        )
+
+
+def test_recovery_summary_uses_nonmemory_failure_before_critical_pressure():
+    workload = build_canonical_workload()
+    measurement, post_exit, samples = _warning_recovery_sample_chain(
+        workload,
+        pressures=("critical",),
+        elapsed=(5.0,),
+        status_changes=({"power_connected": False},),
+    )
+    policy = post_exit_recovery_policy(workload)
+
+    recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=samples,
+        policy=policy,
+        outcome="environment-failure",
+        duration_seconds=5.0,
+        failure_fields=("power_connected",),
+    )
+
+    assert recovery["outcome"] == "environment-failure"
+    assert recovery["failure_fields"] == ["power_connected"]
+    with pytest.raises(ValueError, match="recovery outcome"):
+        build_post_exit_recovery(
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+            policy=policy,
+            outcome="critical",
+            duration_seconds=5.0,
         )
 
 
@@ -3424,6 +3638,16 @@ def test_capture_reconstructs_measurement_and_post_exit_before_replacement_launc
     measurement, post_exit, _samples, _recovery, expected = _journal_trial_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
+    expected_recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=(),
+        policy=post_exit_recovery_policy(workload),
+        outcome="not-required",
+        duration_seconds=0.0,
+        completion_source="crash-reconstruction",
+    )
+    expected = finalize_raw_trial(measurement, post_exit, (), expected_recovery)
     atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
     atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
 
@@ -3458,6 +3682,16 @@ def test_capture_reconstructs_not_required_summary_before_any_launch(tmp_path):
     measurement, post_exit, _samples, _recovery, expected = _journal_trial_evidence(
         journal, attempt, _valid_raw_trial(workload)
     )
+    expected_recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=(),
+        policy=post_exit_recovery_policy(workload),
+        outcome="not-required",
+        duration_seconds=0.0,
+        completion_source="crash-reconstruction",
+    )
+    expected = finalize_raw_trial(measurement, post_exit, (), expected_recovery)
     atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
     atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
     launches = []
@@ -3530,6 +3764,113 @@ def test_capture_rejects_partial_warning_recovery_before_any_launch(tmp_path):
         read_json_object(journal.recovery_path(slot, 0), label="recovery")["outcome"]
         == "interrupted"
     )
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("critical", "environment-failure", "stable-completion", "deadline"),
+)
+def test_capture_reconstructs_decisive_warning_crash_as_interrupted(tmp_path, boundary):
+    workload = build_canonical_workload()
+    if boundary == "critical":
+        terminal = _recovery_evidence(
+            workload,
+            immediate_pressure="warning",
+            sample_pressures=("critical",),
+            sample_elapsed=(5.0,),
+            outcome="critical",
+        )[4]
+    elif boundary == "environment-failure":
+        terminal = _recovery_evidence(
+            workload,
+            immediate_pressure="warning",
+            sample_pressures=("critical",),
+            sample_elapsed=(5.0,),
+            sample_status_changes=({"power_connected": False},),
+            outcome="environment-failure",
+            failure_fields=("power_connected",),
+        )[4]
+    elif boundary == "stable-completion":
+        terminal = _valid_recovered_raw_trial(workload)
+    else:
+        terminal = _recovery_evidence(
+            workload,
+            immediate_pressure="warning",
+            sample_pressures=("warning",),
+            sample_elapsed=(300.0,),
+            outcome="timeout",
+        )[4]
+
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, samples, _summary, rebound = _journal_trial_evidence(
+        journal, attempt, terminal
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    for index, sample in enumerate(samples):
+        atomic_write_json(
+            journal.recovery_sample_path(slot, 0, index), sample, create_only=True
+        )
+
+    with pytest.raises(
+        benchmark_runner.MemoryPressureTrialRejected,
+        match="interrupted-post-exit-recovery",
+    ):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=lambda *args: pytest.fail(
+                "crash reconstruction launched a replacement"
+            ),
+            preflight=lambda: _preflight_from_trial(rebound),
+            validate_preflight=lambda *args: None,
+            recover=lambda *args: pytest.fail("memory rejection entered recovery"),
+            validate_trial=_baseline_validator(workload),
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            progress=lambda message: None,
+        )
+
+    recovery_path = journal.recovery_path(slot, 0)
+    rejection_path = journal.rejected_path(slot, 0)
+    recovery = read_json_object(recovery_path, label="recovery")
+    rejected = read_json_object(rejection_path, label="rejection")
+    assert (
+        recovery["version"],
+        recovery["completion_source"],
+        recovery["outcome"],
+    ) == (
+        2,
+        "crash-reconstruction",
+        "interrupted",
+    )
+    assert rejected["reason"] == "interrupted-post-exit-recovery"
+    retained_paths = tuple(
+        [journal.recovery_sample_path(slot, 0, index) for index in range(len(samples))]
+        + [recovery_path, rejection_path]
+    )
+    retained = tuple(path.read_bytes() for path in retained_paths)
+    launches = []
+    normal = _valid_raw_trial(workload)
+
+    capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, next_attempt: (
+            launches.append(next_attempt.journal_attempt_index)
+            or _persist_journal_trial(journal, next_attempt, normal)
+        ),
+        preflight=lambda: _preflight_from_trial(normal),
+        validate_preflight=lambda *args: None,
+        recover=lambda *args: pytest.fail("memory rejection created thermal recovery"),
+        validate_trial=_baseline_validator(workload),
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
+        progress=lambda message: None,
+    )
+
+    assert launches == [1]
+    assert tuple(path.read_bytes() for path in retained_paths) == retained
 
 
 @pytest.mark.parametrize(
@@ -5672,7 +6013,7 @@ def test_parent_records_immediate_warning_then_every_recovery_sample_before_fina
         benchmark_runner,
         "collect_post_exit_environment",
         lambda **kwargs: (
-            events.append("memory-first") or 0.0,
+            events.append("memory-first") or clock(),
             observations.pop(0),
         ),
     )
@@ -5713,6 +6054,88 @@ def test_parent_records_immediate_warning_then_every_recovery_sample_before_fina
     assert events.index("write:6.json") < events.index("write:recovery.json")
     assert events.index("write:recovery.json") < events.index("write:trial.json")
     assert trial == RawTrial.from_dict(read_json_object(trial_path, label="trial"))
+
+
+def test_parent_finalizes_and_rejects_timeout_when_deadline_sleep_overshoots(
+    tmp_path, monkeypatch
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    measurement = _valid_child_measurement(
+        workload,
+        session_identity=journal.session["identity"],
+        journal_attempt_index=0,
+    )
+    immediate = _observation_with_memory("warning", 36)
+
+    class OversleepingDeadlineClock(_RecoveryClock):
+        def sleep(self, seconds):
+            super().sleep(seconds)
+            if self.now == 300.0:
+                self.now += 0.001
+
+    clock = OversleepingDeadlineClock()
+    collection_starts = []
+
+    monkeypatch.setattr(
+        benchmark_runner.subprocess,
+        "run",
+        lambda command, *, cwd, check: atomic_write_json(
+            journal.measurement_path(slot, 0), measurement, create_only=True
+        ),
+    )
+
+    def collect_post_exit_environment(**kwargs):
+        collection_starts.append(clock())
+        return clock(), immediate
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "collect_post_exit_environment",
+        collect_post_exit_environment,
+    )
+
+    def launch(current_slot, attempt):
+        assert current_slot == slot
+        return benchmark_runner._launch_trial(
+            **_launch_trial_arguments(tmp_path),
+            evidence_session_identity=journal.session["identity"],
+            journal_attempt_index=attempt.journal_attempt_index,
+            measurement_output=journal.measurement_path(slot, 0),
+            post_exit_output=journal.post_exit_path(slot, 0),
+            recovery_samples_directory=journal.recovery_samples_path(slot, 0),
+            recovery_output=journal.recovery_path(slot, 0),
+            output=attempt.path,
+            clock=clock,
+            sleep=clock.sleep,
+        )
+
+    with pytest.raises(
+        benchmark_runner.MemoryPressureTrialRejected,
+        match="persistent-post-exit-memory-pressure",
+    ):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=launch,
+            preflight=lambda: _preflight_from_trial(_valid_raw_trial(workload)),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=lambda *args: pytest.fail("memory rejection entered recovery"),
+            validate_trial=_baseline_validator(workload),
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            progress=lambda message: None,
+            clock=clock,
+        )
+
+    recovery = read_json_object(journal.recovery_path(slot, 0), label="recovery")
+    rejected = read_json_object(journal.rejected_path(slot, 0), label="rejection")
+    assert recovery["outcome"] == "timeout"
+    assert recovery["duration_seconds"] == 300.0
+    assert recovery["terminal_environment_status"] == immediate["environment_status"]
+    assert collection_starts == [float(value) for value in range(0, 300, 5)]
+    assert rejected["reason"] == "persistent-post-exit-memory-pressure"
+    assert rejected["trial"]["post_exit_recovery"] == recovery
 
 
 def test_parent_finalizes_immediate_hardware_drift_without_recovery_samples(
@@ -6270,6 +6693,7 @@ def _journal_trial_evidence(journal, attempt, trial=None):
         outcome=raw_recovery["outcome"],
         duration_seconds=raw_recovery["duration_seconds"],
         failure_fields=raw_recovery["failure_fields"],
+        completion_source=raw_recovery["completion_source"],
     )
     return (
         measurement,
@@ -7683,13 +8107,14 @@ def test_post_exit_recovery_requires_thirty_continuous_normal_seconds():
         _valid_observation(f"2026-08-09T00:00:{second:02d}+00:00")
         for second in (5, 10, 15, 20, 25, 30, 35)
     ]
+    iter_observations = iter(observations)
     persisted = []
 
     result = wait_for_post_exit_memory_recovery(
         immediate_observation=immediate,
         immediate_started_at=0.0,
         recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-        collect=iter(observations).__next__,
+        collect=lambda: (clock(), next(iter_observations)),
         classify_nonmemory=lambda observation: (),
         record_sample=lambda index, elapsed, observation, previous: (
             persisted.append(
@@ -7722,13 +8147,14 @@ def _run_scripted_memory_recovery(*, pressures, failure_fields=()):
         )
         observation["environment_status"]["memory_pressure"] = pressure
         scripted.append(observation)
+    iter_scripted = iter(scripted)
     persisted = []
 
     result = wait_for_post_exit_memory_recovery(
         immediate_observation=immediate,
         immediate_started_at=0.0,
         recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-        collect=iter(scripted).__next__,
+        collect=lambda: (clock(), next(iter_scripted)),
         classify_nonmemory=lambda observation: (
             () if observation is immediate else tuple(failure_fields)
         ),
@@ -7771,6 +8197,42 @@ def test_post_exit_recovery_records_the_deadline_sample_without_extending_deadli
     assert persisted[-1]["elapsed_seconds"] == 300.0
 
 
+def test_post_exit_recovery_first_wake_overshoot_finalizes_zero_sample_timeout():
+    clock = _RecoveryClock()
+    immediate = _valid_observation("2026-08-09T00:00:00+00:00")
+    immediate["environment_status"]["memory_pressure"] = "warning"
+
+    def oversleep(_seconds):
+        clock.now = 300.001
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=immediate,
+        immediate_started_at=0.0,
+        recovery_policy=_valid_recovery_policy(build_canonical_workload()),
+        collect=lambda: pytest.fail("deadline overshoot must not collect"),
+        classify_nonmemory=lambda observation: (),
+        record_sample=lambda *args: pytest.fail("deadline overshoot must not persist"),
+        clock=clock,
+        sleep=oversleep,
+    )
+    measurement = _valid_child_measurement(build_canonical_workload())
+    post_exit = build_post_exit_observation(measurement=measurement, **immediate)
+    recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=result.samples,
+        policy=post_exit_recovery_policy(build_canonical_workload()),
+        outcome=result.outcome,
+        duration_seconds=result.duration_seconds,
+        completion_source="live",
+    )
+    trial = finalize_raw_trial(measurement, post_exit, result.samples, recovery)
+
+    assert result == PostExitMemoryRecoveryResult("timeout", 300.0, (), ())
+    assert recovery["terminal_sample_identity"] is None
+    validate_raw_trial_evidence(trial)
+
+
 @pytest.mark.parametrize(
     ("terminal_pressure", "failure_fields", "expected"),
     (
@@ -7803,14 +8265,14 @@ def test_post_exit_recovery_persists_before_classifying_a_sample():
     def classify_nonmemory(candidate):
         if candidate is immediate:
             return ()
-        assert persisted == [candidate]
+        assert persisted == [observation]
         return ("power_connected",)
 
     result = wait_for_post_exit_memory_recovery(
         immediate_observation=immediate,
         immediate_started_at=clock(),
         recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-        collect=lambda: observation,
+        collect=lambda: (clock(), observation),
         classify_nonmemory=classify_nonmemory,
         record_sample=lambda index, elapsed, candidate, previous: (
             persisted.append(candidate) or {"identity": "sample-0"}
@@ -7831,11 +8293,12 @@ def test_post_exit_recovery_does_not_overlap_a_slow_collector():
     collection_starts = []
 
     def collect():
-        collection_starts.append(clock())
+        sample_started_at = clock()
+        collection_starts.append(sample_started_at)
         clock.now += 7.0
         observation = _valid_observation("2026-08-09T00:00:05+00:00")
         observation["environment_status"]["memory_pressure"] = next(pressures)
-        return observation
+        return sample_started_at, observation
 
     result = wait_for_post_exit_memory_recovery(
         immediate_observation=immediate,
@@ -7853,6 +8316,37 @@ def test_post_exit_recovery_does_not_overlap_a_slow_collector():
     assert result.outcome == "critical"
     assert collection_starts == [5.0, 12.0]
     assert clock.sleeps == [5.0, 0.0]
+
+
+def test_post_exit_recovery_uses_memory_probe_start_as_sample_time():
+    clock = _RecoveryClock()
+    immediate = _valid_observation("2026-08-09T00:00:00+00:00")
+    immediate["environment_status"]["memory_pressure"] = "warning"
+    pressures = iter(("normal", "critical"))
+    persisted_elapsed = []
+
+    def collect():
+        clock.now += 1.0
+        observation = _valid_observation("2026-08-09T00:00:05+00:00")
+        observation["environment_status"]["memory_pressure"] = next(pressures)
+        return clock(), observation
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=immediate,
+        immediate_started_at=0.0,
+        recovery_policy=_valid_recovery_policy(build_canonical_workload()),
+        collect=collect,
+        classify_nonmemory=lambda observation: (),
+        record_sample=lambda index, elapsed, observation, previous: (
+            persisted_elapsed.append(elapsed) or {"identity": f"sample-{index}"}
+        ),
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.outcome == "critical"
+    assert persisted_elapsed == [6.0, 12.0]
+    assert clock.sleeps == [5.0, 5.0]
 
 
 @pytest.mark.parametrize(
