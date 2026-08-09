@@ -1,0 +1,758 @@
+{
+  "canonical_workload": {
+    "compilation": {
+      "compilation_passes": 1,
+      "fresh_processes": true,
+      "measured_units": 20,
+      "state_reset_policy": "fresh-native-workload-per-process",
+      "warmup_units": 5
+    },
+    "generation": {
+      "decode_chunk_size": 8,
+      "no_repeat_ngram_size": 0,
+      "prompt_tokens": 128,
+      "repetition_penalty": 1.0,
+      "request_count": 32,
+      "request_order": "fixed-canonical-order-v1",
+      "seed": 42,
+      "temperature": 0.0,
+      "top_p": 1.0
+    },
+    "loader": {
+      "canonical_dtype": "int32",
+      "legacy_dtype": "uint16",
+      "microbatch_size": 1,
+      "replacement_dtype": "int32",
+      "row_count": 968,
+      "row_order": "fixed-canonical-order-v1",
+      "sequence_length": 1024,
+      "swag": {
+        "batch_size": 1,
+        "cache_format": "npz-int32-v1",
+        "dataset_config": "regular",
+        "dataset_name": "allenai/swag",
+        "dataset_revision": "benchmark-fixed-examples-v1",
+        "dataset_split": "train",
+        "example_count": 128,
+        "sequence_length": 256,
+        "shuffle_examples": false
+      }
+    },
+    "model": {
+      "bos_token_id": 1,
+      "eos_token_id": 2,
+      "hidden_dropout": 0.01,
+      "hidden_size": 768,
+      "initializer_range": 0.02,
+      "intermediate_size": 2176,
+      "num_kv_heads": 3,
+      "num_layers": 12,
+      "num_q_heads": 12,
+      "original_max_position_embeddings": 1024,
+      "pad_token_id": 0,
+      "parameter_initializer_range": {
+        "down_proj": 0.004082482904638631,
+        "embed_tokens": 0.02,
+        "gate_proj": 0.02,
+        "k_proj": 0.02,
+        "lm_head": 0.02,
+        "o_proj": 0.004082482904638631,
+        "other": 0.02,
+        "q_proj": 0.02,
+        "up_proj": 0.02,
+        "v_proj": 0.02
+      },
+      "rms_norm_eps": 1e-06,
+      "rope_scaling_factor": 1.0,
+      "rope_theta": 10000.0,
+      "tie_word_embeddings": true,
+      "unk_token_id": 3,
+      "use_cache": true,
+      "vocab_size": 28672,
+      "yarn_attention_factor": null,
+      "yarn_beta_fast": 32.0,
+      "yarn_beta_slow": 1.0,
+      "yarn_mscale": null,
+      "yarn_mscale_all_dim": null,
+      "yarn_truncate": true
+    },
+    "native_representation_identities": {
+      "legacy-inference-request-schema": "sha256:858a2d0c87d88192ec45c4a337f0901c3e7bbd23b85ce2a85aafb600285ad734",
+      "legacy-prepared-data-schema": "sha256:13a661a5b02122470d62cc29396e778c7066f88901a294b0907bcd48ffc205cc",
+      "legacy-swag-cache-schema": "sha256:1f92e628271178f52a0e3cb8d48768608393dc04ac64b049b0548420a7bfbf23",
+      "replacement-inference-request-schema": "sha256:c165b8ae3ecdeaba50003028552e56fbdef451715de01ee456e0462d44b7c521",
+      "replacement-prepared-data-schema": "sha256:8b6ebfc899ddad9c4992787d1166c485170f1bc5807f8dac09de71b841727d9d",
+      "replacement-swag-cache-schema": "sha256:35b6f564b38568786a5cfcedcf5a8ecdd03c44c4a488c3fac443be79bda839a1"
+    },
+    "optimizer": {
+      "betas": [
+        0.9,
+        0.999
+      ],
+      "bias_correction": false,
+      "epsilon": 1e-08,
+      "gradient_accumulation_steps": 8,
+      "learning_rate": 0.0003,
+      "max_grad_norm": 1.0,
+      "minimum_learning_rate_ratio": 0.1,
+      "name": "adamw",
+      "optimizer_weight_decay": 0.0,
+      "parameter_weight_decay": {
+        "down_proj": 0.1,
+        "embed_tokens": 0.0,
+        "gate_proj": 0.1,
+        "k_proj": 0.1,
+        "lm_head": 0.0,
+        "o_proj": 0.1,
+        "other": 0.1,
+        "q_proj": 0.1,
+        "rms_norm": 0.0,
+        "up_proj": 0.1,
+        "v_proj": 0.1
+      },
+      "seed": 42,
+      "swag": {
+        "betas": [
+          0.9,
+          0.999
+        ],
+        "bias_correction": false,
+        "epsilon": 1e-08,
+        "gradient_accumulation_steps": 8,
+        "learning_rate": 0.0001,
+        "lora": {
+          "alpha": 32.0,
+          "dropout": 0.05,
+          "rank": 16,
+          "scaling_mode": "rslora",
+          "target_modules": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj"
+          ]
+        },
+        "max_grad_norm": 1.0,
+        "minimum_learning_rate_ratio": 0.1,
+        "optimizer_weight_decay": 0.0,
+        "parameter_weight_decay": {
+          "down_proj": 0.1,
+          "embed_tokens": 0.0,
+          "gate_proj": 0.1,
+          "k_proj": 0.1,
+          "lm_head": 0.0,
+          "lora_a": 0.0,
+          "lora_b": 0.0,
+          "o_proj": 0.1,
+          "other": 0.1,
+          "q_proj": 0.1,
+          "rms_norm": 0.0,
+          "up_proj": 0.1,
+          "v_proj": 0.1
+        },
+        "seed": 42,
+        "total_steps": 8192,
+        "warmup_steps": 81
+      },
+      "total_steps": 268000,
+      "warmup_steps": 2680
+    },
+    "precision": {
+      "compute_dtype": "bfloat16",
+      "legacy_moment_dtype": "bfloat16",
+      "legacy_parameter_dtype": "bfloat16",
+      "replacement_master_parameter_dtype": "float32",
+      "replacement_moment_dtype": "float32",
+      "replacement_working_parameter_dtype": "bfloat16"
+    },
+    "required_environment": {
+      "chip": "Apple M5",
+      "competing_gpu_workload": false,
+      "cpu_cores": 10,
+      "gpu_cores": 10,
+      "low_power_mode": false,
+      "measurement_end_memory_pressure_allowed": [
+        "normal",
+        "warning"
+      ],
+      "memory_pressure": "normal",
+      "post_exit_memory_pressure": "normal",
+      "post_exit_memory_pressure_allowed": [
+        "normal",
+        "warning"
+      ],
+      "post_exit_recovery_evidence_required": true,
+      "post_exit_recovery_required_for_warning": true,
+      "post_exit_recovery_sample_interval_seconds": 5.0,
+      "post_exit_recovery_stability_seconds": 30.0,
+      "post_exit_recovery_timeout_seconds": 300.0,
+      "power_connected": true,
+      "power_mode": "automatic",
+      "thermal_state": "nominal",
+      "unified_memory_bytes": 25769803776
+    },
+    "schema_version": 1,
+    "semantic_identities": {
+      "benchmark_tokenizer": "sha256:f273e830fccdd034964484bf3e557dcaedc6f995f6a495ce443dae680f83ca74",
+      "canonical_inference_requests": "sha256:5cae495b333f5228c630e8aa071ffd526f5b6d5d793ea9378d6331d01e93c5bd",
+      "canonical_swag_examples": "sha256:08172e8618bb639670bce8599a456d5419cfe66ae05b809bb14c3800a3e517e4",
+      "canonical_training_rows": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+      "initial_bf16_parameters": "sha256:d1561b27480fe8dd6531e810159bf3c1acb614373bccfe4e0c512afede1e6327",
+      "source_corpus_sample": "sha256:ca7bd6cd86486a9ca31893dc64c88d2b5db7e901718291f0547badddf12cfd14"
+    },
+    "software_requirements": {
+      "mlx": ">=0.32.0,<1.0.0",
+      "numpy": ">=2.4.6,<3.0.0",
+      "python": "3.12.13",
+      "sentencepiece": ">=0.2.1,<1.0.0"
+    },
+    "synchronization_boundaries": [
+      "mlx.core.synchronize immediately before every timed region",
+      "mlx.core.synchronize immediately after every timed region"
+    ],
+    "work_units": [
+      {
+        "direction": "higher-is-better",
+        "end_boundary": "after the batch transfer is synchronized",
+        "measured_units": 20,
+        "metric": "prepared-data",
+        "numerator": "batches",
+        "start_boundary": "before requesting the next native prepared-data batch",
+        "work_unit": "one on-device microbatch"
+      },
+      {
+        "direction": "higher-is-better",
+        "end_boundary": "after the optimizer update is synchronized",
+        "measured_units": 20,
+        "metric": "pretraining-compute",
+        "numerator": "tokens",
+        "start_boundary": "before the first compiled microstep",
+        "work_unit": "one optimizer step"
+      },
+      {
+        "direction": "higher-is-better",
+        "end_boundary": "after the optimizer update is synchronized",
+        "measured_units": 20,
+        "metric": "pretraining-end-to-end",
+        "numerator": "tokens",
+        "start_boundary": "before requesting the first microbatch",
+        "work_unit": "one accumulation window and optimizer update"
+      },
+      {
+        "direction": "higher-is-better",
+        "end_boundary": "after the adapter update is synchronized",
+        "measured_units": 20,
+        "metric": "swag-end-to-end",
+        "numerator": "examples",
+        "start_boundary": "before requesting the encoded batch",
+        "work_unit": "one fixed-shape SWAG batch"
+      },
+      {
+        "direction": "higher-is-better",
+        "end_boundary": "after prefill logits and cache state are synchronized",
+        "measured_units": 32,
+        "metric": "inference-prefill",
+        "numerator": "tokens",
+        "start_boundary": "before the prefill call",
+        "work_unit": "one fixed request batch prefill"
+      },
+      {
+        "direction": "higher-is-better",
+        "end_boundary": "after decoded tokens and cache state are synchronized",
+        "measured_units": 32,
+        "metric": "inference-decode",
+        "numerator": "tokens",
+        "start_boundary": "before the decode chunk call",
+        "work_unit": "one fixed decode chunk"
+      },
+      {
+        "direction": "lower-is-better",
+        "end_boundary": "after directory fsync and obsolete-step pruning",
+        "measured_units": 20,
+        "metric": "checkpoint-pause",
+        "numerator": "seconds",
+        "start_boundary": "before checkpoint serialization",
+        "work_unit": "one durable checkpoint replacement"
+      },
+      {
+        "direction": "lower-is-better",
+        "end_boundary": "after its outputs are synchronized",
+        "measured_units": 1,
+        "metric": "compile-cold-start",
+        "numerator": "seconds",
+        "start_boundary": "before the first compiled invocation in a fresh process",
+        "work_unit": "one cold compiled-kernel invocation"
+      },
+      {
+        "direction": "lower-is-better",
+        "end_boundary": "after the optimizer update is synchronized",
+        "measured_units": 1,
+        "metric": "peak-metal-memory",
+        "numerator": "bytes",
+        "start_boundary": "after resetting the Metal peak-memory counter",
+        "work_unit": "one end-to-end pretraining optimizer step"
+      }
+    ]
+  },
+  "canonical_workload_identity": "sha256:fa4d745307ac32ca9616c7055b9299c556c23dec54b94c2f626a17cbca44e392",
+  "command": "uv run python -m v2.benchmarks.runner record-baseline --source-commit 3687f8b3214a44c675ae67af52e4997762f6c634 --manifest /private/tmp/sml-v2-baseline-recovery-v3.json --raw-output /private/tmp/sml-v2-baseline-recovery-v3.jsonl --state-directory SESSION_STATE_DIRECTORY --metrics prepared-data,pretraining-compute,pretraining-end-to-end,swag-end-to-end,inference-prefill,inference-decode,checkpoint-pause,compile-cold-start,peak-metal-memory --pairs 5 --warmup 5 --measure 20",
+  "environment_status": {
+    "competing_gpu_workload": false,
+    "end": {
+      "competing_gpu_workload": false,
+      "low_power_mode": false,
+      "memory_free_percentage": 54,
+      "memory_pressure": "normal",
+      "power_connected": true,
+      "power_mode": "automatic",
+      "thermal_state": "nominal",
+      "thermal_state_raw_value": 0
+    },
+    "low_power_mode": false,
+    "measurement_memory_pressure": "normal",
+    "measurement_min_free_percentage": 54,
+    "memory_free_percentage": 54,
+    "memory_pressure": "normal",
+    "post_exit": {
+      "competing_gpu_workload": false,
+      "low_power_mode": false,
+      "memory_free_percentage": 54,
+      "memory_pressure": "normal",
+      "power_connected": true,
+      "power_mode": "automatic",
+      "thermal_state": "nominal",
+      "thermal_state_raw_value": 0
+    },
+    "post_exit_recovery_final": {
+      "competing_gpu_workload": false,
+      "low_power_mode": false,
+      "memory_free_percentage": 54,
+      "memory_pressure": "normal",
+      "power_connected": true,
+      "power_mode": "automatic",
+      "thermal_state": "nominal",
+      "thermal_state_raw_value": 0
+    },
+    "post_exit_recovery_outcome": "not-required",
+    "power_connected": true,
+    "power_mode": "automatic",
+    "start": {
+      "competing_gpu_workload": false,
+      "low_power_mode": false,
+      "memory_free_percentage": 54,
+      "memory_pressure": "normal",
+      "power_connected": true,
+      "power_mode": "automatic",
+      "thermal_state": "nominal",
+      "thermal_state_raw_value": 0
+    },
+    "thermal_state": "nominal",
+    "thermal_state_raw_value": 0
+  },
+  "hardware": {
+    "chip": "Apple M5",
+    "cpu_cores": 10,
+    "gpu_cores": 10,
+    "machine_model": "Mac17,3",
+    "macos_build": "25F84",
+    "unified_memory_bytes": 25769803776
+  },
+  "harness": {
+    "clean": true,
+    "commit": "7cbf8aa9a4d1d93087e9cff74beabd1f16de39dc",
+    "content_identity": "sha256:b56d972847b3100c993e90d39e2189febb73045617e01a63f24cc27ddf3106d9"
+  },
+  "identity": "sha256:e60c7d93f7aec005a640cbffde3e3fc71960e12916cf38fc8ecbba5af47ebf9a",
+  "kind": "sml-performance-baseline",
+  "metrics": {
+    "checkpoint-pause": {
+      "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+      "direction": "lower-is-better",
+      "execution_order_identity": "sha256:72d2490bd4e46663d9063e8c37f027e06113d9a05675a47178acfeb022d6d949",
+      "initial_parameter_identity": "sha256:9223c7036876b6e791a5e17dbb25613f4a285e8e6f89bb278f45d7bbfd318784",
+      "native_configuration": {
+        "canonical_execution_order_identity": "sha256:72d2490bd4e46663d9063e8c37f027e06113d9a05675a47178acfeb022d6d949",
+        "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "canonical_projection_identity": "sha256:0226b0c963f34cb45bffa1f93086c4a7e8c3438250f7e5eb7bb47d553f00f69b",
+        "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "gradient_accumulation_steps": 8,
+        "master_parameters": false,
+        "metric": "checkpoint-pause",
+        "microbatch_size": 1,
+        "moment_dtype": "bfloat16",
+        "native_input_format": "prepared-data-npz-uint16",
+        "parameter_dtype": "bfloat16",
+        "parameter_precision_policy": "legacy BF16 persistent parameters and BF16 Adam moments without authoritative master parameters",
+        "rope_scaling_factor": 1.0,
+        "sequence_length": 1024
+      },
+      "native_representation_identity": "sha256:2102b1c9d7b4606635e00467c7f573f27b2e4697c4d5760c7e9f8d6247fd47ee",
+      "raw_trial_identities": [
+        "sha256:3fec1aa94ed335683e248397e701a269f4da43da5d9e5244f0c2b1bea7236869",
+        "sha256:5cd137f76e47325e5fcfd6b62a5196fea3ff09f9235372451a58b40ff1c444f7",
+        "sha256:e3d2fb6dd051d333b70730cc205ff3a8ce4aa81ce2c22280d538e482791488a2",
+        "sha256:c6404aac8e8c53896ed5f02e5ceff9926b5c40aa599f8a0427cd5a2d0f242e8f",
+        "sha256:4b6bda740303824a6b120f456a8adabaae72a701a1035b2f43ceaaff22c40697"
+      ],
+      "raw_values": [
+        0.18031122499960475,
+        0.16717112915066537,
+        0.35387359999876933,
+        0.7409549332980532,
+        1.2250765791977756
+      ],
+      "work_unit": "one durable checkpoint replacement"
+    },
+    "compile-cold-start": {
+      "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+      "direction": "lower-is-better",
+      "execution_order_identity": "sha256:32deb47dfaabbcbdc073a85494b0ae3e6d3b2161f6d747b73a74b5e05343201e",
+      "initial_parameter_identity": "sha256:9223c7036876b6e791a5e17dbb25613f4a285e8e6f89bb278f45d7bbfd318784",
+      "native_configuration": {
+        "canonical_execution_order_identity": "sha256:32deb47dfaabbcbdc073a85494b0ae3e6d3b2161f6d747b73a74b5e05343201e",
+        "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "canonical_projection_identity": "sha256:9e04e03897f873e03048dbdce515489f4379b8ee953246a992c49d770b707f65",
+        "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "gradient_accumulation_steps": 8,
+        "master_parameters": false,
+        "metric": "compile-cold-start",
+        "microbatch_size": 1,
+        "moment_dtype": "bfloat16",
+        "native_input_format": "prepared-data-npz-uint16",
+        "parameter_dtype": "bfloat16",
+        "parameter_precision_policy": "legacy BF16 persistent parameters and BF16 Adam moments without authoritative master parameters",
+        "rope_scaling_factor": 1.0,
+        "sequence_length": 1024
+      },
+      "native_representation_identity": "sha256:2102b1c9d7b4606635e00467c7f573f27b2e4697c4d5760c7e9f8d6247fd47ee",
+      "raw_trial_identities": [
+        "sha256:63e48aa01b0e9d66f69fd7698239ab61415fc61ee3a06fb07091c81900d757ed",
+        "sha256:708622a8f8ad918e36e03898bfd4f90b4524cf9ee585165b41a207e61464cb52",
+        "sha256:ad942a6091f2e9d8e18a512262ad83f14523fd5bf7fac80d2aa401a739fe81a5",
+        "sha256:b214a6b813ce7234d779a8adbfae6bcca4a125657d470f25de08aad43ae7efb7",
+        "sha256:cc3577c2c08d467d4b53d1e63cad9fcc77695d07b426c97089bd31a7c34e25b3"
+      ],
+      "raw_values": [
+        1.448623874981422,
+        1.3362576250219718,
+        1.3785122080007568,
+        1.4127040000166744,
+        1.3954398750211112
+      ],
+      "work_unit": "one cold compiled-kernel invocation"
+    },
+    "inference-decode": {
+      "canonical_input_identity": "sha256:5cae495b333f5228c630e8aa071ffd526f5b6d5d793ea9378d6331d01e93c5bd",
+      "direction": "higher-is-better",
+      "execution_order_identity": "sha256:aee54a6b28175bb4523dfcfd96445639189c9e12af35e137560586e446462bbc",
+      "initial_parameter_identity": "sha256:9223c7036876b6e791a5e17dbb25613f4a285e8e6f89bb278f45d7bbfd318784",
+      "native_configuration": {
+        "canonical_execution_order_identity": "sha256:aee54a6b28175bb4523dfcfd96445639189c9e12af35e137560586e446462bbc",
+        "canonical_input_identity": "sha256:5cae495b333f5228c630e8aa071ffd526f5b6d5d793ea9378d6331d01e93c5bd",
+        "canonical_projection_identity": "sha256:e610d3cd0e9d48bbf0b777530ae735b4d31bfc831d97f94c68c0faf3040dea1b",
+        "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "gradient_accumulation_steps": 8,
+        "master_parameters": false,
+        "metric": "inference-decode",
+        "microbatch_size": 1,
+        "moment_dtype": "bfloat16",
+        "native_input_format": "inference-request-npz-int32",
+        "parameter_dtype": "bfloat16",
+        "parameter_precision_policy": "legacy BF16 persistent parameters and BF16 Adam moments without authoritative master parameters",
+        "rope_scaling_factor": 1.0,
+        "sequence_length": 1024
+      },
+      "native_representation_identity": "sha256:8f2ed3ab2c29e5f3bd8256382fef45c5c6884f087802bb05d4d70ece181f4f72",
+      "raw_trial_identities": [
+        "sha256:1979f2cbbeb1a702b4e4c711a57c02eeba5793e3291081f2e14c620f81b5d01a",
+        "sha256:90841617c8b9406f316185357b1fb91f2011ff995dae71e8fc44d1b1d8511e7f",
+        "sha256:89645e754ee2f32331b7bf8b96d874d14f872fa252a615ee1d850fba212fdc16",
+        "sha256:e077613d95a0e37f4e03c0a9a408930b152e86e2567cfac358c52ba048296da1",
+        "sha256:6df179107e0741ce0672825950389150af1279fb14739ac400669245be850f42"
+      ],
+      "raw_values": [
+        417.2052056758534,
+        412.27492218758255,
+        410.2910673622551,
+        405.90657489557793,
+        406.1547246585747
+      ],
+      "work_unit": "one fixed decode chunk"
+    },
+    "inference-prefill": {
+      "canonical_input_identity": "sha256:5cae495b333f5228c630e8aa071ffd526f5b6d5d793ea9378d6331d01e93c5bd",
+      "direction": "higher-is-better",
+      "execution_order_identity": "sha256:c9d2364b3497f49408f3ef09fa1acfeb2c3ec49c16e6d4898bde97325cccb015",
+      "initial_parameter_identity": "sha256:9223c7036876b6e791a5e17dbb25613f4a285e8e6f89bb278f45d7bbfd318784",
+      "native_configuration": {
+        "canonical_execution_order_identity": "sha256:c9d2364b3497f49408f3ef09fa1acfeb2c3ec49c16e6d4898bde97325cccb015",
+        "canonical_input_identity": "sha256:5cae495b333f5228c630e8aa071ffd526f5b6d5d793ea9378d6331d01e93c5bd",
+        "canonical_projection_identity": "sha256:1b5ebf23dadbd5b7360924fc912ff38d96fa2ba0a026b84a8aa3353b69dfac33",
+        "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "gradient_accumulation_steps": 8,
+        "master_parameters": false,
+        "metric": "inference-prefill",
+        "microbatch_size": 1,
+        "moment_dtype": "bfloat16",
+        "native_input_format": "inference-request-npz-int32",
+        "parameter_dtype": "bfloat16",
+        "parameter_precision_policy": "legacy BF16 persistent parameters and BF16 Adam moments without authoritative master parameters",
+        "rope_scaling_factor": 1.0,
+        "sequence_length": 1024
+      },
+      "native_representation_identity": "sha256:8f2ed3ab2c29e5f3bd8256382fef45c5c6884f087802bb05d4d70ece181f4f72",
+      "raw_trial_identities": [
+        "sha256:b0d2ebd567019ff5540dff99383212db346cfdcec2a2af33d02037ab8ea6e396",
+        "sha256:f19d9bc0153732a9e0723f90700c9c4cec8d3a6bd1b4484288839d3c46677d2e",
+        "sha256:f7a65abb4ab26b3b2d10330cf0c185d3d2413e821367538dd40ae5f5328ee950",
+        "sha256:4a5989300ae76593346c74d23f16708c6f7347cb62b49207f25aa473bc73e18f",
+        "sha256:6ca1d9785983bb7f4aaba871ed3dd0e6941fd8be47e560ea95cb3e9e159a84c6"
+      ],
+      "raw_values": [
+        27229.689782610112,
+        25698.148128840658,
+        26766.69323913397,
+        27332.435140288308,
+        27450.254369477483
+      ],
+      "work_unit": "one fixed request batch prefill"
+    },
+    "peak-metal-memory": {
+      "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+      "direction": "lower-is-better",
+      "execution_order_identity": "sha256:a1002ef3ad20ef172cf60705312e76b192fb398b517286eb98150138d707c662",
+      "initial_parameter_identity": "sha256:9223c7036876b6e791a5e17dbb25613f4a285e8e6f89bb278f45d7bbfd318784",
+      "native_configuration": {
+        "canonical_execution_order_identity": "sha256:a1002ef3ad20ef172cf60705312e76b192fb398b517286eb98150138d707c662",
+        "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "canonical_projection_identity": "sha256:8cdba1a78c6e7291351ee0641a1934cc16741b8469111c787810a641df1ea51f",
+        "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "gradient_accumulation_steps": 8,
+        "master_parameters": false,
+        "metric": "peak-metal-memory",
+        "microbatch_size": 1,
+        "moment_dtype": "bfloat16",
+        "native_input_format": "prepared-data-npz-uint16",
+        "parameter_dtype": "bfloat16",
+        "parameter_precision_policy": "legacy BF16 persistent parameters and BF16 Adam moments without authoritative master parameters",
+        "rope_scaling_factor": 1.0,
+        "sequence_length": 1024
+      },
+      "native_representation_identity": "sha256:2102b1c9d7b4606635e00467c7f573f27b2e4697c4d5760c7e9f8d6247fd47ee",
+      "raw_trial_identities": [
+        "sha256:58368615947a5ceb664591ca8810d72274e8e04ca0e0f86c415366ee907306fc",
+        "sha256:303421072b188414ce0f2eb193ec8084e55a8b5da9b7f215aa0b00d39a86e106",
+        "sha256:9572aa94872994130ab1deaa3896a5227a512f2f07d90d99c8e5dd1a1b0d59d8",
+        "sha256:eef96133b0c749a8292a452fe319bb4144561be7f9ca52df6bd71a29517eae2f",
+        "sha256:679bc6bfc0ce3981c6e050009c771f20acde0b7a6177a36aa99e00fa69d74fed"
+      ],
+      "raw_values": [
+        7387912604.0,
+        7387912604.0,
+        7387912604.0,
+        7387912604.0,
+        7387912604.0
+      ],
+      "work_unit": "one end-to-end pretraining optimizer step"
+    },
+    "prepared-data": {
+      "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+      "direction": "higher-is-better",
+      "execution_order_identity": "sha256:93bf95aa9ab7d466e2e4bda66e649a7d29f787b498d4d8989f58d677aca79fe3",
+      "initial_parameter_identity": "sha256:d1561b27480fe8dd6531e810159bf3c1acb614373bccfe4e0c512afede1e6327",
+      "native_configuration": {
+        "canonical_execution_order_identity": "sha256:93bf95aa9ab7d466e2e4bda66e649a7d29f787b498d4d8989f58d677aca79fe3",
+        "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "canonical_projection_identity": "sha256:d097e1f959b7eed0e665f6dee6e3bf36b03174604c4674c79f90688e87d9c072",
+        "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "gradient_accumulation_steps": 8,
+        "master_parameters": false,
+        "metric": "prepared-data",
+        "microbatch_size": 1,
+        "moment_dtype": "bfloat16",
+        "native_input_format": "prepared-data-npz-uint16",
+        "parameter_dtype": "bfloat16",
+        "parameter_precision_policy": "legacy BF16 persistent parameters and BF16 Adam moments without authoritative master parameters",
+        "rope_scaling_factor": 1.0,
+        "sequence_length": 1024
+      },
+      "native_representation_identity": "sha256:2102b1c9d7b4606635e00467c7f573f27b2e4697c4d5760c7e9f8d6247fd47ee",
+      "raw_trial_identities": [
+        "sha256:c22d15eee095781ed538312ecf97f60aa8de6e8567b9ca7ab86da53eecd983c6",
+        "sha256:b2c804ef00a56cf2245d5016003a154a6a0171e00639197554caffc4de392bd2",
+        "sha256:94ac452da1634f0b5a595d265f7cbfdc22d5a153a9ff2e4aec1d37020e3ea846",
+        "sha256:d9b035ff2050ff83b80d8729915e1e16e8ce0d849b13eb61113fdbfe0ff5d739",
+        "sha256:92cb293e897a2075e0be8716b638faa5ff014a753f016e13470cc8bc45e6b481"
+      ],
+      "raw_values": [
+        13591.572958070154,
+        13695.506384043896,
+        13549.749656215863,
+        13756.738087609068,
+        13798.261047658216
+      ],
+      "work_unit": "one on-device microbatch"
+    },
+    "pretraining-compute": {
+      "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+      "direction": "higher-is-better",
+      "execution_order_identity": "sha256:dd7250f4f13ccf0415f59251445e66fd1c0a2c99339fb07df0460d7e1627497c",
+      "initial_parameter_identity": "sha256:9223c7036876b6e791a5e17dbb25613f4a285e8e6f89bb278f45d7bbfd318784",
+      "native_configuration": {
+        "canonical_execution_order_identity": "sha256:dd7250f4f13ccf0415f59251445e66fd1c0a2c99339fb07df0460d7e1627497c",
+        "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "canonical_projection_identity": "sha256:57320448dbe8b6e863fb0b7f86bf94f901e60495bbcffb3d748cf7ba09da3d67",
+        "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "gradient_accumulation_steps": 8,
+        "master_parameters": false,
+        "metric": "pretraining-compute",
+        "microbatch_size": 1,
+        "moment_dtype": "bfloat16",
+        "native_input_format": "prepared-data-npz-uint16",
+        "parameter_dtype": "bfloat16",
+        "parameter_precision_policy": "legacy BF16 persistent parameters and BF16 Adam moments without authoritative master parameters",
+        "rope_scaling_factor": 1.0,
+        "sequence_length": 1024
+      },
+      "native_representation_identity": "sha256:2102b1c9d7b4606635e00467c7f573f27b2e4697c4d5760c7e9f8d6247fd47ee",
+      "raw_trial_identities": [
+        "sha256:e8a72427f227405e0caf4c7ef9c9e99a648ed1073f6ebf476b3464c9ea91414a",
+        "sha256:757d4daf35824262b23041700a6f173927241b0242169d2cb84f5c12642f3189",
+        "sha256:42ceeaf78bb123ed2d3f385417ab6a87c9d9ca937320ff3a9cf067745f9f55d2",
+        "sha256:8e5eb3e8ca3acacb441ddcc6715ee7c27be58280ddc59fa6bd557f10d492f0ea",
+        "sha256:0dae2f508bb389936fe19ec2f67fe8b56443054f7a4ed58ad50a64cd65af8dd8"
+      ],
+      "raw_values": [
+        3671.9125825051515,
+        3670.3091079509213,
+        3661.5638208826376,
+        3679.308507706219,
+        3622.0684101413435
+      ],
+      "work_unit": "one optimizer step"
+    },
+    "pretraining-end-to-end": {
+      "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+      "direction": "higher-is-better",
+      "execution_order_identity": "sha256:c169db5b2fd9e0b1566f54a2347a515aca62ff14c0407d52bc27693e3511ae8e",
+      "initial_parameter_identity": "sha256:9223c7036876b6e791a5e17dbb25613f4a285e8e6f89bb278f45d7bbfd318784",
+      "native_configuration": {
+        "canonical_execution_order_identity": "sha256:c169db5b2fd9e0b1566f54a2347a515aca62ff14c0407d52bc27693e3511ae8e",
+        "canonical_input_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "canonical_projection_identity": "sha256:3926ae7f8ce65f2ce5235da7735d6f42bb90b7d57db569e9c00a1cfd157814f7",
+        "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "gradient_accumulation_steps": 8,
+        "master_parameters": false,
+        "metric": "pretraining-end-to-end",
+        "microbatch_size": 1,
+        "moment_dtype": "bfloat16",
+        "native_input_format": "prepared-data-npz-uint16",
+        "parameter_dtype": "bfloat16",
+        "parameter_precision_policy": "legacy BF16 persistent parameters and BF16 Adam moments without authoritative master parameters",
+        "rope_scaling_factor": 1.0,
+        "sequence_length": 1024
+      },
+      "native_representation_identity": "sha256:2102b1c9d7b4606635e00467c7f573f27b2e4697c4d5760c7e9f8d6247fd47ee",
+      "raw_trial_identities": [
+        "sha256:6d799ee19a8be4df73872a75e88c68a1b77810d9634cef46b237b92d4292c3a7",
+        "sha256:f8cbfca0d3d160532f4bf47c1fd652df8d2c4e81c80bd321df986a812643c6e4",
+        "sha256:fc90a4b129f21249f418362d4fd877e78fb5a4e27cdaec2913ec291cef50a3f4",
+        "sha256:3b1c30e7eb6317430a2a5033c9ba65a42861f580cfb60c80fc0883b63be32bbf",
+        "sha256:3b86a13cc4e2d8ffc9b280e9c67d635f8b95c9df8c6cc5092d0b3c08f78248cb"
+      ],
+      "raw_values": [
+        3572.3809166856095,
+        3700.1855616189864,
+        3735.219055087479,
+        3720.149790636943,
+        3691.1929656738853
+      ],
+      "work_unit": "one accumulation window and optimizer update"
+    },
+    "swag-end-to-end": {
+      "canonical_input_identity": "sha256:08172e8618bb639670bce8599a456d5419cfe66ae05b809bb14c3800a3e517e4",
+      "direction": "higher-is-better",
+      "execution_order_identity": "sha256:782383e4847297b65f565c6540d45e29ee06dd4eeba4d6bfe7340835be534b8a",
+      "initial_parameter_identity": "sha256:a5c7ee85b5065b153c81e0a41d16e5531f69ca306964b5462cbd8d113508e62a",
+      "native_configuration": {
+        "canonical_execution_order_identity": "sha256:782383e4847297b65f565c6540d45e29ee06dd4eeba4d6bfe7340835be534b8a",
+        "canonical_input_identity": "sha256:08172e8618bb639670bce8599a456d5419cfe66ae05b809bb14c3800a3e517e4",
+        "canonical_projection_identity": "sha256:80d686aee5c4e45fa45c34917e95263149804d4196a05576a8c3e9746226759f",
+        "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+        "gradient_accumulation_steps": 8,
+        "master_parameters": false,
+        "metric": "swag-end-to-end",
+        "microbatch_size": 1,
+        "moment_dtype": "bfloat16",
+        "native_input_format": "swag-npz-int32",
+        "parameter_dtype": "bfloat16",
+        "parameter_precision_policy": "legacy BF16 persistent parameters and BF16 Adam moments without authoritative master parameters",
+        "rope_scaling_factor": 1.0,
+        "sequence_length": 256
+      },
+      "native_representation_identity": "sha256:4d89e706e255eed54eee2fd07d5df2a219bfa772a105878b8f3a2a78ab054e7f",
+      "raw_trial_identities": [
+        "sha256:0ed0ac137181b13cf97148affdf38b96cba8ea87aac3c130da19b966f4ac3cac",
+        "sha256:b522bd4d0955b29a4ad3b6715c87c2bffdc3cef42e066af4f80d4f464d580c6d",
+        "sha256:6bad319ec81535469325afbdf8448c5268ff1bfec2928aca01a455ba23bb3ba1",
+        "sha256:85727b75a1dd1248681489b7db22b22e16d3fb11361c0c080f096aeeedb9df66",
+        "sha256:94a9278a9df586d770bf2cf894afd7a8ba6ce25351c226f0a43a36b77ddc2442"
+      ],
+      "raw_values": [
+        8.987178435027584,
+        9.180456906510154,
+        9.087784089046536,
+        9.505280168249971,
+        8.811304233630048
+      ],
+      "work_unit": "one fixed-shape SWAG batch"
+    }
+  },
+  "paired_pretraining_representations": {
+    "canonical_row_identity": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+    "legacy_byte_size": 1984666,
+    "legacy_dtype": "uint16",
+    "legacy_file_identity": "sha256:2102b1c9d7b4606635e00467c7f573f27b2e4697c4d5760c7e9f8d6247fd47ee",
+    "legacy_format": "npz",
+    "replacement_byte_size": 3968928,
+    "replacement_dtype": "int32",
+    "replacement_file_identity": "sha256:fa5e6f265e1a61abcd726aacd7fc39a4dfee4ffe396378da73a7f2799d2e0eaa",
+    "replacement_format": "npy",
+    "row_count": 968,
+    "row_width": 1025
+  },
+  "protocol": {
+    "bootstrap_resamples": 10000,
+    "bootstrap_seed": 1729,
+    "compilation_passes": 1,
+    "measured_units": 20,
+    "pairs": 5,
+    "synchronization_boundaries": [
+      "mlx.core.synchronize immediately before every timed region",
+      "mlx.core.synchronize immediately after every timed region"
+    ],
+    "warmup_units": 5
+  },
+  "semantic_identities": {
+    "benchmark_tokenizer": "sha256:f273e830fccdd034964484bf3e557dcaedc6f995f6a495ce443dae680f83ca74",
+    "canonical_inference_requests": "sha256:5cae495b333f5228c630e8aa071ffd526f5b6d5d793ea9378d6331d01e93c5bd",
+    "canonical_swag_examples": "sha256:08172e8618bb639670bce8599a456d5419cfe66ae05b809bb14c3800a3e517e4",
+    "canonical_training_rows": "sha256:55bfaa6cfdf599039adfa2f9e5ce11f6bb06f5a1b8f8ea85b0709255af861683",
+    "initial_bf16_parameters": "sha256:d1561b27480fe8dd6531e810159bf3c1acb614373bccfe4e0c512afede1e6327",
+    "source_corpus_sample": "sha256:ca7bd6cd86486a9ca31893dc64c88d2b5db7e901718291f0547badddf12cfd14"
+  },
+  "software_versions": {
+    "datasets": "5.0.1",
+    "lm_eval": "0.4.12",
+    "macos": "26.5.2",
+    "mlx": "0.32.0",
+    "numpy": "2.5.1",
+    "python": "3.12.13",
+    "sentencepiece": "0.2.2"
+  },
+  "source": {
+    "clean": true,
+    "commit": "3687f8b3214a44c675ae67af52e4997762f6c634"
+  },
+  "version": 1
+}
