@@ -931,23 +931,45 @@ def finalized_trial_rejection_reason(
     trial: RawTrial, required_environment: Mapping[str, object]
 ) -> str | None:
     status = trial.environment_status
-    if status["start"]["memory_pressure"] != required_environment["memory_pressure"]:
+    start = status["start"]
+    end = status["end"]
+    recovery = trial.post_exit_recovery
+    recovery_statuses = [
+        sample["environment_status"] for sample in trial.post_exit_recovery_samples
+    ]
+    if start["memory_pressure"] != required_environment["memory_pressure"]:
         return "non-normal-start-memory-pressure"
     if (
-        status["end"]["memory_pressure"]
+        end["memory_pressure"]
         not in required_environment["measurement_end_memory_pressure_allowed"]
     ):
         return "critical-measurement-memory-pressure"
-    if (
-        status["post_exit"]["memory_pressure"]
-        != required_environment["post_exit_memory_pressure"]
-    ):
+    if recovery["outcome"] == "critical":
+        return "critical-post-exit-memory-pressure"
+    if recovery["outcome"] == "timeout":
         return "persistent-post-exit-memory-pressure"
-    if any(
-        status[name]["thermal_state"] != required_environment["thermal_state"]
-        for name in ("start", "end", "post_exit")
+    if recovery["outcome"] == "interrupted":
+        return "interrupted-post-exit-recovery"
+    thermal_failed = any(
+        observation["thermal_state"] != required_environment["thermal_state"]
+        for observation in (
+            status["start"],
+            status["end"],
+            status["post_exit"],
+            *recovery_statuses,
+        )
+    )
+    recovery_failures = set(recovery["failure_fields"])
+    if recovery["outcome"] == "environment-failure" and (
+        recovery_failures - {"thermal_state"}
     ):
+        return "post-exit-recovery-environment-violation"
+    if thermal_failed:
         return "non-nominal-thermal"
+    if recovery["outcome"] == "environment-failure":
+        return "post-exit-recovery-environment-violation"
+    if recovery["outcome"] not in ("not-required", "recovered"):
+        raise ValueError("post-exit recovery outcome is invalid")
     return None
 
 

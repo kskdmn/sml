@@ -76,11 +76,18 @@ Side = Literal["reference", "candidate"]
 
 @dataclass(frozen=True, slots=True)
 class TrialEnvironmentDisposition:
-    outcome: Literal["accept", "thermal-reject", "memory-reject"]
+    outcome: Literal["accept", "thermal-reject", "memory-reject", "environment-reject"]
     reason: str | None
 
 
 class MemoryPressureTrialRejected(RuntimeError):
+    def __init__(self, slot: BaselineSlot, reason: str):
+        self.slot = slot
+        self.reason = reason
+        super().__init__(f"{slot.metric} pair {slot.pair_index}: {reason}")
+
+
+class EnvironmentTrialRejected(RuntimeError):
     def __init__(self, slot: BaselineSlot, reason: str):
         self.slot = slot
         self.reason = reason
@@ -537,12 +544,18 @@ def _validate_observation_power(
     required: dict,
     *,
     label: str,
+    allowed_failures: frozenset[str] = frozenset(),
 ) -> None:
     for key in ("power_connected", "low_power_mode", "competing_gpu_workload"):
         observed = status.get(key)
-        if type(observed) is not bool or observed is not required[key]:
+        if type(observed) is not bool or (
+            key not in allowed_failures and observed is not required[key]
+        ):
             raise ValueError(f"{label} does not match required {key}")
-    if status.get("power_mode") != required["power_mode"]:
+    if (
+        "power_mode" not in allowed_failures
+        and status.get("power_mode") != required["power_mode"]
+    ):
         raise ValueError(f"{label} does not match required power_mode")
 
 
@@ -563,7 +576,12 @@ def classify_trial_environment(
     reason = finalized_trial_rejection_reason(trial, workload.required_environment)
     if reason is None:
         return TrialEnvironmentDisposition("accept", None)
-    outcome = "thermal-reject" if reason == "non-nominal-thermal" else "memory-reject"
+    if reason == "non-nominal-thermal":
+        outcome = "thermal-reject"
+    elif reason == "post-exit-recovery-environment-violation":
+        outcome = "environment-reject"
+    else:
+        outcome = "memory-reject"
     return TrialEnvironmentDisposition(outcome, reason)
 
 
@@ -575,26 +593,85 @@ def _validate_acceptance_environment(
 ) -> None:
     validate_raw_trial_evidence(trial)
     required = workload.required_environment
+    disposition = classify_trial_environment(workload, trial)
+    valid_outcomes = {
+        "accept",
+        "thermal-reject",
+        "memory-reject",
+        "environment-reject",
+    }
+    if disposition.outcome not in valid_outcomes:
+        raise ValueError("raw environment has an unknown disposition")
+    recovery_failures = (
+        frozenset(trial.post_exit_recovery["failure_fields"])
+        if allow_rejected_environment
+        and trial.post_exit_recovery["outcome"] == "environment-failure"
+        else frozenset()
+    )
+    thermal_rejection = (
+        allow_rejected_environment and disposition.outcome == "thermal-reject"
+    )
     for key in ("chip", "cpu_cores", "gpu_cores", "unified_memory_bytes"):
         if trial.hardware.get(key) != required[key]:
             raise ValueError(f"raw hardware does not match required {key}")
     _validate_software_versions(workload, trial.software_versions)
-    for name in ("start", "end", "post_exit"):
-        status = trial.environment_status[name]
+    observations = (
+        ("start", trial.child_measurement["start"], frozenset()),
+        ("end", trial.child_measurement["end"], frozenset()),
+        ("post_exit", trial.post_exit_observation, recovery_failures),
+        *(
+            (f"recovery sample {index}", sample, recovery_failures)
+            for index, sample in enumerate(trial.post_exit_recovery_samples)
+        ),
+    )
+    statuses = []
+    for name, observation, allowed_failures in observations:
+        status = observation["environment_status"]
+        statuses.append(status)
         validate_thermal_observation(status)
+        if (
+            status["thermal_state"] != required["thermal_state"]
+            and "thermal_state" not in allowed_failures
+            and not thermal_rejection
+        ):
+            raise ValueError(
+                f"raw {name} environment does not match required thermal_state"
+            )
         _validate_observation_power(
             status,
             required,
             label=f"raw {name} environment",
+            allowed_failures=allowed_failures,
         )
+        if (
+            observation["hardware"] != trial.hardware
+            and "hardware" not in allowed_failures
+        ):
+            raise ValueError(f"raw {name} hardware records are inconsistent")
+        if (
+            observation["software_versions"] != trial.software_versions
+            and "software_versions" not in allowed_failures
+        ):
+            raise ValueError(f"raw {name} software-version records are inconsistent")
+    summary = trial.environment_status
+    validate_thermal_observation(
+        {
+            "thermal_state": summary["thermal_state"],
+            "thermal_state_raw_value": summary["thermal_state_raw_value"],
+        }
+    )
+    expected_thermal_raw = max(status["thermal_state_raw_value"] for status in statuses)
+    if summary["thermal_state_raw_value"] != expected_thermal_raw:
+        raise ValueError("merged thermal state is not the worse observation")
+    summary_failures = recovery_failures | (
+        frozenset({"thermal_state"}) if thermal_rejection else frozenset()
+    )
     _validate_observation_power(
-        trial.environment_status,
+        summary,
         required,
         label="raw environment summary",
+        allowed_failures=summary_failures,
     )
-    disposition = classify_trial_environment(workload, trial)
-    if disposition.outcome not in {"accept", "thermal-reject", "memory-reject"}:
-        raise ValueError("raw environment has an unknown disposition")
     if not allow_rejected_environment and disposition.outcome != "accept":
         raise ValueError(f"raw environment rejected: {disposition.reason}")
 
@@ -1826,6 +1903,46 @@ def _recovery_failure_fields(
     return tuple(sorted(failure_fields))
 
 
+def _reconstruct_missing_recovery(state, workload):
+    observation = {
+        name: state.post_exit[name]
+        for name in (
+            "observed_at_utc",
+            "hardware",
+            "environment_status",
+            "software_versions",
+        )
+    }
+    failures = _recovery_failure_fields(
+        observation,
+        expected_hardware=state.measurement["start"]["hardware"],
+        expected_software_versions=state.measurement["start"]["software_versions"],
+        required_environment=workload.required_environment,
+    )
+    pressure = observation["environment_status"]["memory_pressure"]
+    if failures:
+        outcome = "environment-failure"
+    elif pressure == "critical":
+        outcome = "critical"
+    elif pressure == "normal":
+        outcome = "not-required"
+    else:
+        outcome = "interrupted"
+    return build_post_exit_recovery(
+        measurement=state.measurement,
+        post_exit=state.post_exit,
+        samples=state.recovery_samples,
+        policy=post_exit_recovery_policy(workload),
+        outcome=outcome,
+        duration_seconds=(
+            0.0
+            if not state.recovery_samples
+            else state.recovery_samples[-1]["elapsed_seconds"]
+        ),
+        failure_fields=failures,
+    )
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -2388,6 +2505,11 @@ def capture_baseline_trials(
                 f"raw={trial.environment_status['thermal_state_raw_value']}"
             )
             return
+        if disposition.outcome == "environment-reject":
+            if disposition.reason is None:
+                raise AssertionError("environment rejection is missing its reason")
+            journal.reject_inflight(attempt, trial, reason=disposition.reason)
+            raise EnvironmentTrialRejected(attempt.slot, disposition.reason)
         if disposition.outcome != "memory-reject":
             raise AssertionError("trial classification has an unknown outcome")
         if disposition.reason is None:
@@ -2402,7 +2524,9 @@ def capture_baseline_trials(
         validate_trial(trial, allow_rejected_environment=False)
         progress(f"resumed accepted {slot.metric} pair {slot.pair_index}")
 
-    for state in journal.load_pending_attempts(ordered_slots):
+    pending_attempts = journal.load_pending_attempts(ordered_slots)
+    workload = None
+    for state in pending_attempts:
         if state.post_exit is None:
             journal.reject_unfinalized(
                 state.attempt,
@@ -2410,8 +2534,27 @@ def capture_baseline_trials(
                 reason="missing-immediate-post-exit-evidence",
             )
             continue
+        recovery = state.recovery
+        if recovery is None:
+            if workload is None:
+                workload = CanonicalWorkload.from_dict(
+                    journal.session["canonical_workload"]
+                )
+            recovery = _reconstruct_missing_recovery(state, workload)
+            atomic_write_json(
+                journal.recovery_path(
+                    state.attempt.slot, state.attempt.journal_attempt_index
+                ),
+                recovery,
+                create_only=True,
+            )
         if state.trial is None:
-            trial = finalize_raw_trial(state.measurement, state.post_exit)
+            trial = finalize_raw_trial(
+                state.measurement,
+                state.post_exit,
+                state.recovery_samples,
+                recovery,
+            )
             atomic_write_json(state.attempt.path, trial.to_dict(), create_only=True)
         else:
             trial = state.trial

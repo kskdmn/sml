@@ -1326,8 +1326,33 @@ def _with_trial_payload(trial, **changes):
     post_exit["identity"] = structured_identity(
         "sml-parent-post-exit-observation-v1", post_exit_body
     )
-    recovery = _valid_post_exit_recovery(measurement, post_exit)
-    return finalize_raw_trial(measurement, post_exit, (), recovery)
+    samples = []
+    previous_identity = None
+    for raw_sample in trial.post_exit_recovery_samples:
+        sample = build_post_exit_recovery_sample(
+            measurement=measurement,
+            post_exit=post_exit,
+            sample_index=raw_sample["sample_index"],
+            previous_sample_identity=previous_identity,
+            observed_at_utc=raw_sample["observed_at_utc"],
+            elapsed_seconds=raw_sample["elapsed_seconds"],
+            hardware=raw_sample["hardware"],
+            environment_status=raw_sample["environment_status"],
+            software_versions=raw_sample["software_versions"],
+        )
+        samples.append(sample)
+        previous_identity = sample["identity"]
+    raw_recovery = trial.post_exit_recovery
+    recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=samples,
+        policy=raw_recovery["policy"],
+        outcome=raw_recovery["outcome"],
+        duration_seconds=raw_recovery["duration_seconds"],
+        failure_fields=raw_recovery["failure_fields"],
+    )
+    return finalize_raw_trial(measurement, post_exit, samples, recovery)
 
 
 def test_child_and_post_exit_documents_are_exactly_identity_bound():
@@ -1696,51 +1721,102 @@ def _with_environment_observations(trial, *, start=None, end=None, post_exit=Non
     return finalize_raw_trial(measurement, parent, (), recovery)
 
 
+def _raw_trial_for_recovery_signal(workload, signal):
+    if signal == "accepted-not-required":
+        return _valid_raw_trial(workload)
+    if signal == "accepted-recovered":
+        return _valid_recovered_raw_trial(workload)
+    if signal in {"start-warning", "end-critical"}:
+        trial = _valid_raw_trial(workload)
+        start = dict(trial.environment_status["start"])
+        end = dict(trial.environment_status["end"])
+        if signal == "start-warning":
+            start["memory_pressure"] = "warning"
+        else:
+            end["memory_pressure"] = "critical"
+        return _with_environment_observations(trial, start=start, end=end)
+    if signal == "recovery-timeout":
+        return _recovery_evidence(
+            workload,
+            immediate_pressure="warning",
+            sample_pressures=("warning",),
+            sample_elapsed=(300.0,),
+            outcome="timeout",
+        )[4]
+    if signal == "recovery-critical":
+        return _recovery_evidence(
+            workload, immediate_pressure="critical", outcome="critical"
+        )[4]
+    if signal == "recovery-interrupted":
+        return _recovery_evidence(
+            workload, immediate_pressure="warning", outcome="interrupted"
+        )[4]
+    if signal == "recovery-thermal":
+        return _recovery_evidence(
+            workload,
+            immediate_pressure="warning",
+            sample_pressures=("normal",),
+            sample_elapsed=(5.0,),
+            sample_status_changes=(
+                {"thermal_state": "fair", "thermal_state_raw_value": 1},
+            ),
+            outcome="environment-failure",
+            failure_fields=("thermal_state",),
+        )[4]
+    if signal == "recovery-power":
+        return _recovery_evidence(
+            workload,
+            immediate_pressure="warning",
+            sample_pressures=("normal",),
+            sample_elapsed=(5.0,),
+            sample_status_changes=({"power_connected": False},),
+            outcome="environment-failure",
+            failure_fields=("power_connected",),
+        )[4]
+    raise AssertionError(f"unknown recovery signal: {signal}")
+
+
 @pytest.mark.parametrize(
-    ("endpoint", "pressure", "outcome", "reason"),
+    ("signal", "outcome", "reason"),
     (
-        ("end", "warning", "accept", None),
+        ("accepted-not-required", "accept", None),
+        ("accepted-recovered", "accept", None),
+        ("start-warning", "memory-reject", "non-normal-start-memory-pressure"),
+        ("end-critical", "memory-reject", "critical-measurement-memory-pressure"),
+        ("recovery-timeout", "memory-reject", "persistent-post-exit-memory-pressure"),
+        ("recovery-critical", "memory-reject", "critical-post-exit-memory-pressure"),
+        ("recovery-interrupted", "memory-reject", "interrupted-post-exit-recovery"),
+        ("recovery-thermal", "thermal-reject", "non-nominal-thermal"),
         (
-            "start",
-            "warning",
-            "memory-reject",
-            "non-normal-start-memory-pressure",
-        ),
-        (
-            "end",
-            "critical",
-            "memory-reject",
-            "critical-measurement-memory-pressure",
-        ),
-        (
-            "post_exit",
-            "warning",
-            "memory-reject",
-            "persistent-post-exit-memory-pressure",
-        ),
-        (
-            "post_exit",
-            "critical",
-            "memory-reject",
-            "persistent-post-exit-memory-pressure",
+            "recovery-power",
+            "environment-reject",
+            "post-exit-recovery-environment-violation",
         ),
     ),
 )
-def test_trial_memory_disposition_uses_post_exit_as_authority(
-    endpoint, pressure, outcome, reason
-):
+def test_trial_disposition_uses_the_complete_recovery_chain(signal, outcome, reason):
     workload = build_canonical_workload()
-    trial = _valid_raw_trial(workload)
-    statuses = {
-        name: dict(trial.environment_status[name])
-        for name in ("start", "end", "post_exit")
-    }
-    statuses[endpoint]["memory_pressure"] = pressure
-    changed = _with_environment_observations(trial, **statuses)
+    trial = _raw_trial_for_recovery_signal(workload, signal)
 
-    disposition = classify_trial_environment(workload, changed)
+    disposition = classify_trial_environment(workload, trial)
 
     assert (disposition.outcome, disposition.reason) == (outcome, reason)
+
+
+def test_trial_disposition_is_performance_independent():
+    workload = build_canonical_workload()
+    trial = _raw_trial_for_recovery_signal(workload, "recovery-timeout")
+    changed = _with_trial_payload(
+        trial,
+        value=123.0,
+        elapsed_seconds=17.0,
+        compilation_seconds=0.25,
+        peak_memory_bytes=9_999,
+    )
+
+    assert classify_trial_environment(workload, changed) == (
+        classify_trial_environment(workload, trial)
+    )
 
 
 @pytest.mark.parametrize("endpoint", ("start", "end", "post_exit"))
@@ -1767,7 +1843,6 @@ def test_trial_thermal_disposition_rejects_each_non_nominal_observation(endpoint
     (
         ("start", {"power_connected": False}, "power_connected"),
         ("end", {"power_mode": "changed"}, "power_mode"),
-        ("post_exit", {"low_power_mode": True}, "low_power_mode"),
         ("start", {"competing_gpu_workload": True}, "competing_gpu_workload"),
     ),
 )
@@ -1787,6 +1862,42 @@ def test_rejected_environment_override_never_allows_power_policy_failures(
         benchmark_runner._validate_acceptance_environment(
             workload, changed, allow_rejected_environment=True
         )
+
+
+def test_rejected_environment_override_allows_named_immediate_failure_only():
+    workload = build_canonical_workload()
+    trial = _valid_raw_trial(workload)
+    post_exit = {
+        **trial.environment_status["post_exit"],
+        "low_power_mode": True,
+    }
+    changed = _with_environment_observations(trial, post_exit=post_exit)
+
+    with pytest.raises(ValueError, match="low_power_mode"):
+        benchmark_runner._validate_acceptance_environment(workload, changed)
+    benchmark_runner._validate_acceptance_environment(
+        workload, changed, allow_rejected_environment=True
+    )
+
+
+@pytest.mark.parametrize(
+    ("signal", "message"),
+    (
+        ("recovery-power", "power_connected"),
+        ("recovery-thermal", "thermal_state"),
+    ),
+)
+def test_rejected_environment_override_validates_nested_recovery_samples(
+    signal, message
+):
+    workload = build_canonical_workload()
+    trial = _raw_trial_for_recovery_signal(workload, signal)
+
+    with pytest.raises(ValueError, match=message):
+        benchmark_runner._validate_acceptance_environment(workload, trial)
+    benchmark_runner._validate_acceptance_environment(
+        workload, trial, allow_rejected_environment=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -1824,7 +1935,7 @@ def test_rejected_environment_override_allows_only_retryable_dispositions():
     statuses["post_exit"]["memory_pressure"] = "warning"
     changed = _with_environment_observations(trial, **statuses)
 
-    with pytest.raises(ValueError, match="persistent-post-exit-memory-pressure"):
+    with pytest.raises(ValueError, match="interrupted-post-exit-recovery"):
         benchmark_runner._validate_acceptance_environment(workload, changed)
     benchmark_runner._validate_acceptance_environment(
         workload, changed, allow_rejected_environment=True
@@ -2994,7 +3105,7 @@ def _accept_trial(_trial):
     return benchmark_runner.TrialEnvironmentDisposition("accept", None)
 
 
-def test_persistent_memory_rejection_stops_then_manual_resume_fills_only_missing_slot(
+def test_interrupted_memory_rejection_stops_then_manual_resume_fills_only_missing_slot(
     tmp_path,
 ):
     workload = build_canonical_workload()
@@ -3016,7 +3127,7 @@ def test_persistent_memory_rejection_stops_then_manual_resume_fills_only_missing
 
     with pytest.raises(
         benchmark_runner.MemoryPressureTrialRejected,
-        match="persistent-post-exit-memory-pressure",
+        match="interrupted-post-exit-recovery",
     ):
         capture_baseline_trials(
             journal=journal,
@@ -3041,7 +3152,7 @@ def test_persistent_memory_rejection_stops_then_manual_resume_fills_only_missing
         read_json_object(journal.rejected_path(second, 0), label="memory rejection")[
             "reason"
         ]
-        == "persistent-post-exit-memory-pressure"
+        == "interrupted-post-exit-recovery"
     )
 
     second_run_launches = []
@@ -3264,6 +3375,220 @@ def test_capture_reconstructs_measurement_and_post_exit_before_replacement_launc
     assert trials == (expected,)
     assert not attempt.path.exists()
     assert journal.load_accepted((slot,)) == {slot: expected}
+
+
+def test_capture_reconstructs_not_required_summary_before_any_launch(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    measurement, post_exit, _samples, _recovery, expected = _journal_trial_evidence(
+        journal, attempt, _valid_raw_trial(workload)
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    launches = []
+
+    trials = capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda slot, next_attempt: launches.append(next_attempt),
+        preflight=lambda: _preflight_from_trial(expected),
+        validate_preflight=lambda hardware, status, software: None,
+        recover=lambda slot, index, deadline, trigger: pytest.fail(
+            "normal pending evidence entered thermal recovery"
+        ),
+        validate_trial=_baseline_validator(workload),
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
+        progress=lambda message: None,
+    )
+
+    assert launches == []
+    assert trials == (expected,)
+    assert journal.recovery_path(slot, 0).is_file()
+    assert (
+        read_json_object(journal.recovery_path(slot, 0), label="recovery")["outcome"]
+        == "not-required"
+    )
+
+
+def test_capture_rejects_partial_warning_recovery_before_any_launch(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    interrupted = _recovery_evidence(
+        workload,
+        immediate_pressure="warning",
+        sample_pressures=("normal",),
+        sample_elapsed=(5.0,),
+        outcome="interrupted",
+    )[4]
+    measurement, post_exit, samples, _recovery, rebound = _journal_trial_evidence(
+        journal, attempt, interrupted
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    atomic_write_json(
+        journal.recovery_sample_path(slot, 0, 0), samples[0], create_only=True
+    )
+    launches = []
+
+    with pytest.raises(
+        benchmark_runner.MemoryPressureTrialRejected,
+        match="interrupted-post-exit-recovery",
+    ):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=lambda slot, next_attempt: launches.append(next_attempt),
+            preflight=lambda: _preflight_from_trial(rebound),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=lambda slot, index, deadline, trigger: pytest.fail(
+                "interrupted memory recovery entered thermal recovery"
+            ),
+            validate_trial=_baseline_validator(workload),
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            progress=lambda message: None,
+        )
+
+    assert launches == []
+    assert (
+        read_json_object(journal.recovery_path(slot, 0), label="recovery")["outcome"]
+        == "interrupted"
+    )
+
+
+@pytest.mark.parametrize(
+    ("trial", "exception_name", "reason"),
+    (
+        (
+            lambda workload: _recovery_evidence(
+                workload, immediate_pressure="critical", outcome="critical"
+            )[4],
+            "MemoryPressureTrialRejected",
+            "critical-post-exit-memory-pressure",
+        ),
+        (
+            lambda workload: _with_environment_observations(
+                _valid_raw_trial(workload),
+                post_exit={
+                    **_valid_raw_trial(workload).environment_status["post_exit"],
+                    "power_connected": False,
+                },
+            ),
+            "EnvironmentTrialRejected",
+            "post-exit-recovery-environment-violation",
+        ),
+    ),
+)
+def test_capture_reconstructs_terminal_immediate_failure_before_any_launch(
+    tmp_path, trial, exception_name, reason
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    rejected = trial(workload)
+    measurement, post_exit, _samples, _recovery, rebound = _journal_trial_evidence(
+        journal, attempt, rejected
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    launches = []
+
+    exception = getattr(benchmark_runner, exception_name)
+    with pytest.raises(exception, match=reason):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=lambda slot, next_attempt: launches.append(next_attempt),
+            preflight=lambda: _preflight_from_trial(rebound),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=lambda *args: pytest.fail(
+                "terminal immediate failure entered thermal recovery"
+            ),
+            validate_trial=_baseline_validator(workload),
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            progress=lambda message: None,
+        )
+
+    assert launches == []
+    assert read_json_object(journal.recovery_path(slot, 0), label="recovery")[
+        "outcome"
+    ] in {"critical", "environment-failure"}
+    assert (
+        read_json_object(journal.rejected_path(slot, 0), label="rejection")["reason"]
+        == reason
+    )
+
+
+def test_capture_resumes_after_interruption_with_only_the_next_attempt(tmp_path):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    attempt = journal.next_attempt(slot)
+    interrupted = _recovery_evidence(
+        workload,
+        immediate_pressure="warning",
+        sample_pressures=("normal",),
+        sample_elapsed=(5.0,),
+        outcome="interrupted",
+    )[4]
+    measurement, post_exit, samples, _recovery, rebound = _journal_trial_evidence(
+        journal, attempt, interrupted
+    )
+    atomic_write_json(journal.measurement_path(slot, 0), measurement, create_only=True)
+    atomic_write_json(journal.post_exit_path(slot, 0), post_exit, create_only=True)
+    atomic_write_json(
+        journal.recovery_sample_path(slot, 0, 0), samples[0], create_only=True
+    )
+
+    with pytest.raises(benchmark_runner.MemoryPressureTrialRejected):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=lambda *args: pytest.fail(
+                "interrupted attempt was relaunched"
+            ),
+            preflight=lambda: _preflight_from_trial(rebound),
+            validate_preflight=lambda *args: None,
+            recover=lambda *args: pytest.fail("memory rejection entered recovery"),
+            validate_trial=_baseline_validator(workload),
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            progress=lambda message: None,
+        )
+
+    retained_paths = (
+        journal.recovery_sample_path(slot, 0, 0),
+        journal.recovery_path(slot, 0),
+        journal.rejected_path(slot, 0),
+    )
+    retained = tuple(path.read_bytes() for path in retained_paths)
+    rejected_document = read_json_object(retained_paths[-1], label="rejection")
+    raw_trial = rejected_document["trial"]
+    launches = []
+    normal = _valid_raw_trial(workload)
+
+    trials = capture_baseline_trials(
+        journal=journal,
+        slots=(slot,),
+        launch_trial=lambda current_slot, next_attempt: (
+            launches.append(next_attempt.journal_attempt_index)
+            or _persist_journal_trial(journal, next_attempt, normal)
+        ),
+        preflight=lambda: _preflight_from_trial(normal),
+        validate_preflight=lambda *args: None,
+        recover=lambda *args: pytest.fail("memory rejection created thermal recovery"),
+        validate_trial=_baseline_validator(workload),
+        classify_trial=lambda trial: classify_trial_environment(workload, trial),
+        progress=lambda message: None,
+    )
+
+    assert launches == [1]
+    assert len(trials) == 1
+    assert tuple(path.read_bytes() for path in retained_paths) == retained
+    assert read_json_object(retained_paths[-1], label="rejection")["trial"] == raw_trial
 
 
 def test_capture_retries_only_the_thermal_slot_and_resumes_accepted_slots(tmp_path):
@@ -5554,7 +5879,7 @@ def test_nonzero_child_exit_does_not_publish_parent_evidence(tmp_path, monkeypat
     assert not trial_path.exists()
 
 
-def test_paired_trials_stops_before_the_next_process_on_persistent_memory(
+def test_paired_trials_stops_before_the_next_process_on_interrupted_memory(
     tmp_path, monkeypatch
 ):
     workload = build_canonical_workload()
@@ -5570,7 +5895,7 @@ def test_paired_trials_stops_before_the_next_process_on_persistent_memory(
 
     monkeypatch.setattr(benchmark_runner, "_launch_trial", launch)
 
-    with pytest.raises(ValueError, match="persistent-post-exit-memory-pressure"):
+    with pytest.raises(ValueError, match="interrupted-post-exit-recovery"):
         benchmark_runner._run_paired_trials(
             harness_root=tmp_path / "harness",
             reference_root=tmp_path / "reference",
@@ -5638,7 +5963,7 @@ def test_paired_trials_rejects_every_terminal_recovery_outcome_before_next_launc
         benchmark_runner, "_validate_acceptance_environment", validate_at_boundary
     )
 
-    with pytest.raises(ValueError, match="raw environment"):
+    with pytest.raises(ValueError, match=r"raw .*environment"):
         benchmark_runner._run_paired_trials(
             harness_root=tmp_path / "harness",
             reference_root=tmp_path / "reference",
@@ -6319,9 +6644,7 @@ def test_journal_memory_rejection_needs_no_thermal_trigger(tmp_path):
         journal, attempt, memory_trial
     )
 
-    journal.reject_inflight(
-        attempt, persisted, reason="persistent-post-exit-memory-pressure"
-    )
+    journal.reject_inflight(attempt, persisted, reason="interrupted-post-exit-recovery")
 
     rejected = read_json_object(journal.rejected_path(slot, 0), label="rejected trial")
     assert rejected["version"] == 3
@@ -6411,7 +6734,7 @@ def test_journal_reject_inflight_refuses_an_accept_disposition(tmp_path):
         (
             "post-exit-memory",
             "non-nominal-thermal",
-            "persistent-post-exit-memory-pressure",
+            "interrupted-post-exit-recovery",
         ),
         (
             "thermal",
@@ -6441,7 +6764,6 @@ def test_journal_reject_inflight_requires_the_ordered_evidence_reason(
         post_exit.update(thermal_state="fair", thermal_state_raw_value=1)
     elif primary_signal == "post-exit-memory":
         post_exit["memory_pressure"] = "warning"
-        post_exit.update(thermal_state="fair", thermal_state_raw_value=1)
     else:
         post_exit.update(thermal_state="fair", thermal_state_raw_value=1)
     rejected = _with_environment_observations(
@@ -6867,7 +7189,7 @@ def _persist_rejected_trial_for_recovery_test(journal, slot, reason):
         journal.reject_unfinalized(attempt, measurement, reason=reason)
     else:
         trial = _valid_raw_trial(workload, pair_index=slot.pair_index)
-        if reason == "persistent-post-exit-memory-pressure":
+        if reason == "interrupted-post-exit-recovery":
             warning = dict(trial.environment_status["post_exit"])
             warning["memory_pressure"] = "warning"
             trial = _with_environment_observations(trial, post_exit=warning)
@@ -6886,7 +7208,7 @@ def _persist_rejected_trial_for_recovery_test(journal, slot, reason):
 @pytest.mark.parametrize(
     "reason",
     (
-        "persistent-post-exit-memory-pressure",
+        "interrupted-post-exit-recovery",
         "missing-immediate-post-exit-evidence",
     ),
 )
