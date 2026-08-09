@@ -5944,7 +5944,8 @@ def test_collect_post_exit_environment_records_monotonic_time_before_memory_prob
     )
 
     started_at, collected = benchmark_runner.collect_post_exit_environment(
-        clock=lambda: events.append("clock") or 42.0
+        clock=lambda: events.append("clock") or 42.0,
+        deadline=42.0,
     )
 
     assert started_at == 42.0
@@ -6136,6 +6137,113 @@ def test_parent_finalizes_and_rejects_timeout_when_deadline_sleep_overshoots(
     assert collection_starts == [float(value) for value in range(0, 300, 5)]
     assert rejected["reason"] == "persistent-post-exit-memory-pressure"
     assert rejected["trial"]["post_exit_recovery"] == recovery
+
+
+def test_parent_aborts_recovery_collection_when_probe_start_crosses_deadline(
+    tmp_path, monkeypatch
+):
+    workload = build_canonical_workload()
+    journal = BaselineJournal.open(tmp_path / "state", _session_document(tmp_path))
+    slot = BaselineSlot("prepared-data", 0)
+    measurement = _valid_child_measurement(
+        workload,
+        session_identity=journal.session["identity"],
+        journal_attempt_index=0,
+    )
+    immediate = _observation_with_memory("warning", 36)
+
+    class CollectorRaceClock(_RecoveryClock):
+        def __init__(self):
+            super().__init__()
+            self.deadline_reads = 0
+
+        def __call__(self):
+            if self.now == 300.0:
+                self.deadline_reads += 1
+                if self.deadline_reads == 2:
+                    self.now += 0.001
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now = 300.0
+            self.deadline_reads = 0
+
+    clock = CollectorRaceClock()
+    memory_probe_calls = []
+    environment_collection_calls = []
+
+    monkeypatch.setattr(
+        benchmark_runner.subprocess,
+        "run",
+        lambda command, *, cwd, check: atomic_write_json(
+            journal.measurement_path(slot, 0), measurement, create_only=True
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_memory_pressure",
+        lambda: memory_probe_calls.append(True) or ("warning", 36),
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_utc_now_iso",
+        lambda: immediate["observed_at_utc"],
+    )
+
+    def collect_environment(*, memory_sample):
+        environment_collection_calls.append(memory_sample)
+        return (
+            immediate["hardware"],
+            immediate["environment_status"],
+            immediate["software_versions"],
+        )
+
+    monkeypatch.setattr(benchmark_runner, "collect_environment", collect_environment)
+
+    def launch(current_slot, attempt):
+        assert current_slot == slot
+        return benchmark_runner._launch_trial(
+            **_launch_trial_arguments(tmp_path),
+            evidence_session_identity=journal.session["identity"],
+            journal_attempt_index=attempt.journal_attempt_index,
+            measurement_output=journal.measurement_path(slot, 0),
+            post_exit_output=journal.post_exit_path(slot, 0),
+            recovery_samples_directory=journal.recovery_samples_path(slot, 0),
+            recovery_output=journal.recovery_path(slot, 0),
+            output=attempt.path,
+            clock=clock,
+            sleep=clock.sleep,
+        )
+
+    with pytest.raises(
+        benchmark_runner.MemoryPressureTrialRejected,
+        match="persistent-post-exit-memory-pressure",
+    ):
+        capture_baseline_trials(
+            journal=journal,
+            slots=(slot,),
+            launch_trial=launch,
+            preflight=lambda: _preflight_from_trial(_valid_raw_trial(workload)),
+            validate_preflight=lambda hardware, status, software: None,
+            recover=lambda *args: pytest.fail("memory rejection entered recovery"),
+            validate_trial=_baseline_validator(workload),
+            classify_trial=lambda trial: classify_trial_environment(workload, trial),
+            progress=lambda message: None,
+            clock=clock,
+        )
+
+    recovery = read_json_object(journal.recovery_path(slot, 0), label="recovery")
+    rejected = read_json_object(journal.rejected_path(slot, 0), label="rejection")
+    assert memory_probe_calls == [True]
+    assert environment_collection_calls == [("warning", 36)]
+    assert not journal.recovery_samples_path(slot, 0).exists()
+    assert recovery["outcome"] == "timeout"
+    assert recovery["duration_seconds"] == 300.0
+    assert recovery["completion_source"] == "live"
+    assert rejected["reason"] == "persistent-post-exit-memory-pressure"
+    assert rejected["trial"]["post_exit_recovery"] == recovery
+    validate_raw_trial_evidence(RawTrial.from_dict(rejected["trial"]))
 
 
 def test_parent_finalizes_immediate_hardware_drift_without_recovery_samples(
@@ -8056,7 +8164,7 @@ def test_post_exit_recovery_returns_immediately_for_normal_memory():
         immediate_observation=_valid_observation("2026-08-09T00:00:00+00:00"),
         immediate_started_at=clock(),
         recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-        collect=lambda: collected.append(True),
+        collect=lambda _deadline: collected.append(True),
         classify_nonmemory=lambda observation: (),
         record_sample=lambda *args: pytest.fail("normal memory must not sample"),
         clock=clock,
@@ -8086,7 +8194,9 @@ def test_post_exit_recovery_returns_immediately_for_terminal_immediate_observati
         immediate_observation=immediate,
         immediate_started_at=clock(),
         recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-        collect=lambda: pytest.fail("terminal immediate observation must not collect"),
+        collect=lambda _deadline: pytest.fail(
+            "terminal immediate observation must not collect"
+        ),
         classify_nonmemory=lambda observation: tuple(failure_fields),
         record_sample=lambda *args: pytest.fail(
             "terminal immediate observation must not sample"
@@ -8114,7 +8224,7 @@ def test_post_exit_recovery_requires_thirty_continuous_normal_seconds():
         immediate_observation=immediate,
         immediate_started_at=0.0,
         recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-        collect=lambda: (clock(), next(iter_observations)),
+        collect=lambda _deadline: (clock(), next(iter_observations)),
         classify_nonmemory=lambda observation: (),
         record_sample=lambda index, elapsed, observation, previous: (
             persisted.append(
@@ -8154,7 +8264,7 @@ def _run_scripted_memory_recovery(*, pressures, failure_fields=()):
         immediate_observation=immediate,
         immediate_started_at=0.0,
         recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-        collect=lambda: (clock(), next(iter_scripted)),
+        collect=lambda _deadline: (clock(), next(iter_scripted)),
         classify_nonmemory=lambda observation: (
             () if observation is immediate else tuple(failure_fields)
         ),
@@ -8209,7 +8319,7 @@ def test_post_exit_recovery_first_wake_overshoot_finalizes_zero_sample_timeout()
         immediate_observation=immediate,
         immediate_started_at=0.0,
         recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-        collect=lambda: pytest.fail("deadline overshoot must not collect"),
+        collect=lambda _deadline: pytest.fail("deadline overshoot must not collect"),
         classify_nonmemory=lambda observation: (),
         record_sample=lambda *args: pytest.fail("deadline overshoot must not persist"),
         clock=clock,
@@ -8272,7 +8382,7 @@ def test_post_exit_recovery_persists_before_classifying_a_sample():
         immediate_observation=immediate,
         immediate_started_at=clock(),
         recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-        collect=lambda: (clock(), observation),
+        collect=lambda _deadline: (clock(), observation),
         classify_nonmemory=classify_nonmemory,
         record_sample=lambda index, elapsed, candidate, previous: (
             persisted.append(candidate) or {"identity": "sample-0"}
@@ -8292,7 +8402,7 @@ def test_post_exit_recovery_does_not_overlap_a_slow_collector():
     pressures = iter(("normal", "critical"))
     collection_starts = []
 
-    def collect():
+    def collect(_deadline):
         sample_started_at = clock()
         collection_starts.append(sample_started_at)
         clock.now += 7.0
@@ -8325,7 +8435,7 @@ def test_post_exit_recovery_uses_memory_probe_start_as_sample_time():
     pressures = iter(("normal", "critical"))
     persisted_elapsed = []
 
-    def collect():
+    def collect(_deadline):
         clock.now += 1.0
         observation = _valid_observation("2026-08-09T00:00:05+00:00")
         observation["environment_status"]["memory_pressure"] = next(pressures)
@@ -8367,7 +8477,7 @@ def test_post_exit_recovery_validates_time_policy(policy_change, message):
             immediate_observation=_valid_observation("2026-08-09T00:00:00+00:00"),
             immediate_started_at=0.0,
             recovery_policy=policy,
-            collect=lambda: pytest.fail("invalid policy must not collect"),
+            collect=lambda _deadline: pytest.fail("invalid policy must not collect"),
             classify_nonmemory=lambda observation: (),
             record_sample=lambda *args: pytest.fail("invalid policy must not sample"),
             clock=lambda: 0.0,
@@ -8382,7 +8492,9 @@ def test_post_exit_recovery_validates_immediate_start_time(started_at):
             immediate_observation=_valid_observation("2026-08-09T00:00:00+00:00"),
             immediate_started_at=started_at,
             recovery_policy=_valid_recovery_policy(build_canonical_workload()),
-            collect=lambda: pytest.fail("invalid start time must not collect"),
+            collect=lambda _deadline: pytest.fail(
+                "invalid start time must not collect"
+            ),
             classify_nonmemory=lambda observation: (),
             record_sample=lambda *args: pytest.fail(
                 "invalid start time must not sample"

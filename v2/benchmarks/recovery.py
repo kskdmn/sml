@@ -152,7 +152,7 @@ def wait_for_post_exit_memory_recovery(
     immediate_observation: dict,
     immediate_started_at: float,
     recovery_policy: dict,
-    collect: Callable[[], tuple[float, dict]],
+    collect: Callable[[float], tuple[float, dict] | None],
     classify_nonmemory: Callable[[dict], tuple[str, ...]],
     record_sample: Callable[[int, float, dict, str | None], dict],
     clock: Callable[[], float],
@@ -183,51 +183,39 @@ def wait_for_post_exit_memory_recovery(
     previous_identity = None
     last_sample_started_at = immediate_started_at
 
+    def timeout_result() -> PostExitMemoryRecoveryResult:
+        terminal = reduce_post_exit_memory_recovery(
+            immediate_observation=immediate_observation,
+            samples=observations,
+            recovery_policy=recovery_policy,
+            classify_nonmemory=classify_nonmemory,
+            deadline_reached=True,
+        )
+        if terminal is None:
+            raise AssertionError("recovery deadline did not produce a terminal state")
+        return PostExitMemoryRecoveryResult(
+            terminal.outcome,
+            terminal.duration_seconds,
+            tuple(samples),
+            terminal.failure_fields,
+        )
+
     while True:
         scheduled = min(last_sample_started_at + interval, deadline)
         sleep(max(0.0, scheduled - clock()))
         if clock() > deadline:
-            terminal = reduce_post_exit_memory_recovery(
-                immediate_observation=immediate_observation,
-                samples=observations,
-                recovery_policy=recovery_policy,
-                classify_nonmemory=classify_nonmemory,
-                deadline_reached=True,
-            )
-            if terminal is None:
-                raise AssertionError(
-                    "recovery deadline did not produce a terminal state"
-                )
-            return PostExitMemoryRecoveryResult(
-                terminal.outcome,
-                terminal.duration_seconds,
-                tuple(samples),
-                terminal.failure_fields,
-            )
-        sample_started_at, observation = collect()
+            return timeout_result()
+        collected = collect(deadline)
+        if collected is None:
+            return timeout_result()
+        sample_started_at, observation = collected
         if type(sample_started_at) not in (int, float) or not math.isfinite(
             sample_started_at
         ):
             raise ValueError("recovery sample start must be a finite number")
         sample_started_at = float(sample_started_at)
         if sample_started_at > deadline:
-            terminal = reduce_post_exit_memory_recovery(
-                immediate_observation=immediate_observation,
-                samples=observations,
-                recovery_policy=recovery_policy,
-                classify_nonmemory=classify_nonmemory,
-                deadline_reached=True,
-            )
-            if terminal is None:
-                raise AssertionError(
-                    "recovery deadline did not produce a terminal state"
-                )
-            return PostExitMemoryRecoveryResult(
-                terminal.outcome,
-                terminal.duration_seconds,
-                tuple(samples),
-                terminal.failure_fields,
-            )
+            return timeout_result()
         elapsed = sample_started_at - immediate_started_at
         sample = record_sample(len(samples), elapsed, observation, previous_identity)
         samples.append(sample)

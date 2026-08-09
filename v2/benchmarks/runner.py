@@ -1881,9 +1881,13 @@ def collect_environment(
 
 
 def collect_post_exit_environment(
-    *, clock: Callable[[], float] = time.monotonic
-) -> tuple[float, dict[str, object]]:
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    deadline: float | None = None,
+) -> tuple[float, dict[str, object]] | None:
     started_at = clock()
+    if deadline is not None and started_at > deadline:
+        return None
     memory_sample = _memory_pressure()
     observed_at_utc = _utc_now_iso()
     hardware, environment_status, software_versions = collect_environment(
@@ -2310,7 +2314,9 @@ def _launch_trial(
         immediate_observation=observation,
         immediate_started_at=immediate_started_at,
         recovery_policy=policy,
-        collect=lambda: collect_post_exit_environment(clock=clock),
+        collect=lambda deadline: collect_post_exit_environment(
+            clock=clock, deadline=deadline
+        ),
         classify_nonmemory=lambda item: _recovery_failure_fields(
             item,
             expected_hardware=measurement["start"]["hardware"],
