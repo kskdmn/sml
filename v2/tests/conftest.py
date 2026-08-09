@@ -26,7 +26,8 @@ def legacy_control() -> dict[str, object]:
 
 @pytest.fixture(scope="session")
 def legacy_arrays():
-    return mx.load(str(EQUIVALENCE_FIXTURE_DIR / "legacy-arrays.safetensors"))
+    loaded = mx.load(str(EQUIVALENCE_FIXTURE_DIR / "legacy-arrays.safetensors"))
+    return dict(sorted(loaded.items()))
 
 
 def _validate_and_load_legacy_state(
