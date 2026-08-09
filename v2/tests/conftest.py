@@ -72,6 +72,11 @@ def load_legacy_model_state(model, legacy_arrays, legacy_control) -> None:
     )
 
 
+@pytest.fixture(name="load_legacy_model_state")
+def _load_legacy_model_state_fixture():
+    return load_legacy_model_state
+
+
 def load_legacy_lora_state(model, legacy_arrays, legacy_control) -> None:
     lora_state = legacy_control["lora_parameter_state"]
     mappings = [*lora_state["base_mapping"], *lora_state["adapter_mapping"]]

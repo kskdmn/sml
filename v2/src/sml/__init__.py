@@ -4,6 +4,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+from sml import model
+
 LEGACY_BRIDGE_EXPORTS = (
     "ParameterInitializerRangeConfig",
     "SMLConfig",
@@ -85,6 +87,7 @@ __all__ = (
     "count_parameters",
     "create_model",
     "estimate_model_size",
+    "model",
     "resolve_yarn_attention_factor",
     "rotate_half",
     "select_next_token",
