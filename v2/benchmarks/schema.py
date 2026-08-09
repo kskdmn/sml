@@ -371,10 +371,13 @@ class RawTrial:
     journal_attempt_index: int
     child_measurement: dict[str, JsonValue]
     post_exit_observation: dict[str, JsonValue]
+    post_exit_recovery_samples: tuple[dict[str, JsonValue], ...]
+    post_exit_recovery: dict[str, JsonValue]
 
     def to_dict(self) -> dict[str, JsonValue]:
         raw = asdict(self)
         raw["synchronization_boundaries"] = list(self.synchronization_boundaries)
+        raw["post_exit_recovery_samples"] = list(self.post_exit_recovery_samples)
         return raw
 
     @classmethod
@@ -384,7 +387,7 @@ class RawTrial:
             raise ValueError("raw trial has an invalid field set")
         if type(raw["schema_version"]) is not int:
             raise ValueError("raw trial schema_version must be an integer")
-        if raw["schema_version"] != 2:
+        if raw["schema_version"] != 3:
             raise ValueError("unsupported raw trial schema version")
         payload = validate_trial_payload(
             {name: raw[name] for name in TRIAL_PAYLOAD_FIELDS}
@@ -405,13 +408,22 @@ class RawTrial:
                 raise ValueError(f"{name} must be an object")
             mappings[name] = dict(item)
         evidence = {}
-        for name in ("child_measurement", "post_exit_observation"):
+        for name in (
+            "child_measurement",
+            "post_exit_observation",
+            "post_exit_recovery",
+        ):
             item = raw[name]
             if not isinstance(item, dict):
                 raise ValueError(f"{name} must be an object")
             evidence[name] = dict(item)
+        raw_samples = raw["post_exit_recovery_samples"]
+        if not isinstance(raw_samples, list) or not all(
+            isinstance(item, dict) for item in raw_samples
+        ):
+            raise ValueError("post_exit_recovery_samples must be a list of objects")
         return cls(
-            schema_version=2,
+            schema_version=3,
             metric=payload["metric"],
             side=payload["side"],
             attempt_index=payload["attempt_index"],
@@ -446,6 +458,8 @@ class RawTrial:
             journal_attempt_index=journal_attempt_index,
             child_measurement=evidence["child_measurement"],
             post_exit_observation=evidence["post_exit_observation"],
+            post_exit_recovery_samples=tuple(dict(item) for item in raw_samples),
+            post_exit_recovery=evidence["post_exit_recovery"],
         )
 
 

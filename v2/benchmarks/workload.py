@@ -646,8 +646,13 @@ def build_canonical_workload(
             "thermal_state": "nominal",
             "memory_pressure": "normal",
             "measurement_end_memory_pressure_allowed": ["normal", "warning"],
+            "post_exit_memory_pressure_allowed": ["normal", "warning"],
             "post_exit_memory_pressure": "normal",
-            "post_exit_evidence_required": True,
+            "post_exit_recovery_required_for_warning": True,
+            "post_exit_recovery_sample_interval_seconds": 5.0,
+            "post_exit_recovery_timeout_seconds": 300.0,
+            "post_exit_recovery_stability_seconds": 30.0,
+            "post_exit_recovery_evidence_required": True,
             "competing_gpu_workload": False,
         },
         software_requirements={
@@ -667,6 +672,31 @@ def build_canonical_workload(
             "canonical_inference_requests": requests.identity,
         },
     )
+
+
+def post_exit_recovery_policy(
+    workload: CanonicalWorkload,
+) -> dict[str, JsonValue]:
+    required = workload.required_environment
+    return {
+        "sample_interval_seconds": required[
+            "post_exit_recovery_sample_interval_seconds"
+        ],
+        "timeout_seconds": required["post_exit_recovery_timeout_seconds"],
+        "stability_seconds": required["post_exit_recovery_stability_seconds"],
+        "required_memory_pressure": required["post_exit_memory_pressure"],
+        "required_environment": {
+            name: required[name]
+            for name in (
+                "power_connected",
+                "power_mode",
+                "low_power_mode",
+                "thermal_state",
+                "competing_gpu_workload",
+            )
+        },
+        "require_same_hardware_and_software": True,
+    }
 
 
 def canonical_input_identity(metric: str, workload: CanonicalWorkload) -> str:

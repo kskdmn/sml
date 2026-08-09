@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 
 from v2.benchmarks.schema import JsonValue, RawTrial, validate_trial_payload
@@ -11,6 +12,10 @@ CHILD_KIND = "sml-child-trial-measurement"
 CHILD_IDENTITY_DOMAIN = "sml-child-trial-measurement-v1"
 POST_EXIT_KIND = "sml-parent-post-exit-observation"
 POST_EXIT_IDENTITY_DOMAIN = "sml-parent-post-exit-observation-v1"
+RECOVERY_SAMPLE_KIND = "sml-parent-post-exit-recovery-sample"
+RECOVERY_SAMPLE_IDENTITY_DOMAIN = "sml-parent-post-exit-recovery-sample-v1"
+RECOVERY_KIND = "sml-parent-post-exit-recovery"
+RECOVERY_IDENTITY_DOMAIN = "sml-parent-post-exit-recovery-v1"
 MISSING_POST_EXIT_REASON = "missing-immediate-post-exit-evidence"
 FINALIZED_REJECTION_REASONS = frozenset(
     {
@@ -322,10 +327,483 @@ def validate_post_exit_observation(
     return {**body, "identity": identity}
 
 
-def merge_environment_status(
-    start: dict, end: dict, post_exit: dict
+def _recovery_binding(
+    child: dict[str, JsonValue], parent: dict[str, JsonValue]
+) -> dict:
+    trial = child["trial"]
+    if not isinstance(trial, dict):
+        raise ValueError("child measurement trial must be an object")  # noqa: TRY004
+    return {
+        "session_identity": child["session_identity"],
+        "journal_attempt_index": child["journal_attempt_index"],
+        "metric": trial["metric"],
+        "pair_index": trial["pair_index"],
+        "child_measurement_identity": child["identity"],
+        "post_exit_observation_identity": parent["identity"],
+    }
+
+
+def _validate_elapsed_seconds(value: object, *, label: str) -> float:
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ValueError(f"{label} must be a finite non-negative number")
+    return float(value)
+
+
+def _validate_recovery_policy(raw: Mapping[str, object]) -> dict[str, JsonValue]:
+    expected = {
+        "sample_interval_seconds",
+        "timeout_seconds",
+        "stability_seconds",
+        "required_memory_pressure",
+        "required_environment",
+        "require_same_hardware_and_software",
+    }
+    if set(raw) != expected:
+        raise ValueError("recovery policy has an invalid field set")
+    required_environment = raw["required_environment"]
+    if not isinstance(required_environment, dict) or required_environment != {
+        "power_connected": True,
+        "power_mode": "automatic",
+        "low_power_mode": False,
+        "thermal_state": "nominal",
+        "competing_gpu_workload": False,
+    }:
+        raise ValueError("recovery policy required_environment drifted")
+    policy = {
+        "sample_interval_seconds": _validate_elapsed_seconds(
+            raw["sample_interval_seconds"], label="recovery sample interval"
+        ),
+        "timeout_seconds": _validate_elapsed_seconds(
+            raw["timeout_seconds"], label="recovery timeout"
+        ),
+        "stability_seconds": _validate_elapsed_seconds(
+            raw["stability_seconds"], label="recovery stability window"
+        ),
+        "required_memory_pressure": raw["required_memory_pressure"],
+        "required_environment": dict(required_environment),
+        "require_same_hardware_and_software": raw["require_same_hardware_and_software"],
+    }
+    if policy != {
+        "sample_interval_seconds": 5.0,
+        "timeout_seconds": 300.0,
+        "stability_seconds": 30.0,
+        "required_memory_pressure": "normal",
+        "required_environment": dict(required_environment),
+        "require_same_hardware_and_software": True,
+    }:
+        raise ValueError("recovery policy drifted")
+    return policy
+
+
+def _validate_recovery_binding(
+    document: Mapping[str, object],
+    child: dict[str, JsonValue],
+    parent: dict[str, JsonValue],
 ) -> dict[str, JsonValue]:
-    observations = (start, end, post_exit)
+    binding = _recovery_binding(child, parent)
+    for name, expected_value in binding.items():
+        value = document[name]
+        if value != expected_value:
+            raise ValueError(f"recovery {name} does not match bound evidence")
+    return binding
+
+
+def build_post_exit_recovery_sample(
+    *,
+    measurement: Mapping[str, object],
+    post_exit: Mapping[str, object],
+    sample_index: int,
+    previous_sample_identity: str | None,
+    observed_at_utc: str,
+    elapsed_seconds: float,
+    hardware: Mapping[str, object],
+    environment_status: Mapping[str, object],
+    software_versions: Mapping[str, object],
+) -> dict[str, JsonValue]:
+    child = validate_child_trial_measurement(measurement)
+    parent = validate_post_exit_observation(post_exit, measurement=child)
+    if type(sample_index) is not int or sample_index < 0:
+        raise ValueError("recovery sample_index must be a non-negative integer")
+    if previous_sample_identity is not None:
+        previous_sample_identity = _validate_identity(
+            previous_sample_identity, label="previous sample identity"
+        )
+    observation = _validate_observation(
+        {
+            "observed_at_utc": observed_at_utc,
+            "hardware": dict(hardware),
+            "environment_status": dict(environment_status),
+            "software_versions": dict(software_versions),
+        },
+        label="post-exit recovery sample",
+    )
+    body = {
+        "kind": RECOVERY_SAMPLE_KIND,
+        "version": 1,
+        **_recovery_binding(child, parent),
+        "sample_index": sample_index,
+        "previous_sample_identity": previous_sample_identity,
+        "elapsed_seconds": _validate_elapsed_seconds(
+            elapsed_seconds, label="recovery elapsed_seconds"
+        ),
+        **observation,
+    }
+    return _identity_document(
+        RECOVERY_SAMPLE_KIND, RECOVERY_SAMPLE_IDENTITY_DOMAIN, body
+    )
+
+
+def validate_post_exit_recovery_sample(
+    document: Mapping[str, object],
+    *,
+    measurement: Mapping[str, object],
+    post_exit: Mapping[str, object],
+    previous_sample: Mapping[str, object] | None,
+) -> dict[str, JsonValue]:
+    child = validate_child_trial_measurement(measurement)
+    parent = validate_post_exit_observation(post_exit, measurement=child)
+    expected = {
+        "kind",
+        "version",
+        *_recovery_binding(child, parent),
+        "sample_index",
+        "previous_sample_identity",
+        "elapsed_seconds",
+        "observed_at_utc",
+        "hardware",
+        "environment_status",
+        "software_versions",
+        "identity",
+    }
+    if set(document) != expected:
+        raise ValueError("recovery sample has an invalid field set")
+    if document["kind"] != RECOVERY_SAMPLE_KIND or document["version"] != 1:
+        raise ValueError("unsupported recovery sample kind or version")
+    sample_index = document["sample_index"]
+    if type(sample_index) is not int or sample_index < 0:
+        raise ValueError("recovery sample_index must be a non-negative integer")
+    if previous_sample is None:
+        expected_previous_identity = None
+    else:
+        expected_previous_identity = _validate_identity(
+            previous_sample.get("identity"), label="previous sample identity"
+        )
+    if document["previous_sample_identity"] != expected_previous_identity:
+        raise ValueError("recovery previous sample identity does not match")
+    observation = _validate_observation(
+        {
+            name: document[name]
+            for name in (
+                "observed_at_utc",
+                "hardware",
+                "environment_status",
+                "software_versions",
+            )
+        },
+        label="post-exit recovery sample",
+    )
+    body = {
+        "kind": RECOVERY_SAMPLE_KIND,
+        "version": 1,
+        **_validate_recovery_binding(document, child, parent),
+        "sample_index": sample_index,
+        "previous_sample_identity": expected_previous_identity,
+        "elapsed_seconds": _validate_elapsed_seconds(
+            document["elapsed_seconds"], label="recovery elapsed_seconds"
+        ),
+        **observation,
+    }
+    identity = _validate_identity(
+        document["identity"], label="recovery sample identity"
+    )
+    if identity != structured_identity(RECOVERY_SAMPLE_IDENTITY_DOMAIN, body):
+        raise ValueError("recovery sample identity does not match")
+    return {**body, "identity": identity}
+
+
+def validate_post_exit_recovery_samples(
+    documents: Sequence[Mapping[str, object]],
+    *,
+    measurement: Mapping[str, object],
+    post_exit: Mapping[str, object],
+) -> tuple[dict[str, JsonValue], ...]:
+    previous = None
+    identities: set[str] = set()
+    elapsed = -1.0
+    samples = []
+    for index, document in enumerate(documents):
+        sample = validate_post_exit_recovery_sample(
+            document,
+            measurement=measurement,
+            post_exit=post_exit,
+            previous_sample=previous,
+        )
+        if sample["sample_index"] != index:
+            raise ValueError("recovery sample indices must be contiguous")
+        sample_elapsed = sample["elapsed_seconds"]
+        if not isinstance(sample_elapsed, float) or sample_elapsed <= elapsed:
+            raise ValueError("recovery sample elapsed_seconds must be increasing")
+        if sample_elapsed > 300.0:
+            raise ValueError("recovery sample exceeds the timeout")
+        identity = sample["identity"]
+        if not isinstance(identity, str) or identity in identities:
+            raise ValueError("recovery sample identities must be unique")
+        identities.add(identity)
+        samples.append(sample)
+        previous = sample
+        elapsed = sample_elapsed
+    return tuple(samples)
+
+
+def _environment_matches_recovery_policy(
+    environment: Mapping[str, object], policy: Mapping[str, object]
+) -> bool:
+    required = policy["required_environment"]
+    return environment["memory_pressure"] == policy["required_memory_pressure"] and all(
+        environment[name] == value for name, value in required.items()
+    )
+
+
+def _validate_recovery_outcome(
+    *,
+    outcome: object,
+    immediate: Mapping[str, object],
+    samples: Sequence[Mapping[str, object]],
+    policy: Mapping[str, object],
+    duration_seconds: float,
+    failure_fields: list[str],
+) -> str:
+    if outcome not in {
+        "not-required",
+        "recovered",
+        "timeout",
+        "critical",
+        "environment-failure",
+        "interrupted",
+    }:
+        raise ValueError("recovery outcome is invalid")
+    immediate_pressure = immediate["environment_status"]["memory_pressure"]
+    terminal = (
+        samples[-1]["environment_status"]
+        if samples
+        else immediate["environment_status"]
+    )
+    if outcome == "not-required":
+        valid = (
+            immediate_pressure == "normal" and not samples and duration_seconds == 0.0
+        )
+    elif outcome == "recovered":
+        last_nonmatching = max(
+            (
+                sample["elapsed_seconds"]
+                for sample in samples
+                if not _environment_matches_recovery_policy(
+                    sample["environment_status"], policy
+                )
+            ),
+            default=0.0,
+        )
+        stable_samples = [
+            sample
+            for sample in samples
+            if sample["elapsed_seconds"] > last_nonmatching
+            and _environment_matches_recovery_policy(
+                sample["environment_status"], policy
+            )
+        ]
+        valid = (
+            immediate_pressure == "warning"
+            and bool(samples)
+            and _environment_matches_recovery_policy(terminal, policy)
+            and stable_samples
+            and duration_seconds - stable_samples[0]["elapsed_seconds"]
+            >= policy["stability_seconds"]
+        )
+    elif outcome == "timeout":
+        valid = (
+            immediate_pressure == "warning"
+            and duration_seconds == policy["timeout_seconds"]
+            and not _environment_matches_recovery_policy(terminal, policy)
+        )
+    elif outcome == "critical":
+        valid = immediate_pressure == "critical"
+    elif outcome == "environment-failure":
+        valid = (
+            immediate_pressure == "warning"
+            and bool(samples)
+            and bool(failure_fields)
+            and any(
+                not _environment_matches_recovery_policy(
+                    sample["environment_status"], policy
+                )
+                for sample in samples
+            )
+        )
+    else:
+        valid = immediate_pressure == "warning"
+    if outcome != "environment-failure" and failure_fields:
+        valid = False
+    if not valid:
+        raise ValueError("recovery outcome conflicts with the evidence")
+    return outcome
+
+
+def build_post_exit_recovery(
+    *,
+    measurement: Mapping[str, object],
+    post_exit: Mapping[str, object],
+    samples: Sequence[Mapping[str, object]],
+    policy: Mapping[str, object],
+    outcome: str,
+    duration_seconds: float,
+    failure_fields: Sequence[str] = (),
+) -> dict[str, JsonValue]:
+    child = validate_child_trial_measurement(measurement)
+    parent = validate_post_exit_observation(post_exit, measurement=child)
+    validated_samples = validate_post_exit_recovery_samples(
+        samples, measurement=child, post_exit=parent
+    )
+    normalized_policy = _validate_recovery_policy(policy)
+    if any(not isinstance(field, str) or not field for field in failure_fields):
+        raise ValueError("recovery failure_fields must be non-empty strings")
+    normalized_failure_fields = sorted(set(failure_fields))
+    normalized_duration = _validate_elapsed_seconds(
+        duration_seconds, label="recovery duration_seconds"
+    )
+    if normalized_duration != (
+        0.0 if not validated_samples else validated_samples[-1]["elapsed_seconds"]
+    ):
+        raise ValueError("recovery duration_seconds must match the terminal sample")
+    outcome = _validate_recovery_outcome(
+        outcome=outcome,
+        immediate=parent,
+        samples=validated_samples,
+        policy=normalized_policy,
+        duration_seconds=normalized_duration,
+        failure_fields=normalized_failure_fields,
+    )
+    terminal_environment = (
+        parent["environment_status"]
+        if not validated_samples
+        else validated_samples[-1]["environment_status"]
+    )
+    body = {
+        "kind": RECOVERY_KIND,
+        "version": 1,
+        **_recovery_binding(child, parent),
+        "policy": normalized_policy,
+        "sample_identities": [sample["identity"] for sample in validated_samples],
+        "outcome": outcome,
+        "duration_seconds": normalized_duration,
+        "failure_fields": normalized_failure_fields,
+        "terminal_sample_identity": (
+            None if not validated_samples else validated_samples[-1]["identity"]
+        ),
+        "terminal_environment_status": terminal_environment,
+    }
+    return _identity_document(RECOVERY_KIND, RECOVERY_IDENTITY_DOMAIN, body)
+
+
+def validate_post_exit_recovery(
+    document: Mapping[str, object],
+    *,
+    measurement: Mapping[str, object],
+    post_exit: Mapping[str, object],
+    samples: Sequence[Mapping[str, object]],
+) -> dict[str, JsonValue]:
+    child = validate_child_trial_measurement(measurement)
+    parent = validate_post_exit_observation(post_exit, measurement=child)
+    validated_samples = validate_post_exit_recovery_samples(
+        samples, measurement=child, post_exit=parent
+    )
+    expected = {
+        "kind",
+        "version",
+        *_recovery_binding(child, parent),
+        "policy",
+        "sample_identities",
+        "outcome",
+        "duration_seconds",
+        "failure_fields",
+        "terminal_sample_identity",
+        "terminal_environment_status",
+        "identity",
+    }
+    if set(document) != expected:
+        raise ValueError("post-exit recovery has an invalid field set")
+    if document["kind"] != RECOVERY_KIND or document["version"] != 1:
+        raise ValueError("unsupported post-exit recovery kind or version")
+    policy = document["policy"]
+    if not isinstance(policy, dict):
+        raise ValueError("recovery policy must be an object")  # noqa: TRY004
+    normalized_policy = _validate_recovery_policy(policy)
+    sample_identities = document["sample_identities"]
+    expected_sample_identities = [sample["identity"] for sample in validated_samples]
+    if sample_identities != expected_sample_identities:
+        raise ValueError("recovery sample identities do not match samples")
+    raw_failure_fields = document["failure_fields"]
+    if (
+        not isinstance(raw_failure_fields, list)
+        or any(not isinstance(field, str) or not field for field in raw_failure_fields)
+        or raw_failure_fields != sorted(set(raw_failure_fields))
+    ):
+        raise ValueError("recovery failure_fields must be sorted and duplicate-free")
+    duration_seconds = _validate_elapsed_seconds(
+        document["duration_seconds"], label="recovery duration_seconds"
+    )
+    if duration_seconds != (
+        0.0 if not validated_samples else validated_samples[-1]["elapsed_seconds"]
+    ):
+        raise ValueError("recovery duration_seconds must match the terminal sample")
+    _validate_recovery_outcome(
+        outcome=document["outcome"],
+        immediate=parent,
+        samples=validated_samples,
+        policy=normalized_policy,
+        duration_seconds=duration_seconds,
+        failure_fields=raw_failure_fields,
+    )
+    terminal_identity = (
+        None if not validated_samples else validated_samples[-1]["identity"]
+    )
+    if document["terminal_sample_identity"] != terminal_identity:
+        raise ValueError("recovery terminal sample identity does not match")
+    terminal_environment = (
+        parent["environment_status"]
+        if not validated_samples
+        else validated_samples[-1]["environment_status"]
+    )
+    if document["terminal_environment_status"] != terminal_environment:
+        raise ValueError("recovery terminal environment does not match")
+    body = {
+        "kind": RECOVERY_KIND,
+        "version": 1,
+        **_validate_recovery_binding(document, child, parent),
+        "policy": normalized_policy,
+        "sample_identities": expected_sample_identities,
+        "outcome": document["outcome"],
+        "duration_seconds": duration_seconds,
+        "failure_fields": raw_failure_fields,
+        "terminal_sample_identity": terminal_identity,
+        "terminal_environment_status": terminal_environment,
+    }
+    identity = _validate_identity(document["identity"], label="recovery identity")
+    if identity != structured_identity(RECOVERY_IDENTITY_DOMAIN, body):
+        raise ValueError("recovery identity does not match")
+    return {**body, "identity": identity}
+
+
+def merge_environment_status(
+    start: dict,
+    end: dict,
+    post_exit: dict,
+    recovery_samples: Sequence[Mapping[str, object]],
+    recovery: Mapping[str, object],
+) -> dict[str, JsonValue]:
+    recovery_statuses = tuple(
+        sample["environment_status"] for sample in recovery_samples
+    )
+    observations = (start, end, post_exit, *recovery_statuses)
     pressure_order = {"normal": 0, "warning": 1, "critical": 2}
     thermal_raw = max(item["thermal_state_raw_value"] for item in observations)
     measurement_pressure = max(
@@ -339,8 +817,16 @@ def merge_environment_status(
         "low_power_mode": any(item["low_power_mode"] for item in observations),
         "thermal_state": _decode_thermal_state(thermal_raw),
         "thermal_state_raw_value": thermal_raw,
-        "memory_pressure": post_exit["memory_pressure"],
-        "memory_free_percentage": post_exit["memory_free_percentage"],
+        "memory_pressure": (
+            post_exit["memory_pressure"]
+            if recovery["outcome"] == "not-required" or not recovery_statuses
+            else recovery_statuses[-1]["memory_pressure"]
+        ),
+        "memory_free_percentage": (
+            post_exit["memory_free_percentage"]
+            if recovery["outcome"] == "not-required" or not recovery_statuses
+            else recovery_statuses[-1]["memory_free_percentage"]
+        ),
         "measurement_memory_pressure": measurement_pressure,
         "measurement_min_free_percentage": min(
             start["memory_free_percentage"], end["memory_free_percentage"]
@@ -351,6 +837,8 @@ def merge_environment_status(
         "start": dict(start),
         "end": dict(end),
         "post_exit": dict(post_exit),
+        "post_exit_recovery_outcome": recovery["outcome"],
+        "post_exit_recovery_final": dict(recovery["terminal_environment_status"]),
     }
 
 
@@ -379,39 +867,48 @@ def finalized_trial_rejection_reason(
 
 
 def finalize_raw_trial(
-    measurement: Mapping[str, object], post_exit: Mapping[str, object]
+    measurement: Mapping[str, object],
+    post_exit: Mapping[str, object],
+    recovery_samples: Sequence[Mapping[str, object]],
+    recovery: Mapping[str, object],
 ) -> RawTrial:
     child = validate_child_trial_measurement(measurement)
     parent = validate_post_exit_observation(post_exit, measurement=child)
-    start = child["start"]
-    end = child["end"]
-    if start["hardware"] != end["hardware"] or start["hardware"] != parent["hardware"]:
-        raise ValueError("evidence hardware changed during measurement")
-    if (
-        start["software_versions"] != end["software_versions"]
-        or start["software_versions"] != parent["software_versions"]
-    ):
-        raise ValueError("evidence software versions changed during measurement")
+    samples = validate_post_exit_recovery_samples(
+        recovery_samples, measurement=child, post_exit=parent
+    )
+    summary = validate_post_exit_recovery(
+        recovery, measurement=child, post_exit=parent, samples=samples
+    )
     return RawTrial.from_dict(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             **child["trial"],
-            "software_versions": start["software_versions"],
-            "hardware": start["hardware"],
+            "software_versions": child["start"]["software_versions"],
+            "hardware": child["start"]["hardware"],
             "environment_status": merge_environment_status(
-                start["environment_status"],
-                end["environment_status"],
+                child["start"]["environment_status"],
+                child["end"]["environment_status"],
                 parent["environment_status"],
+                samples,
+                summary,
             ),
             "evidence_session_identity": child["session_identity"],
             "journal_attempt_index": child["journal_attempt_index"],
             "child_measurement": child,
             "post_exit_observation": parent,
+            "post_exit_recovery_samples": list(samples),
+            "post_exit_recovery": summary,
         }
     )
 
 
 def validate_raw_trial_evidence(trial: RawTrial) -> None:
-    expected = finalize_raw_trial(trial.child_measurement, trial.post_exit_observation)
+    expected = finalize_raw_trial(
+        trial.child_measurement,
+        trial.post_exit_observation,
+        trial.post_exit_recovery_samples,
+        trial.post_exit_recovery,
+    )
     if expected != trial:
         raise ValueError("raw trial does not match its embedded evidence")

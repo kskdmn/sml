@@ -33,9 +33,13 @@ from v2.benchmarks.analysis import analyze_pairs
 from v2.benchmarks.evidence import (
     build_child_trial_measurement,
     build_post_exit_observation,
+    build_post_exit_recovery,
+    build_post_exit_recovery_sample,
     finalize_raw_trial,
     validate_child_trial_measurement,
     validate_post_exit_observation,
+    validate_post_exit_recovery,
+    validate_post_exit_recovery_sample,
     validate_raw_trial_evidence,
 )
 from v2.benchmarks.journal import (
@@ -95,6 +99,7 @@ from v2.benchmarks.workload import (
     fixed_inference_requests,
     fixed_swag_examples,
     harness_content_identity,
+    post_exit_recovery_policy,
     semantic_row_content_identity,
     structured_identity,
     write_paired_pretraining_representations,
@@ -265,7 +270,7 @@ def test_canonical_workload_round_trip_pins_complete_benchmark_contract():
         structured_identity(
             "sml-benchmark-protocol-neutral-workload-v1", protocol_neutral
         )
-        == "sha256:7f1f8c8f6721ebaf58745a219bf15765072744fa7f53ec2ccd7c83127dc76cdc"
+        == "sha256:90981b91ce14a96a5b44f40258f44b762b11e96dc82f57586348c84370bf41b2"
     )
 
 
@@ -639,7 +644,7 @@ def test_latency_and_peak_memory_metrics_use_their_pinned_values():
     assert memory.value == 700.0
 
 
-def test_canonical_workload_binds_the_post_exit_memory_policy():
+def test_canonical_workload_binds_the_post_exit_recovery_policy():
     required = build_canonical_workload().required_environment
 
     assert required["memory_pressure"] == "normal"
@@ -647,8 +652,13 @@ def test_canonical_workload_binds_the_post_exit_memory_policy():
         "normal",
         "warning",
     ]
+    assert required["post_exit_memory_pressure_allowed"] == ["normal", "warning"]
     assert required["post_exit_memory_pressure"] == "normal"
-    assert required["post_exit_evidence_required"] is True
+    assert required["post_exit_recovery_required_for_warning"] is True
+    assert required["post_exit_recovery_sample_interval_seconds"] == 5.0
+    assert required["post_exit_recovery_timeout_seconds"] == 300.0
+    assert required["post_exit_recovery_stability_seconds"] == 30.0
+    assert required["post_exit_recovery_evidence_required"] is True
 
 
 @pytest.mark.parametrize(
@@ -1118,9 +1128,128 @@ def _valid_post_exit_observation(measurement):
     return build_post_exit_observation(measurement=measurement, **observation)
 
 
+def _valid_recovery_policy(workload):
+    return post_exit_recovery_policy(workload)
+
+
+def _recovery_evidence(
+    workload,
+    *,
+    immediate_pressure="normal",
+    sample_pressures=(),
+    sample_elapsed=(),
+    sample_status_changes=(),
+    outcome=None,
+    failure_fields=(),
+):
+    if len(sample_pressures) != len(sample_elapsed):
+        raise ValueError("sample pressure and elapsed fixtures must have equal length")
+    if sample_status_changes and len(sample_status_changes) != len(sample_pressures):
+        raise ValueError("sample status changes must match the sample count")
+    measurement = _valid_child_measurement(workload)
+    immediate = _valid_observation("2026-08-09T00:00:02+00:00")
+    immediate["environment_status"]["memory_pressure"] = immediate_pressure
+    post_exit = build_post_exit_observation(measurement=measurement, **immediate)
+    samples = []
+    previous_identity = None
+    changes = sample_status_changes or ({},) * len(sample_pressures)
+    for index, (pressure, elapsed, status_changes) in enumerate(
+        zip(sample_pressures, sample_elapsed, changes, strict=True)
+    ):
+        observation = _valid_observation("2026-08-09T00:00:03+00:00")
+        observation["environment_status"].update(
+            memory_pressure=pressure, **status_changes
+        )
+        sample = build_post_exit_recovery_sample(
+            measurement=measurement,
+            post_exit=post_exit,
+            sample_index=index,
+            previous_sample_identity=previous_identity,
+            elapsed_seconds=elapsed,
+            **observation,
+        )
+        samples.append(sample)
+        previous_identity = sample["identity"]
+    resolved_outcome = outcome or (
+        "not-required" if immediate_pressure == "normal" else "recovered"
+    )
+    recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=samples,
+        policy=post_exit_recovery_policy(workload),
+        outcome=resolved_outcome,
+        duration_seconds=0.0 if not samples else samples[-1]["elapsed_seconds"],
+        failure_fields=failure_fields,
+    )
+    trial = finalize_raw_trial(measurement, post_exit, samples, recovery)
+    return measurement, post_exit, tuple(samples), recovery, trial
+
+
+def _valid_post_exit_recovery(measurement, post_exit, samples=()):
+    immediate_pressure = post_exit["environment_status"]["memory_pressure"]
+    outcome = {
+        "normal": "not-required",
+        "warning": "interrupted",
+        "critical": "critical",
+    }[immediate_pressure]
+    return build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=samples,
+        policy=post_exit_recovery_policy(build_canonical_workload()),
+        outcome=outcome if not samples else "recovered",
+        duration_seconds=0.0 if not samples else samples[-1]["elapsed_seconds"],
+    )
+
+
+def _valid_recovered_evidence():
+    return _recovery_evidence(
+        build_canonical_workload(),
+        immediate_pressure="warning",
+        sample_pressures=("normal",) * 7,
+        sample_elapsed=(5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0),
+        outcome="recovered",
+    )[:4]
+
+
+def _valid_recovered_raw_trial(workload):
+    return _recovery_evidence(
+        workload,
+        immediate_pressure="warning",
+        sample_pressures=("normal",) * 7,
+        sample_elapsed=(5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0),
+        outcome="recovered",
+    )[4]
+
+
+def _evidence_for_recovery_outcome(outcome, pressure, failure_fields):
+    kwargs = {
+        "immediate_pressure": pressure,
+        "outcome": outcome,
+        "failure_fields": failure_fields,
+    }
+    if outcome == "recovered":
+        kwargs.update(
+            sample_pressures=("normal",) * 7,
+            sample_elapsed=(5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0),
+        )
+    elif outcome == "timeout":
+        kwargs.update(sample_pressures=("warning",), sample_elapsed=(300.0,))
+    elif outcome == "environment-failure":
+        kwargs.update(
+            sample_pressures=("normal",),
+            sample_elapsed=(5.0,),
+            sample_status_changes=({"power_connected": False},),
+        )
+    return _recovery_evidence(build_canonical_workload(), **kwargs)[:3]
+
+
 def _valid_raw_trial(workload, metric="prepared-data", pair_index=0):
     measurement = _valid_child_measurement(workload, metric, pair_index)
-    return finalize_raw_trial(measurement, _valid_post_exit_observation(measurement))
+    post_exit = _valid_post_exit_observation(measurement)
+    recovery = _valid_post_exit_recovery(measurement, post_exit)
+    return finalize_raw_trial(measurement, post_exit, (), recovery)
 
 
 def _with_trial_payload(trial, **changes):
@@ -1142,7 +1271,8 @@ def _with_trial_payload(trial, **changes):
     post_exit["identity"] = structured_identity(
         "sml-parent-post-exit-observation-v1", post_exit_body
     )
-    return finalize_raw_trial(measurement, post_exit)
+    recovery = _valid_post_exit_recovery(measurement, post_exit)
+    return finalize_raw_trial(measurement, post_exit, (), recovery)
 
 
 def test_child_and_post_exit_documents_are_exactly_identity_bound():
@@ -1192,21 +1322,99 @@ def test_post_exit_observation_rejects_a_boolean_pair_index():
         validate_post_exit_observation(post_exit, measurement=measurement)
 
 
-def test_raw_trial_v2_embeds_and_revalidates_both_evidence_documents():
+def test_raw_trial_v3_embeds_and_revalidates_the_recovery_chain():
     workload = build_canonical_workload()
     measurement = _valid_child_measurement(workload)
     post_exit = _valid_post_exit_observation(measurement)
-    trial = finalize_raw_trial(measurement, post_exit)
+    recovery = _valid_post_exit_recovery(measurement, post_exit)
+    trial = finalize_raw_trial(measurement, post_exit, (), recovery)
 
-    assert trial.schema_version == 2
-    assert trial.child_measurement == measurement
-    assert trial.post_exit_observation == post_exit
+    assert trial.schema_version == 3
+    assert trial.post_exit_recovery_samples == ()
+    assert trial.post_exit_recovery == recovery
     validate_raw_trial_evidence(trial)
 
-    version_one = trial.to_dict()
-    version_one["schema_version"] = 1
+    version_two = trial.to_dict()
+    version_two["schema_version"] = 2
     with pytest.raises(ValueError, match="schema version"):
-        RawTrial.from_dict(version_one)
+        RawTrial.from_dict(version_two)
+
+
+def test_recovery_samples_form_an_exact_ordered_identity_chain():
+    measurement, post_exit, samples, recovery = _valid_recovered_evidence()
+
+    previous = None
+    for index, sample in enumerate(samples):
+        assert (
+            validate_post_exit_recovery_sample(
+                sample,
+                measurement=measurement,
+                post_exit=post_exit,
+                previous_sample=previous,
+            )
+            == sample
+        )
+        assert sample["sample_index"] == index
+        previous = sample
+    assert (
+        validate_post_exit_recovery(
+            recovery,
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+        )
+        == recovery
+    )
+
+    changed = json.loads(json.dumps(samples))
+    changed[1]["previous_sample_identity"] = "sha256:" + "0" * 64
+    with pytest.raises(ValueError, match="previous sample identity"):
+        validate_post_exit_recovery(
+            recovery,
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=changed,
+        )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "pressure", "failure_fields"),
+    (
+        ("not-required", "normal", ()),
+        ("recovered", "warning", ()),
+        ("timeout", "warning", ()),
+        ("critical", "critical", ()),
+        ("environment-failure", "warning", ("power_connected",)),
+        ("interrupted", "warning", ()),
+    ),
+)
+def test_recovery_summary_rejects_incompatible_outcome_evidence(
+    outcome, pressure, failure_fields
+):
+    measurement, post_exit, samples = _evidence_for_recovery_outcome(
+        outcome, pressure, failure_fields
+    )
+    recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=samples,
+        policy=_valid_recovery_policy(build_canonical_workload()),
+        outcome=outcome,
+        duration_seconds=0.0 if not samples else samples[-1]["elapsed_seconds"],
+        failure_fields=failure_fields,
+    )
+    changed = {
+        **recovery,
+        "outcome": "timeout" if outcome == "recovered" else "recovered",
+    }
+
+    with pytest.raises(ValueError, match="recovery identity|recovery outcome"):
+        validate_post_exit_recovery(
+            changed,
+            measurement=measurement,
+            post_exit=post_exit,
+            samples=samples,
+        )
 
 
 def _with_observation_changes(
@@ -1237,7 +1445,8 @@ def _with_observation_changes(
         environment_status=post_exit["environment_status"],
         software_versions=post_exit["software_versions"],
     )
-    return finalize_raw_trial(measurement, updated_post_exit)
+    recovery = _valid_post_exit_recovery(measurement, updated_post_exit)
+    return finalize_raw_trial(measurement, updated_post_exit, (), recovery)
 
 
 def _with_environment_observations(trial, *, start=None, end=None, post_exit=None):
@@ -1260,7 +1469,8 @@ def _with_environment_observations(trial, *, start=None, end=None, post_exit=Non
     parent["identity"] = structured_identity(
         "sml-parent-post-exit-observation-v1", parent_body
     )
-    return finalize_raw_trial(measurement, parent)
+    recovery = _valid_post_exit_recovery(measurement, parent)
+    return finalize_raw_trial(measurement, parent, (), recovery)
 
 
 @pytest.mark.parametrize(
@@ -2547,7 +2757,8 @@ def _persist_journal_trial(journal, attempt, trial):
     post_exit["identity"] = structured_identity(
         "sml-parent-post-exit-observation-v1", post_exit_body
     )
-    persisted = finalize_raw_trial(measurement, post_exit)
+    recovery = _valid_post_exit_recovery(measurement, post_exit)
+    persisted = finalize_raw_trial(measurement, post_exit, (), recovery)
     atomic_write_json(
         journal.measurement_path(attempt.slot, attempt.journal_attempt_index),
         measurement,
@@ -3999,8 +4210,13 @@ def test_baseline_journal_rejects_old_journal_session_without_post_exit_policy(
     required = old["canonical_workload"]["required_environment"]
     for key in (
         "measurement_end_memory_pressure_allowed",
+        "post_exit_memory_pressure_allowed",
         "post_exit_memory_pressure",
-        "post_exit_evidence_required",
+        "post_exit_recovery_required_for_warning",
+        "post_exit_recovery_sample_interval_seconds",
+        "post_exit_recovery_timeout_seconds",
+        "post_exit_recovery_stability_seconds",
+        "post_exit_recovery_evidence_required",
     ):
         required.pop(key)
     old["canonical_workload_identity"] = structured_identity(
@@ -4974,9 +5190,9 @@ def test_paired_trials_share_one_identity_bound_evidence_session(tmp_path, monke
             session_identity=kwargs["evidence_session_identity"],
             journal_attempt_index=kwargs["journal_attempt_index"],
         )
-        return finalize_raw_trial(
-            measurement, _valid_post_exit_observation(measurement)
-        )
+        post_exit = _valid_post_exit_observation(measurement)
+        recovery = _valid_post_exit_recovery(measurement, post_exit)
+        return finalize_raw_trial(measurement, post_exit, (), recovery)
 
     monkeypatch.setattr(benchmark_runner, "_launch_trial", launch)
 
@@ -5045,7 +5261,12 @@ def _journal_trial_evidence(journal, attempt, trial=None):
         post_exit["identity"] = structured_identity(
             "sml-parent-post-exit-observation-v1", post_exit_body
         )
-    return measurement, post_exit, finalize_raw_trial(measurement, post_exit)
+    recovery = _valid_post_exit_recovery(measurement, post_exit)
+    return (
+        measurement,
+        post_exit,
+        finalize_raw_trial(measurement, post_exit, (), recovery),
+    )
 
 
 def _persist_journal_evidence(
