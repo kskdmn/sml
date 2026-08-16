@@ -181,6 +181,19 @@ def _rows(row_width: int, *identifiers: int) -> np.ndarray:
     )
 
 
+class _CountingMX:
+    def __init__(self, delegate) -> None:
+        self._delegate = delegate
+        self.transfer_count = 0
+
+    def array(self, rows: np.ndarray):
+        self.transfer_count += 1
+        return self._delegate.array(rows)
+
+    def eval(self, *arrays) -> None:
+        self._delegate.eval(*arrays)
+
+
 @pytest.fixture
 def prepared_bundle(prepared_sources, tmp_path) -> PreparedDataBundle:
     bundle = prepare_pretraining_bundle(
@@ -195,6 +208,37 @@ def prepared_bundle(prepared_sources, tmp_path) -> PreparedDataBundle:
             _rows(width, 20, 21),
         ),
     )
+
+
+def test_benchmark_adapter_runs_real_prepared_data_workflow(monkeypatch):
+    source_root = Path(__file__).resolve().parents[3]
+    monkeypatch.syspath_prepend(str(source_root))
+    from v2.benchmarks.adapters.replacement import (
+        ReplacementNativeWorkload,
+        resolve_native_workload,
+        run_measured,
+        run_warmup,
+    )
+    from v2.benchmarks.workload import build_canonical_workload
+
+    workload = build_canonical_workload(
+        model_overrides={"vocab_size": 32},
+        loader_overrides={"sequence_length": 8},
+        row_count=32,
+    )
+    native = resolve_native_workload("prepared-data", workload, source_root)
+
+    assert isinstance(native, ReplacementNativeWorkload)
+    recorder = _CountingMX(native.runtime._mx)
+    native.runtime._mx = recorder
+    try:
+        assert run_warmup("prepared-data", native, 1) is None
+        assert recorder.transfer_count == 1
+        recorder.transfer_count = 0
+        assert run_measured("prepared-data", native, 3) == 3.0
+        assert recorder.transfer_count == 3
+    finally:
+        native.runtime.close()
 
 
 def _take(stream: PretrainingBatchStream, count: int) -> list[BatchEnvelope]:

@@ -435,11 +435,26 @@ def test_replacement_adapter_has_frozen_lazy_owner_map_before_modules_exist():
         "peak-metal-memory": "sml.training.pretrain",
     }
 
-    native = resolve_native_workload(
-        "prepared-data", build_canonical_workload(), Path.cwd()
+
+def test_replacement_adapter_enables_real_prepared_data_owner():
+    workload = build_canonical_workload(
+        model_overrides={"vocab_size": 32},
+        loader_overrides={"sequence_length": 8},
+        row_count=32,
     )
-    assert isinstance(native, UnavailableNativeWorkload)
+
+    native = resolve_native_workload("prepared-data", workload, Path.cwd())
+
+    assert isinstance(native, ReplacementNativeWorkload)
     assert native.owner_import == "sml.data.pretraining"
+    assert (
+        native.canonical_row_identity
+        == workload.semantic_identities["canonical_training_rows"]
+    )
+    assert native.canonical_projection == canonical_metric_projection(
+        "prepared-data", workload
+    )
+    native.runtime.close()
 
 
 def test_replacement_adapter_abi_and_future_owner_transition(tmp_path, monkeypatch):

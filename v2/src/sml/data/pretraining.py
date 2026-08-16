@@ -1203,6 +1203,15 @@ def prepare_pretraining_bundle(
     )
 
 
+def build_benchmark_workload(metric: str, canonical_workload: object) -> object:
+    """Build the production prepared-data path for the pinned benchmark ABI."""
+    from sml.data._pretraining_benchmark import (
+        build_prepared_data_benchmark_workload,
+    )
+
+    return build_prepared_data_benchmark_workload(metric, canonical_workload)
+
+
 __all__ = [
     "WINDOWED_ROW_SHUFFLE_V1",
     "BatchEnvelope",
@@ -1210,6 +1219,7 @@ __all__ = [
     "PretrainingBatchStream",
     "PretrainingCursor",
     "PretrainingPreparationConfig",
+    "build_benchmark_workload",
     "pack_token_ranges",
     "prepare_pretraining_bundle",
 ]
