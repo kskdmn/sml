@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -8,13 +10,21 @@ import numpy as np
 import pytest
 import zstandard as zstd
 from sml.artifacts.manifest import (
+    PayloadRef,
     PretrainingDataManifest,
     TokenizerManifest,
     VerificationLevel,
+    canonical_json_bytes,
+    file_identity,
     read_manifest,
+    row_content_identity,
 )
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
+    BatchEnvelope,
+    PreparedDataBundle,
+    PretrainingBatchStream,
+    PretrainingCursor,
     PretrainingPreparationConfig,
     prepare_pretraining_bundle,
 )
@@ -93,6 +103,123 @@ def _load_rows(bundle_path: Path) -> np.ndarray:
         for shard in manifest.shards
     ]
     return np.concatenate(arrays, axis=0)
+
+
+def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
+    with path.open("rb") as payload:
+        identity = file_identity(payload)
+    return PayloadRef(
+        logical_path=logical_path,
+        identity=identity,
+        byte_size=path.stat().st_size,
+    )
+
+
+def _write_manifest(path: Path, manifest: PretrainingDataManifest) -> None:
+    path.joinpath("manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+
+def _replace_shards(
+    bundle: PreparedDataBundle,
+    arrays: tuple[np.ndarray, ...],
+    *,
+    declared_counts: tuple[int, ...] | None = None,
+) -> PreparedDataBundle:
+    shard_directory = bundle.path / "shards"
+    for path in shard_directory.iterdir():
+        path.unlink()
+
+    paths = []
+    for index, array in enumerate(arrays):
+        path = shard_directory / f"train-{index:06d}.npy"
+        with path.open("wb") as payload:
+            np.save(payload, array, allow_pickle=False)
+        paths.append(path)
+
+    counts = declared_counts or tuple(array.shape[0] for array in arrays)
+    references = tuple(_payload_ref(path, f"shards/{path.name}") for path in paths)
+    rows = (row for array in arrays for row in array)
+    manifest = replace(
+        bundle.manifest,
+        shard_row_counts=counts,
+        shards=references,
+        row_content_identity=row_content_identity(
+            rows,
+            sum(array.shape[0] for array in arrays),
+            bundle.manifest.row_width,
+        ),
+    )
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    _write_manifest(bundle.path, manifest)
+    return replace(bundle, manifest=manifest)
+
+
+def _replace_manifest(
+    bundle: PreparedDataBundle, **changes: object
+) -> PreparedDataBundle:
+    manifest = replace(bundle.manifest, **changes)
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    _write_manifest(bundle.path, manifest)
+    return replace(bundle, manifest=manifest)
+
+
+def _replace_shard_payload(
+    bundle: PreparedDataBundle, index: int, array: np.ndarray
+) -> PreparedDataBundle:
+    reference = bundle.manifest.shards[index]
+    path = bundle.path / reference.logical_path
+    with path.open("wb") as payload:
+        np.save(payload, array, allow_pickle=False)
+    references = list(bundle.manifest.shards)
+    references[index] = _payload_ref(path, reference.logical_path)
+    return _replace_manifest(bundle, shards=tuple(references))
+
+
+def _rows(row_width: int, *identifiers: int) -> np.ndarray:
+    return np.stack(
+        [np.full(row_width, identifier, dtype="<i4") for identifier in identifiers]
+    )
+
+
+@pytest.fixture
+def prepared_bundle(prepared_sources, tmp_path) -> PreparedDataBundle:
+    bundle = prepare_pretraining_bundle(
+        _config(prepared_sources), tmp_path / "stream-bundle"
+    )
+    width = bundle.manifest.row_width
+    return _replace_shards(
+        bundle,
+        (
+            _rows(width, 0, 1),
+            _rows(width, 10, 11),
+            _rows(width, 20, 21),
+        ),
+    )
+
+
+def _take(stream: PretrainingBatchStream, count: int) -> list[BatchEnvelope]:
+    iterator = iter(stream)
+    return [next(iterator) for _ in range(count)]
+
+
+def _assert_constructor_fails_before_thread_start(
+    monkeypatch,
+    error: type[Exception],
+    message: str,
+    construct,
+) -> None:
+    starts = 0
+    original_start = threading.Thread.start
+
+    def record_start(thread):
+        nonlocal starts
+        starts += 1
+        return original_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", record_start)
+    with pytest.raises(error, match=message):
+        construct()
+    assert starts == 0
 
 
 def test_prepared_bundle_is_closed_self_describing_and_mmap_ready(
@@ -271,3 +398,707 @@ def test_preparation_rejects_invalid_processor_token_ids_before_publication(
         prepare_pretraining_bundle(_config(prepared_sources), output)
 
     assert not output.exists()
+
+
+def test_epoch_stream_crosses_shards_and_drops_one_tail(prepared_bundle):
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=2,
+        cursor=PretrainingCursor.initial(),
+    )
+    identifiers = []
+    shapes = []
+    cursors = []
+    with stream:
+        for envelope in stream.iter_epoch(0):
+            try:
+                identifiers.extend(envelope.rows[:, 0].tolist())
+                shapes.append(envelope.rows.shape)
+                cursors.append(envelope.cursor_after)
+            finally:
+                envelope.release()
+
+    assert identifiers == [10, 11, 20, 21, 0, 1]
+    assert shapes == [(3, prepared_bundle.manifest.row_width)] * 2
+    assert cursors == [PretrainingCursor(0, 1, 1), PretrainingCursor(1, 0, 0)]
+
+
+def test_resume_stream_starts_at_normalized_cursor_without_replay(prepared_bundle):
+    cursor = PretrainingCursor(epoch=0, shard_order_position=1, row_offset=2)
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=2,
+        seed=5,
+        prefetch_depth=4,
+        cursor=cursor,
+    )
+
+    with stream:
+        assert stream.committed_cursor == PretrainingCursor(0, 2, 0)
+        resumed = next(iter(stream))
+        try:
+            assert resumed.rows[:, 0].tolist() == [0, 1]
+            assert resumed.cursor_after == PretrainingCursor(1, 0, 0)
+        finally:
+            resumed.release()
+
+
+def test_stream_normalizes_exact_epoch_end_and_continues_in_next_epoch(
+    prepared_bundle,
+):
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=2,
+        cursor=PretrainingCursor(0, 3, 0),
+    )
+
+    with stream:
+        assert stream.committed_cursor == PretrainingCursor(1, 0, 0)
+        envelope = next(stream)
+        try:
+            assert envelope.rows[:, 0].tolist() == [0, 1, 20]
+            assert envelope.cursor_after == PretrainingCursor(1, 1, 1)
+        finally:
+            envelope.release()
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        PretrainingCursor(0, 4, 0),
+        PretrainingCursor(0, 0, 3),
+        PretrainingCursor(0, 3, 1),
+    ],
+)
+def test_stream_rejects_cursor_beyond_epoch_order_or_shard(prepared_bundle, cursor):
+    with pytest.raises(SMLDataError, match="cursor"):
+        PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=cursor,
+        )
+
+
+def test_dropped_tail_stream_retains_commit_and_does_not_consume_next_epoch(
+    prepared_bundle,
+):
+    width = prepared_bundle.manifest.row_width
+    prepared_bundle = _replace_shards(
+        prepared_bundle,
+        (
+            _rows(width, 0, 1),
+            _rows(width, 10, 11),
+            _rows(width, 20, 21, 22),
+        ),
+    )
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=2,
+        cursor=PretrainingCursor.initial(),
+    )
+
+    epoch_zero_rows = []
+    with stream:
+        for envelope in stream.iter_epoch(0):
+            try:
+                epoch_zero_rows.extend(envelope.rows[:, 0].tolist())
+                stream.commit(envelope.cursor_after)
+            finally:
+                envelope.release()
+
+        assert epoch_zero_rows == [10, 11, 20, 21, 22, 0]
+        assert stream.committed_cursor == PretrainingCursor(0, 2, 1)
+        with pytest.raises(SMLDataError, match="delivered"):
+            stream.commit(PretrainingCursor(1, 0, 0))
+        resume_cursor = stream.committed_cursor
+
+    resumed = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=2,
+        cursor=resume_cursor,
+    )
+    resumed_rows = []
+    resumed_cursors = []
+    with resumed:
+        for _index in range(3):
+            envelope = next(resumed)
+            try:
+                resumed_rows.append(envelope.rows[:, 0].tolist())
+                resumed_cursors.append(envelope.cursor_after)
+            finally:
+                envelope.release()
+
+    assert resumed_rows == [[0, 1, 20], [21, 22, 10], [0, 1, 10]]
+    assert resumed_cursors == [
+        PretrainingCursor(1, 1, 1),
+        PretrainingCursor(1, 2, 1),
+        PretrainingCursor(2, 1, 1),
+    ]
+
+
+def test_prefetch_producer_position_is_not_committed(prepared_bundle):
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=4,
+        cursor=PretrainingCursor.initial(),
+    )
+
+    with stream:
+        first, second = _take(stream, 2)
+        try:
+            assert stream.committed_cursor == PretrainingCursor.initial()
+            stream.commit(second.cursor_after)
+            assert stream.committed_cursor == second.cursor_after
+            with pytest.raises(SMLDataError, match="regress"):
+                stream.commit(first.cursor_after)
+            with pytest.raises(SMLDataError, match="delivered"):
+                stream.commit(PretrainingCursor(99, 0, 0))
+        finally:
+            first.release()
+            second.release()
+
+
+def test_stream_builds_the_shard_permutation_once_per_active_epoch(
+    prepared_bundle, monkeypatch
+):
+    generator_constructions = 0
+    numpy_generator = np.random.Generator
+
+    def counting_generator(bit_generator):
+        nonlocal generator_constructions
+        generator_constructions += 1
+        return numpy_generator(bit_generator)
+
+    monkeypatch.setattr(np.random, "Generator", counting_generator)
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=1,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    with stream:
+        for _index in range(4):
+            envelope = next(stream)
+            envelope.release()
+
+        assert generator_constructions == 1
+
+
+def test_full_queue_cross_shard_envelopes_do_not_share_mutable_staging(
+    prepared_bundle,
+):
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=4,
+        cursor=PretrainingCursor.initial(),
+    )
+    envelopes = _take(stream, 4)
+    try:
+        snapshots = [envelope.rows.copy() for envelope in envelopes]
+        assert all(not envelope.rows.flags.writeable for envelope in envelopes)
+        assert len(
+            {envelope.rows.__array_interface__["data"][0] for envelope in envelopes}
+        ) == len(envelopes)
+        assert [envelope.rows.tolist() for envelope in envelopes] == [
+            rows.tolist() for rows in snapshots
+        ]
+    finally:
+        for envelope in envelopes:
+            envelope.release()
+        stream.close()
+
+
+def test_prefetch_pool_double_release_cannot_free_a_reused_live_buffer(
+    prepared_bundle,
+):
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    iterator = iter(stream)
+    first = next(iterator)
+    first_pointer = first.rows.__array_interface__["data"][0]
+    first.release()
+    second = next(iterator)
+    assert second.rows.__array_interface__["data"][0] == first_pointer
+
+    delivered = []
+    failures = []
+    completed = threading.Event()
+
+    def consume_third():
+        try:
+            delivered.append(next(iterator))
+        except Exception as error:  # noqa: BLE001 - captured from worker thread
+            failures.append(error)
+        finally:
+            completed.set()
+
+    consumer = threading.Thread(target=consume_third)
+    consumer.start()
+    try:
+        assert not completed.wait(0.15)
+        first.release()
+        assert not completed.wait(0.15)
+        second.release()
+        assert completed.wait(2)
+        assert failures == []
+        assert len(delivered) == 1
+    finally:
+        second.release()
+        for envelope in delivered:
+            envelope.release()
+        stream.close()
+        consumer.join(timeout=2)
+
+
+def test_mlx_transfer_does_not_alias_released_prefetch_staging(prepared_bundle):
+    import mlx.core as mx
+
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    iterator = iter(stream)
+    first = next(iterator)
+    snapshot = first.rows.copy()
+    first_pointer = first.rows.__array_interface__["data"][0]
+    device_rows = mx.array(first.rows)
+    first.release()
+    reused = next(iterator)
+    try:
+        assert reused.rows.__array_interface__["data"][0] == first_pointer
+        mx.eval(device_rows)
+        assert device_rows.tolist() == snapshot.tolist()
+    finally:
+        reused.release()
+        stream.close()
+
+
+def test_stream_close_wakes_full_queue_and_abandoned_envelope(prepared_bundle):
+    full_stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=2,
+        cursor=PretrainingCursor.initial(),
+    )
+    deadline = time.monotonic() + 2
+    while not full_stream._queue.full() and time.monotonic() < deadline:
+        threading.Event().wait(0.01)
+    assert full_stream._queue.full()
+    closer = threading.Thread(target=full_stream.close)
+    closer.start()
+    closer.join(timeout=2)
+    assert not closer.is_alive()
+    full_stream.close()
+
+    abandoned_stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    abandoned = next(abandoned_stream)
+    closer = threading.Thread(target=abandoned_stream.close)
+    closer.start()
+    closer.join(timeout=2)
+    assert not closer.is_alive()
+    abandoned.release()
+    abandoned_stream.close()
+    with pytest.raises(StopIteration):
+        next(abandoned_stream)
+
+
+def test_stream_close_wakes_consumer_waiting_on_empty_queue(
+    prepared_bundle, monkeypatch
+):
+    producer_entered = threading.Event()
+    allow_producer_exit = threading.Event()
+
+    def block_producer(_stream, cursor):
+        producer_entered.set()
+        allow_producer_exit.wait(2)
+        return None, cursor
+
+    monkeypatch.setattr(PretrainingBatchStream, "_next_produced", block_producer)
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    assert producer_entered.wait(2)
+
+    consumer_finished = threading.Event()
+
+    def wait_for_batch():
+        try:
+            next(stream)
+        except StopIteration:
+            pass
+        finally:
+            consumer_finished.set()
+
+    consumer = threading.Thread(target=wait_for_batch, daemon=True)
+    consumer.start()
+    threading.Event().wait(0.1)
+    closer = threading.Thread(target=stream.close, daemon=True)
+    closer.start()
+    allow_producer_exit.set()
+    closer.join(timeout=0.5)
+    closed_without_deadlock = not closer.is_alive()
+
+    if not closed_without_deadlock:  # Emergency cleanup for the RED implementation.
+        with stream._state_condition:
+            stream._closed = True
+            stream._state_condition.notify_all()
+    consumer.join(timeout=2)
+    closer.join(timeout=2)
+
+    assert closed_without_deadlock
+    assert consumer_finished.is_set()
+
+
+def test_stream_producer_exception_propagates_as_focused_data_error(
+    prepared_bundle, monkeypatch
+):
+    def fail_producer(_stream, _cursor):
+        raise RuntimeError("forced producer failure")
+
+    monkeypatch.setattr(PretrainingBatchStream, "_next_produced", fail_producer)
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    try:
+        with pytest.raises(SMLDataError, match="producer failed") as raised:
+            next(stream)
+        assert isinstance(raised.value.__cause__, RuntimeError)
+    finally:
+        stream.close()
+
+
+def test_stream_maps_open_descriptors_without_numpy_path_reload(
+    prepared_bundle, monkeypatch
+):
+    def reject_path_reload(*_args, **_kwargs):
+        raise AssertionError("runtime loader must not call np.load")
+
+    monkeypatch.setattr(np, "load", reject_path_reload)
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    with stream:
+        envelope = next(stream)
+        try:
+            assert envelope.rows[:, 0].tolist() == [10, 11, 20]
+        finally:
+            envelope.release()
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "error"),
+    [
+        ("batch_size", True, TypeError),
+        ("batch_size", 0, ValueError),
+        ("prefetch_depth", 1.0, TypeError),
+        ("prefetch_depth", 0, ValueError),
+        ("seed", np.int64(5), TypeError),
+        ("seed", -1, ValueError),
+    ],
+)
+def test_stream_rejects_invalid_plain_integer_arguments_before_thread_start(
+    prepared_bundle, monkeypatch, argument, value, error
+):
+    arguments = {
+        "batch_size": 3,
+        "seed": 5,
+        "prefetch_depth": 2,
+        "cursor": PretrainingCursor.initial(),
+    }
+    arguments[argument] = value
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        error,
+        argument,
+        lambda: PretrainingBatchStream(prepared_bundle, **arguments),
+    )
+
+
+def test_stream_requires_a_fully_verified_prepared_bundle_before_thread_start(
+    prepared_bundle, monkeypatch
+):
+    unverified = replace(
+        prepared_bundle, verification=VerificationLevel.MANIFEST_TRUSTED
+    )
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "FULL",
+        lambda: PretrainingBatchStream(
+            unverified,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+def test_stream_rejects_non_prepared_bundle_before_thread_start(monkeypatch):
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        TypeError,
+        "PreparedDataBundle",
+        lambda: PretrainingBatchStream(
+            object(),
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+def test_stream_rejects_noncanonical_outer_manifest_before_thread_start(
+    prepared_bundle, monkeypatch
+):
+    manifest_path = prepared_bundle.path / "manifest.json"
+    manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "canonical",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+def test_stream_rejects_corrupt_shard_bytes_before_thread_start(
+    prepared_bundle, monkeypatch
+):
+    shard_path = prepared_bundle.path / prepared_bundle.manifest.shards[0].logical_path
+    payload = bytearray(shard_path.read_bytes())
+    payload[-1] ^= 1
+    shard_path.write_bytes(payload)
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "identity",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+@pytest.mark.parametrize("representation", ["dtype", "shape", "count", "order"])
+def test_stream_rejects_invalid_npy_metadata_before_thread_start(
+    prepared_bundle, monkeypatch, representation
+):
+    width = prepared_bundle.manifest.row_width
+    if representation == "dtype":
+        prepared_bundle = _replace_shard_payload(
+            prepared_bundle, 0, np.zeros((2, width), dtype="<i8")
+        )
+    elif representation == "shape":
+        prepared_bundle = _replace_shard_payload(
+            prepared_bundle, 0, np.zeros((2, width + 1), dtype="<i4")
+        )
+    elif representation == "count":
+        prepared_bundle = _replace_shard_payload(
+            prepared_bundle, 0, np.zeros((3, width), dtype="<i4")
+        )
+    else:
+        prepared_bundle = _replace_shard_payload(
+            prepared_bundle,
+            0,
+            np.asfortranarray(np.zeros((2, width), dtype="<i4")),
+        )
+
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "shard",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+def test_stream_rejects_invalid_npy_header_before_thread_start(
+    prepared_bundle, monkeypatch
+):
+    reference = prepared_bundle.manifest.shards[0]
+    shard_path = prepared_bundle.path / reference.logical_path
+    payload = bytearray(shard_path.read_bytes())
+    payload[:6] = b"broken"
+    shard_path.write_bytes(payload)
+    references = list(prepared_bundle.manifest.shards)
+    references[0] = _payload_ref(shard_path, reference.logical_path)
+    prepared_bundle = _replace_manifest(prepared_bundle, shards=tuple(references))
+
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "NPY|header|shard",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+@pytest.mark.parametrize("invalid_token", [-1, 300])
+def test_stream_rejects_bundle_wide_invalid_token_range_before_thread_start(
+    prepared_bundle, monkeypatch, invalid_token
+):
+    width = prepared_bundle.manifest.row_width
+    prepared_bundle = _replace_shards(
+        prepared_bundle,
+        (
+            _rows(width, 0, 1),
+            _rows(width, 10, 11),
+            _rows(width, 20, invalid_token),
+        ),
+    )
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "token ID",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+def test_stream_binds_copied_tokenizer_manifest_to_outer_manifest_before_start(
+    prepared_bundle, monkeypatch
+):
+    prepared_bundle = _replace_manifest(
+        prepared_bundle, tokenizer_identity="sha256:" + "0" * 64
+    )
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "tokenizer",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+def test_stream_binds_copied_tokenizer_payload_refs_before_thread_start(
+    prepared_bundle, monkeypatch
+):
+    prepared_bundle = _replace_manifest(
+        prepared_bundle,
+        tokenizer_model=prepared_bundle.manifest.tokenizer_vocab,
+        tokenizer_vocab=prepared_bundle.manifest.tokenizer_model,
+    )
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "tokenizer",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+def test_stream_rejects_noncanonical_copied_tokenizer_manifest_before_start(
+    prepared_bundle, monkeypatch
+):
+    manifest_path = prepared_bundle.path / "tokenizer" / "manifest.json"
+    manifest_path.write_bytes(manifest_path.read_bytes() + b"\n")
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "tokenizer.*canonical|canonical.*tokenizer",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+def test_stream_rejects_bundle_too_small_for_one_batch_before_thread_start(
+    prepared_bundle, monkeypatch
+):
+    width = prepared_bundle.manifest.row_width
+    prepared_bundle = _replace_shards(
+        prepared_bundle, (_rows(width, 0), _rows(width, 10))
+    )
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLDataError,
+        "full runtime batch",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )

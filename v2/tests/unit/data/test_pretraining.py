@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
+    BatchEnvelope,
+    PretrainingCursor,
     PretrainingPreparationConfig,
     _windowed_row_shuffle,
     pack_token_ranges,
@@ -105,14 +107,59 @@ def test_preparation_config_expands_paths(monkeypatch, tmp_path):
     assert config.tokenizer_bundle == tmp_path / "tokenizer"
 
 
-def test_importing_pretraining_module_does_not_import_sentencepiece():
-    code = (
-        "import sys; import sml.data.pretraining; print('sentencepiece' in sys.modules)"
+def test_pretraining_cursor_is_canonical_and_rejects_non_plain_integers():
+    assert PretrainingCursor.initial() == PretrainingCursor(
+        epoch=0,
+        shard_order_position=0,
+        row_offset=0,
     )
+
+    for invalid in (True, 1.0, np.int64(1)):
+        with pytest.raises(TypeError, match="epoch"):
+            PretrainingCursor(invalid, 0, 0)
+    with pytest.raises(ValueError, match="row_offset"):
+        PretrainingCursor(0, 0, -1)
+
+
+def test_batch_envelope_exposes_read_only_rows_and_releases_idempotently():
+    rows = np.arange(12, dtype="<i4").reshape(3, 4)
+    cursor = PretrainingCursor(0, 1, 1)
+    envelope = BatchEnvelope(rows, cursor)
+
+    with envelope as entered:
+        assert entered is envelope
+        assert envelope.rows.shape == (3, 4)
+        assert not envelope.rows.flags.writeable
+        with pytest.raises(ValueError, match="read-only"):
+            envelope.rows[0, 0] = 99
+
+    envelope.release()
+
+
+def test_importing_pretraining_module_does_not_import_heavy_dependencies_itself():
+    code = """
+import builtins
+import sml
+import sys
+
+original_import = builtins.__import__
+imports = []
+
+def tracked_import(name, *args, **kwargs):
+    imports.append(name)
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = tracked_import
+try:
+    import sml.data.pretraining
+finally:
+    builtins.__import__ = original_import
+print('sentencepiece' in sys.modules, any(name == 'mlx' or name.startswith('mlx.') for name in imports))
+"""
     completed = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=False
     )
 
     assert completed.returncode == 0
-    assert completed.stdout.strip() == "False"
+    assert completed.stdout.strip() == "False False"
     assert completed.stderr == ""
