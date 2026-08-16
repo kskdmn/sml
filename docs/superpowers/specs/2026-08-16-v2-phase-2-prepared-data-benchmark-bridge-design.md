@@ -75,15 +75,18 @@ The prepared-data manifest binds:
 - the workload sequence length and row width;
 - all canonical rows in fixed order;
 - uncompressed little-endian int32 C-order NPY shards;
-- the canonical row-content identity;
+- the product `sml-row-content-v1` identity for those rows;
 - deterministic shard layout and epoch seed metadata; and
 - copied nested tokenizer manifest/model/vocab references.
 
 Factory return is permitted only after reopening the published bundle at FULL
-verification and proving the manifest row identity equals the workload's
-`canonical_training_rows` identity. Artifact construction and verification time
-is reported as startup verification by the replacement adapter and remains
-outside steady-state timing.
+verification. The bridge computes both identity domains from the same canonical
+int32 matrix: the manifest must equal the product `sml-row-content-v1` identity,
+while the adapter-facing `canonical_row_identity` must equal the harness's
+`sml-pretraining-rows-v1` `canonical_training_rows` identity. These identities
+are intentionally not equal because their domains differ. Artifact construction
+and verification time is reported as startup verification by the replacement
+adapter and remains outside steady-state timing.
 
 ## Timed Data Flow
 
