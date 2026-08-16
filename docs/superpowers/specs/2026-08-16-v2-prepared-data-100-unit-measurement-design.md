@@ -1,134 +1,259 @@
-# V2 Prepared-Data 100-Unit Measurement Design
+# V2 Prepared-Data 100-Unit Protocol and Baseline Design
 
-## Context
+**Status:** Approved revised design
 
-The reviewed stop-interruptible shutdown fix at
-`8e2291f1c87244fa8acd33d375c9e49961bb70fa` removed the candidate loader's
-fixed shutdown delay. A fresh Phase 2 comparison using 20 measured batches per
-trial then showed strong throughput but failed the unchanged dispersion gate:
+**Date:** 2026-08-16
 
-- attempt 0 median candidate/reference ratio: `2.0102596413753253`;
-- attempt 0 ratio MAD: `0.041183156349385186`;
-- harness-owned retry median ratio: `2.05762452965475`;
-- harness-owned retry ratio MAD: `0.04980990612059033`;
-- required maximum ratio MAD: `0.02`.
+## Context and Correction
 
-All 20 raw trials, the 30-second launch gate, and the harness-owned 15-minute
-cooldown were nominal: AC connected, automatic power mode, low-power mode off,
-thermal state nominal/raw `0`, normal memory pressure, and no competing GPU
-workload. The final comparison decision was therefore `too-noisy`, not a
-thermal or power rejection.
+The stop-interruptible stream fix made prepared-data throughput roughly twice
+the current pinned baseline, but two 20-unit comparison attempts failed the
+unchanged dispersion ceiling. Their measured regions were only about `0.7 ms`
+for the candidate and `1.4 ms` for the reference, so fixed scheduling and timer
+variation remained material.
 
-At the observed medians, 20 measured batches cover only about `0.7 ms` on the
-candidate and `1.4 ms` on the reference. Fixed scheduling and timer variation
-therefore represent a meaningful fraction of each measured interval.
+The first follow-up design treated `--measure 100` as an ordinary comparison
+override. A clean execution proved that assumption false before any trial ran:
+
+```text
+ValueError: comparison protocol has invalid measured_units
+```
+
+Root-cause tracing established three binding facts:
+
+1. comparison validation requires `DEFAULT_MEASURED_UNITS == 20`;
+2. child measurement ignores the supplied global CLI count and derives its
+   actual count from the canonical metric work unit; and
+3. the pinned baseline's canonical workload, harness identity, session, raw
+   trials, and manifest all encode the current per-metric count map.
+
+Prepared-data at 100 is therefore a new versioned benchmark protocol. It needs
+harness changes and a fresh baseline; old trials cannot be reused.
 
 ## Goal
 
-Increase the measured work inside each prepared-data trial from 20 to 100
-batches so each timing interval contains five times more real loader work,
-while preserving the full 1,024-token workload and every existing acceptance
-threshold and evidence rule.
+Measure prepared-data with 100 real microbatches per trial while keeping the
+full 1,024-token workload, every other metric's current count, and all existing
+environment and statistical acceptance gates.
 
-## Chosen Protocol
+## Protocol Model
 
-The next Phase 2 comparison changes exactly one comparison parameter:
+The protocol keeps the global default and adds one explicit prepared-data
+count:
 
 ```text
---measure 20  ->  --measure 100
+DEFAULT_MEASURED_UNITS = 20
+PREPARED_DATA_MEASURED_UNITS = 100
 ```
 
-Every measured unit remains one real prepared-data batch with microbatch size
-1 and sequence length 1,024. The replacement continues to exercise the real
-`PretrainingBatchStream`, consumer-side MLX transfer/evaluation, and stream
-shutdown before the measured call returns. The reference and candidate receive
-the same 100-unit work request.
+The canonical per-metric map becomes:
 
-The following protocol fields remain unchanged:
+| Metric | Measured units |
+| --- | ---: |
+| `prepared-data` | 100 |
+| `pretraining-compute` | 20 |
+| `pretraining-end-to-end` | 20 |
+| `swag-end-to-end` | 20 |
+| `inference-prefill` | 32 fixed requests |
+| `inference-decode` | 32 fixed requests |
+| `checkpoint-pause` | 20 |
+| `compile-cold-start` | 1 |
+| `peak-metal-memory` | 1 optimizer step |
 
-- screen mode;
-- 5 paired comparisons per attempt;
+Warmup remains 5 for every non-compile metric and 0 for cold compile.
+Prepared-data still means microbatch size 1, sequence length 1,024, canonical
+row order, real native loader consumption, consumer-side MLX transfer and
+evaluation, and stream closure before the measured call returns.
+
+The canonical workload, protocol records, journal session, baseline manifest,
+raw trials, comparison reports, and replay commands all bind both the global
+default `20` and prepared-data count `100`.
+
+## Versioning and Compatibility
+
+The existing baseline is version 1 and remains bound to prepared-data 20. The
+new baseline is version 2 and is bound to prepared-data 100. Version 2 uses the
+identity domain `sml-performance-baseline-v2` and adds
+`prepared_data_measured_units` to its exact protocol field set.
+
+Current validators dispatch by baseline version:
+
+- version 1 reconstructs the legacy canonical workload with prepared-data 20,
+  requires the old protocol field set, and preserves validation of the
+  existing committed baseline;
+- version 2 reconstructs the new canonical workload with prepared-data 100 and
+  requires the new explicit protocol field.
+
+Comparison and phase validation derive the expected prepared-data count and
+protocol shape from the supplied baseline version. Old reports are never
+silently upgraded, and a report or raw trial cannot mix version-1 and
+version-2 workload, harness, protocol, or evidence identities.
+
+## CLI and Runtime Data Flow
+
+`record-baseline` and `compare` receive an explicit option:
+
+```text
+--prepared-data-measure 100
+```
+
+The existing `--measure 20` remains the immutable global default for metrics
+without a dedicated count. New baseline capture requires the explicit value
+100. Comparison resolves the expected prepared-data count from the supplied
+baseline: omitting the new option infers that exact value for compatibility,
+while supplying it requires an exact match. Canonical replay commands always
+write it explicitly. Supplying any other global or prepared-data value fails
+before process launch.
+
+The controller constructs one canonical workload with the exact per-metric
+map. For every trial it resolves the selected metric's canonical count and
+passes that count to the child process. The child reconstructs the same
+canonical workload, verifies that its received count equals the selected work
+unit, and then passes that exact value to `measure_native_process()` and the
+adapter. It must no longer silently ignore a mismatched child count.
+
+Raw-trial validation continues to compare `trial.measured_units` to the
+canonical metric work unit. Prepared-data trials with 20 or any value other
+than 100 fail; unchanged metrics fail if they depart from their existing
+counts.
+
+## Baseline Versioning and Capture
+
+The existing baseline remains immutable and continues to support evidence
+created under the 20-unit prepared-data protocol:
+
+- `v2/benchmarks/manifests/baseline-3687f8b.json`
+- `v2/benchmarks/results/baseline-3687f8b.jsonl`
+
+The new protocol publishes separate artifacts:
+
+- `v2/benchmarks/manifests/baseline-3687f8b-prepared100.json`
+- `v2/benchmarks/results/baseline-3687f8b-prepared100.jsonl`
+
+Changing the harness and canonical workload changes their identities. The new
+baseline must therefore capture all 45 raw trials—five reference-side trials
+for each of nine metrics—using the pinned legacy source commit
+`3687f8b3214a44c675ae67af52e4997762f6c634` and the newly committed harness.
+No raw trial or journal slot from the old baseline is copied.
+
+Capture uses a new external state directory under `/private/tmp`, durable
+journaling, atomic trial publication, and the existing retry/cooldown rules.
+It may resume only its own compatible journal after interruption or an
+environment rejection. AC, automatic power mode, Low Power Mode off, nominal
+thermal/raw `0`, normal memory pressure, no competing GPU workload, clean
+checkout, software, and identity gates remain fail-closed.
+
+The harness implementation commit must exist and pass independent review
+before baseline capture starts. The new baseline manifest and JSONL are
+independently validated before their separate evidence commit.
+
+## Phase 2 Comparison
+
+After the new baseline validates, Phase 2 starts from zero against
+`baseline-3687f8b-prepared100.json`. The exact screen profile remains:
+
+- prepared-data only;
+- 5 pairs;
 - 5 warmup units;
+- prepared-data measured units 100;
 - 10,000 bootstrap resamples;
-- median ratio floor `0.97`;
-- ratio MAD ceiling `0.02`;
-- lower confidence bound report-only;
-- predecessor mapping `{"prepared-data": null}`;
-- pinned baseline manifest `baseline-3687f8b.json`;
-- canonical `TMPDIR=/private/tmp`;
-- harness-owned statistical-noise retry and cooldown only.
-
-This is a duration increase, not a workload-shape change or threshold
-relaxation. It is expected to lengthen each measured interval by roughly five
-times, but it does not guarantee that dispersion will pass.
-
-## Evidence Isolation and Execution
-
-The rejected 20-unit report with comparison identity
-`sha256:1b19e60760cd84144395eb70cf001bd683a2afc552dfa68e344c3902bc09ea58`
-must be moved from the public result path to an ignored preservation path
-before the new run. It must never be staged, validated, merged with new trials,
-or used as resumable evidence.
-
-The 100-unit attempt starts from zero after:
-
-1. a clean candidate/status check;
-2. Ruff and full v2 pytest verification;
-3. confirmation that `uv.lock` is unchanged;
-4. a fresh 30-continuous-second launch gate requiring AC connected, automatic
-   power mode, low-power mode off, thermal nominal/raw `0`, normal memory
-   pressure, and no competing GPU workload.
-
-The comparison is non-resumable. The operator must not manually retry or
-salvage trials. Only the harness may perform its configured statistical-noise
-retry and cooldown.
-
-## Validation and Acceptance
-
-Independent Phase 2 validation runs only if the fresh comparison's final
-prepared-data decision is `pass`. Acceptance still requires:
-
 - median candidate/reference ratio at least `0.97`;
 - ratio MAD no greater than `0.02`;
-- valid canonical workload, baseline, harness, candidate, trial, and
-  environment identities;
-- every retained trial passing its power, thermal, memory, and competing-work
-  checks;
-- an empty predecessor set for prepared-data.
+- lower confidence bound report-only; and
+- predecessors `{"prepared-data": null}`.
 
-Only a passing comparison and passing independent validation may publish and
-commit `phase-2-loader.json` and `phase-2.json`. Any gate timeout, comparison
-rejection, environment rejection, or validation failure blocks staging and
-commit. Nothing is pushed as part of this protocol task.
+The comparison is non-resumable. Only the harness may perform its one
+statistical-noise retry and cooldown. Independent Phase 2 validation runs only
+after a passing comparison. Exactly `phase-2-loader.json` and `phase-2.json`
+may enter the acceptance commit.
+
+## Evidence Isolation
+
+The rejected 20-unit comparison is preserved at:
+
+```text
+.superpowers/sdd/2026-08-16-v2-prepared-data-100-unit-measurement/
+failed-phase-2-loader-too-noisy-1b19e607.json
+```
+
+It remains diagnostic-only and unstaged. The failed no-trial 100-unit CLI
+attempt produced no public report. Neither is merged into the new baseline or
+Phase 2 evidence.
+
+## Failure Handling
+
+- Harness or test failure blocks baseline capture.
+- A non-nominal live gate blocks launch.
+- Baseline environment rejection preserves its compatible journal and resumes
+  only under the baseline-capture protocol's recovery rules.
+- Baseline validation failure blocks publication and commit.
+- Comparison rejection or `too-noisy` after the harness retry blocks Phase 2
+  validation, staging, and commit.
+- Phase 2 validation failure blocks acceptance.
+- No threshold is relaxed and no result is edited, salvaged, or manually
+  combined.
+- Nothing is pushed automatically.
 
 ## Rejected Alternatives
 
-### Aggregate several 20-unit submeasurements
+### Set the global measured default to 100
 
-This would require benchmark-harness code and a new aggregation/statistical
-contract. It is unnecessary when the existing measured-unit interface can
-increase real work directly.
+This would also lengthen expensive training and checkpoint metrics fivefold,
+recreating the sustained thermal problem that motivated the 20-unit default.
 
-### Relax the dispersion ceiling
+### Add a prepared-data-only baseline schema
 
-Changing the `0.02` threshold after observing a rejection would weaken the
-prospective acceptance contract. The threshold remains unchanged.
+This avoids full recapture but creates a second lineage/validation model and
+weakens the single canonical baseline contract. The existing full baseline
+format is retained instead.
 
-### Reuse or merge rejected trials
+### Bypass protocol validation or edit the report
 
-The comparison is explicitly non-resumable. Reusing the 20-unit trials would
-mix different protocols and invalidate the evidence identity.
+The child would still run 20 units, and the result would falsely claim 100.
+This is invalid evidence.
 
-## Verification and Success Criteria
+### Reuse unchanged old baseline trials
 
-- The written plan and exact comparison command use `--measure 100` once and
-  contain no active `--measure 20` command for this attempt.
-- The rejected 20-unit report remains preserved outside the public result
-  paths and unstaged.
-- Preflight and the 30-second nominal launch gate pass before comparison.
-- Every fresh trial records `measured_units=100` and retains the 1,024-token
-  prepared-data workload identity.
-- Comparison and validation both decide `pass` under the unchanged `0.97` and
-  `0.02` gates before evidence is staged.
-- Exactly the two accepted Phase 2 reports are committed; `uv.lock` and
-  production code remain unchanged.
+Those trials name the old harness and workload identities. Mixing them with
+new evidence would break the manifest's single-protocol guarantee.
+
+## Tests and Review
+
+Implementation is test-driven. Tests must prove:
+
+- only prepared-data changes from 20 to 100 in the canonical per-metric map;
+- all model, loader, sequence, optimizer, precision, data, and other metric
+  fields remain identical;
+- workload and protocol identities change and bind the prepared-data count;
+- version-1 baseline validation reconstructs prepared-data 20 while version-2
+  validation reconstructs prepared-data 100;
+- new baseline and comparison replay commands require global 20 and explicitly
+  record prepared-data 100;
+- parent process commands pass each metric's canonical count to children;
+- children reject a mismatched supplied count before measurement;
+- prepared-data adapters receive 100 while every other adapter receives its
+  unchanged count;
+- raw trials, journals, manifests, comparisons, phase validation, and final
+  validation reject old or tampered count combinations;
+- old baseline artifacts still validate under their recorded version without
+  being accepted as the new protocol;
+- thermal recovery, post-exit evidence, locking, atomicity, and resume behavior
+  remain unchanged; and
+- Ruff and the full v2 pytest suite pass without warnings.
+
+The harness commit, new baseline evidence commit, and Phase 2 evidence commit
+each receive independent review. A final whole-branch review checks the entire
+lineage from protocol constants through accepted Phase 2 evidence.
+
+## Success Criteria
+
+- The new harness identity-binds prepared-data at 100 and all other metric
+  counts remain unchanged.
+- Every new prepared-data baseline and comparison raw trial records and runs
+  exactly 100 units with the full 1,024-token workload.
+- A fresh 45-trial baseline is captured, independently validated, reviewed,
+  and committed under the new harness identity.
+- Phase 2 comparison and validation pass the unchanged `0.97` ratio and `0.02`
+  dispersion gates before evidence is committed.
+- Old baseline and rejected evidence remain preserved and unmodified.
+- `uv.lock` and production model/training code remain unchanged.
