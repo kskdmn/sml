@@ -724,7 +724,7 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         finally:
             self._put(_QUEUE_STOP)
 
-    def _pull_envelope(self) -> BatchEnvelope:
+    def _pull_envelope(self) -> BatchEnvelope | _ProducerFailure:
         if self._pending_envelope is not None:
             envelope = self._pending_envelope
             self._pending_envelope = None
@@ -747,8 +747,7 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
             if isinstance(item, BatchEnvelope):
                 return item
             if isinstance(item, _ProducerFailure):
-                self.close()
-                raise item.error
+                return item
             if item is _QUEUE_STOP:
                 with self._state_condition:
                     if self._closed or self._stop.is_set():
@@ -764,25 +763,32 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
 
     def __next__(self) -> BatchEnvelope:
         with self._consumer_lock:
-            envelope = self._pull_envelope()
-            self._record_delivery(envelope)
-            return envelope
+            item = self._pull_envelope()
+            if isinstance(item, BatchEnvelope):
+                self._record_delivery(item)
+                return item
+        self.close()
+        raise item.error
 
     def iter_epoch(self, epoch: int) -> Iterator[BatchEnvelope]:
         _require_plain_int(epoch, "epoch")
         while True:
             with self._consumer_lock:
-                envelope = self._pull_envelope()
-                if envelope._source_epoch > epoch:
-                    self._pending_envelope = envelope
-                    return
-                if envelope._source_epoch < epoch:
-                    self._pending_envelope = envelope
-                    raise SMLDataError(
-                        "requested epoch is ahead of the next prefetched batch"
-                    )
-                self._record_delivery(envelope)
-            yield envelope
+                item = self._pull_envelope()
+                if isinstance(item, BatchEnvelope):
+                    if item._source_epoch > epoch:
+                        self._pending_envelope = item
+                        return
+                    if item._source_epoch < epoch:
+                        self._pending_envelope = item
+                        raise SMLDataError(
+                            "requested epoch is ahead of the next prefetched batch"
+                        )
+                    self._record_delivery(item)
+            if isinstance(item, _ProducerFailure):
+                self.close()
+                raise item.error
+            yield item
 
     def commit(self, cursor_after: PretrainingCursor) -> None:
         if not isinstance(cursor_after, PretrainingCursor):
@@ -832,6 +838,19 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         if root is not None:
             root.close()
 
+    def _drain_consumer_items(self) -> None:
+        pending = self._pending_envelope
+        self._pending_envelope = None
+        if pending is not None:
+            pending.release()
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, BatchEnvelope):
+                item.release()
+
     def close(self) -> None:
         with self._state_condition:
             if self._closed:
@@ -846,22 +865,16 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         pool = self._pool
         if pool is not None:
             pool.stop()
+
+        with self._consumer_lock:
+            self._drain_consumer_items()
+
         producer = self._producer
         if producer is not None and producer is not threading.current_thread():
             producer.join()
 
         with self._consumer_lock:
-            pending = self._pending_envelope
-            self._pending_envelope = None
-            if pending is not None:
-                pending.release()
-            while True:
-                try:
-                    item = self._queue.get_nowait()
-                except queue.Empty:
-                    break
-                if isinstance(item, BatchEnvelope):
-                    item.release()
+            self._drain_consumer_items()
 
         with self._envelope_lock:
             owned = tuple(self._owned_envelopes.values())

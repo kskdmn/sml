@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 from dataclasses import replace
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import sml.data.pretraining as pretraining_module
 import zstandard as zstd
 from sml.artifacts.manifest import (
     PayloadRef,
@@ -740,6 +742,54 @@ def test_mlx_transfer_does_not_alias_released_prefetch_staging(prepared_bundle):
         stream.close()
 
 
+class _CloseCoordinatedQueue(queue.Queue):
+    def __init__(self, maxsize: int):
+        super().__init__(maxsize=maxsize)
+        self.full_put_entered = threading.Event()
+        self.drain_observed = threading.Event()
+        self.release_put = threading.Event()
+
+    def put(self, item, block=True, timeout=None):
+        if self.full():
+            self.full_put_entered.set()
+            self.release_put.wait(2)
+        return super().put(item, block=block, timeout=timeout)
+
+    def get_nowait(self):
+        item = super().get_nowait()
+        self.drain_observed.set()
+        self.release_put.set()
+        return item
+
+
+def test_stream_close_drains_full_queue_before_join(prepared_bundle, monkeypatch):
+    monkeypatch.setattr(pretraining_module.queue, "Queue", _CloseCoordinatedQueue)
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=1,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    queue_instance = stream._queue
+    assert isinstance(queue_instance, _CloseCoordinatedQueue)
+    assert queue_instance.full_put_entered.wait(2)
+
+    closer = threading.Thread(target=stream.close)
+    closer.start()
+    drain_observed_before_emergency = queue_instance.drain_observed.wait(2)
+    if not drain_observed_before_emergency:
+        queue_instance.release_put.set()
+    closer.join(timeout=2)
+
+    assert drain_observed_before_emergency
+    assert not closer.is_alive()
+    assert stream._producer is None or not stream._producer.is_alive()
+    assert stream._queue.empty()
+    assert stream._owned_envelopes == {}
+    stream.close()
+
+
 def test_stream_close_wakes_full_queue_and_abandoned_envelope(prepared_bundle):
     full_stream = PretrainingBatchStream(
         prepared_bundle,
@@ -825,6 +875,119 @@ def test_stream_close_wakes_consumer_waiting_on_empty_queue(
 
     assert closed_without_deadlock
     assert consumer_finished.is_set()
+
+
+@pytest.mark.parametrize("consumer_api", ["next", "iter_epoch"])
+def test_stream_producer_failure_does_not_deadlock_with_concurrent_close(
+    prepared_bundle, monkeypatch, consumer_api
+):
+    producer_failed = threading.Event()
+
+    def fail_producer(_stream, _cursor):
+        producer_failed.set()
+        raise RuntimeError("forced producer failure")
+
+    monkeypatch.setattr(PretrainingBatchStream, "_next_produced", fail_producer)
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    allow_failure_pull = threading.Event()
+    consumer_holds_lock = threading.Event()
+    close_reached_consumer_lock = threading.Event()
+    consumer_finished = threading.Event()
+    close_finished = threading.Event()
+    consumer_errors = []
+    close_errors = []
+    consumer = None
+    closer = None
+
+    def emergency_notify_closed():
+        with stream._state_condition:
+            stream._closed = True
+            stream._state_condition.notify_all()
+
+    try:
+        assert producer_failed.wait(2)
+        deadline = time.monotonic() + 2
+        while stream._queue.empty() and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        assert not stream._queue.empty()
+
+        original_pull_envelope = stream._pull_envelope
+
+        def coordinated_pull_envelope():
+            consumer_holds_lock.set()
+            assert allow_failure_pull.wait(2)
+            return original_pull_envelope()
+
+        monkeypatch.setattr(stream, "_pull_envelope", coordinated_pull_envelope)
+        pool = stream._pool
+        assert pool is not None
+        original_pool_stop = pool.stop
+
+        def coordinated_pool_stop():
+            original_pool_stop()
+            close_reached_consumer_lock.set()
+
+        monkeypatch.setattr(pool, "stop", coordinated_pool_stop)
+
+        def consume_failure():
+            try:
+                if consumer_api == "next":
+                    next(stream)
+                else:
+                    next(stream.iter_epoch(0))
+            except BaseException as error:  # noqa: BLE001 - worker boundary
+                consumer_errors.append(error)
+            finally:
+                consumer_finished.set()
+
+        def close_stream():
+            try:
+                stream.close()
+            except BaseException as error:  # noqa: BLE001 - worker boundary
+                close_errors.append(error)
+            finally:
+                close_finished.set()
+
+        consumer = threading.Thread(target=consume_failure)
+        consumer.start()
+        assert consumer_holds_lock.wait(2)
+        closer = threading.Thread(target=close_stream)
+        closer.start()
+        assert close_reached_consumer_lock.wait(2)
+        allow_failure_pull.set()
+
+        failure_propagated_before_emergency = consumer_finished.wait(0.5)
+        if not failure_propagated_before_emergency:
+            emergency_notify_closed()
+        consumer.join(timeout=2)
+        closer.join(timeout=2)
+
+        assert failure_propagated_before_emergency
+        assert close_finished.is_set()
+        assert not consumer.is_alive()
+        assert not closer.is_alive()
+        assert close_errors == []
+        assert len(consumer_errors) == 1
+        assert isinstance(consumer_errors[0], SMLDataError)
+        assert str(consumer_errors[0]) == "pretraining batch producer failed"
+        assert isinstance(consumer_errors[0].__cause__, RuntimeError)
+        assert str(consumer_errors[0].__cause__) == "forced producer failure"
+        assert stream._queue.empty()
+        assert stream._owned_envelopes == {}
+    finally:
+        allow_failure_pull.set()
+        if consumer is not None and consumer.is_alive():
+            emergency_notify_closed()
+            consumer.join(timeout=2)
+        if closer is not None:
+            closer.join(timeout=2)
+        stream.close()
 
 
 def test_stream_producer_exception_propagates_as_focused_data_error(
