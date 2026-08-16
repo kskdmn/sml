@@ -37,7 +37,6 @@ from sml.artifacts.manifest import (
     _reject_json_constant,
     canonical_json_bytes,
     parse_logical_path,
-    read_manifest,
     structured_identity,
 )
 from sml.errors import SMLArtifactError
@@ -934,6 +933,78 @@ def _format_logical_paths(paths: set[tuple[str, ...]]) -> list[str]:
     return ["/".join(path) for path in sorted(paths)]
 
 
+def _verify_pretraining_nested_tokenizer(
+    fs: FilesystemOps,
+    temporary_descriptor: int,
+    manifest: PretrainingDataManifest,
+) -> None:
+    expected_model_path = "tokenizer/tokenizer.model"
+    expected_vocab_path = "tokenizer/tokenizer.vocab"
+    if manifest.tokenizer_model.logical_path != expected_model_path:
+        raise SMLArtifactError(
+            "nested tokenizer model must be bound to tokenizer/tokenizer.model"
+        )
+    if manifest.tokenizer_vocab.logical_path != expected_vocab_path:
+        raise SMLArtifactError(
+            "nested tokenizer vocab must be bound to tokenizer/tokenizer.vocab"
+        )
+
+    descriptor, _opened_stat = _opened_entry(
+        fs,
+        "tokenizer",
+        parent_descriptor=temporary_descriptor,
+        flags=_OPEN_DIRECTORY,
+    )
+    try:
+        try:
+            nested = _read_manifest_from_descriptor(
+                descriptor,
+                TokenizerManifest,
+                VerificationLevel.FULL,
+                context="nested tokenizer manifest",
+            )
+        except SMLArtifactError as error:
+            raise SMLArtifactError(
+                f"invalid nested tokenizer manifest: {error}"
+            ) from error
+        _require_named_directory_inode(
+            fs,
+            "tokenizer",
+            parent_descriptor=temporary_descriptor,
+            directory_descriptor=descriptor,
+            context="nested tokenizer directory",
+        )
+    finally:
+        os.close(descriptor)
+
+    if nested.model.logical_path != "tokenizer.model":
+        raise SMLArtifactError(
+            "nested tokenizer model logical path must be tokenizer.model"
+        )
+    if nested.vocab.logical_path != "tokenizer.vocab":
+        raise SMLArtifactError(
+            "nested tokenizer vocab logical path must be tokenizer.vocab"
+        )
+    if nested.identity != manifest.tokenizer_identity:
+        raise SMLArtifactError(
+            "nested tokenizer identity does not match pretraining manifest"
+        )
+    if (
+        nested.model.identity != manifest.tokenizer_model.identity
+        or nested.model.byte_size != manifest.tokenizer_model.byte_size
+    ):
+        raise SMLArtifactError(
+            "nested tokenizer model does not match pretraining manifest"
+        )
+    if (
+        nested.vocab.identity != manifest.tokenizer_vocab.identity
+        or nested.vocab.byte_size != manifest.tokenizer_vocab.byte_size
+    ):
+        raise SMLArtifactError(
+            "nested tokenizer vocab does not match pretraining manifest"
+        )
+
+
 def _verify_closed_world(
     fs: FilesystemOps,
     temporary_descriptor: int,
@@ -944,6 +1015,9 @@ def _verify_closed_world(
 ) -> None:
     references = tuple(_payload_references(manifest))
     expected_files, expected_directories = _expected_closed_world(references)
+    if isinstance(manifest, PretrainingDataManifest):
+        _verify_pretraining_nested_tokenizer(fs, temporary_descriptor, manifest)
+        expected_files.add(("tokenizer", TokenizerManifest.MANIFEST_FILENAME))
     if manifest_present:
         expected_files.add(parse_logical_path(manifest.MANIFEST_FILENAME))
     actual_files, actual_directories = _scan_closed_world(
@@ -971,6 +1045,8 @@ def _verify_closed_world(
                     raise SMLArtifactError(
                         "publisher-owned manifest changed before immutable commit"
                     )
+    if isinstance(manifest, PretrainingDataManifest):
+        _verify_pretraining_nested_tokenizer(fs, temporary_descriptor, manifest)
 
 
 def _make_payload_tree_durable(fs: FilesystemOps, directory_descriptor: int) -> None:
@@ -1072,22 +1148,59 @@ def _write_manifest_last(
             os.close(descriptor)
 
 
-def _accept_existing[M](target: Path, manifest: M) -> Published[M]:
+def _accept_existing[M](
+    target: Path,
+    manifest: M,
+    *,
+    fs: FilesystemOps,
+    parent_descriptor: int,
+    target_name: str,
+) -> Published[M]:
+    target_descriptor = -1
     try:
-        verified = read_manifest(target, type(manifest), VerificationLevel.FULL)
-    except SMLArtifactError as error:
+        target_descriptor, opened_stat = _opened_entry(
+            fs,
+            target_name,
+            parent_descriptor=parent_descriptor,
+            flags=_OPEN_DIRECTORY,
+        )
+        if not stat.S_ISDIR(opened_stat.st_mode):
+            raise SMLArtifactError("existing publication target is not a directory")
+        existing_manifest = _read_manifest_from_descriptor(
+            target_descriptor,
+            type(manifest),
+            VerificationLevel.FULL,
+            context=str(target),
+        )
+        _verify_closed_world(
+            fs,
+            target_descriptor,
+            existing_manifest,
+            manifest_present=True,
+        )
+        _require_named_directory_inode(
+            fs,
+            target_name,
+            parent_descriptor=parent_descriptor,
+            directory_descriptor=target_descriptor,
+            context="existing publication target after full verification",
+        )
+    except (OSError, SMLArtifactError) as error:
         raise SMLArtifactError(
             f"existing target failed full verification: {target}"
         ) from error
-    if type(verified.manifest) is not type(manifest):
+    finally:
+        if target_descriptor >= 0:
+            os.close(target_descriptor)
+    if type(existing_manifest) is not type(manifest):
         raise SMLArtifactError(f"existing target manifest type collision: {target}")
-    if verified.manifest.identity != manifest.identity:
+    if existing_manifest.identity != manifest.identity:
         raise SMLArtifactError(
             f"existing target has a different identity collision: {target}"
         )
     return Published(
         path=target,
-        manifest=verified.manifest,
+        manifest=existing_manifest,
         verification=VerificationLevel.FULL,
     )
 
@@ -1131,7 +1244,13 @@ def _publish_with_lock[M](
                 manifest,
                 manifest_present=True,
             )
-            return _accept_existing(target, manifest)
+            return _accept_existing(
+                target,
+                manifest,
+                fs=fs,
+                parent_descriptor=parent_descriptor,
+                target_name=target_name,
+            )
 
         _verify_closed_world(
             fs,

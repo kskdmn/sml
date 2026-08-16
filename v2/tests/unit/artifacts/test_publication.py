@@ -21,8 +21,10 @@ from sml.artifacts.checkpoint import (
 )
 from sml.artifacts.manifest import (
     PayloadRef,
+    PretrainingDataManifest,
     TokenizerManifest,
     VerificationLevel,
+    canonical_json_bytes,
     file_identity,
     read_manifest,
 )
@@ -216,6 +218,97 @@ def _bundle_builder(model_bytes: bytes = b"model bytes"):
             model=_payload_ref(model_path, "tokenizer.model"),
             vocab=_payload_ref(vocab_path, "tokenizer.vocab"),
             diagnostic_source_locator="/source/tokenizer",
+        )
+        return replace(manifest, identity=manifest.recompute_identity())
+
+    return build
+
+
+def _prepared_bundle_builder(*, mutation: str | None = None):
+    def build(private_path: Path) -> PretrainingDataManifest:
+        tokenizer_path = private_path / "tokenizer"
+        tokenizer_path.mkdir()
+        tokenizer_manifest = _bundle_builder()(tokenizer_path)
+        if mutation == "nested-model-logical-path":
+            vocab_bytes = (tokenizer_path / "tokenizer.vocab").read_bytes()
+            (tokenizer_path / "tokenizer.model").write_bytes(vocab_bytes)
+            shared_ref = _payload_ref(
+                tokenizer_path / "tokenizer.vocab", "tokenizer.vocab"
+            )
+            tokenizer_manifest = replace(
+                tokenizer_manifest,
+                identity="sha256:" + "0" * 64,
+                model=shared_ref,
+            )
+            tokenizer_manifest = replace(
+                tokenizer_manifest,
+                identity=tokenizer_manifest.recompute_identity(),
+            )
+        elif mutation == "nested-vocab-logical-path":
+            model_bytes = (tokenizer_path / "tokenizer.model").read_bytes()
+            (tokenizer_path / "tokenizer.vocab").write_bytes(model_bytes)
+            shared_ref = _payload_ref(
+                tokenizer_path / "tokenizer.model", "tokenizer.model"
+            )
+            tokenizer_manifest = replace(
+                tokenizer_manifest,
+                identity="sha256:" + "0" * 64,
+                vocab=shared_ref,
+            )
+            tokenizer_manifest = replace(
+                tokenizer_manifest,
+                identity=tokenizer_manifest.recompute_identity(),
+            )
+        (tokenizer_path / "manifest.json").write_bytes(
+            canonical_json_bytes(tokenizer_manifest)
+        )
+
+        shards_path = private_path / "shards"
+        shards_path.mkdir()
+        shard_path = shards_path / "train-000000.npy"
+        shard_path.write_bytes(b"npy bytes")
+
+        tokenizer_identity = tokenizer_manifest.identity
+        tokenizer_model = PayloadRef(
+            "tokenizer/tokenizer.model",
+            tokenizer_manifest.model.identity,
+            tokenizer_manifest.model.byte_size,
+        )
+        tokenizer_vocab = PayloadRef(
+            "tokenizer/tokenizer.vocab",
+            tokenizer_manifest.vocab.identity,
+            tokenizer_manifest.vocab.byte_size,
+        )
+        if mutation == "outer-tokenizer-identity":
+            tokenizer_identity = "sha256:" + "f" * 64
+        elif mutation == "outer-model-ref":
+            tokenizer_model = replace(
+                tokenizer_model,
+                identity="sha256:" + "f" * 64,
+            )
+        elif mutation == "noncanonical-nested-manifest":
+            (tokenizer_path / "manifest.json").write_text(
+                canonical_json_bytes(tokenizer_manifest).decode("utf-8") + "\n",
+                encoding="utf-8",
+            )
+
+        manifest = PretrainingDataManifest(
+            kind="pretraining-data",
+            version=1,
+            identity="sha256:" + "0" * 64,
+            sequence_length=3,
+            row_width=4,
+            dtype="int32",
+            shard_row_counts=(1,),
+            shards=(_payload_ref(shard_path, "shards/train-000000.npy"),),
+            preparation_seed=42,
+            row_order_policy={"algorithm": "windowed-row-shuffle-v1"},
+            tokenizer_identity=tokenizer_identity,
+            tokenizer_model=tokenizer_model,
+            tokenizer_vocab=tokenizer_vocab,
+            source_summary={},
+            diagnostic_source_locator=None,
+            row_content_identity="sha256:" + "a" * 64,
         )
         return replace(manifest, identity=manifest.recompute_identity())
 
@@ -744,6 +837,72 @@ def test_builder_cannot_add_another_manifest_filename(target):
     with pytest.raises(SMLArtifactError, match="closed-world|unreferenced|manifest"):
         publish_immutable_bundle(target, adds_other_manifest)
     assert not target.exists()
+
+
+def test_pretraining_publication_owns_a_fully_bound_nested_tokenizer_manifest(
+    target,
+):
+    """Removing child-manifest ownership would reject the portable tokenizer copy."""
+    published = publish_immutable_bundle(target, _prepared_bundle_builder())
+
+    assert published.verification is VerificationLevel.FULL
+    assert (target / "tokenizer" / "manifest.json").is_file()
+    assert {path.name for path in (target / "tokenizer").iterdir()} == {
+        "manifest.json",
+        "tokenizer.model",
+        "tokenizer.vocab",
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("outer-tokenizer-identity", "nested tokenizer.*identity|identity.*nested"),
+        ("outer-model-ref", "nested tokenizer.*model|model.*nested tokenizer"),
+        (
+            "noncanonical-nested-manifest",
+            "nested tokenizer.*canonical|canonical.*nested",
+        ),
+        ("nested-model-logical-path", "nested tokenizer.*model logical path"),
+        ("nested-vocab-logical-path", "nested tokenizer.*vocab logical path"),
+    ],
+)
+def test_pretraining_publication_rejects_unbound_nested_tokenizer_manifest(
+    target,
+    mutation,
+    message,
+):
+    """Weak child ownership could publish tokenizer metadata unrelated to its bytes."""
+    with pytest.raises(SMLArtifactError, match=message):
+        publish_immutable_bundle(
+            target,
+            _prepared_bundle_builder(mutation=mutation),
+        )
+
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing-nested-manifest", "corrupt-nested-manifest", "unknown-file"],
+)
+def test_existing_pretraining_target_requires_complete_closed_world(
+    target,
+    mutation,
+):
+    """An identical retry must FULL-verify child metadata and the whole tree."""
+    publish_immutable_bundle(target, _prepared_bundle_builder())
+    if mutation == "missing-nested-manifest":
+        (target / "tokenizer" / "manifest.json").unlink()
+    elif mutation == "corrupt-nested-manifest":
+        (target / "tokenizer" / "manifest.json").write_bytes(b"not json")
+    else:
+        (target / "unknown.bin").write_bytes(b"not owned")
+
+    with pytest.raises(
+        SMLArtifactError, match="existing target failed full verification"
+    ):
+        publish_immutable_bundle(target, _prepared_bundle_builder())
 
 
 def test_temporary_name_uses_exact_target_digest(bundle_builder, target):
