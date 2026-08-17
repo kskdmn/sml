@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -255,7 +256,7 @@ def test_canonical_workload_round_trip_pins_complete_benchmark_contract():
     assert workload.generation["decode_chunk_size"] == 8
     assert tuple(unit.metric for unit in workload.work_units) == METRIC_NAMES
     assert {unit.metric: unit.measured_units for unit in workload.work_units} == {
-        "prepared-data": 20,
+        "prepared-data": 100,
         "pretraining-compute": 20,
         "pretraining-end-to-end": 20,
         "swag-end-to-end": 20,
@@ -277,6 +278,72 @@ def test_canonical_workload_round_trip_pins_complete_benchmark_contract():
         )
         == "sha256:90981b91ce14a96a5b44f40258f44b762b11e96dc82f57586348c84370bf41b2"
     )
+
+
+def test_canonical_workload_changes_only_prepared_data_to_one_hundred_units():
+    legacy = build_canonical_workload(prepared_data_measured_units=20)
+    current = build_canonical_workload()
+    legacy_raw = legacy.to_dict()
+    current_raw = current.to_dict()
+
+    legacy_units = {
+        unit["metric"]: unit.pop("measured_units") for unit in legacy_raw["work_units"]
+    }
+    current_units = {
+        unit["metric"]: unit.pop("measured_units") for unit in current_raw["work_units"]
+    }
+
+    assert legacy_raw == current_raw
+    assert legacy_units == {
+        "prepared-data": 20,
+        "pretraining-compute": 20,
+        "pretraining-end-to-end": 20,
+        "swag-end-to-end": 20,
+        "inference-prefill": 32,
+        "inference-decode": 32,
+        "checkpoint-pause": 20,
+        "compile-cold-start": 1,
+        "peak-metal-memory": 1,
+    }
+    assert current_units == {**legacy_units, "prepared-data": 100}
+
+
+def test_benchmark_parser_exposes_explicit_prepared_data_count():
+    baseline = build_parser().parse_args(
+        [
+            "record-baseline",
+            "--source-commit",
+            benchmark_runner.PINNED_BASELINE_SOURCE_COMMIT,
+            "--manifest",
+            "manifest.json",
+            "--raw-output",
+            "raw.jsonl",
+            "--state-directory",
+            "state",
+            "--prepared-data-measure",
+            "100",
+            "--prepared-data-measure",
+            "100",
+        ]
+    )
+    comparison = build_parser().parse_args(
+        [
+            "compare",
+            "--baseline",
+            "manifest.json",
+            "--candidate",
+            "HEAD",
+            "--metrics",
+            "prepared-data",
+            "--predecessors",
+            '{"prepared-data":null}',
+            "--output",
+            "report.json",
+        ]
+    )
+
+    assert (baseline.measure, baseline.prepared_data_measure) == (20, 100)
+    assert (comparison.measure, comparison.prepared_data_measure) == (20, None)
 
 
 @pytest.mark.parametrize("metric", ("compile-cold-start", "peak-metal-memory"))
@@ -781,6 +848,8 @@ def test_metric_parser_rejects_unknown_or_duplicate_names():
             "raw.jsonl",
             "--state-directory",
             "state",
+            "--prepared-data-measure",
+            "100",
         ],
         [
             "compare",
@@ -823,6 +892,23 @@ def test_record_baseline_parser_requires_state_directory():
         )
 
 
+def test_record_baseline_parser_requires_prepared_data_measure():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "record-baseline",
+                "--source-commit",
+                "3687f8b",
+                "--manifest",
+                "manifest.json",
+                "--raw-output",
+                "raw.jsonl",
+                "--state-directory",
+                "state",
+            ]
+        )
+
+
 def test_benchmark_parser_defaults_to_the_shorter_protocol():
     baseline = build_parser().parse_args(
         [
@@ -835,6 +921,8 @@ def test_benchmark_parser_defaults_to_the_shorter_protocol():
             "raw.jsonl",
             "--state-directory",
             "state",
+            "--prepared-data-measure",
+            "100",
         ]
     )
     comparison = build_parser().parse_args(
@@ -854,6 +942,7 @@ def test_benchmark_parser_defaults_to_the_shorter_protocol():
     )
 
     assert (baseline.pairs, baseline.warmup, baseline.measure) == (5, 5, 20)
+    assert baseline.prepared_data_measure == 100
     assert (comparison.pairs, comparison.warmup, comparison.measure) == (5, 5, 20)
 
 
@@ -2283,6 +2372,7 @@ def test_baseline_manifest_binds_raw_trials_to_clean_source_and_harness():
         warmup_units=5,
         measured_units=20,
         paired_representations=paired_representations,
+        baseline_version=2,
     )
 
     validate_baseline_manifest(manifest, trials)
@@ -2329,12 +2419,154 @@ def test_baseline_manifest_construction_rejects_tampered_embedded_evidence():
             warmup_units=5,
             measured_units=20,
             paired_representations=_valid_paired_representations(workload),
+            baseline_version=2,
         )
 
 
 def _resign_baseline(manifest):
     body = {key: value for key, value in manifest.items() if key != "identity"}
-    manifest["identity"] = structured_identity("sml-performance-baseline-v1", body)
+    manifest["identity"] = structured_identity(
+        benchmark_runner._baseline_identity_domain(manifest["version"]), body
+    )
+
+
+def _baseline_fixture(version):
+    prepared_units = 20 if version == 1 else 100
+    workload = build_canonical_workload(prepared_data_measured_units=prepared_units)
+    trials = _valid_baseline_trials(workload)
+    manifest = build_baseline_manifest(
+        trials=trials,
+        workload=workload,
+        workload_identity=canonical_workload_identity(workload),
+        source_commit=trials[0].source_commit,
+        harness_commit=trials[0].harness_commit,
+        harness_identity=trials[0].harness_identity,
+        command="record-baseline",
+        pairs=5,
+        warmup_units=5,
+        measured_units=20,
+        paired_representations=_valid_paired_representations(workload),
+        baseline_version=version,
+    )
+    return manifest, trials
+
+
+@pytest.mark.parametrize(
+    ("version", "prepared_units", "domain", "has_explicit_field"),
+    [
+        (1, 20, "sml-performance-baseline-v1", False),
+        (2, 100, "sml-performance-baseline-v2", True),
+    ],
+)
+def test_baseline_versions_bind_their_exact_prepared_data_protocol(
+    version, prepared_units, domain, has_explicit_field
+):
+    manifest, trials = _baseline_fixture(version)
+
+    validate_baseline_manifest(manifest, trials)
+    assert manifest["version"] == version
+    assert manifest["identity"] == structured_identity(
+        domain, {key: value for key, value in manifest.items() if key != "identity"}
+    )
+    assert (
+        "prepared_data_measured_units" in manifest["protocol"]
+    ) is has_explicit_field
+    assert (
+        next(
+            unit["measured_units"]
+            for unit in manifest["canonical_workload"]["work_units"]
+            if unit["metric"] == "prepared-data"
+        )
+        == prepared_units
+    )
+
+
+def test_committed_version_one_baseline_remains_valid():
+    manifest_path = Path("v2/benchmarks/manifests/baseline-3687f8b.json")
+    raw_path = Path("v2/benchmarks/results/baseline-3687f8b.jsonl")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    trials = tuple(
+        RawTrial.from_dict(json.loads(line))
+        for line in raw_path.read_text(encoding="utf-8").splitlines()
+    )
+
+    validate_baseline_manifest(manifest, trials)
+    assert manifest["version"] == 1
+
+
+@pytest.mark.parametrize(("version", "prepared_units"), [(1, 100), (2, 20), (2, 99)])
+def test_baseline_validator_rejects_cross_version_prepared_data_counts(
+    version, prepared_units
+):
+    manifest, trials = _baseline_fixture(version=version)
+    tampered = deepcopy(manifest)
+    next(
+        unit
+        for unit in tampered["canonical_workload"]["work_units"]
+        if unit["metric"] == "prepared-data"
+    )["measured_units"] = prepared_units
+    _resign_baseline(tampered)
+
+    with pytest.raises(ValueError, match="pinned workload"):
+        validate_baseline_manifest(tampered, trials)
+
+
+@pytest.mark.parametrize("version", (True, 1.0))
+def test_baseline_validator_rejects_boolean_and_float_version_aliases(version):
+    manifest, trials = _baseline_fixture(version=1)
+    tampered = deepcopy(manifest)
+    tampered["version"] = version
+    body = {key: value for key, value in tampered.items() if key != "identity"}
+    tampered["identity"] = structured_identity("sml-performance-baseline-v1", body)
+
+    with pytest.raises(ValueError, match="unsupported baseline"):
+        validate_baseline_manifest(tampered, trials)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("measured_units", 20.0), ("prepared_data_measured_units", 100.0)),
+)
+def test_baseline_validator_rejects_float_protocol_aliases(field, value):
+    manifest, trials = _baseline_fixture(version=2)
+    tampered = deepcopy(manifest)
+    tampered["protocol"][field] = value
+    _resign_baseline(tampered)
+
+    with pytest.raises(ValueError, match="baseline protocol"):
+        validate_baseline_manifest(tampered, trials)
+
+
+@pytest.mark.parametrize(
+    ("version", "explicit", "expected"),
+    [(1, None, 20), (1, 20, 20), (2, None, 100), (2, 100, 100)],
+)
+def test_compare_resolves_prepared_data_count_from_baseline(
+    version, explicit, expected
+):
+    baseline, _ = _baseline_fixture(version=version)
+
+    assert (
+        benchmark_runner._resolve_prepared_data_measure(
+            SimpleNamespace(prepared_data_measure=explicit), baseline
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "explicit"),
+    [(1, 100), (2, 20), (2, 99), (2, True)],
+)
+def test_compare_rejects_prepared_data_count_that_disagrees_with_baseline(
+    version, explicit
+):
+    baseline, _ = _baseline_fixture(version=version)
+
+    with pytest.raises(ValueError, match="prepared-data measured units"):
+        benchmark_runner._resolve_prepared_data_measure(
+            SimpleNamespace(prepared_data_measure=explicit), baseline
+        )
 
 
 def test_baseline_validator_rejects_partial_or_weakened_protocols():
@@ -2352,6 +2584,7 @@ def test_baseline_validator_rejects_partial_or_weakened_protocols():
         warmup_units=5,
         measured_units=20,
         paired_representations=_valid_paired_representations(workload),
+        baseline_version=2,
     )
 
     wrong_source = json.loads(json.dumps(manifest))
@@ -2373,7 +2606,7 @@ def test_baseline_validator_rejects_partial_or_weakened_protocols():
     with pytest.raises(ValueError, match="warmup or measured"):
         validate_baseline_manifest(manifest, (wrong_warmup, *trials[1:]))
 
-    wrong_units = _with_trial_payload(trials[0], measured_units=100)
+    wrong_units = _with_trial_payload(trials[0], measured_units=99)
     with pytest.raises(ValueError, match="warmup or measured"):
         validate_baseline_manifest(manifest, (wrong_units, *trials[1:]))
 
@@ -2420,6 +2653,7 @@ def test_baseline_rejects_invalid_environment_or_software(
         warmup_units=5,
         measured_units=20,
         paired_representations=_valid_paired_representations(workload),
+        baseline_version=2,
     )
     changed = _with_observation_changes(
         trials[0],
@@ -2553,6 +2787,7 @@ def test_comparison_report_pins_pairs_decisions_and_metric_lineage():
         warmup_units=5,
         measured_units=20,
         paired_representations=_valid_paired_representations(workload),
+        baseline_version=2,
     )
     trials = []
     candidate_commit = "e" * 40
@@ -2754,6 +2989,7 @@ def _valid_prepared_comparison():
         warmup_units=5,
         measured_units=20,
         paired_representations=_valid_paired_representations(workload),
+        baseline_version=2,
     )
     candidate_commit = "e" * 40
     trials = _comparison_trials(workload, candidate_commit, [100.0] * 5, 0)
@@ -2769,6 +3005,196 @@ def _valid_prepared_comparison():
         predecessor_metrics={},
     )
     return workload, baseline, report
+
+
+def _resign_comparison(report):
+    body = {key: value for key, value in report.items() if key != "identity"}
+    report["identity"] = structured_identity("sml-performance-comparison-v1", body)
+
+
+@pytest.mark.parametrize("version", (True, 1.0))
+def test_comparison_validator_rejects_boolean_and_float_version_aliases(version):
+    _workload, baseline, report = _valid_prepared_comparison()
+    report["version"] = version
+    _resign_comparison(report)
+
+    with pytest.raises(ValueError, match="unsupported comparison"):
+        validate_comparison_report(report, baseline, None)
+
+
+@pytest.mark.parametrize("baseline_version", (1, 2))
+def test_comparison_construction_preserves_the_baseline_version_protocol(
+    baseline_version,
+):
+    baseline, _trials = _baseline_fixture(baseline_version)
+    workload = CanonicalWorkload.from_dict(baseline["canonical_workload"])
+    candidate_commit = "e" * 40
+    report = build_comparison_report(
+        baseline=baseline,
+        trials=_comparison_trials(workload, candidate_commit, [100.0] * 5, 0),
+        candidate_commit=candidate_commit,
+        minimum_ratio=0.97,
+        pretraining_minimum_ratio=None,
+        maximum_dispersion=0.02,
+        require_lower_bound=False,
+        bootstrap_resamples=10_000,
+        predecessor_metrics={},
+    )
+
+    validate_comparison_report(report, baseline, None)
+    expected = {
+        "pairs",
+        "compilation_passes",
+        "warmup_units",
+        "measured_units",
+        "bootstrap_seed",
+        "bootstrap_resamples",
+        "minimum_ratio",
+        "pretraining_minimum_ratio",
+        "maximum_dispersion",
+        "require_lower_bound",
+    }
+    if baseline_version == 2:
+        expected.add("prepared_data_measured_units")
+    assert set(report["protocol"]) == expected
+
+
+@pytest.mark.parametrize("mutation", ("omit", "extra"))
+def test_comparison_validator_rejects_serialized_version_two_protocol_field_changes(
+    mutation,
+):
+    _workload, baseline, report = _valid_prepared_comparison()
+    if mutation == "omit":
+        report["protocol"].pop("prepared_data_measured_units")
+    else:
+        report["protocol"]["unexpected"] = 100
+    _resign_comparison(report)
+
+    with pytest.raises(ValueError, match="protocol"):
+        validate_comparison_report(report, baseline, None)
+
+
+def test_comparison_validator_rejects_added_prepared_data_field_for_version_one():
+    baseline, _trials = _baseline_fixture(1)
+    workload = CanonicalWorkload.from_dict(baseline["canonical_workload"])
+    candidate_commit = "e" * 40
+    report = build_comparison_report(
+        baseline=baseline,
+        trials=_comparison_trials(workload, candidate_commit, [100.0] * 5, 0),
+        candidate_commit=candidate_commit,
+        minimum_ratio=0.97,
+        pretraining_minimum_ratio=None,
+        maximum_dispersion=0.02,
+        require_lower_bound=False,
+        bootstrap_resamples=10_000,
+        predecessor_metrics={},
+    )
+    report["protocol"]["prepared_data_measured_units"] = 100
+    _resign_comparison(report)
+
+    with pytest.raises(ValueError, match="field set"):
+        validate_comparison_report(report, baseline, None)
+
+
+def test_validate_phase_rejects_version_one_report_against_version_two_baseline(
+    tmp_path, monkeypatch
+):
+    legacy_baseline, _trials = _baseline_fixture(1)
+    workload = CanonicalWorkload.from_dict(legacy_baseline["canonical_workload"])
+    report = build_comparison_report(
+        baseline=legacy_baseline,
+        trials=_comparison_trials(workload, "e" * 40, [100.0] * 5, 0),
+        candidate_commit="e" * 40,
+        minimum_ratio=0.97,
+        pretraining_minimum_ratio=None,
+        maximum_dispersion=0.02,
+        require_lower_bound=False,
+        bootstrap_resamples=10_000,
+        predecessor_metrics={},
+    )
+    current_baseline, _trials = _baseline_fixture(2)
+    baseline_path = tmp_path / "baseline-v2.json"
+    report_path = tmp_path / "report-v1.json"
+    baseline_path.write_text(json.dumps(current_baseline), encoding="utf-8")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    monkeypatch.setattr(benchmark_runner, "_git_root", lambda _path: tmp_path)
+    args = SimpleNamespace(
+        baseline=baseline_path,
+        results=report_path,
+        predecessors=json.dumps({"prepared-data": None}),
+        phase=2,
+        output=None,
+    )
+
+    with pytest.raises(ValueError, match="wrong baseline"):
+        benchmark_runner._validate_phase(args)
+
+
+def test_validate_final_rejects_version_one_report_against_version_two_baseline(
+    tmp_path, monkeypatch
+):
+    legacy_baseline, _trials = _baseline_fixture(1)
+    workload = CanonicalWorkload.from_dict(legacy_baseline["canonical_workload"])
+    report = build_comparison_report(
+        baseline=legacy_baseline,
+        trials=_comparison_trials(workload, "e" * 40, [100.0] * 5, 0),
+        candidate_commit="e" * 40,
+        minimum_ratio=0.97,
+        pretraining_minimum_ratio=None,
+        maximum_dispersion=0.02,
+        require_lower_bound=False,
+        bootstrap_resamples=10_000,
+        predecessor_metrics={},
+    )
+    proof = {
+        "report_identity": "sha256:" + "a" * 64,
+        "result_identity": "sha256:" + "b" * 64,
+    }
+    report["metrics"] = {metric: {} for metric in benchmark_runner.FINAL_METRICS}
+    report["comparison_mode"] = benchmark_runner.COMPARISON_FINAL
+    report["predecessors"] = {
+        metric: proof if metric in benchmark_runner.FINAL_PREDECESSOR_METRICS else None
+        for metric in benchmark_runner.FINAL_METRICS
+    }
+    _resign_comparison(report)
+    current_baseline, _trials = _baseline_fixture(2)
+    baseline_path = tmp_path / "baseline-v2.json"
+    report_path = tmp_path / "report-v1.json"
+    raw_path = tmp_path / "report-v1.jsonl"
+    baseline_path.write_text(json.dumps(current_baseline), encoding="utf-8")
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+    raw_path.write_text(
+        "".join(json.dumps(raw) + "\n" for raw in report["raw_trials"]),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(benchmark_runner, "_git_root", lambda _path: tmp_path)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_resolve_predecessor_mapping",
+        lambda *_args, **_kwargs: (
+            {metric: None for metric in benchmark_runner.FINAL_METRICS},
+            {},
+            {},
+        ),
+    )
+    args = SimpleNamespace(
+        baseline=baseline_path,
+        report=report_path,
+        raw_input=raw_path,
+    )
+
+    with pytest.raises(ValueError, match="wrong baseline"):
+        benchmark_runner._validate_final(args)
+
+
+def test_comparison_validator_rejects_float_prepared_data_protocol_alias():
+    _workload, baseline, report = _valid_prepared_comparison()
+    report["protocol"]["prepared_data_measured_units"] = 100.0
+    body = {key: value for key, value in report.items() if key != "identity"}
+    report["identity"] = structured_identity("sml-performance-comparison-v1", body)
+
+    with pytest.raises(ValueError, match="prepared_data_measured_units"):
+        validate_comparison_report(report, baseline, None)
 
 
 def test_comparison_rejects_raw_trial_without_valid_post_exit_evidence():
@@ -2985,6 +3411,7 @@ def test_noisy_comparison_retains_exactly_one_cooled_retry():
         warmup_units=5,
         measured_units=20,
         paired_representations=_valid_paired_representations(workload),
+        baseline_version=2,
     )
     candidate_commit = "e" * 40
     trials = _comparison_trials(
@@ -3028,6 +3455,7 @@ def test_persistent_noise_blocks_acceptance_after_the_single_retry():
         warmup_units=5,
         measured_units=20,
         paired_representations=_valid_paired_representations(workload),
+        baseline_version=2,
     )
     candidate_commit = "e" * 40
     noisy = [95.0, 100.0, 103.0, 106.0, 110.0]
@@ -3114,6 +3542,7 @@ def test_predecessors_are_resolved_as_an_explicit_per_metric_mapping(tmp_path):
         warmup_units=5,
         measured_units=20,
         paired_representations=_valid_paired_representations(workload),
+        baseline_version=2,
     )
 
     def write_report(metric, commit, path):
@@ -3371,6 +3800,19 @@ def _session_document(
         manifest_path=tmp_path / manifest_name,
         raw_output_path=tmp_path / raw_output_name,
     )
+
+
+def test_version_two_baseline_session_and_replay_bind_prepared_data_units(tmp_path):
+    workload = build_canonical_workload()
+    protocol = benchmark_runner._baseline_protocol(2, workload)
+    session = _session_document(tmp_path, protocol=protocol)
+    journal = BaselineJournal.open(tmp_path / "state", session)
+
+    assert journal.session["protocol"]["measured_units"] == 20
+    assert journal.session["protocol"]["prepared_data_measured_units"] == 100
+    command = benchmark_runner.canonical_baseline_command(journal)
+    assert "--measure 20" in command
+    assert "--prepared-data-measure 100" in command
 
 
 def _persist_journal_trial(journal, attempt, trial):
@@ -5757,7 +6199,8 @@ def _single_process_arguments(tmp_path):
         pair_index=0,
         process_order=0,
         warmup=5,
-        measure=20,
+        measure=100,
+        prepared_data_measure=100,
         comparison_target="baseline",
         evidence_session_identity="sha256:" + "9" * 64,
         journal_attempt_index=0,
@@ -5781,7 +6224,8 @@ def _launch_trial_arguments(tmp_path):
         "pair_index": 0,
         "order": 0,
         "warmup": 5,
-        "measure": 20,
+        "measure": 100,
+        "prepared_data_measure": 100,
         "comparison_target": "baseline",
     }
 
@@ -5853,7 +6297,7 @@ def _stub_single_process_measurement(monkeypatch, args, captured=None):
 @pytest.mark.parametrize(
     ("metric", "expected_warmup", "expected_measured"),
     [
-        ("prepared-data", 5, 20),
+        ("prepared-data", 5, 100),
         ("inference-prefill", 5, 32),
         ("compile-cold-start", 0, 1),
         ("peak-metal-memory", 5, 1),
@@ -5864,6 +6308,7 @@ def test_child_process_forwards_each_canonical_metric_count(
 ):
     args = _single_process_arguments(tmp_path)
     args.metric = metric
+    args.measure = expected_measured
     args.measurement_output = (
         tmp_path / "state" / "measurements" / metric / "0" / "0.json"
     )
@@ -5879,6 +6324,28 @@ def test_child_process_forwards_each_canonical_metric_count(
     )
     assert measurement["trial"]["warmup_units"] == expected_warmup
     assert measurement["trial"]["measured_units"] == expected_measured
+
+
+@pytest.mark.parametrize(
+    ("metric", "supplied"),
+    (("prepared-data", 20), ("prepared-data", 99), ("pretraining-compute", 100)),
+)
+def test_child_rejects_noncanonical_count_before_adapter_import(
+    tmp_path, monkeypatch, metric, supplied
+):
+    args = _single_process_arguments(tmp_path)
+    args.metric = metric
+    args.measure = supplied
+    resolved = []
+    _stub_single_process_measurement(monkeypatch, args)
+    monkeypatch.setattr(
+        legacy, "resolve_native_workload", lambda *args: resolved.append(args)
+    )
+
+    with pytest.raises(ValueError, match="child measured units do not match"):
+        benchmark_runner._run_single_process(args)
+
+    assert resolved == []
 
 
 def test_completed_child_output_never_overwrites_an_existing_attempt(
@@ -6314,6 +6781,43 @@ def _stub_parent_observation(monkeypatch, observation):
     )
 
 
+def test_parent_rejects_wrong_child_count_before_post_exit_publication(
+    tmp_path, monkeypatch
+):
+    workload = build_canonical_workload()
+    measurement = build_child_trial_measurement(
+        session_identity="sha256:" + "9" * 64,
+        journal_attempt_index=0,
+        trial={**_valid_trial_payload(workload), "measured_units": 20},
+        start=_valid_observation("2026-08-08T00:00:00+00:00"),
+        end=_valid_observation("2026-08-08T00:00:01+00:00"),
+    )
+    measurement_path = tmp_path / "measurement.json"
+    post_exit_path = tmp_path / "post-exit.json"
+
+    monkeypatch.setattr(
+        benchmark_runner.subprocess,
+        "run",
+        lambda command, **unused: atomic_write_json(
+            measurement_path, measurement, create_only=True
+        ),
+    )
+
+    with pytest.raises(ValueError, match="child trial does not match"):
+        benchmark_runner._launch_trial(
+            **_launch_trial_arguments(tmp_path),
+            evidence_session_identity=measurement["session_identity"],
+            journal_attempt_index=0,
+            measurement_output=measurement_path,
+            post_exit_output=post_exit_path,
+            recovery_samples_directory=tmp_path / "recovery-samples",
+            recovery_output=tmp_path / "recovery.json",
+            output=tmp_path / "trial.json",
+        )
+
+    assert not post_exit_path.exists()
+
+
 def test_parent_post_exit_output_never_overwrites_existing_evidence(
     tmp_path, monkeypatch
 ):
@@ -6667,6 +7171,48 @@ def test_paired_trials_share_one_identity_bound_evidence_session(tmp_path, monke
     }
 
 
+def test_parent_launches_each_metric_with_its_canonical_count(tmp_path, monkeypatch):
+    workload = build_canonical_workload()
+    launches = []
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_launch_trial",
+        lambda **kwargs: (
+            launches.append(kwargs)
+            or _valid_raw_trial(workload, metric=kwargs["metric"])
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "_validate_acceptance_environment", lambda *_: None
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "_validate_software_versions", lambda *_: None
+    )
+
+    benchmark_runner._run_paired_trials(
+        harness_root=tmp_path / "harness",
+        reference_root=tmp_path / "reference",
+        candidate_root=tmp_path / "candidate",
+        reference_commit="1" * 40,
+        candidate_commit="2" * 40,
+        harness_commit="3" * 40,
+        harness_identity="sha256:" + "4" * 64,
+        reference_adapter="legacy",
+        metrics=METRIC_NAMES,
+        pairs=1,
+        warmup=5,
+        measure=20,
+        prepared_data_measure=100,
+        comparison_target="baseline:sha256:" + "5" * 64,
+        attempt_index=0,
+        output_directory=tmp_path,
+    )
+
+    assert {launch["metric"]: launch["measure"] for launch in launches} == {
+        unit.metric: unit.measured_units for unit in workload.work_units
+    }
+
+
 def test_baseline_launch_routes_recovery_paths_when_journal_supports_them(
     tmp_path, monkeypatch
 ):
@@ -6695,6 +7241,7 @@ def test_baseline_launch_routes_recovery_paths_when_journal_supports_them(
         pairs=benchmark_runner.SCREEN_PAIRS,
         warmup=benchmark_runner.WARMUP_UNITS,
         measure=benchmark_runner.DEFAULT_MEASURED_UNITS,
+        prepared_data_measure=benchmark_runner.PREPARED_DATA_MEASURED_UNITS,
     )
 
     class FakeBaselineJournal:

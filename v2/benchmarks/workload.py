@@ -70,6 +70,7 @@ REPLACEMENT_PRECISION_POLICY = (
 )
 WARMUP_UNITS = 5
 DEFAULT_MEASURED_UNITS = 20
+PREPARED_DATA_MEASURED_UNITS = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,7 +314,9 @@ def fixed_inference_requests(
     )
 
 
-def _work_units(request_count: int) -> tuple[WorkUnitDefinition, ...]:
+def _work_units(
+    request_count: int, *, prepared_data_measured_units: int
+) -> tuple[WorkUnitDefinition, ...]:
     definitions = (
         (
             "prepared-data",
@@ -389,6 +392,7 @@ def _work_units(request_count: int) -> tuple[WorkUnitDefinition, ...]:
         ),
     )
     measured_units = {
+        "prepared-data": prepared_data_measured_units,
         "inference-prefill": request_count,
         "inference-decode": request_count,
         "compile-cold-start": 1,
@@ -415,6 +419,7 @@ def build_canonical_workload(
     loader_overrides: dict[str, JsonValue] | None = None,
     generation_overrides: dict[str, JsonValue] | None = None,
     row_count: int = 968,
+    prepared_data_measured_units: int = PREPARED_DATA_MEASURED_UNITS,
 ) -> CanonicalWorkload:
     model: dict[str, JsonValue] = {
         "vocab_size": 28_672,
@@ -539,6 +544,11 @@ def build_canonical_workload(
     _merge_overrides(optimizer, optimizer_overrides)
     _merge_overrides(loader, loader_overrides)
     _merge_overrides(generation, generation_overrides)
+    if (
+        type(prepared_data_measured_units) is not int
+        or prepared_data_measured_units <= 0
+    ):
+        raise ValueError("prepared_data_measured_units must be a positive integer")
     if "parameter_initializer_range" not in model:
         initializer_range = float(model["initializer_range"])
         residual_range = initializer_range / (2 * int(model["num_layers"])) ** 0.5
@@ -630,7 +640,10 @@ def build_canonical_workload(
                 },
             ),
         },
-        work_units=_work_units(int(generation["request_count"])),
+        work_units=_work_units(
+            int(generation["request_count"]),
+            prepared_data_measured_units=prepared_data_measured_units,
+        ),
         synchronization_boundaries=(
             "mlx.core.synchronize immediately before every timed region",
             "mlx.core.synchronize immediately after every timed region",

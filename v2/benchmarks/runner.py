@@ -57,6 +57,7 @@ from v2.benchmarks.schema import METRIC_NAMES, CanonicalWorkload, MetricName, Ra
 from v2.benchmarks.workload import (
     DEFAULT_MEASURED_UNITS,
     LEGACY_PRECISION_POLICY,
+    PREPARED_DATA_MEASURED_UNITS,
     REPLACEMENT_PRECISION_POLICY,
     WARMUP_UNITS,
     build_canonical_workload,
@@ -95,6 +96,8 @@ class EnvironmentTrialRejected(RuntimeError):
 
 
 PINNED_BASELINE_SOURCE_COMMIT = "3687f8b3214a44c675ae67af52e4997762f6c634"
+BASELINE_VERSION_LEGACY = 1
+BASELINE_VERSION_PREPARED_DATA_100 = 2
 COMPARISON_SCREEN = "screen"
 COMPARISON_FINAL = "final"
 SCREEN_PAIRS = 5
@@ -171,6 +174,45 @@ def _metric_report_dict(report) -> dict:
     return json.loads(json.dumps(asdict(report)))
 
 
+def _baseline_identity_domain(version: int) -> str:
+    if type(version) is not int:
+        raise ValueError("unsupported baseline manifest kind or version")
+    if version == BASELINE_VERSION_LEGACY:
+        return "sml-performance-baseline-v1"
+    if version == BASELINE_VERSION_PREPARED_DATA_100:
+        return "sml-performance-baseline-v2"
+    raise ValueError("unsupported baseline manifest kind or version")
+
+
+def _baseline_workload(version: int) -> CanonicalWorkload:
+    if type(version) is not int:
+        raise ValueError("unsupported baseline manifest kind or version")
+    if version == BASELINE_VERSION_LEGACY:
+        return build_canonical_workload(prepared_data_measured_units=20)
+    if version == BASELINE_VERSION_PREPARED_DATA_100:
+        return build_canonical_workload()
+    raise ValueError("unsupported baseline manifest kind or version")
+
+
+def _baseline_protocol(version: int, workload: CanonicalWorkload) -> dict:
+    if type(version) is not int:
+        raise ValueError("unsupported baseline manifest kind or version")
+    protocol = {
+        "pairs": SCREEN_PAIRS,
+        "compilation_passes": 1,
+        "warmup_units": WARMUP_UNITS,
+        "measured_units": DEFAULT_MEASURED_UNITS,
+        "bootstrap_seed": 1729,
+        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
+        "synchronization_boundaries": list(workload.synchronization_boundaries),
+    }
+    if version == BASELINE_VERSION_PREPARED_DATA_100:
+        protocol["prepared_data_measured_units"] = PREPARED_DATA_MEASURED_UNITS
+    elif version != BASELINE_VERSION_LEGACY:
+        raise ValueError("unsupported baseline manifest kind or version")
+    return protocol
+
+
 def build_baseline_manifest(
     *,
     trials: Sequence[RawTrial],
@@ -184,10 +226,15 @@ def build_baseline_manifest(
     warmup_units: int,
     measured_units: int,
     paired_representations: dict,
+    baseline_version: int,
 ) -> dict:
     _validate_raw_trials_evidence(trials)
-    if pairs <= 0:
-        raise ValueError("pairs must be positive")
+    if (
+        pairs != SCREEN_PAIRS
+        or warmup_units != WARMUP_UNITS
+        or measured_units != DEFAULT_MEASURED_UNITS
+    ):
+        raise ValueError("baseline protocol does not match the pinned protocol")
     if not trials:
         raise ValueError("baseline requires raw trials")
     metric_records = {}
@@ -213,7 +260,7 @@ def build_baseline_manifest(
         }
     body = {
         "kind": "sml-performance-baseline",
-        "version": 1,
+        "version": baseline_version,
         "source": {"commit": source_commit, "clean": True},
         "harness": {
             "commit": harness_commit,
@@ -223,15 +270,7 @@ def build_baseline_manifest(
         "command": command,
         "canonical_workload": workload.to_dict(),
         "canonical_workload_identity": workload_identity,
-        "protocol": {
-            "pairs": pairs,
-            "compilation_passes": 1,
-            "warmup_units": warmup_units,
-            "measured_units": measured_units,
-            "bootstrap_seed": 1729,
-            "bootstrap_resamples": 10_000,
-            "synchronization_boundaries": list(workload.synchronization_boundaries),
-        },
+        "protocol": _baseline_protocol(baseline_version, workload),
         "hardware": trials[0].hardware,
         "environment_status": trials[0].environment_status,
         "software_versions": trials[0].software_versions,
@@ -241,8 +280,69 @@ def build_baseline_manifest(
     }
     return {
         **body,
-        "identity": structured_identity("sml-performance-baseline-v1", body),
+        "identity": structured_identity(
+            _baseline_identity_domain(baseline_version), body
+        ),
     }
+
+
+def _validate_baseline_header(manifest: dict) -> CanonicalWorkload:
+    expected_fields = {
+        "kind",
+        "version",
+        "identity",
+        "source",
+        "harness",
+        "command",
+        "canonical_workload",
+        "canonical_workload_identity",
+        "protocol",
+        "hardware",
+        "environment_status",
+        "software_versions",
+        "semantic_identities",
+        "paired_pretraining_representations",
+        "metrics",
+    }
+    if set(manifest) != expected_fields:
+        raise ValueError("baseline manifest has an invalid field set")
+    version = manifest.get("version")
+    if manifest.get("kind") != "sml-performance-baseline":
+        raise ValueError("unsupported baseline manifest kind or version")
+    domain = _baseline_identity_domain(version)
+    body = {key: value for key, value in manifest.items() if key != "identity"}
+    if manifest.get("identity") != structured_identity(domain, body):
+        raise ValueError("baseline manifest identity does not match content")
+    workload_raw = manifest.get("canonical_workload")
+    if not isinstance(workload_raw, dict):
+        raise ValueError("baseline canonical workload must be an object")
+    workload = CanonicalWorkload.from_dict(workload_raw)
+    if workload != _baseline_workload(version):
+        raise ValueError("baseline canonical workload is not the pinned workload")
+    if manifest.get("canonical_workload_identity") != canonical_workload_identity(
+        workload
+    ):
+        raise ValueError("canonical workload identity does not match content")
+    protocol = manifest.get("protocol")
+    expected_protocol = _baseline_protocol(version, workload)
+    if not isinstance(protocol, dict) or protocol != expected_protocol:
+        raise ValueError("baseline protocol does not match the pinned protocol")
+    for name in (
+        "pairs",
+        "compilation_passes",
+        "warmup_units",
+        "measured_units",
+        "bootstrap_seed",
+        "bootstrap_resamples",
+    ):
+        if type(protocol[name]) is not int:
+            raise ValueError("baseline protocol does not match the pinned protocol")
+    if (
+        version == BASELINE_VERSION_PREPARED_DATA_100
+        and type(protocol["prepared_data_measured_units"]) is not int
+    ):
+        raise ValueError("baseline protocol does not match the pinned protocol")
+    return workload
 
 
 def validate_baseline_trial(
@@ -335,42 +435,7 @@ def validate_baseline_manifest(
     trials: Sequence[RawTrial],
 ) -> None:
     _validate_raw_trials_evidence(trials)
-    expected_fields = {
-        "kind",
-        "version",
-        "identity",
-        "source",
-        "harness",
-        "command",
-        "canonical_workload",
-        "canonical_workload_identity",
-        "protocol",
-        "hardware",
-        "environment_status",
-        "software_versions",
-        "semantic_identities",
-        "paired_pretraining_representations",
-        "metrics",
-    }
-    if set(manifest) != expected_fields:
-        raise ValueError("baseline manifest has an invalid field set")
-    if manifest["kind"] != "sml-performance-baseline" or manifest["version"] != 1:
-        raise ValueError("unsupported baseline manifest kind or version")
-    body = {key: value for key, value in manifest.items() if key != "identity"}
-    expected_identity = structured_identity("sml-performance-baseline-v1", body)
-    if manifest["identity"] != expected_identity:
-        raise ValueError("baseline manifest identity does not match content")
-    workload_raw = manifest["canonical_workload"]
-    if not isinstance(workload_raw, dict):
-        raise ValueError("baseline canonical workload must be an object")
-    workload = CanonicalWorkload.from_dict(workload_raw)
-    if workload != build_canonical_workload():
-        raise ValueError("baseline canonical workload is not the pinned workload")
-    workload_identity = structured_identity(
-        "sml-canonical-benchmark-workload-v1", workload.to_dict()
-    )
-    if manifest["canonical_workload_identity"] != workload_identity:
-        raise ValueError("canonical workload identity does not match content")
+    workload = _validate_baseline_header(manifest)
     paired_representations = manifest["paired_pretraining_representations"]
     if not isinstance(paired_representations, dict):
         raise ValueError("paired pretraining representations must be an object")
@@ -432,16 +497,6 @@ def validate_baseline_manifest(
     pairs = protocol.get("pairs")
     if pairs != SCREEN_PAIRS:
         raise ValueError("baseline requires exactly five fresh-process trials")
-    if protocol != {
-        "pairs": SCREEN_PAIRS,
-        "compilation_passes": 1,
-        "warmup_units": WARMUP_UNITS,
-        "measured_units": DEFAULT_MEASURED_UNITS,
-        "bootstrap_seed": 1729,
-        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
-        "synchronization_boundaries": list(workload.synchronization_boundaries),
-    }:
-        raise ValueError("baseline protocol does not match the pinned protocol")
     if set(metrics) != set(METRIC_NAMES):
         raise ValueError("baseline must contain every benchmark metric")
     if len(trials) != len(METRIC_NAMES) * SCREEN_PAIRS:
@@ -755,6 +810,7 @@ def build_comparison_report(
     pairs: int | None = None,
     warmup_units: int = WARMUP_UNITS,
     measured_units: int = DEFAULT_MEASURED_UNITS,
+    prepared_data_measured_units: int | None = None,
     cooldown_evidence: dict | None = None,
 ) -> dict:
     _validate_raw_trials_evidence(trials)
@@ -864,6 +920,24 @@ def build_comparison_report(
         raise ValueError("comparison requires one predecessor entry per metric")
     if pairs is None:
         pairs = 1 + max(trial.pair_index for trial in trials)
+    protocol = {
+        "pairs": pairs,
+        "compilation_passes": 1,
+        "warmup_units": warmup_units,
+        "measured_units": measured_units,
+        "bootstrap_seed": 1729,
+        "bootstrap_resamples": bootstrap_resamples,
+        "minimum_ratio": minimum_ratio,
+        "pretraining_minimum_ratio": pretraining_minimum_ratio,
+        "maximum_dispersion": maximum_dispersion,
+        "require_lower_bound": require_lower_bound,
+    }
+    if baseline["version"] == BASELINE_VERSION_PREPARED_DATA_100:
+        protocol["prepared_data_measured_units"] = (
+            PREPARED_DATA_MEASURED_UNITS
+            if prepared_data_measured_units is None
+            else prepared_data_measured_units
+        )
     body = {
         "kind": "sml-performance-comparison",
         "version": 1,
@@ -873,18 +947,7 @@ def build_comparison_report(
         "canonical_workload_identity": baseline["canonical_workload_identity"],
         "candidate_commit": candidate_commit,
         "comparison_mode": comparison_mode,
-        "protocol": {
-            "pairs": pairs,
-            "compilation_passes": 1,
-            "warmup_units": warmup_units,
-            "measured_units": measured_units,
-            "bootstrap_seed": 1729,
-            "bootstrap_resamples": bootstrap_resamples,
-            "minimum_ratio": minimum_ratio,
-            "pretraining_minimum_ratio": pretraining_minimum_ratio,
-            "maximum_dispersion": maximum_dispersion,
-            "require_lower_bound": require_lower_bound,
-        },
+        "protocol": protocol,
         "cooldown_evidence": cooldown_evidence,
         "metrics": metric_records,
         "raw_trials": [trial.to_dict() for trial in trials],
@@ -954,7 +1017,7 @@ def _normalize_previous_comparison(record: dict | None) -> dict | None:
     }
 
 
-def _validate_comparison_protocol(report: dict) -> None:
+def _validate_comparison_protocol(report: dict, baseline: dict | None = None) -> None:
     protocol = report.get("protocol")
     if not isinstance(protocol, dict):
         raise ValueError("comparison protocol must be an object")
@@ -970,6 +1033,37 @@ def _validate_comparison_protocol(report: dict) -> None:
     for key, expected in common.items():
         if protocol.get(key) != expected:
             raise ValueError(f"comparison protocol has invalid {key}")
+    for key in (
+        "pairs",
+        "compilation_passes",
+        "warmup_units",
+        "measured_units",
+        "bootstrap_seed",
+        "bootstrap_resamples",
+    ):
+        if type(protocol.get(key)) is not int:
+            raise ValueError(f"comparison protocol has invalid {key}")
+    if baseline is not None:
+        version = baseline["version"]
+        expected_fields = set(common) | {
+            "pairs",
+            "maximum_dispersion",
+            "require_lower_bound",
+            "pretraining_minimum_ratio",
+        }
+        if version == BASELINE_VERSION_PREPARED_DATA_100:
+            expected_fields.add("prepared_data_measured_units")
+            if type(protocol.get("prepared_data_measured_units")) is not int or (
+                protocol.get("prepared_data_measured_units")
+                != PREPARED_DATA_MEASURED_UNITS
+            ):
+                raise ValueError(
+                    "comparison protocol has invalid prepared_data_measured_units"
+                )
+        elif version != BASELINE_VERSION_LEGACY:
+            raise ValueError("unsupported baseline manifest kind or version")
+        if set(protocol) != expected_fields:
+            raise ValueError("comparison protocol has an invalid field set")
     if mode == COMPARISON_SCREEN:
         if (
             protocol.get("pairs") != SCREEN_PAIRS
@@ -1272,7 +1366,11 @@ def validate_comparison_report(
     }
     if set(report) != expected_fields:
         raise ValueError("comparison report has an invalid field set")
-    if report["kind"] != "sml-performance-comparison" or report["version"] != 1:
+    if (
+        report["kind"] != "sml-performance-comparison"
+        or type(report["version"]) is not int
+        or report["version"] != 1
+    ):
         raise ValueError("unsupported comparison report kind or version")
     body = {key: value for key, value in report.items() if key != "identity"}
     expected_identity = structured_identity("sml-performance-comparison-v1", body)
@@ -1300,7 +1398,7 @@ def validate_comparison_report(
     metrics = report["metrics"]
     if not isinstance(protocol, dict) or not isinstance(metrics, dict):
         raise ValueError("comparison protocol and metrics must be objects")
-    _validate_comparison_protocol(report)
+    _validate_comparison_protocol(report, baseline)
     if _use_embedded_predecessors:
         embedded = report.get("predecessors")
         if not isinstance(embedded, dict) or set(embedded) != set(metrics):
@@ -2030,8 +2128,14 @@ def _run_single_process(args: argparse.Namespace) -> int:
         raise RuntimeError("source checkout commit changed before measurement")
     if harness_content_identity(harness_root) != args.harness_identity:
         raise RuntimeError("harness content identity changed before measurement")
-    workload = build_canonical_workload()
+    workload = build_canonical_workload(
+        prepared_data_measured_units=args.prepared_data_measure
+    )
     workload_identity = canonical_workload_identity(workload)
+    work_unit = next(unit for unit in workload.work_units if unit.metric == args.metric)
+    if type(args.measure) is not int or args.measure != work_unit.measured_units:
+        raise ValueError("child measured units do not match the canonical metric")
+    measured_units = args.measure
     if args.adapter == "legacy":
         from v2.benchmarks.adapters import legacy as adapter
     else:
@@ -2048,8 +2152,6 @@ def _run_single_process(args: argparse.Namespace) -> int:
     }
     import mlx.core as mx
 
-    work_unit = next(unit for unit in workload.work_units if unit.metric == args.metric)
-    measured_units = work_unit.measured_units
     process_measurement = measure_native_process(
         adapter=adapter,
         metric=args.metric,
@@ -2221,6 +2323,7 @@ def _launch_trial(
     order: int,
     warmup: int,
     measure: int,
+    prepared_data_measure: int = PREPARED_DATA_MEASURED_UNITS,
     comparison_target: str,
     evidence_session_identity: str,
     journal_attempt_index: int,
@@ -2263,6 +2366,8 @@ def _launch_trial(
         str(warmup),
         "--measure",
         str(measure),
+        "--prepared-data-measure",
+        str(prepared_data_measure),
         "--comparison-target",
         comparison_target,
         "--evidence-session-identity",
@@ -2280,13 +2385,27 @@ def _launch_trial(
         raise ValueError("fresh child measurement has the wrong session identity")
     if measurement["journal_attempt_index"] != journal_attempt_index:
         raise ValueError("fresh child measurement has the wrong journal attempt index")
+    trial = measurement["trial"]
+    expected_warmup = 0 if metric == "compile-cold-start" else warmup
+    if (
+        trial["metric"] != metric
+        or trial["canonical_workload_identity"]
+        != canonical_workload_identity(
+            build_canonical_workload(prepared_data_measured_units=prepared_data_measure)
+        )
+        or trial["warmup_units"] != expected_warmup
+        or trial["measured_units"] != measure
+    ):
+        raise ValueError("child trial does not match canonical launch arguments")
     immediate_started_at, observation = collect_post_exit_environment(clock=clock)
     post_exit = build_post_exit_observation(
         measurement=measurement,
         **observation,
     )
     atomic_write_json(post_exit_output, post_exit, create_only=True)
-    workload = build_canonical_workload()
+    workload = build_canonical_workload(
+        prepared_data_measured_units=prepared_data_measure
+    )
     policy = post_exit_recovery_policy(workload)
 
     def record_sample(
@@ -2740,32 +2859,35 @@ def _publish_final_artifact(path: Path, text: str) -> None:
 def canonical_baseline_command(journal: BaselineJournal) -> str:
     session = journal.session
     protocol = session["protocol"]
-    return shlex.join(
-        (
-            "uv",
-            "run",
-            "python",
-            "-m",
-            "v2.benchmarks.runner",
-            "record-baseline",
-            "--source-commit",
-            session["source"]["commit"],
-            "--manifest",
-            session["manifest_path"],
-            "--raw-output",
-            session["raw_output_path"],
-            "--state-directory",
-            "SESSION_STATE_DIRECTORY",
-            "--metrics",
-            ",".join(METRIC_NAMES),
-            "--pairs",
-            str(protocol["pairs"]),
-            "--warmup",
-            str(protocol["warmup_units"]),
-            "--measure",
-            str(protocol["measured_units"]),
+    arguments = [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "v2.benchmarks.runner",
+        "record-baseline",
+        "--source-commit",
+        session["source"]["commit"],
+        "--manifest",
+        session["manifest_path"],
+        "--raw-output",
+        session["raw_output_path"],
+        "--state-directory",
+        "SESSION_STATE_DIRECTORY",
+        "--metrics",
+        ",".join(METRIC_NAMES),
+        "--pairs",
+        str(protocol["pairs"]),
+        "--warmup",
+        str(protocol["warmup_units"]),
+        "--measure",
+        str(protocol["measured_units"]),
+    ]
+    if "prepared_data_measured_units" in protocol:
+        arguments.extend(
+            ("--prepared-data-measure", str(protocol["prepared_data_measured_units"]))
         )
-    )
+    return shlex.join(arguments)
 
 
 def publish_baseline_from_journal(
@@ -2780,6 +2902,7 @@ def publish_baseline_from_journal(
     paired_representations: dict,
     manifest_path: Path,
     raw_output_path: Path,
+    baseline_version: int = BASELINE_VERSION_PREPARED_DATA_100,
 ) -> dict:
     _validate_raw_trials_evidence(trials)
     manifest_path, raw_output_path = _resolve_baseline_output_paths(
@@ -2814,6 +2937,7 @@ def publish_baseline_from_journal(
         warmup_units=WARMUP_UNITS,
         measured_units=DEFAULT_MEASURED_UNITS,
         paired_representations=paired_representations,
+        baseline_version=baseline_version,
     )
     validate_baseline_manifest(manifest, ordered_trials)
 
@@ -2908,20 +3032,16 @@ def _record_baseline_locked(
         or args.pairs != SCREEN_PAIRS
         or args.warmup != WARMUP_UNITS
         or args.measure != DEFAULT_MEASURED_UNITS
+        or args.prepared_data_measure != PREPARED_DATA_MEASURED_UNITS
     ):
         raise ValueError("record-baseline protocol is immutable")
     workload = build_canonical_workload()
     workload_identity = canonical_workload_identity(workload)
     initial_environment = collect_environment()
     initial_hardware, _initial_status, initial_software_versions = initial_environment
-    protocol = {
-        "pairs": args.pairs,
-        "compilation_passes": 1,
-        "warmup_units": args.warmup,
-        "measured_units": args.measure,
-        "bootstrap_seed": 1729,
-        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
-        "synchronization_boundaries": list(workload.synchronization_boundaries),
+    protocol = _baseline_protocol(BASELINE_VERSION_PREPARED_DATA_100, workload)
+    measured_units_by_metric = {
+        unit.metric: unit.measured_units for unit in workload.work_units
     }
     with tempfile.TemporaryDirectory(prefix="sml-v2-baseline-") as temporary_name:
         temporary = Path(temporary_name)
@@ -3020,7 +3140,8 @@ def _record_baseline_locked(
                     pair_index=slot.pair_index,
                     order=0,
                     warmup=args.warmup,
-                    measure=args.measure,
+                    measure=measured_units_by_metric[slot.metric],
+                    prepared_data_measure=args.prepared_data_measure,
                     comparison_target="baseline",
                     evidence_session_identity=journal.session["identity"],
                     journal_attempt_index=attempt.journal_attempt_index,
@@ -3077,6 +3198,7 @@ def _record_baseline_locked(
         paired_representations=paired_representations,
         manifest_path=manifest_path,
         raw_output_path=raw_output_path,
+        baseline_version=BASELINE_VERSION_PREPARED_DATA_100,
     )
     return 0
 
@@ -3098,26 +3220,7 @@ def _read_json_object(path: Path, *, label: str) -> dict:
 
 
 def _validate_baseline_document(manifest: dict) -> None:
-    body = {key: value for key, value in manifest.items() if key != "identity"}
-    if manifest.get("identity") != structured_identity(
-        "sml-performance-baseline-v1", body
-    ):
-        raise ValueError("baseline manifest identity does not match content")
-    if (
-        manifest.get("kind") != "sml-performance-baseline"
-        or manifest.get("version") != 1
-    ):
-        raise ValueError("unsupported baseline manifest kind or version")
-    workload_raw = manifest.get("canonical_workload")
-    if not isinstance(workload_raw, dict):
-        raise ValueError("baseline canonical workload must be an object")
-    workload = CanonicalWorkload.from_dict(workload_raw)
-    if workload != build_canonical_workload():
-        raise ValueError("baseline canonical workload is not the pinned workload")
-    if manifest.get("canonical_workload_identity") != canonical_workload_identity(
-        workload
-    ):
-        raise ValueError("baseline canonical workload identity is invalid")
+    _validate_baseline_header(manifest)
     source = manifest.get("source")
     harness = manifest.get("harness")
     if not isinstance(source, dict) or source.get("clean") is not True:
@@ -3126,17 +3229,6 @@ def _validate_baseline_document(manifest: dict) -> None:
         raise ValueError("baseline harness proof is invalid")
     if source.get("commit") != PINNED_BASELINE_SOURCE_COMMIT:
         raise ValueError("baseline source is not the pinned 3687f8b commit")
-    protocol = manifest.get("protocol")
-    if protocol != {
-        "pairs": SCREEN_PAIRS,
-        "compilation_passes": 1,
-        "warmup_units": WARMUP_UNITS,
-        "measured_units": DEFAULT_MEASURED_UNITS,
-        "bootstrap_seed": 1729,
-        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
-        "synchronization_boundaries": list(workload.synchronization_boundaries),
-    }:
-        raise ValueError("baseline document has the wrong protocol")
     metrics = manifest.get("metrics")
     if not isinstance(metrics, dict) or set(metrics) != set(METRIC_NAMES):
         raise ValueError("baseline document does not contain every metric")
@@ -3258,6 +3350,7 @@ def _comparison_evidence_session_identity(
     pairs: int,
     warmup: int,
     measure: int,
+    prepared_data_measure: int,
 ) -> str:
     return structured_identity(
         "sml-comparison-evidence-session-v1",
@@ -3272,6 +3365,7 @@ def _comparison_evidence_session_identity(
             "pairs": pairs,
             "warmup": warmup,
             "measure": measure,
+            "prepared_data_measure": prepared_data_measure,
         },
     )
 
@@ -3290,11 +3384,14 @@ def _run_paired_trials(
     pairs: int,
     warmup: int,
     measure: int,
+    prepared_data_measure: int = PREPARED_DATA_MEASURED_UNITS,
     comparison_target: str,
     attempt_index: int,
     output_directory: Path,
 ) -> list[RawTrial]:
-    workload = build_canonical_workload()
+    workload = build_canonical_workload(
+        prepared_data_measured_units=prepared_data_measure
+    )
     evidence_session_identity = _comparison_evidence_session_identity(
         harness_commit=harness_commit,
         harness_identity=harness_identity,
@@ -3306,6 +3403,7 @@ def _run_paired_trials(
         pairs=pairs,
         warmup=warmup,
         measure=measure,
+        prepared_data_measure=prepared_data_measure,
     )
     trials = []
     for metric in metrics:
@@ -3329,7 +3427,12 @@ def _run_paired_trials(
                     pair_index=pair_index,
                     order=order_index,
                     warmup=warmup,
-                    measure=measure,
+                    measure=next(
+                        unit.measured_units
+                        for unit in workload.work_units
+                        if unit.metric == metric
+                    ),
+                    prepared_data_measure=prepared_data_measure,
                     comparison_target=comparison_target,
                     evidence_session_identity=evidence_session_identity,
                     journal_attempt_index=attempt_index,
@@ -3460,6 +3563,7 @@ def _collect_comparison_attempt(
                 pairs=args.pairs,
                 warmup=args.warmup,
                 measure=args.measure,
+                prepared_data_measure=args.prepared_data_measure,
                 comparison_target=baseline_target,
                 attempt_index=attempt_index,
                 output_directory=temporary,
@@ -3496,6 +3600,7 @@ def _collect_comparison_attempt(
                         pairs=args.pairs,
                         warmup=args.warmup,
                         measure=args.measure,
+                        prepared_data_measure=args.prepared_data_measure,
                         comparison_target=target,
                         attempt_index=attempt_index,
                         output_directory=temporary,
@@ -3559,9 +3664,10 @@ def _combine_previous_attempts(
 def _compare(args: argparse.Namespace) -> int:
     repository = _git_root(Path.cwd())
     _require_clean_checkout(repository, label="candidate")
-    comparison_mode = _resolve_comparison_mode(args)
     baseline = _read_json_object(args.baseline, label="baseline manifest")
     _validate_baseline_document(baseline)
+    args.prepared_data_measure = _resolve_prepared_data_measure(args, baseline)
+    comparison_mode = _resolve_comparison_mode(args, baseline)
     predecessor_reports, predecessor_metrics, predecessor_proof = (
         _resolve_predecessor_mapping(
             args.predecessors, repository, baseline, args.metrics
@@ -3609,6 +3715,7 @@ def _compare(args: argparse.Namespace) -> int:
         "pairs": args.pairs,
         "warmup_units": args.warmup,
         "measured_units": args.measure,
+        "prepared_data_measured_units": args.prepared_data_measure,
     }
     provisional = build_comparison_report(trials=trials, **report_arguments)
     cooldown_evidence = None
@@ -3767,7 +3874,9 @@ def process_order(pair_index: int) -> tuple[Side, Side]:
     return ("candidate", "reference")
 
 
-def _resolve_comparison_mode(args: argparse.Namespace) -> str:
+def _resolve_comparison_mode(
+    args: argparse.Namespace, baseline: dict | None = None
+) -> str:
     mode = args.mode
     if mode is None:
         mode = (
@@ -3787,10 +3896,32 @@ def _resolve_comparison_mode(args: argparse.Namespace) -> str:
         "maximum_dispersion": args.maximum_dispersion,
         "require_lower_bound": not args.lower_bound_report_only,
     }
-    _validate_comparison_protocol({"comparison_mode": mode, "protocol": protocol})
+    if (
+        baseline is not None
+        and baseline["version"] == BASELINE_VERSION_PREPARED_DATA_100
+    ):
+        protocol["prepared_data_measured_units"] = args.prepared_data_measure
+    _validate_comparison_protocol(
+        {"comparison_mode": mode, "protocol": protocol}, baseline
+    )
     if mode == COMPARISON_FINAL and tuple(args.metrics) != FINAL_METRICS:
         raise ValueError("final acceptance requires the complete final metric set")
     return mode
+
+
+def _resolve_prepared_data_measure(args: argparse.Namespace, baseline: dict) -> int:
+    workload = _baseline_workload(baseline["version"])
+    expected = next(
+        unit.measured_units
+        for unit in workload.work_units
+        if unit.metric == "prepared-data"
+    )
+    supplied = args.prepared_data_measure
+    if supplied is not None and (type(supplied) is not int or supplied != expected):
+        raise ValueError(
+            "prepared-data measured units do not match the baseline protocol"
+        )
+    return expected
 
 
 def parse_metrics(value: str) -> tuple[MetricName, ...]:
@@ -3880,6 +4011,7 @@ def build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("--pairs", type=int, default=SCREEN_PAIRS)
     baseline.add_argument("--warmup", type=int, default=WARMUP_UNITS)
     baseline.add_argument("--measure", type=int, default=DEFAULT_MEASURED_UNITS)
+    baseline.add_argument("--prepared-data-measure", type=int, required=True)
 
     compare = subparsers.add_parser("compare")
     compare.add_argument("--baseline", type=Path, required=True)
@@ -3889,6 +4021,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--pairs", type=int, default=SCREEN_PAIRS)
     compare.add_argument("--warmup", type=int, default=WARMUP_UNITS)
     compare.add_argument("--measure", type=int, default=DEFAULT_MEASURED_UNITS)
+    compare.add_argument("--prepared-data-measure", type=int)
     compare.add_argument("--bootstrap-resamples", type=int, default=10_000)
     compare.add_argument("--minimum-ratio", type=float, default=0.97)
     compare.add_argument("--pretraining-minimum-ratio", type=float)
@@ -3932,6 +4065,7 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument("--process-order", type=int, required=True)
     process.add_argument("--warmup", type=int, required=True)
     process.add_argument("--measure", type=int, required=True)
+    process.add_argument("--prepared-data-measure", type=int, required=True)
     process.add_argument("--comparison-target", required=True)
     process.add_argument("--evidence-session-identity", required=True)
     process.add_argument("--journal-attempt-index", type=int, required=True)
