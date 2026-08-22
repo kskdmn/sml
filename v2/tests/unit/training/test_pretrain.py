@@ -10,23 +10,22 @@ import pytest
 import sml.training.pretrain as pretrain_module
 from mlx.utils import tree_flatten, tree_map
 from sml.model.config import ModelConfig
-from sml.model.language_model import SMLLanguageModel
+from sml.model.language_model import SMLLanguageModel, causal_lm_loss
 from sml.training.common import (
     BaseParameterState,
     LoaderConfig,
+    OptimizerConfig,
     PretrainingConfig,
     TrainerState,
-    adamw_mixed_precision_update,
     build_weight_decay_tree,
     initialize_adam_state,
     initialize_base_parameter_state,
-    normalize_and_clip,
 )
 from sml.training.pretrain import build_pretraining_kernels
 
 
 def assert_tree_close(
-    actual: dict, expected: dict, *, atol: float, rtol: float
+    actual: object, expected: object, *, atol: float, rtol: float
 ) -> None:
     actual_leaves = dict(tree_flatten(actual))
     expected_leaves = dict(tree_flatten(expected))
@@ -59,6 +58,7 @@ def source_has_none_of(module: object, forbidden: list[str]) -> bool:
 @dataclass(frozen=True)
 class TinyRuntime:
     config: PretrainingConfig
+    model: SMLLanguageModel
     parameters: BaseParameterState
     trainer: TrainerState
     optimizer: object
@@ -87,6 +87,14 @@ def build_tiny_runtime(tmp_path: Path, *, dropout: float = 0.0) -> TinyRuntime:
         output_run=tmp_path / "run",
         model=model_config,
         loader=LoaderConfig(gradient_accumulation_steps=4),
+        optimizer=OptimizerConfig(
+            learning_rate=0.01,
+            beta1=0.5,
+            beta2=0.5,
+            schedule_steps=None,
+            warmup_steps=0,
+            gradient_clip_norm=1.0,
+        ),
     )
     model = SMLLanguageModel(model_config, key=mx.random.key(9))
     parameters = initialize_base_parameter_state(model.parameters())
@@ -94,6 +102,7 @@ def build_tiny_runtime(tmp_path: Path, *, dropout: float = 0.0) -> TinyRuntime:
         accumulators=tree_map(mx.zeros_like, parameters.master_parameters),
         accumulation_count=mx.array(0, dtype=mx.int32),
         next_key=mx.random.key(11),
+        loss_numerator=mx.array(0.0, dtype=mx.float32),
     )
     weight_decay_tree = build_weight_decay_tree(
         parameters.working_parameters,
@@ -101,6 +110,7 @@ def build_tiny_runtime(tmp_path: Path, *, dropout: float = 0.0) -> TinyRuntime:
     )
     return TinyRuntime(
         config=config,
+        model=model,
         parameters=parameters,
         trainer=trainer,
         optimizer=initialize_adam_state(parameters.master_parameters),
@@ -122,6 +132,7 @@ def test_microstep_transfers_rows_once_and_keeps_state_on_device(tiny_runtime):
     )
 
     assert state.trainer.accumulation_count.dtype == mx.int32
+    assert state.trainer.loss_numerator.dtype == mx.float32
     assert state.trainer.accumulators["embed_tokens"]["weight"].dtype == mx.float32
     assert source_has_none_of(
         pretrain_module, ["loss.item(", ".tolist(", "mx.eval(loss"]
@@ -157,10 +168,92 @@ def test_compiled_cores_use_only_builtin_array_trees(tiny_runtime):
     )
 
 
+def _reference_partial_window_update(runtime: TinyRuntime, trainer_tree: tuple):
+    accumulators, accumulation_count, next_key, loss_numerator = trainer_tree
+    count = accumulation_count.astype(mx.float32)
+    normalized = tree_map(lambda value: value.astype(mx.float32) / count, accumulators)
+    squared_norm = sum(
+        (mx.sum(mx.square(value)) for _, value in tree_flatten(normalized)),
+        mx.array(0.0, dtype=mx.float32),
+    )
+    global_norm = mx.sqrt(squared_norm)
+    scale = mx.minimum(
+        mx.array(1.0, dtype=mx.float32),
+        mx.array(runtime.config.optimizer.gradient_clip_norm, dtype=mx.float32)
+        / mx.maximum(global_norm, mx.array(1e-12, dtype=mx.float32)),
+    )
+    gradients = tree_map(lambda value: value * scale, normalized)
+    beta1 = runtime.config.optimizer.beta1
+    beta2 = runtime.config.optimizer.beta2
+    first_moments = tree_map(
+        lambda moment, gradient: beta1 * moment + (1.0 - beta1) * gradient,
+        runtime.optimizer.first_moments,
+        gradients,
+    )
+    second_moments = tree_map(
+        lambda moment, gradient: beta2 * moment + (1.0 - beta2) * mx.square(gradient),
+        runtime.optimizer.second_moments,
+        gradients,
+    )
+    learning_rate = mx.array(runtime.config.optimizer.learning_rate, dtype=mx.float32)
+    masters = tree_map(
+        lambda master, first, second, decay: (
+            master
+            - learning_rate
+            * (
+                first / (mx.sqrt(second) + runtime.config.optimizer.epsilon)
+                + float(decay) * master
+            )
+        ),
+        runtime.parameters.master_parameters,
+        first_moments,
+        second_moments,
+        runtime.weight_decay_tree,
+    )
+    working = tree_map(lambda master: master.astype(mx.bfloat16), masters)
+    return (
+        masters,
+        working,
+        (
+            runtime.optimizer.step + mx.array(1, dtype=mx.int32),
+            first_moments,
+            second_moments,
+        ),
+        (
+            tree_map(lambda value: value - value, accumulators),
+            accumulation_count - accumulation_count,
+            next_key,
+            loss_numerator - loss_numerator,
+        ),
+        {
+            "learning_rate": learning_rate,
+            "loss_numerator": loss_numerator,
+            "loss": loss_numerator / count,
+            "accumulation_count": accumulation_count,
+        },
+    )
+
+
 def test_optimizer_step_resets_partial_window_using_actual_microbatch_count(
     tiny_runtime,
 ):
     """Dividing by configured accumulation would under-scale an epoch-tail update."""
+    rows = mx.array(tiny_runtime.rows)
+    logits, cache_state, _next_key = tiny_runtime.model.forward_arrays(
+        tiny_runtime.parameters.working_parameters,
+        rows[:, :-1],
+        attention_mask=None,
+        positions=None,
+        cache_state=None,
+        training=True,
+        key=tiny_runtime.trainer.next_key,
+    )
+    assert cache_state is None
+    single_loss_numerator = causal_lm_loss(
+        logits,
+        rows[:, 1:],
+        rows[:, 1:] != tiny_runtime.model.config.pad_token_id,
+    )
     compiled_trainer = tiny_runtime.trainer
     eager_trainer_tree = tiny_runtime.trainer.to_tree()
     eager_working = tiny_runtime.parameters.working_parameters
@@ -178,18 +271,14 @@ def test_optimizer_step_resets_partial_window_using_actual_microbatch_count(
     compiled = tiny_runtime.kernels.optimizer_step(
         tiny_runtime.parameters, tiny_runtime.optimizer, compiled_trainer
     )
-    expected_gradients = normalize_and_clip(
-        eager_trainer_tree[0],
-        eager_trainer_tree[1],
-        gradient_clip_norm=tiny_runtime.config.optimizer.gradient_clip_norm,
-    )
-    expected_masters, expected_working, expected_adam = adamw_mixed_precision_update(
-        tiny_runtime.parameters.master_parameters,
-        expected_gradients,
-        tiny_runtime.optimizer,
-        tiny_runtime.config.optimizer,
-        tiny_runtime.weight_decay_tree,
-    )
+    expected = _reference_partial_window_update(tiny_runtime, eager_trainer_tree)
+    (
+        expected_masters,
+        expected_working,
+        expected_adam,
+        expected_trainer,
+        expected_metrics,
+    ) = expected
 
     assert_tree_close(
         compiled.parameters.master_parameters,
@@ -203,33 +292,64 @@ def test_optimizer_step_resets_partial_window_using_actual_microbatch_count(
         atol=0.0,
         rtol=0.0,
     )
-    assert int(compiled.trainer.accumulation_count.item()) == 0
-    assert int(compiled.optimizer.step.item()) == 1
+    assert_tree_close(compiled.optimizer.to_tree(), expected_adam, atol=1e-6, rtol=1e-6)
+    assert_tree_close(compiled.trainer.to_tree(), expected_trainer, atol=0.0, rtol=0.0)
+    assert_tree_close(compiled.metrics, expected_metrics, atol=1e-6, rtol=1e-6)
     assert_tree_close(
-        compiled.optimizer.first_moments,
-        expected_adam.first_moments,
+        {"loss_numerator": compiled.metrics["loss_numerator"]},
+        {"loss_numerator": 3.0 * single_loss_numerator},
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert_tree_close(
+        {"loss": compiled.metrics["loss"]},
+        {"loss": single_loss_numerator},
         atol=1e-6,
         rtol=1e-6,
     )
 
-    second_microstep = tiny_runtime.microstep(
-        compiled.parameters, compiled.trainer, tiny_runtime.rows
+
+def test_consecutive_eager_and_compiled_transitions_match_every_state_tree(
+    tmp_path: Path,
+):
+    """Returning stale state would only become visible on the second transition."""
+    runtime = build_tiny_runtime(tmp_path, dropout=0.2)
+    rows = mx.array(runtime.rows)
+
+    def run(microstep_core, optimizer_step_core):
+        masters = runtime.parameters.master_parameters
+        working = runtime.parameters.working_parameters
+        adam_tree = runtime.optimizer.to_tree()
+        trainer_tree = runtime.trainer.to_tree()
+        for _ in range(2):
+            working, trainer_tree = microstep_core(
+                working, trainer_tree, rows[:, :-1], rows[:, 1:]
+            )
+            masters, working, adam_tree, trainer_tree, metrics = optimizer_step_core(
+                masters, working, adam_tree, trainer_tree
+            )
+        return masters, working, adam_tree, trainer_tree, metrics
+
+    eager = run(
+        runtime.kernels.eager_microstep_core,
+        runtime.kernels.eager_optimizer_step_core,
     )
-    second = tiny_runtime.kernels.optimizer_step(
-        second_microstep.parameters,
-        compiled.optimizer,
-        second_microstep.trainer,
+    compiled = run(
+        runtime.kernels.compiled_microstep_core,
+        runtime.kernels.compiled_optimizer_step_core,
     )
-    assert int(second.optimizer.step.item()) == 2
-    assert_tree_close(
-        second.parameters.working_parameters,
-        tree_map(
-            lambda master: master.astype(mx.bfloat16),
-            second.parameters.master_parameters,
-        ),
-        atol=0.0,
-        rtol=0.0,
-    )
+
+    for actual, expected in zip(compiled, eager, strict=True):
+        assert_tree_close(actual, expected, atol=1e-6, rtol=1e-6)
+    assert int(compiled[2][0].item()) == 2
+    assert not bool(mx.array_equal(compiled[3][2], runtime.trainer.next_key))
+
+
+def test_optimizer_core_uses_no_adam_wrapper_in_traced_body(tiny_runtime):
+    """Custom wrapper construction in a traced core would violate its array boundary."""
+    source = inspect.getsource(tiny_runtime.kernels.eager_optimizer_step_core)
+
+    assert "AdamState" not in source
 
 
 def test_disabled_dropout_preserves_explicit_prng_key(tiny_runtime):

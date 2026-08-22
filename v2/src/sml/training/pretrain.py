@@ -14,7 +14,7 @@ from sml.training.common import (
     PretrainingConfig,
     TrainerState,
     accumulate_fp32,
-    adamw_mixed_precision_update,
+    adamw_mixed_precision_update_tree,
     learning_rate_at,
     normalize_and_clip,
 )
@@ -128,38 +128,49 @@ def build_pretraining_kernels(
 
     def microstep_core(
         working_parameters: dict,
-        trainer_tree: tuple[dict, mx.array, mx.array],
+        trainer_tree: tuple[dict, mx.array, mx.array, mx.array],
         input_ids: mx.array,
         labels: mx.array,
-    ) -> tuple[dict, tuple[dict, mx.array, mx.array]]:
-        accumulators, accumulation_count, key = trainer_tree
-        (_loss, next_key), gradients = loss_and_grad(
+    ) -> tuple[dict, tuple[dict, mx.array, mx.array, mx.array]]:
+        accumulators, accumulation_count, key, loss_numerator = trainer_tree
+        (loss, next_key), gradients = loss_and_grad(
             working_parameters, input_ids, labels, key
         )
         next_accumulators = accumulate_fp32(accumulators, gradients)
         next_count = (accumulation_count + mx.array(1, dtype=mx.int32)).astype(mx.int32)
-        return working_parameters, (next_accumulators, next_count, next_key)
+        next_loss_numerator = (loss_numerator + loss.astype(mx.float32)).astype(
+            mx.float32
+        )
+        return working_parameters, (
+            next_accumulators,
+            next_count,
+            next_key,
+            next_loss_numerator,
+        )
 
     def optimizer_step_core(
         master_parameters: dict,
         working_parameters: dict,
         adam_tree: tuple[mx.array, dict, dict],
-        trainer_tree: tuple[dict, mx.array, mx.array],
+        trainer_tree: tuple[dict, mx.array, mx.array, mx.array],
     ) -> tuple[
-        dict, dict, tuple[mx.array, dict, dict], tuple[dict, mx.array, mx.array], dict
+        dict,
+        dict,
+        tuple[mx.array, dict, dict],
+        tuple[dict, mx.array, mx.array, mx.array],
+        dict,
     ]:
         del working_parameters
-        accumulators, accumulation_count, next_key = trainer_tree
-        adam_state = AdamState.from_tree(adam_tree)
+        accumulators, accumulation_count, next_key, loss_numerator = trainer_tree
         gradients = normalize_and_clip(
             accumulators,
             accumulation_count,
             gradient_clip_norm=config.optimizer.gradient_clip_norm,
         )
-        next_masters, next_working, next_adam = adamw_mixed_precision_update(
+        next_masters, next_working, next_adam_tree = adamw_mixed_precision_update_tree(
             master_parameters,
             gradients,
-            adam_state,
+            adam_tree,
             config.optimizer,
             weight_decay_tree,
         )
@@ -171,15 +182,21 @@ def build_pretraining_kernels(
             reset_accumulators,
             (accumulation_count - accumulation_count).astype(mx.int32),
             next_key,
+            (loss_numerator - loss_numerator).astype(mx.float32),
+        )
+        safe_count = mx.maximum(
+            accumulation_count.astype(mx.float32), mx.array(1.0, dtype=mx.float32)
         )
         metrics = {
-            "learning_rate": learning_rate_at(adam_state.step, config.optimizer),
+            "learning_rate": learning_rate_at(adam_tree[0], config.optimizer),
             "accumulation_count": accumulation_count,
+            "loss_numerator": loss_numerator,
+            "loss": (loss_numerator / safe_count).astype(mx.float32),
         }
         return (
             next_masters,
             next_working,
-            next_adam.to_tree(),
+            next_adam_tree,
             next_trainer_tree,
             metrics,
         )

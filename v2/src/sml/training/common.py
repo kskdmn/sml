@@ -584,6 +584,7 @@ class TrainerState:
     accumulators: dict
     accumulation_count: mx.array
     next_key: mx.array
+    loss_numerator: mx.array
 
     def __post_init__(self) -> None:
         _require_top_level_dict(self.accumulators, "accumulators")
@@ -608,26 +609,40 @@ class TrainerState:
         ):
             raise SMLConfigurationError("next_key must be a uint32 MLX random key")
 
-    def to_tree(self) -> tuple[dict, mx.array, mx.array]:
-        return self.accumulators, self.accumulation_count, self.next_key
+        if (
+            not isinstance(self.loss_numerator, mx.array)
+            or self.loss_numerator.dtype != mx.float32
+            or self.loss_numerator.shape != ()
+        ):
+            raise SMLConfigurationError("loss_numerator must be a float32 scalar")
+        if _materialized_truth(self.loss_numerator >= 0.0) is False:
+            raise SMLConfigurationError("loss_numerator must be non-negative")
+
+    def to_tree(self) -> tuple[dict, mx.array, mx.array, mx.array]:
+        return (
+            self.accumulators,
+            self.accumulation_count,
+            self.next_key,
+            self.loss_numerator,
+        )
 
     @classmethod
     def from_tree(cls, tree: object) -> TrainerState:
-        if not isinstance(tree, tuple) or len(tree) != 3:
-            raise SMLConfigurationError("trainer state tree must be a three-item tuple")
-        accumulators, accumulation_count, next_key = tree
+        if not isinstance(tree, tuple) or len(tree) != 4:
+            raise SMLConfigurationError("trainer state tree must be a four-item tuple")
+        accumulators, accumulation_count, next_key, loss_numerator = tree
         if not isinstance(accumulators, dict):
             raise SMLConfigurationError(
                 "trainer state tree must contain accumulator dicts"
             )
-        return cls(accumulators, accumulation_count, next_key)
+        return cls(accumulators, accumulation_count, next_key, loss_numerator)
 
     @classmethod
     def from_compiled_tree(cls, tree: object) -> TrainerState:
         """Wrap a compiled result without synchronizing its device counter."""
-        if not isinstance(tree, tuple) or len(tree) != 3:
-            raise SMLConfigurationError("trainer state tree must be a three-item tuple")
-        accumulators, accumulation_count, next_key = tree
+        if not isinstance(tree, tuple) or len(tree) != 4:
+            raise SMLConfigurationError("trainer state tree must be a four-item tuple")
+        accumulators, accumulation_count, next_key, loss_numerator = tree
         if not isinstance(accumulators, dict):
             raise SMLConfigurationError(
                 "trainer state tree must contain accumulator dicts"
@@ -646,10 +661,17 @@ class TrainerState:
             or next_key.shape != (2,)
         ):
             raise SMLConfigurationError("next_key must be a uint32 MLX random key")
+        if (
+            not isinstance(loss_numerator, mx.array)
+            or loss_numerator.dtype != mx.float32
+            or loss_numerator.shape != ()
+        ):
+            raise SMLConfigurationError("loss_numerator must be a float32 scalar")
         instance = object.__new__(cls)
         object.__setattr__(instance, "accumulators", accumulators)
         object.__setattr__(instance, "accumulation_count", accumulation_count)
         object.__setattr__(instance, "next_key", next_key)
+        object.__setattr__(instance, "loss_numerator", loss_numerator)
         return instance
 
 
@@ -771,17 +793,25 @@ def _decay_coefficient(value: object, config: OptimizerConfig) -> float:
     )
 
 
-def adamw_mixed_precision_update(
+def adamw_mixed_precision_update_tree(
     master_parameters: dict,
     gradients: dict,
-    state: AdamState,
+    adam_tree: tuple[mx.array, dict, dict],
     config: OptimizerConfig,
     weight_decay_tree: dict,
-) -> tuple[dict, dict, AdamState]:
-    if not isinstance(state, AdamState):
-        raise SMLConfigurationError("state must be an AdamState")
+) -> tuple[dict, dict, tuple[mx.array, dict, dict]]:
+    """Update explicit Adam array trees without constructing host state wrappers."""
     if not isinstance(config, OptimizerConfig):
         raise SMLConfigurationError("config must be an OptimizerConfig")
+    if not isinstance(adam_tree, tuple) or len(adam_tree) != 3:
+        raise SMLConfigurationError("Adam state tree must be a three-item tuple")
+    step, first_state, second_state = adam_tree
+    if not isinstance(first_state, dict) or not isinstance(second_state, dict):
+        raise SMLConfigurationError("Adam state tree must contain moment dicts")
+    if not isinstance(step, mx.array) or step.dtype != mx.int32 or step.shape != ():
+        raise SMLConfigurationError("Adam step must be an int32 scalar")
+    if _materialized_truth((step >= 0) & (step <= _INT32_MAX)) is False:
+        raise SMLConfigurationError("Adam step must be an int32 counter")
     _require_top_level_dict(master_parameters, "master_parameters")
     _require_top_level_dict(gradients, "gradients")
     _require_top_level_dict(weight_decay_tree, "weight_decay_tree")
@@ -799,16 +829,18 @@ def adamw_mixed_precision_update(
         )
     _require_same_structure(
         master_parameters,
-        state.first_moments,
+        first_state,
         left_name="master_parameters",
         right_name="first_moments",
     )
     _require_same_structure(
         master_parameters,
-        state.second_moments,
+        second_state,
         left_name="master_parameters",
         right_name="second_moments",
     )
+    _require_dtype(first_state, "first_moments", mx.float32)
+    _require_dtype(second_state, "second_moments", mx.float32)
     _require_matching_tree_keys(
         master_parameters,
         weight_decay_tree,
@@ -816,7 +848,7 @@ def adamw_mixed_precision_update(
         right_name="weight_decay_tree",
     )
     fp32_gradients = tree_map(lambda gradient: gradient.astype(mx.float32), gradients)
-    can_increment = state.step < _INT32_MAX
+    can_increment = step < _INT32_MAX
     if _materialized_truth(can_increment) is False:
         raise SMLConfigurationError(
             "Adam step cannot be incremented past int32 maximum"
@@ -825,7 +857,7 @@ def adamw_mixed_precision_update(
         lambda first, gradient: (
             config.beta1 * first.astype(mx.float32) + (1.0 - config.beta1) * gradient
         ).astype(mx.float32),
-        state.first_moments,
+        first_state,
         fp32_gradients,
     )
     second_moments = tree_map(
@@ -833,21 +865,21 @@ def adamw_mixed_precision_update(
             config.beta2 * second.astype(mx.float32)
             + (1.0 - config.beta2) * mx.square(gradient)
         ).astype(mx.float32),
-        state.second_moments,
+        second_state,
         fp32_gradients,
     )
     if _materialized_truth(can_increment) is None:
         first_moments = tree_map(
             lambda previous, updated: mx.where(can_increment, updated, previous),
-            state.first_moments,
+            first_state,
             first_moments,
         )
         second_moments = tree_map(
             lambda previous, updated: mx.where(can_increment, updated, previous),
-            state.second_moments,
+            second_state,
             second_moments,
         )
-    completed_updates = state.step.astype(mx.float32) + 1.0
+    completed_updates = step.astype(mx.float32) + 1.0
     if config.bias_correction:
         first_denominator = 1.0 - mx.power(config.beta1, completed_updates)
         second_denominator = 1.0 - mx.power(config.beta2, completed_updates)
@@ -860,7 +892,7 @@ def adamw_mixed_precision_update(
     else:
         first_for_update = first_moments
         second_for_update = second_moments
-    learning_rate = learning_rate_at(state.step, config)
+    learning_rate = learning_rate_at(step, config)
     updated_masters = tree_map(
         lambda master, first, second, decay: (
             master.astype(mx.float32)
@@ -888,16 +920,35 @@ def adamw_mixed_precision_update(
     return (
         updated_masters,
         working_parameters,
-        AdamState(
-            step=mx.where(
+        (
+            mx.where(
                 can_increment,
-                state.step + mx.array(1, dtype=mx.int32),
-                state.step,
+                step + mx.array(1, dtype=mx.int32),
+                step,
             ).astype(mx.int32),
-            first_moments=first_moments,
-            second_moments=second_moments,
+            first_moments,
+            second_moments,
         ),
     )
+
+
+def adamw_mixed_precision_update(
+    master_parameters: dict,
+    gradients: dict,
+    state: AdamState,
+    config: OptimizerConfig,
+    weight_decay_tree: dict,
+) -> tuple[dict, dict, AdamState]:
+    if not isinstance(state, AdamState):
+        raise SMLConfigurationError("state must be an AdamState")
+    masters, working, next_tree = adamw_mixed_precision_update_tree(
+        master_parameters,
+        gradients,
+        state.to_tree(),
+        config,
+        weight_decay_tree,
+    )
+    return masters, working, AdamState.from_tree(next_tree)
 
 
 __all__ = (
@@ -912,6 +963,7 @@ __all__ = (
     "WeightDecayPolicy",
     "accumulate_fp32",
     "adamw_mixed_precision_update",
+    "adamw_mixed_precision_update_tree",
     "build_weight_decay_tree",
     "initialize_adam_state",
     "initialize_base_parameter_state",

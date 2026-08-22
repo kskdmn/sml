@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -17,10 +18,9 @@ from sml.model.rope import (
     resolve_attention_factor,
 )
 from sml.training.common import (
-    AdamState,
     OptimizerConfig,
     PretrainingConfig,
-    adamw_mixed_precision_update,
+    adamw_mixed_precision_update_tree,
     build_weight_decay_tree,
     initialize_adam_state,
 )
@@ -258,11 +258,10 @@ def test_explicit_adam_state_carries_across_consecutive_compiled_calls():
 
     @mx.compile
     def update(parameters, state_tree):
-        state = AdamState.from_tree(state_tree)
-        next_masters, _working, next_state = adamw_mixed_precision_update(
-            parameters, gradients, state, config, {"weight": False}
+        next_masters, _working, next_state = adamw_mixed_precision_update_tree(
+            parameters, gradients, state_tree, config, {"weight": False}
         )
-        return next_masters, next_state.to_tree()
+        return next_masters, next_state
 
     first_masters, first_state = update(
         masters, initialize_adam_state(masters).to_tree()
@@ -270,7 +269,7 @@ def test_explicit_adam_state_carries_across_consecutive_compiled_calls():
     second_masters, second_state = update(first_masters, first_state)
 
     mx.eval(second_masters, second_state)
-    assert int(AdamState.from_tree(second_state).step.item()) == 2
+    assert int(second_state[0].item()) == 2
     assert_close(
         second_masters["weight"],
         mx.array([0.8], dtype=mx.float32),
@@ -296,6 +295,7 @@ def test_pretraining_kernel_factory_exposes_compiled_explicit_state_cores(tmp_pa
 
     assert callable(kernels.compiled_microstep_core)
     assert callable(kernels.compiled_optimizer_step_core)
+    assert "AdamState" not in inspect.getsource(kernels.eager_optimizer_step_core)
 
 
 def test_generation_sampling_matches_captured_legacy_primitive(legacy_arrays):

@@ -23,6 +23,7 @@ from sml.training.common import (
     WeightDecayPolicy,
     accumulate_fp32,
     adamw_mixed_precision_update,
+    adamw_mixed_precision_update_tree,
     build_weight_decay_tree,
     initialize_adam_state,
     initialize_base_parameter_state,
@@ -297,6 +298,7 @@ def test_state_wrappers_require_exact_tree_keys_shapes_and_dtypes():
         accumulators={"weight": mx.zeros((1,), dtype=mx.float32)},
         accumulation_count=mx.array(0, dtype=mx.int32),
         next_key=mx.random.key(4),
+        loss_numerator=mx.array(0.0, dtype=mx.float32),
     )
 
     assert (
@@ -329,8 +331,64 @@ def test_state_wrappers_require_exact_tree_keys_shapes_and_dtypes():
                 {"different": mx.zeros((1,), dtype=mx.bfloat16)},
                 trainer_state.accumulation_count,
                 trainer_state.next_key,
+                trainer_state.loss_numerator,
             )
         )
+
+
+def test_trainer_state_requires_fp32_scalar_loss_numerator():
+    """A non-FP32 loss numerator would make device-side metric reduction drift."""
+    accumulators = {"weight": mx.zeros((1,), dtype=mx.float32)}
+
+    state = TrainerState(
+        accumulators=accumulators,
+        accumulation_count=mx.array(0, dtype=mx.int32),
+        next_key=mx.random.key(4),
+        loss_numerator=mx.array(0.0, dtype=mx.float32),
+    )
+
+    assert state.to_tree()[3].dtype == mx.float32
+    assert state.to_tree()[3].shape == ()
+    with pytest.raises(SMLConfigurationError, match="loss_numerator"):
+        TrainerState(
+            accumulators,
+            mx.array(0, dtype=mx.int32),
+            mx.random.key(4),
+            mx.array(0.0, dtype=mx.bfloat16),
+        )
+
+
+def test_tree_native_adam_update_carries_array_state_through_compilation():
+    """A custom Adam wrapper in the traced body would break a pure array boundary."""
+    masters = {"weight": mx.array([1.0], dtype=mx.float32)}
+    gradients = {"weight": mx.array([1.0], dtype=mx.bfloat16)}
+    config = OptimizerConfig(
+        schedule_steps=None,
+        warmup_steps=0,
+        learning_rate=0.1,
+        beta1=0.0,
+        beta2=0.0,
+    )
+
+    @mx.compile
+    def update(parameters, adam_tree):
+        return adamw_mixed_precision_update_tree(
+            parameters, gradients, adam_tree, config, {"weight": False}
+        )
+
+    first_masters, _first_working, first_adam = update(
+        masters, initialize_adam_state(masters).to_tree()
+    )
+    second_masters, _second_working, second_adam = update(first_masters, first_adam)
+
+    mx.eval(second_masters, second_adam)
+    assert int(second_adam[0].item()) == 2
+    assert_close(
+        second_masters["weight"],
+        mx.array([0.8], dtype=mx.float32),
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 def _run_two_updates(*, compiled: bool):
@@ -533,6 +591,7 @@ def test_counter_boundaries_reject_invalid_loaded_values_and_overflow():
             {"weight": mx.zeros((1,), dtype=mx.float32)},
             mx.array(-1, dtype=mx.int32),
             mx.random.key(7),
+            mx.array(0.0, dtype=mx.float32),
         )
     with pytest.raises(SMLConfigurationError, match="normalization_count"):
         normalize_and_clip(
@@ -567,25 +626,21 @@ def test_compiled_maximum_adam_step_preserves_every_optimizer_leaf():
 
     @mx.compile
     def update(parameters, state_tree):
-        state = AdamState.from_tree(state_tree)
-        next_masters, _working, next_state = adamw_mixed_precision_update(
+        next_masters, _working, next_state = adamw_mixed_precision_update_tree(
             parameters,
             {"weight": mx.ones((1,), dtype=mx.bfloat16)},
-            state,
+            state_tree,
             optimizer_config(),
             {"weight": False},
         )
-        return next_masters, next_state.to_tree()
+        return next_masters, next_state
 
     next_masters, next_state_tree = update(masters, state.to_tree())
-    next_state = AdamState.from_tree(next_state_tree)
 
     assert_tree_close(next_masters, masters, atol=0.0, rtol=0.0)
-    assert_tree_close(next_state.first_moments, state.first_moments, atol=0.0, rtol=0.0)
-    assert_tree_close(
-        next_state.second_moments, state.second_moments, atol=0.0, rtol=0.0
-    )
-    assert int(next_state.step.item()) == 2**31 - 1
+    assert_tree_close(next_state_tree[1], state.first_moments, atol=0.0, rtol=0.0)
+    assert_tree_close(next_state_tree[2], state.second_moments, atol=0.0, rtol=0.0)
+    assert int(next_state_tree[0].item()) == 2**31 - 1
 
 
 def test_state_tree_validation_preserves_nested_containers_keys_shapes_and_random_key():
@@ -622,6 +677,7 @@ def test_state_tree_validation_preserves_nested_containers_keys_shapes_and_rando
             {"weight": mx.zeros((1,), dtype=mx.float32)},
             mx.array(0, dtype=mx.int32),
             mx.zeros((1,), dtype=mx.uint32),
+            mx.array(0.0, dtype=mx.float32),
         )
 
     tied = dict(
