@@ -39,25 +39,24 @@ they verify correctness rather than speed.
 
 - Branch: main, tracking origin/main.
 - Refactor implementation HEAD before the documentation handoff:
-  8c3b1beda277f2c085a10cfd82ffe1cd787b9124
-  (feat(v2): version prepared-data 100-unit protocol).
+  589a2f1 (fix(v2): fail closed invalid gradient normalization).
 - The first tracked handoff was committed as 24b3ba4.
-- No production or test code is changed by the 2026-08-22 acceptance-policy
-  update.
-- uv.lock was unchanged by the prepared-data-100 implementation and by this
-  documentation update.
-- Historical verification on exact implementation commit 8c3b1be:
-  Ruff passed, the benchmark unit module had 412 passing tests, and the full v2
-  suite had 955 passing tests on 2026-08-17.
-- Those historical results explain the completed status below but do not
-  replace the fresh preflight required before starting Phase 3.
+- The functional acceptance-policy update was committed as 8970a16.
+- Task 3.1 was implemented at 243d168 and hardened at 5856e9d and 589a2f1.
+- Fresh controller verification on 589a2f1 passed on 2026-08-22:
+  `uv run ruff check v2`, `uv run ruff format --check v2`, 27 focused training
+  policy/model-math tests, and all 974 v2 tests. `uv.lock` was unchanged and
+  `git diff --check` passed.
+- Independent review is clean. One non-blocking Minor is deferred: an
+  extremely large Python integer passed to scalar validation can surface
+  `OverflowError` instead of the project configuration-error type.
 
 ## Related Specifications and Plans
 
 | File | Role | Done | Remaining under current policy |
 | --- | --- | --- | --- |
 | docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Foundation, model, artifacts, tokenizer, prepared data, and benchmark-owner architecture are implemented through Phase 2 | Phases 3-6; performance section is optional diagnostic guidance |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | Phase 1 code tasks 1.1-1.5 and Phase 2 code tasks 2.1-2.7 are implemented | Run fresh Phase 2 functional preflight, then Tasks 3.1-3.6 |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | Phase 1 tasks 1.1-1.5, Phase 2 tasks 2.1-2.7, the Phase 2 functional preflight, and Task 3.1 are complete | Tasks 3.2-3.6 |
 | docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning only | All Tasks 4.1-4.4, 5.1-5.5, and 6.1-6.4 |
 | docs/superpowers/specs/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge-design.md | Real prepared-data benchmark owner design | Production goal implemented at ffb29f97b7770d06a95df41c2b612c07a9fa6c1b | Nothing required; screen is optional |
 | docs/superpowers/plans/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge.md | Bridge implementation plan | Task 1 complete at ffb29f9 | Task 2 retained only as an optional diagnostic |
@@ -110,8 +109,14 @@ details remain unchanged:
 | Versioned prepared-data 100 harness | Complete and reviewed | 8c3b1be |
 | Phase 2 before/after report | Not present | No longer required |
 
-Phase 2 implementation is complete. It needs one fresh functional preflight
-before takeover proceeds to Phase 3; it does not need benchmark recapture.
+Phase 2 implementation and its fresh functional preflight are complete. No
+benchmark recapture is required.
+
+### Phase 3
+
+| Task | Status | Implementation commit(s) |
+| --- | --- | --- |
+| 3.1: training policies and project-owned mixed-precision Adam | Complete and independently reviewed | 243d168, 5856e9d, 589a2f1 |
 
 ## Cancelled Required Benchmark Work
 
@@ -133,9 +138,9 @@ new empty external journal and follow the optional prepared-data-100 protocol.
 
 | Task | Status | Required completion evidence |
 | --- | --- | --- |
-| Phase 2 functional preflight | Next | Ruff, full v2 pytest, prepared-data workflow tests, unchanged uv.lock |
-| 3.1: training policies and project-owned mixed-precision Adam | Not started | Unit/oracle tests and full phase checks |
-| 3.2: compiled pretraining microstep and optimizer step | Not started | Eager/compiled state and integration tests |
+| Phase 2 functional preflight | Complete | Ruff clean; prepared-data workflow tests passed; all 955 then-current v2 tests passed; unchanged uv.lock |
+| 3.1: training policies and project-owned mixed-precision Adam | Complete and reviewed | 27 focused tests and all 974 v2 tests passed on 589a2f1; Ruff clean; unchanged uv.lock |
+| 3.2: compiled pretraining microstep and optimizer step | Next | Eager/compiled state and integration tests |
 | 3.3: pretraining create/checkpoint/resume/retention | Not started | Fresh/resume/recovery workflow tests |
 | 3.4: complete Part 1 integration | Not started | End-to-end tiny production workflow |
 | 3.5: controlled pretraining-quality gate | Not started | Required correctness/quality evidence |
@@ -170,15 +175,10 @@ The absent files are not blockers and should not be fabricated.
 1. Read this handoff, the umbrella design, and Part 1 plan.
 2. Confirm the latest main commit and inspect git status. Preserve unrelated
    user changes if any exist.
-3. Run outside the sandbox:
-   - uv run ruff check v2
-   - uv run ruff format --check v2
-   - uv run pytest v2/tests
-   - uv run pytest v2/tests/unit/data/test_pretraining.py
-     v2/tests/integration/test_pretraining_data_workflow.py -v
-   - git diff --exit-code -- uv.lock
-4. If the checks pass, record Phase 2 as functionally verified and begin
-   Part 1 Task 3.1.
+3. Begin Part 1 Task 3.2, compiled pretraining microstep and optimizer step,
+   using the Task 3.1 runtime now in `v2/src/sml/training/common.py`.
+4. Use test-driven implementation and verify the task's eager/compiled state
+   and integration contracts. Run MLX pytest commands outside the sandbox.
 5. Follow the updated functional gate at the end of each phase. Do not pause
    for baseline capture or performance comparison.
 6. Keep this handoff current with completed commits, fresh test evidence, and
