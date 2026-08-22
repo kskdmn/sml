@@ -480,6 +480,31 @@ class BaseParameterState:
             raise SMLConfigurationError("base parameter state tree must contain dicts")
         return cls(masters, working)
 
+    @classmethod
+    def from_compiled_tree(cls, tree: object) -> BaseParameterState:
+        """Wrap a compiled result without materializing its array values on the host."""
+        if not isinstance(tree, tuple) or len(tree) != 2:
+            raise SMLConfigurationError(
+                "base parameter state tree must be a two-item tuple"
+            )
+        masters, working = tree
+        if not isinstance(masters, dict) or not isinstance(working, dict):
+            raise SMLConfigurationError("base parameter state tree must contain dicts")
+        _require_top_level_dict(masters, "master_parameters")
+        _require_top_level_dict(working, "working_parameters")
+        _require_same_structure(
+            masters,
+            working,
+            left_name="master_parameters",
+            right_name="working_parameters",
+        )
+        _require_dtype(masters, "master_parameters", mx.float32)
+        _require_dtype(working, "working_parameters", mx.bfloat16)
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "master_parameters", masters)
+        object.__setattr__(instance, "working_parameters", working)
+        return instance
+
 
 @dataclass(frozen=True, slots=True)
 class AdamState:
@@ -527,6 +552,32 @@ class AdamState:
             raise SMLConfigurationError("Adam state tree must contain moment dicts")
         return cls(step, first_moments, second_moments)
 
+    @classmethod
+    def from_compiled_tree(cls, tree: object) -> AdamState:
+        """Wrap a compiled result without synchronizing its device counter."""
+        if not isinstance(tree, tuple) or len(tree) != 3:
+            raise SMLConfigurationError("Adam state tree must be a three-item tuple")
+        step, first_moments, second_moments = tree
+        if not isinstance(first_moments, dict) or not isinstance(second_moments, dict):
+            raise SMLConfigurationError("Adam state tree must contain moment dicts")
+        if not isinstance(step, mx.array) or step.dtype != mx.int32 or step.shape != ():
+            raise SMLConfigurationError("Adam step must be an int32 scalar")
+        _require_top_level_dict(first_moments, "first_moments")
+        _require_top_level_dict(second_moments, "second_moments")
+        _require_same_structure(
+            first_moments,
+            second_moments,
+            left_name="first_moments",
+            right_name="second_moments",
+        )
+        _require_dtype(first_moments, "first_moments", mx.float32)
+        _require_dtype(second_moments, "second_moments", mx.float32)
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "step", step)
+        object.__setattr__(instance, "first_moments", first_moments)
+        object.__setattr__(instance, "second_moments", second_moments)
+        return instance
+
 
 @dataclass(frozen=True, slots=True)
 class TrainerState:
@@ -570,6 +621,36 @@ class TrainerState:
                 "trainer state tree must contain accumulator dicts"
             )
         return cls(accumulators, accumulation_count, next_key)
+
+    @classmethod
+    def from_compiled_tree(cls, tree: object) -> TrainerState:
+        """Wrap a compiled result without synchronizing its device counter."""
+        if not isinstance(tree, tuple) or len(tree) != 3:
+            raise SMLConfigurationError("trainer state tree must be a three-item tuple")
+        accumulators, accumulation_count, next_key = tree
+        if not isinstance(accumulators, dict):
+            raise SMLConfigurationError(
+                "trainer state tree must contain accumulator dicts"
+            )
+        _require_top_level_dict(accumulators, "accumulators")
+        _require_dtype(accumulators, "accumulators", mx.float32)
+        if (
+            not isinstance(accumulation_count, mx.array)
+            or accumulation_count.dtype != mx.int32
+            or accumulation_count.shape != ()
+        ):
+            raise SMLConfigurationError("accumulation_count must be an int32 scalar")
+        if (
+            not isinstance(next_key, mx.array)
+            or next_key.dtype != mx.uint32
+            or next_key.shape != (2,)
+        ):
+            raise SMLConfigurationError("next_key must be a uint32 MLX random key")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "accumulators", accumulators)
+        object.__setattr__(instance, "accumulation_count", accumulation_count)
+        object.__setattr__(instance, "next_key", next_key)
+        return instance
 
 
 def initialize_base_parameter_state(working_parameters: dict) -> BaseParameterState:

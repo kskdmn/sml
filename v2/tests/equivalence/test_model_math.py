@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
+from pathlib import Path
 
 import mlx.core as mx
 import pytest
@@ -17,9 +19,12 @@ from sml.model.rope import (
 from sml.training.common import (
     AdamState,
     OptimizerConfig,
+    PretrainingConfig,
     adamw_mixed_precision_update,
+    build_weight_decay_tree,
     initialize_adam_state,
 )
+from sml.training.pretrain import build_pretraining_kernels
 
 
 def assert_close(actual: mx.array, expected: mx.array, *, atol: float, rtol: float):
@@ -272,6 +277,25 @@ def test_explicit_adam_state_carries_across_consecutive_compiled_calls():
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+def test_pretraining_kernel_factory_exposes_compiled_explicit_state_cores(tmp_path):
+    """The training owner must expose the explicit compiled state boundary."""
+    model = SMLLanguageModel(_tiny_model_config(), key=mx.random.key(59))
+    config = PretrainingConfig(
+        data=Path(tmp_path / "data"),
+        output_run=Path(tmp_path / "run"),
+        model=replace(_tiny_model_config(), rope_scaling_factor=1.0),
+    )
+
+    kernels = build_pretraining_kernels(
+        model,
+        config,
+        build_weight_decay_tree(model.parameters(), config.optimizer.weight_decay),
+    )
+
+    assert callable(kernels.compiled_microstep_core)
+    assert callable(kernels.compiled_optimizer_step_core)
 
 
 def test_generation_sampling_matches_captured_legacy_primitive(legacy_arrays):
