@@ -216,6 +216,27 @@ def test_accumulation_normalization_and_clipping_use_fp32_once():
     )
 
 
+def test_compiled_invalid_normalization_count_fails_closed_with_zero_gradients():
+    """A traced empty accumulation must not emit divide-by-zero values."""
+
+    @mx.compile
+    def normalize(gradients, count):
+        return normalize_and_clip(gradients, count, gradient_clip_norm=1.0)
+
+    normalized = normalize(
+        {"weight": mx.array([2.0, -4.0], dtype=mx.float32)},
+        mx.array(0, dtype=mx.int32),
+    )
+
+    assert normalized["weight"].dtype == mx.float32
+    assert_close(
+        normalized["weight"],
+        mx.zeros((2,), dtype=mx.float32),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
 def test_adam_keeps_fp32_masters_bf16_working_parameters_and_fp32_moments():
     """Casting the authoritative state to BF16 would lose optimizer precision."""
     parameter_state = initialize_base_parameter_state(
@@ -426,6 +447,47 @@ def test_adamw_matches_independent_two_step_oracle_with_epsilon_and_decay(
         atol=2e-6,
         rtol=2e-6,
     )
+
+
+@pytest.mark.parametrize("bias_correction", [False, True])
+def test_adamw_matches_independent_one_step_oracle_with_epsilon_and_decay(
+    bias_correction,
+):
+    """The first update must use the saved beta, epsilon, bias, and decay rules."""
+    config = OptimizerConfig(
+        learning_rate=0.03,
+        beta1=0.8,
+        beta2=0.6,
+        epsilon=0.2,
+        bias_correction=bias_correction,
+        schedule_steps=None,
+        warmup_steps=0,
+    )
+    gradient = 0.75
+    first_moment = (1.0 - config.beta1) * gradient
+    second_moment = (1.0 - config.beta2) * gradient * gradient
+    if bias_correction:
+        first_moment /= 1.0 - config.beta1
+        second_moment /= 1.0 - config.beta2
+    expected = 1.25 - config.learning_rate * (
+        first_moment / (math.sqrt(second_moment) + config.epsilon) + 0.15 * 1.25
+    )
+
+    masters, _working, state = adamw_mixed_precision_update(
+        {"weight": mx.array([1.25], dtype=mx.float32)},
+        {"weight": mx.array([gradient], dtype=mx.bfloat16)},
+        initialize_adam_state({"weight": mx.array([1.25], dtype=mx.float32)}),
+        config,
+        {"weight": 0.15},
+    )
+
+    assert_close(
+        masters["weight"],
+        mx.array([expected], dtype=mx.float32),
+        atol=2e-6,
+        rtol=2e-6,
+    )
+    assert int(state.step.item()) == 1
 
 
 def test_fp32_normalized_gradients_flow_into_adam_update():

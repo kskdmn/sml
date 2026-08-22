@@ -645,8 +645,14 @@ def normalize_and_clip(
         )
     if _require_finite(gradient_clip_norm, "gradient_clip_norm") <= 0.0:
         raise SMLConfigurationError("gradient_clip_norm must be positive")
+    valid_count = (normalization_count > 0) & (normalization_count <= _INT32_MAX)
+    safe_count = mx.where(
+        valid_count,
+        normalization_count.astype(mx.float32),
+        mx.array(1.0, dtype=mx.float32),
+    )
     normalized = tree_map(
-        lambda gradient: gradient / normalization_count.astype(mx.float32),
+        lambda gradient: gradient / safe_count,
         accumulated_gradients,
     )
     squared_norm = sum(
@@ -662,7 +668,14 @@ def normalize_and_clip(
         mx.array(gradient_clip_norm, dtype=mx.float32)
         / mx.maximum(global_norm, mx.array(1e-12, dtype=mx.float32)),
     )
-    return tree_map(lambda gradient: (gradient * scale).astype(mx.float32), normalized)
+    return tree_map(
+        lambda gradient: mx.where(
+            valid_count,
+            (gradient * scale).astype(mx.float32),
+            mx.zeros_like(gradient),
+        ),
+        normalized,
+    )
 
 
 def _decay_coefficient(value: object, config: OptimizerConfig) -> float:
