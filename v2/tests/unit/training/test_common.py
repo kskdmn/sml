@@ -174,16 +174,23 @@ def test_weight_decay_policy_classifies_tied_embeddings_norms_projections_and_lo
         "lm_head": {"weight": mx.ones((2, 2), dtype=mx.bfloat16)},
         "other": {"weight": mx.ones((2,), dtype=mx.bfloat16)},
     }
-    policy = WeightDecayPolicy(q_proj=0.21, lora_a=0.03, lora_b=0.04, other=0.07)
+    policy = WeightDecayPolicy(
+        embed_tokens=0.11,
+        lm_head=0.22,
+        q_proj=0.21,
+        lora_a=0.03,
+        lora_b=0.04,
+        other=0.07,
+    )
 
     decay = dict(tree_flatten(build_weight_decay_tree(named_parameters, policy)))
 
-    assert decay["embed_tokens.weight"] == 0.0
+    assert decay["embed_tokens.weight"] == 0.11
     assert decay["layers.0.input_norm.weight"] == 0.0
     assert decay["layers.0.self_attn.q_proj.weight"] == 0.21
     assert decay["layers.0.self_attn.k_proj.lora_A"] == 0.03
     assert decay["layers.0.self_attn.v_proj.lora_B"] == 0.04
-    assert decay["lm_head.weight"] == 0.0
+    assert decay["lm_head.weight"] == 0.22
     assert decay["other.weight"] == 0.07
 
 
@@ -357,3 +364,210 @@ def test_compiled_second_update_observes_first_state():
         rtol=1e-6,
     )
     assert int(compiled_optimizer.step.item()) == 2
+
+
+def adamw_scalar_oracle(
+    parameter: float,
+    gradients: list[float],
+    config: OptimizerConfig,
+    decay: float,
+) -> float:
+    first_moment = 0.0
+    second_moment = 0.0
+    for step, gradient in enumerate(gradients, start=1):
+        first_moment = config.beta1 * first_moment + (1.0 - config.beta1) * gradient
+        second_moment = (
+            config.beta2 * second_moment + (1.0 - config.beta2) * gradient * gradient
+        )
+        if config.bias_correction:
+            first_for_update = first_moment / (1.0 - config.beta1**step)
+            second_for_update = second_moment / (1.0 - config.beta2**step)
+        else:
+            first_for_update = first_moment
+            second_for_update = second_moment
+        parameter -= config.learning_rate * (
+            first_for_update / (math.sqrt(second_for_update) + config.epsilon)
+            + decay * parameter
+        )
+    return parameter
+
+
+@pytest.mark.parametrize("bias_correction", [False, True])
+def test_adamw_matches_independent_two_step_oracle_with_epsilon_and_decay(
+    bias_correction,
+):
+    """Moving epsilon, decay, or bias correction must change this two-step result."""
+    config = OptimizerConfig(
+        learning_rate=0.03,
+        beta1=0.8,
+        beta2=0.6,
+        epsilon=0.2,
+        bias_correction=bias_correction,
+        schedule_steps=None,
+        warmup_steps=0,
+    )
+    masters = {"weight": mx.array([1.25], dtype=mx.float32)}
+    state = initialize_adam_state(masters)
+    for gradient in (0.75, -0.5):
+        masters, _working, state = adamw_mixed_precision_update(
+            masters,
+            {"weight": mx.array([gradient], dtype=mx.bfloat16)},
+            state,
+            config,
+            {"weight": 0.15},
+        )
+
+    assert_close(
+        masters["weight"],
+        mx.array(
+            [adamw_scalar_oracle(1.25, [0.75, -0.5], config, 0.15)],
+            dtype=mx.float32,
+        ),
+        atol=2e-6,
+        rtol=2e-6,
+    )
+
+
+def test_fp32_normalized_gradients_flow_into_adam_update():
+    """Rejecting normalized FP32 gradients breaks the accumulation-to-Adam boundary."""
+    masters = {"weight": mx.array([1.0], dtype=mx.float32)}
+    normalized = normalize_and_clip(
+        accumulate_fp32(
+            {"weight": mx.zeros((1,), dtype=mx.float32)},
+            {"weight": mx.array([0.5], dtype=mx.bfloat16)},
+        ),
+        mx.array(1, dtype=mx.int32),
+        gradient_clip_norm=1.0,
+    )
+
+    updated, _working, _state = adamw_mixed_precision_update(
+        masters,
+        normalized,
+        initialize_adam_state(masters),
+        optimizer_config(beta1=0.0, beta2=0.0, learning_rate=0.1),
+        {"weight": False},
+    )
+
+    assert_close(
+        updated["weight"],
+        mx.array([0.9], dtype=mx.float32),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_counter_boundaries_reject_invalid_loaded_values_and_overflow():
+    """Invalid counters must fail instead of altering a resumed update position."""
+    with pytest.raises(SMLConfigurationError, match="gradient_accumulation_steps"):
+        LoaderConfig(gradient_accumulation_steps=2**31)
+    with pytest.raises(SMLConfigurationError, match="Adam step"):
+        AdamState(
+            mx.array(-1, dtype=mx.int32),
+            {"weight": mx.zeros((1,), dtype=mx.float32)},
+            {"weight": mx.zeros((1,), dtype=mx.float32)},
+        )
+    with pytest.raises(SMLConfigurationError, match="accumulation_count"):
+        TrainerState(
+            {"weight": mx.zeros((1,), dtype=mx.float32)},
+            mx.array(-1, dtype=mx.int32),
+            mx.random.key(7),
+        )
+    with pytest.raises(SMLConfigurationError, match="normalization_count"):
+        normalize_and_clip(
+            {"weight": mx.ones((1,), dtype=mx.float32)},
+            mx.array(0, dtype=mx.int32),
+            gradient_clip_norm=1.0,
+        )
+
+    masters = {"weight": mx.array([1.0], dtype=mx.float32)}
+    with pytest.raises(SMLConfigurationError, match="Adam step"):
+        adamw_mixed_precision_update(
+            masters,
+            {"weight": mx.ones((1,), dtype=mx.bfloat16)},
+            AdamState(
+                mx.array(2**31 - 1, dtype=mx.int32),
+                {"weight": mx.zeros((1,), dtype=mx.float32)},
+                {"weight": mx.zeros((1,), dtype=mx.float32)},
+            ),
+            optimizer_config(),
+            {"weight": False},
+        )
+
+
+def test_compiled_maximum_adam_step_preserves_every_optimizer_leaf():
+    """A traced counter boundary must not mutate moments while retaining its step."""
+    masters = {"weight": mx.array([1.0], dtype=mx.float32)}
+    state = AdamState(
+        mx.array(2**31 - 1, dtype=mx.int32),
+        {"weight": mx.zeros((1,), dtype=mx.float32)},
+        {"weight": mx.zeros((1,), dtype=mx.float32)},
+    )
+
+    @mx.compile
+    def update(parameters, state_tree):
+        state = AdamState.from_tree(state_tree)
+        next_masters, _working, next_state = adamw_mixed_precision_update(
+            parameters,
+            {"weight": mx.ones((1,), dtype=mx.bfloat16)},
+            state,
+            optimizer_config(),
+            {"weight": False},
+        )
+        return next_masters, next_state.to_tree()
+
+    next_masters, next_state_tree = update(masters, state.to_tree())
+    next_state = AdamState.from_tree(next_state_tree)
+
+    assert_tree_close(next_masters, masters, atol=0.0, rtol=0.0)
+    assert_tree_close(next_state.first_moments, state.first_moments, atol=0.0, rtol=0.0)
+    assert_tree_close(
+        next_state.second_moments, state.second_moments, atol=0.0, rtol=0.0
+    )
+    assert int(next_state.step.item()) == 2**31 - 1
+
+
+def test_state_tree_validation_preserves_nested_containers_keys_shapes_and_random_key():
+    """Flattened paths must not make malformed checkpoint trees appear equivalent."""
+    master = {
+        "weight": mx.ones((2,), dtype=mx.float32),
+        "nested": {},
+    }
+    working = {
+        "weight": mx.ones((2,), dtype=mx.bfloat16),
+        "nested": [],
+    }
+    with pytest.raises(SMLConfigurationError, match="structure|keys"):
+        BaseParameterState(master, working)
+    with pytest.raises(SMLConfigurationError, match="structure|keys"):
+        BaseParameterState(
+            {"a.b": mx.ones((1,), dtype=mx.float32)},
+            {"a": {"b": mx.ones((1,), dtype=mx.bfloat16)}},
+        )
+    with pytest.raises(SMLConfigurationError, match="keys"):
+        BaseParameterState(
+            {"weight": mx.ones((1,), dtype=mx.float32)},
+            {"other": mx.ones((1,), dtype=mx.bfloat16)},
+        )
+    with pytest.raises(SMLConfigurationError, match="shapes"):
+        BaseParameterState(
+            {"weight": mx.ones((2,), dtype=mx.float32)},
+            {"weight": mx.ones((3,), dtype=mx.bfloat16)},
+        )
+    with pytest.raises(SMLConfigurationError, match="top-level dict"):
+        initialize_base_parameter_state([mx.ones((1,), dtype=mx.bfloat16)])
+    with pytest.raises(SMLConfigurationError, match="next_key"):
+        TrainerState(
+            {"weight": mx.zeros((1,), dtype=mx.float32)},
+            mx.array(0, dtype=mx.int32),
+            mx.zeros((1,), dtype=mx.uint32),
+        )
+
+    tied = dict(
+        tree_flatten(
+            build_weight_decay_tree(
+                {"embed_tokens": {"weight": mx.ones((1,), dtype=mx.bfloat16)}},
+                WeightDecayPolicy(embed_tokens=0.11, lm_head=0.22),
+            )
+        )
+    )
+    assert tied == {"embed_tokens.weight": 0.11}

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Literal
 
 import mlx.core as mx
-from mlx.utils import tree_flatten, tree_map, tree_map_with_path
+from mlx.utils import tree_map, tree_map_with_path
 
 from sml.errors import SMLConfigurationError
 from sml.model.config import ModelConfig
@@ -46,18 +46,40 @@ def _require_probability(value: object, field_name: str) -> float:
     return normalized
 
 
-def _flat_arrays(tree: object, name: str) -> dict[str, mx.array]:
-    if not isinstance(tree, (dict, list, tuple)):
-        raise SMLConfigurationError(
-            f"{name} must be a built-in dict/list/tuple array tree"
-        )
-    flattened = dict(tree_flatten(tree))
-    if not flattened:
+def _materialized_truth(condition: mx.array) -> bool | None:
+    try:
+        return bool(condition)
+    except ValueError:
+        return None
+
+
+def _require_top_level_dict(tree: object, name: str) -> dict:
+    if not isinstance(tree, dict):
+        raise SMLConfigurationError(f"{name} must be a top-level dict array tree")
+    return tree
+
+
+def _array_leaves(tree: object, name: str) -> list[mx.array]:
+    leaves: list[mx.array] = []
+
+    def visit(node: object, path: tuple[object, ...]) -> None:
+        location = ".".join(str(part) for part in path)
+        if isinstance(node, dict):
+            for key, value in node.items():
+                visit(value, (*path, key))
+            return
+        if isinstance(node, (list, tuple)):
+            for index, value in enumerate(node):
+                visit(value, (*path, index))
+            return
+        if not isinstance(node, mx.array):
+            raise SMLConfigurationError(f"{name}.{location} must be an MLX array")
+        leaves.append(node)
+
+    visit(tree, ())
+    if not leaves:
         raise SMLConfigurationError(f"{name} must not be empty")
-    for path, leaf in flattened.items():
-        if not isinstance(leaf, mx.array):
-            raise SMLConfigurationError(f"{name}.{path} must be an MLX array")
-    return flattened
+    return leaves
 
 
 def _require_same_structure(
@@ -67,40 +89,91 @@ def _require_same_structure(
     left_name: str,
     right_name: str,
 ) -> tuple[dict[str, mx.array], dict[str, mx.array]]:
-    left_flat = _flat_arrays(left, left_name)
-    right_flat = _flat_arrays(right, right_name)
-    if set(left_flat) != set(right_flat):
-        raise SMLConfigurationError(
-            f"{left_name} and {right_name} must have exact matching keys"
-        )
-    for path, left_leaf in left_flat.items():
-        if left_leaf.shape != right_flat[path].shape:
+    _array_leaves(left, left_name)
+    _array_leaves(right, right_name)
+
+    def compare(left_node: object, right_node: object) -> None:
+        if isinstance(left_node, mx.array):
+            if not isinstance(right_node, mx.array):
+                raise SMLConfigurationError(
+                    f"{left_name} and {right_name} must have exact matching structure"
+                )
+            if left_node.shape != right_node.shape:
+                raise SMLConfigurationError(
+                    f"{left_name} and {right_name} must have exact matching shapes"
+                )
+            return
+        if type(left_node) is not type(right_node):
             raise SMLConfigurationError(
-                f"{left_name} and {right_name} must have exact matching shapes"
+                f"{left_name} and {right_name} must have exact matching structure"
             )
-    return left_flat, right_flat
+        if isinstance(left_node, dict):
+            if set(left_node) != set(right_node):
+                raise SMLConfigurationError(
+                    f"{left_name} and {right_name} must have exact matching keys"
+                )
+            for key in left_node:
+                compare(left_node[key], right_node[key])
+            return
+        if isinstance(left_node, (list, tuple)):
+            if len(left_node) != len(right_node):
+                raise SMLConfigurationError(
+                    f"{left_name} and {right_name} must have exact matching structure"
+                )
+            for left_value, right_value in zip(left_node, right_node, strict=True):
+                compare(left_value, right_value)
+            return
+        raise SMLConfigurationError(
+            f"{left_name} and {right_name} must have exact matching structure"
+        )
+
+    compare(left, right)
+    return {}, {}
 
 
 def _require_matching_tree_keys(
     left: object, right: object, *, left_name: str, right_name: str
 ) -> None:
-    left_flat = _flat_arrays(left, left_name)
-    if not isinstance(right, (dict, list, tuple)):
+    def compare(left_node: object, right_node: object) -> None:
+        if isinstance(left_node, mx.array):
+            if isinstance(right_node, (dict, list, tuple)):
+                raise SMLConfigurationError(
+                    f"{left_name} and {right_name} must have exact matching structure"
+                )
+            return
+        if type(left_node) is not type(right_node):
+            raise SMLConfigurationError(
+                f"{left_name} and {right_name} must have exact matching structure"
+            )
+        if isinstance(left_node, dict):
+            if set(left_node) != set(right_node):
+                raise SMLConfigurationError(
+                    f"{left_name} and {right_name} must have exact matching keys"
+                )
+            for key in left_node:
+                compare(left_node[key], right_node[key])
+            return
+        if isinstance(left_node, (list, tuple)):
+            if len(left_node) != len(right_node):
+                raise SMLConfigurationError(
+                    f"{left_name} and {right_name} must have exact matching structure"
+                )
+            for left_value, right_value in zip(left_node, right_node, strict=True):
+                compare(left_value, right_value)
+            return
         raise SMLConfigurationError(
-            f"{right_name} must be a built-in dict/list/tuple tree"
+            f"{left_name} and {right_name} must have exact matching structure"
         )
-    right_flat = dict(tree_flatten(right))
-    if set(left_flat) != set(right_flat):
-        raise SMLConfigurationError(
-            f"{left_name} and {right_name} must have exact matching keys"
-        )
+
+    _array_leaves(left, left_name)
+    compare(left, right)
 
 
 def _require_dtype(tree: object, name: str, dtype: mx.Dtype) -> dict[str, mx.array]:
-    flattened = _flat_arrays(tree, name)
-    if any(leaf.dtype != dtype for leaf in flattened.values()):
+    leaves = _array_leaves(tree, name)
+    if any(leaf.dtype != dtype for leaf in leaves):
         raise SMLConfigurationError(f"{name} leaves must have dtype {dtype}")
-    return flattened
+    return {}
 
 
 def _path_category(path: str) -> str:
@@ -226,7 +299,7 @@ class LoaderConfig:
             "gradient_accumulation_steps",
             "prefetch_depth",
         ):
-            _require_positive_int(getattr(self, field_name), field_name)
+            _require_int32_counter(getattr(self, field_name), field_name)
         if (
             isinstance(self.epoch_seed, bool)
             or not isinstance(self.epoch_seed, int)
@@ -361,22 +434,34 @@ class BaseParameterState:
     working_parameters: dict
 
     def __post_init__(self) -> None:
-        master_flat, working_flat = _require_same_structure(
+        _require_top_level_dict(self.master_parameters, "master_parameters")
+        _require_top_level_dict(self.working_parameters, "working_parameters")
+        _require_same_structure(
             self.master_parameters,
             self.working_parameters,
             left_name="master_parameters",
             right_name="working_parameters",
         )
-        if any(leaf.dtype != mx.float32 for leaf in master_flat.values()):
+        if any(
+            leaf.dtype != mx.float32
+            for leaf in _array_leaves(self.master_parameters, "master_parameters")
+        ):
             raise SMLConfigurationError(
                 "master_parameters leaves must have dtype float32"
             )
-        if any(leaf.dtype != mx.bfloat16 for leaf in working_flat.values()):
+        if any(
+            leaf.dtype != mx.bfloat16
+            for leaf in _array_leaves(self.working_parameters, "working_parameters")
+        ):
             raise SMLConfigurationError(
                 "working_parameters leaves must have dtype bfloat16"
             )
-        for path, master in master_flat.items():
-            if not bool(mx.array_equal(working_flat[path], master.astype(mx.bfloat16))):
+        for master, working in zip(
+            _array_leaves(self.master_parameters, "master_parameters"),
+            _array_leaves(self.working_parameters, "working_parameters"),
+            strict=True,
+        ):
+            if not bool(mx.array_equal(working, master.astype(mx.bfloat16))):
                 raise SMLConfigurationError(
                     "working_parameters leaves must be exact bfloat16 casts of masters"
                 )
@@ -409,15 +494,25 @@ class AdamState:
             or self.step.shape != ()
         ):
             raise SMLConfigurationError("Adam step must be an int32 scalar")
-        first_flat, second_flat = _require_same_structure(
+        if _materialized_truth((self.step >= 0) & (self.step <= _INT32_MAX)) is False:
+            raise SMLConfigurationError("Adam step must be an int32 counter")
+        _require_top_level_dict(self.first_moments, "first_moments")
+        _require_top_level_dict(self.second_moments, "second_moments")
+        _require_same_structure(
             self.first_moments,
             self.second_moments,
             left_name="first_moments",
             right_name="second_moments",
         )
-        if any(leaf.dtype != mx.float32 for leaf in first_flat.values()):
+        if any(
+            leaf.dtype != mx.float32
+            for leaf in _array_leaves(self.first_moments, "first_moments")
+        ):
             raise SMLConfigurationError("first_moments leaves must have dtype float32")
-        if any(leaf.dtype != mx.float32 for leaf in second_flat.values()):
+        if any(
+            leaf.dtype != mx.float32
+            for leaf in _array_leaves(self.second_moments, "second_moments")
+        ):
             raise SMLConfigurationError("second_moments leaves must have dtype float32")
 
     def to_tree(self) -> tuple[mx.array, dict, dict]:
@@ -440,6 +535,7 @@ class TrainerState:
     next_key: mx.array
 
     def __post_init__(self) -> None:
+        _require_top_level_dict(self.accumulators, "accumulators")
         _require_dtype(self.accumulators, "accumulators", mx.float32)
         if (
             not isinstance(self.accumulation_count, mx.array)
@@ -447,7 +543,18 @@ class TrainerState:
             or self.accumulation_count.shape != ()
         ):
             raise SMLConfigurationError("accumulation_count must be an int32 scalar")
-        if not isinstance(self.next_key, mx.array) or self.next_key.dtype != mx.uint32:
+        if (
+            _materialized_truth(
+                (self.accumulation_count >= 0) & (self.accumulation_count <= _INT32_MAX)
+            )
+            is False
+        ):
+            raise SMLConfigurationError("accumulation_count must be an int32 counter")
+        if (
+            not isinstance(self.next_key, mx.array)
+            or self.next_key.dtype != mx.uint32
+            or self.next_key.shape != (2,)
+        ):
             raise SMLConfigurationError("next_key must be a uint32 MLX random key")
 
     def to_tree(self) -> tuple[dict, mx.array, mx.array]:
@@ -466,6 +573,7 @@ class TrainerState:
 
 
 def initialize_base_parameter_state(working_parameters: dict) -> BaseParameterState:
+    _require_top_level_dict(working_parameters, "working_parameters")
     _require_dtype(working_parameters, "working_parameters", mx.bfloat16)
     master_parameters = tree_map(
         lambda parameter: parameter.astype(mx.float32), working_parameters
@@ -474,6 +582,7 @@ def initialize_base_parameter_state(working_parameters: dict) -> BaseParameterSt
 
 
 def initialize_adam_state(master_parameters: dict) -> AdamState:
+    _require_top_level_dict(master_parameters, "master_parameters")
     _require_dtype(master_parameters, "master_parameters", mx.float32)
     return AdamState(
         step=mx.array(0, dtype=mx.int32),
@@ -483,7 +592,8 @@ def initialize_adam_state(master_parameters: dict) -> AdamState:
 
 
 def build_weight_decay_tree(named_parameters: dict, policy: WeightDecayPolicy) -> dict:
-    _flat_arrays(named_parameters, "named_parameters")
+    _require_top_level_dict(named_parameters, "named_parameters")
+    _array_leaves(named_parameters, "named_parameters")
     if not isinstance(policy, WeightDecayPolicy):
         raise SMLConfigurationError("policy must be a WeightDecayPolicy")
     return tree_map_with_path(
@@ -492,6 +602,8 @@ def build_weight_decay_tree(named_parameters: dict, policy: WeightDecayPolicy) -
 
 
 def accumulate_fp32(accumulators: dict, gradients: dict) -> dict:
+    _require_top_level_dict(accumulators, "accumulators")
+    _require_top_level_dict(gradients, "gradients")
     _require_dtype(accumulators, "accumulators", mx.float32)
     _require_same_structure(
         accumulators,
@@ -514,6 +626,7 @@ def normalize_and_clip(
     *,
     gradient_clip_norm: float,
 ) -> dict:
+    _require_top_level_dict(accumulated_gradients, "accumulated_gradients")
     _require_dtype(accumulated_gradients, "accumulated_gradients", mx.float32)
     if (
         not isinstance(normalization_count, mx.array)
@@ -521,21 +634,25 @@ def normalize_and_clip(
         or normalization_count.shape != ()
     ):
         raise SMLConfigurationError("normalization_count must be an int32 scalar")
+    if (
+        _materialized_truth(
+            (normalization_count > 0) & (normalization_count <= _INT32_MAX)
+        )
+        is False
+    ):
+        raise SMLConfigurationError(
+            "normalization_count must be a positive int32 counter"
+        )
     if _require_finite(gradient_clip_norm, "gradient_clip_norm") <= 0.0:
         raise SMLConfigurationError("gradient_clip_norm must be positive")
     normalized = tree_map(
-        lambda gradient: (
-            gradient
-            / mx.maximum(
-                normalization_count.astype(mx.float32), mx.array(1.0, dtype=mx.float32)
-            )
-        ),
+        lambda gradient: gradient / normalization_count.astype(mx.float32),
         accumulated_gradients,
     )
     squared_norm = sum(
         (
             mx.sum(mx.square(gradient.astype(mx.float32)))
-            for gradient in _flat_arrays(normalized, "normalized_gradients").values()
+            for gradient in _array_leaves(normalized, "normalized_gradients")
         ),
         mx.array(0.0, dtype=mx.float32),
     )
@@ -571,15 +688,22 @@ def adamw_mixed_precision_update(
         raise SMLConfigurationError("state must be an AdamState")
     if not isinstance(config, OptimizerConfig):
         raise SMLConfigurationError("config must be an OptimizerConfig")
-    master_flat, gradient_flat = _require_same_structure(
+    _require_top_level_dict(master_parameters, "master_parameters")
+    _require_top_level_dict(gradients, "gradients")
+    _require_top_level_dict(weight_decay_tree, "weight_decay_tree")
+    _require_same_structure(
         master_parameters,
         gradients,
         left_name="master_parameters",
         right_name="gradients",
     )
     _require_dtype(master_parameters, "master_parameters", mx.float32)
-    _require_dtype(gradients, "gradients", mx.bfloat16)
-    first_flat, second_flat = _require_same_structure(
+    gradient_leaves = _array_leaves(gradients, "gradients")
+    if any(leaf.dtype not in (mx.bfloat16, mx.float32) for leaf in gradient_leaves):
+        raise SMLConfigurationError(
+            "gradients leaves must have dtype bfloat16 or float32"
+        )
+    _require_same_structure(
         master_parameters,
         state.first_moments,
         left_name="master_parameters",
@@ -597,8 +721,12 @@ def adamw_mixed_precision_update(
         left_name="master_parameters",
         right_name="weight_decay_tree",
     )
-    del master_flat, gradient_flat, first_flat, second_flat
     fp32_gradients = tree_map(lambda gradient: gradient.astype(mx.float32), gradients)
+    can_increment = state.step < _INT32_MAX
+    if _materialized_truth(can_increment) is False:
+        raise SMLConfigurationError(
+            "Adam step cannot be incremented past int32 maximum"
+        )
     first_moments = tree_map(
         lambda first, gradient: (
             config.beta1 * first.astype(mx.float32) + (1.0 - config.beta1) * gradient
@@ -614,6 +742,17 @@ def adamw_mixed_precision_update(
         state.second_moments,
         fp32_gradients,
     )
+    if _materialized_truth(can_increment) is None:
+        first_moments = tree_map(
+            lambda previous, updated: mx.where(can_increment, updated, previous),
+            state.first_moments,
+            first_moments,
+        )
+        second_moments = tree_map(
+            lambda previous, updated: mx.where(can_increment, updated, previous),
+            state.second_moments,
+            second_moments,
+        )
     completed_updates = state.step.astype(mx.float32) + 1.0
     if config.bias_correction:
         first_denominator = 1.0 - mx.power(config.beta1, completed_updates)
@@ -643,6 +782,12 @@ def adamw_mixed_precision_update(
         second_for_update,
         weight_decay_tree,
     )
+    if _materialized_truth(can_increment) is None:
+        updated_masters = tree_map(
+            lambda master, updated: mx.where(can_increment, updated, master),
+            master_parameters,
+            updated_masters,
+        )
     working_parameters = tree_map(
         lambda master: master.astype(mx.bfloat16), updated_masters
     )
@@ -650,7 +795,11 @@ def adamw_mixed_precision_update(
         updated_masters,
         working_parameters,
         AdamState(
-            step=state.step + mx.array(1, dtype=mx.int32),
+            step=mx.where(
+                can_increment,
+                state.step + mx.array(1, dtype=mx.int32),
+                state.step,
+            ).astype(mx.int32),
             first_moments=first_moments,
             second_moments=second_moments,
         ),
