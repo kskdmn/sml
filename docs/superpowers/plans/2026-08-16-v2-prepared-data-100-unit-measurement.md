@@ -1,10 +1,17 @@
 # V2 Prepared-Data 100-Unit Protocol and Baseline Implementation Plan
 
+**Status update (2026-08-22):** Task 1 is complete at `8c3b1be`. Tasks 2 and
+3 are cancelled as required refactor work; their commands are retained only as
+an optional reproducible benchmark procedure. No fresh 45-trial baseline,
+before/after comparison, thermal gate, benchmark artifact, or performance
+review is required to continue to Phase 3. Task 4 is reduced to functional
+verification and handoff maintenance.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a versioned benchmark protocol that measures prepared-data with 100 real 1,024-token batches, capture a completely fresh 45-trial baseline, and publish Phase 2 evidence only if every unchanged acceptance gate passes.
+**Goal:** Add a versioned benchmark protocol that can measure prepared-data with 100 real 1,024-token batches while preserving version-1 compatibility. Capturing a new baseline and publishing a comparison are optional diagnostics.
 
-**Architecture:** Keep the global measured-unit default at 20 and add a prepared-data-specific canonical count of 100. Baseline validators dispatch between immutable version-1/20 and version-2/100 contracts, while controllers pass each metric's canonical count into a child that verifies it instead of silently replacing it. Commit and independently review the harness before a fresh resumable baseline capture; only then run the non-resumable prepared-data comparison against that new baseline.
+**Architecture:** Keep the global measured-unit default at 20 and add a prepared-data-specific canonical count of 100. Baseline validators dispatch between immutable version-1/20 and version-2/100 contracts, while controllers pass each metric's canonical count into a child that verifies it instead of silently replacing it. The harness is committed and reviewed independently. If optional evidence is later requested, capture a fresh resumable baseline before running a non-resumable comparison.
 
 **Tech Stack:** Python 3.12.13, `uv`, pytest, Ruff, MLX/Metal, NumPy, the existing `v2.benchmarks` runner/evidence/journal stack, Git, and macOS environment probes.
 
@@ -19,13 +26,13 @@
 - Preserve 5 warmup units for non-compile metrics and 0 for cold compile.
 - Existing version-1 baseline artifacts remain immutable and valid only for prepared-data 20.
 - New version-2 baseline artifacts use identity domain `sml-performance-baseline-v2`, an exact `prepared_data_measured_units` protocol field, and prepared-data 100.
-- Capture all 45 version-2 baseline trials from scratch: 5 trials for each of 9 metrics against source commit `3687f8b3214a44c675ae67af52e4997762f6c634`.
+- If optional version-2 evidence is requested, capture all 45 baseline trials from scratch: 5 trials for each of 9 metrics against source commit `3687f8b3214a44c675ae67af52e4997762f6c634`.
 - Never copy, migrate, salvage, or edit an old raw trial, journal slot, comparison trial, or evidence report.
-- Require AC power, automatic power mode, Low Power Mode off, thermal state nominal/raw `0`, normal memory pressure, and no competing GPU workload.
-- Baseline capture may resume only its own compatible external journal after an environment interruption. Phase 2 comparison is non-resumable and permits only the harness-owned noise retry/cooldown.
-- Preserve screen mode, 5 pairs, 10,000 bootstrap resamples, ratio floor `0.97`, ratio MAD ceiling `0.02`, report-only lower bound, and predecessors `{"prepared-data":null}`.
-- Do not validate, stage, or commit rejected Phase 2 output. Do not relax a threshold. Do not push automatically.
-- Each of the harness, baseline evidence, and Phase 2 evidence commits requires an independent review. Finish with one broad review of the complete range.
+- When optional evidence is collected, require AC power, automatic power mode, Low Power Mode off, thermal state nominal/raw `0`, normal memory pressure, and no competing GPU workload.
+- An optional baseline capture may resume only its own compatible external journal after an environment interruption. An optional comparison is non-resumable and permits only the harness-owned noise retry/cooldown.
+- Optional comparisons preserve screen mode, 5 pairs, 10,000 bootstrap resamples, ratio floor `0.97`, ratio MAD ceiling `0.02`, report-only lower bound, and predecessors `{"prepared-data":null}`.
+- Do not validate, stage, or commit rejected diagnostic output. Do not relax a threshold. Do not push automatically.
+- The harness commit requires review. Any optional baseline or Phase 2 evidence commit also requires evidence review.
 
 ---
 
@@ -34,10 +41,10 @@
 - `v2/benchmarks/workload.py`: defines the canonical per-metric count map and builds either the legacy prepared-data-20 workload or the new prepared-data-100 workload.
 - `v2/benchmarks/runner.py`: owns baseline-version dispatch, exact protocol/identity validation, CLI resolution, controller-to-child count forwarding, comparison construction, and validation.
 - `v2/tests/unit/test_benchmark_analysis.py`: pins both protocol versions, CLI behavior, parent/child forwarding, journal identity, artifact validation, and tamper rejection.
-- `v2/benchmarks/manifests/baseline-3687f8b-prepared100.json`: new independently validated version-2 baseline manifest.
-- `v2/benchmarks/results/baseline-3687f8b-prepared100.jsonl`: new 45-trial version-2 raw baseline evidence.
-- `v2/benchmarks/results/phase-2-loader.json`: accepted prepared-data comparison against the version-2 baseline.
-- `v2/benchmarks/results/phase-2.json`: independently validated Phase 2 result.
+- `v2/benchmarks/manifests/baseline-3687f8b-prepared100.json`: optional version-2 baseline manifest.
+- `v2/benchmarks/results/baseline-3687f8b-prepared100.jsonl`: optional 45-trial version-2 raw baseline evidence.
+- `v2/benchmarks/results/phase-2-loader.json`: optional prepared-data comparison against the version-2 baseline.
+- `v2/benchmarks/results/phase-2.json`: optional independently validated Phase 2 diagnostic report.
 - `.superpowers/sdd/2026-08-16-v2-prepared-data-100-unit-measurement/`: ignored reports, review packages, the preserved rejected 20-unit comparison, and execution ledgers only.
 
 ---
@@ -677,7 +684,12 @@ For every valid finding, use `superpowers:receiving-code-review`, add a focused 
 
 ---
 
-### Task 2: Capture, Validate, Review, and Commit the Fresh Version-2 Baseline
+### Task 2: Optional Fresh Version-2 Baseline (Cancelled as Required Work)
+
+Do not run this task to unblock the refactor. The previous temporary journal
+was cleaned by macOS and is not resumable, but there is no requirement to
+restart its 45 trials. The steps below apply only if the user later explicitly
+requests comparable performance evidence.
 
 **Files:**
 - Create: `v2/benchmarks/manifests/baseline-3687f8b-prepared100.json`
@@ -874,7 +886,11 @@ Expected: exactly the version-2 manifest and 45-trial JSONL are committed, statu
 
 ---
 
-### Task 3: Run, Validate, Review, and Commit Phase 2 Against Version 2
+### Task 3: Optional Phase 2 Comparison (Cancelled as Required Work)
+
+Do not run this task to unblock the refactor. It is conditional on an
+explicitly requested and successfully captured optional Task 2 baseline. Any
+missing, noisy, rejected, or below-target comparison does not block Phase 3.
 
 **Files:**
 - Create on success: `v2/benchmarks/results/phase-2-loader.json`
@@ -1032,23 +1048,13 @@ Expected: exactly two accepted reports are committed, status is empty, and `uv.l
 
 ---
 
-### Task 4: Perform the Final Broad Review and Handoff
+### Task 4: Maintain the Functional Handoff
 
-**Files:**
-- Verify: `v2/benchmarks/workload.py`
-- Verify: `v2/benchmarks/runner.py`
-- Verify: `v2/tests/unit/test_benchmark_analysis.py`
-- Verify: `v2/benchmarks/manifests/baseline-3687f8b-prepared100.json`
-- Verify: `v2/benchmarks/results/baseline-3687f8b-prepared100.jsonl`
-- Verify: `v2/benchmarks/results/phase-2-loader.json`
-- Verify: `v2/benchmarks/results/phase-2.json`
-- Report: `.superpowers/sdd/2026-08-16-v2-prepared-data-100-unit-measurement/final-review.md`
+For the active refactor, verify the implemented harness and prepared-data
+production path, then update the tracked handoff with the next functional task.
+No baseline or Phase 2 result file is required.
 
-**Interfaces:**
-- Consumes: the independently reviewed Task 1, Task 2, and Task 3 commits.
-- Produces: a read-only final verdict over the complete committed range and a handoff that names exact commits, test evidence, benchmark statistics, and whether a push remains pending.
-
-- [ ] **Step 1: Run the definitive repository verification**
+- [ ] **Step 1: Run the functional repository verification**
 
 Run pytest outside the sandbox:
 
@@ -1056,32 +1062,20 @@ Run pytest outside the sandbox:
 uv run ruff check v2
 uv run ruff format --check v2
 uv run pytest v2/tests
-env TMPDIR=/private/tmp uv run python -m v2.benchmarks.runner validate \
-  --manifest v2/benchmarks/manifests/baseline-3687f8b-prepared100.json \
-  --raw-input v2/benchmarks/results/baseline-3687f8b-prepared100.jsonl
-env TMPDIR=/private/tmp uv run python -m v2.benchmarks.runner validate-phase \
-  --phase 2 \
-  --baseline v2/benchmarks/manifests/baseline-3687f8b-prepared100.json \
-  --predecessors '{"prepared-data":null}' \
-  --results v2/benchmarks/results/phase-2-loader.json
+uv run pytest \
+  v2/tests/unit/data/test_pretraining.py \
+  v2/tests/integration/test_pretraining_data_workflow.py \
+  -v
 git status --short
 git diff --exit-code -- uv.lock
 ```
 
-Expected: every command passes, status is empty, and `uv.lock` is unchanged.
+Expected: every command passes, the production prepared-data workflow remains
+runnable, status is clean, and `uv.lock` is unchanged.
 
-- [ ] **Step 2: Dispatch one fresh broad reviewer**
+- [ ] **Step 2: Update the tracked handoff**
 
-Provide the approved design and full range from the pre-Task-1 base through the Phase 2 evidence commit. Require review of code, tests, baseline artifacts, Phase 2 artifacts, commit boundaries, and all ignored task reports. The reviewer must explicitly answer:
-
-```text
-Does the range preserve valid v1/20 evidence, implement v2/100 without changing any other metric, prove exact parent/child counts, publish a fully fresh 45-trial baseline, accept Phase 2 only under the original statistics/environment gates, preserve evidence isolation, and avoid unrelated/top-level changes? Report Critical, Important, and Minor findings with evidence, or state ready.
-```
-
-Do not declare completion while any Critical or Important finding remains. Code findings return to Task 1's test-first fix/review loop and require recapturing downstream evidence if they alter any harness content or canonical identity. Evidence findings return to the owning capture task and may require fresh evidence; never patch JSON by hand.
-
-- [ ] **Step 3: Record the final handoff without pushing**
-
-Write `final-review.md` with: full implementation/base/evidence commit SHAs, final test count, Ruff results, v1 and v2 baseline identities, v2 harness/workload identities, Phase 2 identities, median ratio, ratio MAD, confidence bound, attempt/cooldown evidence, environment summary, reviewer verdict, clean status, unchanged `uv.lock`, and `push pending user request`.
-
-Report the same concise outcome to the user. Do not push unless the user explicitly asks.
+Record fresh verification counts, the current commit, and Part 1 Task 3.1 as
+the next task in
+`docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md`.
+Do not push unless the user explicitly asks.

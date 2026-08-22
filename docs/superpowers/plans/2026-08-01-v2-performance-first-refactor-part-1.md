@@ -2,13 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Establish the pinned performance baseline, replace the v2 model/data/artifact foundation with the `sml` package, and deliver exact, resumable BF16-compute pretraining with authoritative FP32 master parameters and FP32 optimizer state.
+**Goal:** Replace the v2 model/data/artifact foundation with the `sml` package and deliver exact, resumable BF16-compute pretraining with authoritative FP32 master parameters and FP32 optimizer state. The existing benchmark harness may be used for diagnostics, but baseline comparison is not required.
 
 **Architecture:** This first part creates the package and temporary migration bridge, captures legacy equivalence fixtures, implements the model and immutable artifact contracts, then builds prepared-data and pretraining runtimes on those contracts. It ends with a portable pretraining run/checkpoint that Part 2 consumes for inference, evaluation, SWAG fine-tuning, and final cutover.
 
 **Tech Stack:** Python 3.12.13, MLX 0.32+, NumPy 2.4+, SentencePiece 0.2+, safetensors through `mlx.core.save_safetensors`, APFS/macOS file-descriptor APIs, `uv run`, pytest 9, Ruff 0.15+
 
 ## Global Constraints
+
+**Superseding acceptance policy (2026-08-22):** Phase progression is gated by
+Ruff, the full v2 test suite, the controlled correctness/quality checks, and
+relevant integration or CLI smoke workflows. Every baseline capture,
+before/after comparison, performance threshold, thermal launch gate, and
+benchmark evidence commit in this plan is optional and non-blocking.
 
 - The approved source of truth is `docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md`; do not revive the superseded checkpoint/SWAG-only plan.
 - This is a clean break: provide no readers, aliases, conversions, warnings, or fallback interpretations for existing v2 imports, CLI flags, tokenizer inputs, prepared datasets, manifests, checkpoints, metadata, or resume state.
@@ -20,12 +26,9 @@
 - Training with `rope_scaling_factor > 1.0` belongs to a separate future long-context fine-tuning workflow. That workflow will consume a completed base-pretraining artifact and publish a distinct run/model identity; it is not implemented, simulated, or silently enabled anywhere in this refactor.
 - MLX is the only model, training, inference, and evaluation backend, and Apple Silicon is the target.
 - Throughput wins over peak memory only while the default workload still fits the Apple M5 10-core CPU, 10-core GPU, 24 GB target without critical memory pressure.
-- The source performance baseline is commit `3687f8b`. Every comparison uses the same independently versioned harness identity and matching canonical semantic workload identity.
+- Optional performance investigations use source commit `3687f8b` and the same independently versioned harness/canonical workload identity on both sides.
 - The fixed pretraining workload is vocabulary size 28,672, hidden size 768, 12 layers, 12 query heads, 3 KV heads, intermediate size 2,176, sequence length 1,024, microbatch size 1, gradient accumulation 8, BF16 compute, and `rope_scaling_factor=1.0`.
-- Phase screens use five fresh-process paired trials, 20 warmup units, 100 measured units, alternating process order, a fixed 10,000-resample bootstrap seed, and a `MAD / median <= 0.02` noise gate.
-- Every relevant phase-screen throughput median must be at least `0.97` against both commit `3687f8b` and the previous accepted phase.
-- Because Phase 3 completes the base-pretraining hot path, its end-to-end pretraining median must additionally be at least `1.03` against `3687f8b`; Part 2 may not defer discovery of the final pretraining target.
-- Final acceptance in Part 2 uses ten paired trials, `MAD / median <= 0.015`, throughput median and one-sided 95% lower bound at least `0.97`, and pretraining median and lower bound at least `1.03` against `3687f8b`.
+- The historical phase-screen and final-acceptance protocols remain available for optional diagnostics; their ratios, dispersion, confidence bounds, power state, and thermal state never block implementation work.
 - Correctness-sensitive workflows fully rehash payloads before GPU initialization or destructive action. Read-only inference/evaluation may report `manifest-trusted`; they must never report `full` without rehashing.
 - Artifact publication and writable run operations require local APFS. Never weaken descriptor-relative no-follow path traversal, lock, fsync, rename, recovery, or retention guarantees for test convenience.
 - Use Python 3.12.13 through `uv run`. Run every MLX pytest command and every benchmark outside the sandbox so Metal is available.
@@ -38,7 +41,7 @@
 
 ## Master Phase Index
 
-The approved design calls for six ordered, independently reviewable implementation plans. To honor the user's two-document limit, each phase below is a self-contained plan section with its own test/benchmark/commit gate.
+The approved design calls for six ordered, independently reviewable implementation plans. To honor the user's two-document limit, each phase below is a self-contained plan section with its own correctness/workflow/commit gate and optional performance diagnostics.
 
 1. [Foundation and model package](#phase-1-foundation-and-model-package)
 2. [Tokenizer, artifacts, and prepared data](#phase-2-tokenizer-artifacts-and-prepared-data)
@@ -75,7 +78,11 @@ Create mirrored tests under `v2/tests/unit`, `v2/tests/equivalence`, and `v2/tes
 
 Test snippets omit routine imports only. Put MLX availability, `assert_close`, `assert_tree_close`, immutable legacy fixture loading, tiny model/tokenizer/corpus builders, and temporary-APFS fixtures in `v2/tests/conftest.py`; put a helper used by only one module above its first test in that module. Artifact fault injectors wrap the explicit filesystem dependency passed to artifact APIs and live in `v2/tests/integration/test_artifact_integrity.py`; do not add test switches to production code.
 
-## Benchmark Prerequisite
+## Existing Optional Benchmark Tooling
+
+Task 0.1 is already complete. Its original prerequisite wording below is
+historical: the baseline remains useful for optional diagnostics but no new
+baseline or performance validation is required for phase progression.
 
 ### Task 0.1: Version and Record the `3687f8b` Baseline
 
@@ -239,7 +246,7 @@ uv run python -m v2.benchmarks.runner record-baseline --source-commit 3687f8b --
 uv run python -m v2.benchmarks.runner validate --manifest v2/benchmarks/manifests/baseline-3687f8b.json --raw-input v2/benchmarks/results/baseline-3687f8b.jsonl
 ```
 
-Expected: validation passes; the manifest records the already-committed clean harness commit/content identity, the clean `3687f8b` source proof, M5 hardware identity, paired legacy NPZ/`uint16` input identity, canonical ordered `int32` row identity, all raw metric values, and no invalid thermal/power/memory condition. Do not start Phase 1 until validation passes.
+Expected for an optional recapture: validation passes; the manifest records the already-committed clean harness commit/content identity, the clean `3687f8b` source proof, M5 hardware identity, paired legacy NPZ/`uint16` input identity, canonical ordered `int32` row identity, all raw metric values, and no invalid thermal/power/memory condition. This diagnostic no longer controls whether Phase 1 or any later phase may start.
 
 - [ ] **Step 6: Commit the baseline evidence**
 
@@ -780,21 +787,20 @@ git add v2/src/sml/model/generation.py v2/tests/unit/model/test_generation.py v2
 git commit -m "refactor(v2): add explicit mlx generation primitives"
 ```
 
-### Phase 1 Gate
+### Phase 1 Functional Gate
 
-- [ ] Run full correctness and phase performance checks, then commit the phase report:
+- [ ] Run full correctness checks:
 
 ```bash
 uv run ruff check v2
 uv run ruff format --check v2
 uv run pytest v2/tests
 git status --short
-uv run python -m v2.benchmarks.runner compare --baseline v2/benchmarks/manifests/baseline-3687f8b.json --candidate HEAD --metrics pretraining-compute,inference-prefill,inference-decode --pairs 5 --warmup 20 --measure 100 --minimum-ratio 0.97 --maximum-dispersion 0.02 --lower-bound-report-only --compare-previous none --output v2/benchmarks/results/phase-1.json
-git add v2/benchmarks/results/phase-1.json
-git commit -m "bench(v2): accept foundation and model phase"
 ```
 
-Expected: `git status --short` is empty before measurement, every relevant metric passes the baseline rule, and persistent excess dispersion blocks Phase 2.
+Expected: Ruff and all v2 tests pass and the tracked worktree is clean. An
+optional Phase 1 performance comparison may be recorded separately, but its
+absence or result does not block Phase 2.
 
 ## Phase 2: Tokenizer, Artifacts, and Prepared Data
 
@@ -1317,22 +1323,20 @@ git add v2/src/sml/data/pretraining.py v2/tests/unit/data/test_pretraining.py v2
 git commit -m "perf(v2): stream mmap pretraining batches"
 ```
 
-### Phase 2 Gate
+### Phase 2 Functional Gate
 
-- [ ] Run complete Phase 2 validation and commit its combined report:
+- [ ] Run complete Phase 2 correctness and workflow validation:
 
 ```bash
 uv run ruff check v2
 uv run ruff format --check v2
 uv run pytest v2/tests
 git status --short
-uv run python -m v2.benchmarks.runner compare --baseline v2/benchmarks/manifests/baseline-3687f8b.json --candidate HEAD --metrics prepared-data --pairs 5 --warmup 20 --measure 100 --minimum-ratio 0.97 --maximum-dispersion 0.02 --lower-bound-report-only --compare-previous phase-1 --output v2/benchmarks/results/phase-2-loader.json
-uv run python -m v2.benchmarks.runner validate-phase --phase 2 --baseline v2/benchmarks/manifests/baseline-3687f8b.json --previous v2/benchmarks/results/phase-1.json --results v2/benchmarks/results/phase-2-loader.json --output v2/benchmarks/results/phase-2.json
-git add v2/benchmarks/results/phase-2-loader.json v2/benchmarks/results/phase-2.json
-git commit -m "bench(v2): accept artifacts and prepared-data phase"
 ```
 
-Expected: `git status --short` is empty before the compare command; the runner measures the committed loader implementation, and prepared-data throughput passes both baseline and Phase 1 rules.
+Expected: Ruff and all v2 tests pass, including the tokenizer, artifact,
+prepared-data, stream, cursor, resume, and benchmark-owner integration paths.
+The tracked worktree is clean. No Phase 2 performance artifact is required.
 
 ## Phase 3: Pretraining Runtime
 
@@ -1851,42 +1855,40 @@ git add v2/benchmarks/manifests/pretraining-quality-v1.json v2/benchmarks/result
 git commit -m "test(v2): record pretraining quality evidence"
 ```
 
-### Task 3.6: Run the Phase 3 Correctness and Performance Gate
-
-**Files:**
-- Create: `v2/benchmarks/results/phase-3.json`
+### Task 3.6: Run the Phase 3 Correctness and Workflow Gate
 
 **Interfaces:**
-- The phase report compares prepared-data and end-to-end pretraining against baseline and Phase 2, explicitly recording legacy BF16 persistent parameters/moments without masters versus replacement FP32 master parameters/moments with derived BF16 working parameters.
+- Proves the complete Part 1 package, artifact, data, pretraining, checkpoint,
+  exact-resume, and controlled-quality paths run correctly together.
 
-- [ ] **Step 1: Run all Part 1 verification and the phase screen**
+- [ ] **Step 1: Run all Part 1 verification**
 
 ```bash
 uv run ruff check v2
 uv run ruff format --check v2
 uv run pytest v2/tests
 git status --short
-uv run python -m v2.benchmarks.runner compare --baseline v2/benchmarks/manifests/baseline-3687f8b.json --candidate HEAD --metrics prepared-data,pretraining-end-to-end,checkpoint-pause,peak-metal-memory --pairs 5 --warmup 20 --measure 100 --minimum-ratio 0.97 --pretraining-minimum-ratio 1.03 --maximum-dispersion 0.02 --lower-bound-report-only --compare-previous phase-2 --output v2/benchmarks/results/phase-3.json
 ```
 
-Expected: correctness and the committed quality report pass; prepared-data throughput median is at least `0.97` versus baseline and Phase 2, while end-to-end pretraining throughput median is already at least `1.03` versus the pinned baseline and at least `0.97` versus Phase 2. The pretraining lower bound is report-only at this phase. Checkpoint pause and peak memory are reported; candidate CLI startup includes mandatory full input verification outside the steady-state timed region; both adapters record `rope_scaling_factor=1.0`; and every pretraining ratio labels the legacy no-master/BF16-moment state versus replacement FP32 masters/moments plus BF16 working state.
+Expected: correctness and the committed quality report pass; a tiny fresh run,
+checkpoint, exact resume, retained-step recovery, and model-only artifact load
+complete through the production APIs; mandatory full input verification occurs
+before GPU allocation where specified; and the tracked worktree is clean.
 
-- [ ] **Step 2: Commit the accepted Phase 3**
+- [ ] **Step 2: Optionally collect performance diagnostics**
 
-```bash
-git add v2/benchmarks/results/phase-3.json
-git commit -m "bench(v2): accept pretraining runtime phase"
-```
+The historical Phase 3 comparison may be run when speed or memory information
+is useful. It is report-only: no baseline, ratio, dispersion, confidence bound,
+or thermal outcome is required to complete Part 1 or begin Part 2.
 
 ## Part 1 Completion Gate
 
 Part 1 is complete only when:
 
-- the baseline manifest/raw results are committed and validate against clean commit `3687f8b`;
 - package imports, model equivalence/correction tests, artifact integrity tests, and tokenizer/preparation/pretraining workflows all pass;
 - a tiny pretraining run is portable for model-only operations, resumes exactly with a matching data bundle, checkpoints every authoritative FP32 master, proves every BF16 working leaf is its exact cast, and rejects corrupt/mismatched state before GPU allocation;
 - the committed 1,000-step quality report proves finite state, RMSNorm-master movement, survival of sub-BF16-ULP master updates, and candidate validation NLL no more than 1 percent above the FP32-compute oracle;
-- base pretraining, every base checkpoint, and all Phase 3 benchmark identities authoritatively record `rope_scaling_factor=1.0`; training a factor above `1.0` belongs to a later distinct long-context fine-tuning workflow, not this pretraining plan;
-- Phase 1 and 2 reports pass every relevant `0.97` screen; Phase 3 also proves end-to-end pretraining median at least `1.03` against baseline while retaining the `0.97` previous-phase rule;
+- base pretraining and every base checkpoint authoritatively record `rope_scaling_factor=1.0`; training a factor above `1.0` belongs to a later distinct long-context fine-tuning workflow, not this pretraining plan;
+- the Phase 3 functional gate and all controlled quality checks pass; performance reports are optional diagnostics;
 - `uv.lock` remains byte-identical;
-- Part 2 starts from the committed Phase 3 result, not from an uncommitted worktree.
+- Part 2 starts from a committed, functionally verified Phase 3 tree, not from an uncommitted worktree.

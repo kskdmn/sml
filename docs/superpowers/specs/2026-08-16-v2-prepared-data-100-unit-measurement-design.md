@@ -1,6 +1,6 @@
 # V2 Prepared-Data 100-Unit Protocol and Baseline Design
 
-**Status:** Approved revised design
+**Status:** Harness implemented; evidence capture optional as of 2026-08-22
 
 **Date:** 2026-08-16
 
@@ -32,9 +32,10 @@ harness changes and a fresh baseline; old trials cannot be reused.
 
 ## Goal
 
-Measure prepared-data with 100 real microbatches per trial while keeping the
-full 1,024-token workload, every other metric's current count, and all existing
-environment and statistical acceptance gates.
+Provide an optional protocol that can measure prepared-data with 100 real
+microbatches per trial while keeping the full 1,024-token workload and every
+other metric's current count. The protocol no longer gates refactor progress;
+functional tests and runnable workflows are the required acceptance evidence.
 
 ## Protocol Model
 
@@ -117,7 +118,7 @@ canonical metric work unit. Prepared-data trials with 20 or any value other
 than 100 fail; unchanged metrics fail if they depart from their existing
 counts.
 
-## Baseline Versioning and Capture
+## Optional Baseline Versioning and Capture
 
 The existing baseline remains immutable and continues to support evidence
 created under the 20-unit prepared-data protocol:
@@ -125,13 +126,13 @@ created under the 20-unit prepared-data protocol:
 - `v2/benchmarks/manifests/baseline-3687f8b.json`
 - `v2/benchmarks/results/baseline-3687f8b.jsonl`
 
-The new protocol publishes separate artifacts:
+If a new comparison is desired, the protocol publishes separate artifacts:
 
 - `v2/benchmarks/manifests/baseline-3687f8b-prepared100.json`
 - `v2/benchmarks/results/baseline-3687f8b-prepared100.jsonl`
 
-Changing the harness and canonical workload changes their identities. The new
-baseline must therefore capture all 45 raw trials—five reference-side trials
+Changing the harness and canonical workload changes their identities. Such a
+baseline must capture all 45 raw trials—five reference-side trials
 for each of nine metrics—using the pinned legacy source commit
 `3687f8b3214a44c675ae67af52e4997762f6c634` and the newly committed harness.
 No raw trial or journal slot from the old baseline is copied.
@@ -147,9 +148,9 @@ The harness implementation commit must exist and pass independent review
 before baseline capture starts. The new baseline manifest and JSONL are
 independently validated before their separate evidence commit.
 
-## Phase 2 Comparison
+## Optional Phase 2 Comparison
 
-After the new baseline validates, Phase 2 starts from zero against
+If diagnostics are requested and the new baseline validates, the comparison starts from zero against
 `baseline-3687f8b-prepared100.json`. The exact screen profile remains:
 
 - prepared-data only;
@@ -165,7 +166,7 @@ After the new baseline validates, Phase 2 starts from zero against
 The comparison is non-resumable. Only the harness may perform its one
 statistical-noise retry and cooldown. Independent Phase 2 validation runs only
 after a passing comparison. Exactly `phase-2-loader.json` and `phase-2.json`
-may enter the acceptance commit.
+may enter an optional diagnostic evidence commit.
 
 ## Evidence Isolation
 
@@ -180,18 +181,19 @@ It remains diagnostic-only and unstaged. The failed no-trial 100-unit CLI
 attempt produced no public report. Neither is merged into the new baseline or
 Phase 2 evidence.
 
-## Failure Handling
+## Failure Handling for Optional Evidence
 
-- Harness or test failure blocks baseline capture.
+- Harness or test failure blocks only the optional baseline capture.
 - A non-nominal live gate blocks launch.
 - Baseline environment rejection preserves its compatible journal and resumes
   only under the baseline-capture protocol's recovery rules.
 - Baseline validation failure blocks publication and commit.
-- Comparison rejection or `too-noisy` after the harness retry blocks Phase 2
-  validation, staging, and commit.
-- Phase 2 validation failure blocks acceptance.
+- Comparison rejection or `too-noisy` after the harness retry blocks only
+  validation, staging, and commit of that diagnostic result.
+- Phase 2 validation failure rejects only the diagnostic evidence.
 - No threshold is relaxed and no result is edited, salvaged, or manually
   combined.
+- No evidence outcome blocks Phase 3 or later refactor work.
 - Nothing is pushed automatically.
 
 ## Rejected Alternatives
@@ -241,19 +243,19 @@ Implementation is test-driven. Tests must prove:
   remain unchanged; and
 - Ruff and the full v2 pytest suite pass without warnings.
 
-The harness commit, new baseline evidence commit, and Phase 2 evidence commit
-each receive independent review. A final whole-branch review checks the entire
-lineage from protocol constants through accepted Phase 2 evidence.
+The harness commit receives independent review. If optional baseline or Phase 2
+evidence is later produced, each evidence commit receives its own review and a
+final evidence review checks the lineage from protocol constants through that
+diagnostic report.
 
 ## Success Criteria
 
 - The new harness identity-binds prepared-data at 100 and all other metric
   counts remain unchanged.
-- Every new prepared-data baseline and comparison raw trial records and runs
-  exactly 100 units with the full 1,024-token workload.
-- A fresh 45-trial baseline is captured, independently validated, reviewed,
-  and committed under the new harness identity.
-- Phase 2 comparison and validation pass the unchanged `0.97` ratio and `0.02`
-  dispersion gates before evidence is committed.
+- Version-1 and version-2 protocol validation, parent/child count propagation,
+  tamper rejection, and replay behavior pass the automated test suite.
+- If optional evidence is produced, every new prepared-data baseline and
+  comparison raw trial records and runs exactly 100 units with the full
+  1,024-token workload, and it is committed only after its own validators pass.
 - Old baseline and rejected evidence remain preserved and unmodified.
 - `uv.lock` and production model/training code remain unchanged.

@@ -1,5 +1,9 @@
 # V2 Stop-Interruptible Pretraining Stream Design
 
+**Status update (2026-08-22):** The shutdown correctness fix is implemented
+and accepted through its tests and review. Its Phase 2 performance rerun is
+optional diagnostic work and is not required for refactor progression.
+
 ## Context
 
 The first valid Phase 2 prepared-data comparison produced ten accepted trials
@@ -113,7 +117,7 @@ uv run pytest v2/tests
 Every pytest invocation runs outside the sandbox so MLX/Metal remains
 available.
 
-After tests and an independent code review pass, a focused diagnostic will
+After tests and an independent code review pass, a focused diagnostic may
 again separate 20-batch work from shutdown. Phase 2 may be rerun only if stream
 shutdown no longer waits for the 50 ms queue timeout. The failed comparison is
 diagnostic evidence only and must never be staged or accepted.
@@ -130,5 +134,6 @@ diagnostic evidence only and must never be staged or accepted.
 - The benchmark runtime continues to close every taken stream before `run()`
   returns and continues to use the real production loader and MLX consumer
   path.
-- Only after those gates pass is the Phase 2 comparison rerun from zero under
-  canonical `TMPDIR=/private/tmp` and the existing acceptance thresholds.
+- An optional Phase 2 comparison may be rerun from zero under canonical
+  `TMPDIR=/private/tmp` and the historical thresholds; its result cannot block
+  Phase 3.

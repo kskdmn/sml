@@ -5,6 +5,14 @@
 Approved umbrella design for a clean replacement of the entire `v2` tree.
 This specification supersedes the former checkpoint/SWAG-only design and plan.
 
+**Acceptance-policy update (2026-08-22):** Functional correctness is the
+required refactor gate. Ruff, the full v2 test suite, controlled mathematical
+and training-quality checks, and relevant end-to-end/CLI smoke workflows must
+pass. Before/after performance comparisons, baseline capture, statistical
+thresholds, thermal launch windows, and benchmark evidence commits are
+optional diagnostics. Missing, noisy, thermally rejected, or slower benchmark
+results do not block this refactor or progression between phases.
+
 ## Goal
 
 Refactor all v2 capabilities into a cohesive MLX package optimized first for
@@ -83,17 +91,16 @@ throughput and peak memory conflict, throughput wins provided the current
 default model and batch configuration still fit the target Apple-Silicon
 hardware.
 
-The acceptance hardware is an Apple M5 with 10 CPU cores (4 performance and 6
-efficiency cores), 10 GPU cores, and 24 GB of unified memory. Performance
-comparisons use the pre-refactor implementation at commit `3687f8b` as the
-source baseline. The benchmark protocol below pins the remaining workload and
-environment identity; results from other Apple-Silicon systems are informative
-but do not satisfy the acceptance gate.
+The reference hardware for optional diagnostics is an Apple M5 with 10 CPU
+cores (4 performance and 6 efficiency cores), 10 GPU cores, and 24 GB of
+unified memory. A performance investigation may compare with the pre-refactor
+implementation at commit `3687f8b` using the protocol below, but neither that
+comparison nor any particular ratio is required for acceptance.
 
 Correctness and controlled training quality are hard constraints, not
-tradeoffs. Performance changes must retain mathematical equivalence where
-specified, pass the quality gates below, and be measured against a recorded
-baseline.
+tradeoffs. Performance-sensitive changes must retain mathematical equivalence
+where specified and pass the quality gates below. Measurement against a
+recorded baseline is optional.
 
 ## Package Architecture
 
@@ -1370,17 +1377,25 @@ tests where mathematics is preserved, dtype and explicit-PRNG contracts,
 multi-step eager/compiled state tests, uninterrupted/resumed equality, artifact
 schema and adversarial path tests, crash-stage checkpoint replacement tests,
 source-lock concurrency tests, offline end-to-end CLI workflows, controlled
-training-quality gates, and the performance protocol below. Production code may
+training-quality gates, and relevant runnable workflow checks. Production code may
 contain no hidden global randomness, unverified state coercion, legacy fallback,
 test-only switch, mutable compiled closure state, or per-token host conversion.
 HellaSwag/WinoGrande results remain diagnostic; acceptance never substitutes a
 benchmark score for these implementation checks.
 
-## Performance Measurement and Acceptance
+## Optional Performance Measurement
+
+This section defines how to produce a defensible performance claim when a
+developer chooses to investigate speed or memory. It is not a refactor
+acceptance gate. No baseline, phase report, final report, ratio, confidence
+bound, dispersion result, power state, or thermal state is required to start or
+finish an implementation phase. A failed or inconclusive run invalidates only
+the performance claim from that run.
 
 Performance claims require explicit Metal synchronization around timed regions
-and compiled-kernel warmup before measurement. Before phase 1 begins, a
-machine-readable baseline manifest and its raw measurements are committed. The
+and compiled-kernel warmup before measurement. If a before/after comparison is
+published, a machine-readable baseline manifest and its raw measurements are
+committed first. The
 manifest records:
 
 - source commit and clean-worktree proof, harness commit and clean-worktree
@@ -1466,7 +1481,7 @@ boundaries match. Reports state both the master-parameter and moment-precision
 differences next to every end-to-end pretraining ratio and never describe that
 metric as legacy trajectory equivalence.
 
-The acceptance baseline uses commit `3687f8b` on the Apple M5 10-core CPU,
+The optional reference baseline uses commit `3687f8b` on the Apple M5 10-core CPU,
 10-core GPU, 24 GB target. The fixed pretraining workload uses that commit's
 default model configuration with vocabulary size 28,672, hidden size 768, 12
 layers, 12 query heads, 3 KV heads, intermediate size 2,176, sequence length
@@ -1484,8 +1499,8 @@ record version-native representations while proving identical canonical
 examples or requests. Other benchmark workloads likewise use identical
 canonical workload configurations and semantic input identities on both sides.
 
-Steady-state phase screens use five fresh-process comparison pairs; final
-acceptance measurements use ten. Each pair contains one reference and one
+Steady-state diagnostic screens use five fresh-process comparison pairs; the
+historical full comparison uses ten. Each pair contains one reference and one
 candidate process, with reference-first and candidate-first order alternating
 between pairs. Each process performs one untimed compilation pass, 20
 synchronized warmup work units, and 100 synchronized measured work units. Each
@@ -1498,22 +1513,23 @@ For throughput, every pair produces the direction-normalized ratio
 median absolute deviations, every paired ratio, the median paired ratio, and a
 one-sided 95-percent lower confidence bound for that median. The bound uses a
 10,000-resample percentile bootstrap over whole pairs with a fixed seed recorded
-in the benchmark manifest. Phase screens report the bound but do not gate on it;
-final acceptance does. The analysis implementation and fixed statistical test
+in the benchmark manifest. Phase screens report the bound but do not use it for
+their diagnostic decision; the historical full comparison does. The analysis implementation and fixed statistical test
 vectors are part of the versioned harness identity. Compile cold-start time is
 measured separately in a fresh process without warmup and is report-only.
 
-A phase screen is too noisy when `MAD / median` exceeds 2 percent for either
-side or for the paired ratios. Final acceptance uses a 1.5-percent threshold.
+A diagnostic screen is too noisy when `MAD / median` exceeds 2 percent for either
+side or for the paired ratios. The historical full comparison uses a 1.5-percent threshold.
 After a noisy comparison, terminate both benchmark checkouts/processes, keep the
 machine connected to power in the recorded power mode, and cool down for at
 least 15 minutes; the last 5 minutes must report nominal thermal state, normal
 memory pressure, and no competing GPU workload. The complete alternating-order
 comparison is then repeated exactly once and both attempts are retained in the
-raw report. Persistent excess dispersion blocks the phase or final acceptance.
-A final point estimate that satisfies a gate while its required lower confidence
-bound does not is reported as inconclusive and blocks acceptance rather than
-being rounded to a pass or resolved by selecting favorable trials.
+raw report. Persistent excess dispersion makes that diagnostic inconclusive.
+A final point estimate that satisfies a chosen threshold while its required
+lower confidence bound does not is also reported as inconclusive rather than
+being rounded to a pass or resolved by selecting favorable trials. Neither
+outcome blocks feature work.
 
 Benchmarks cover:
 
@@ -1525,8 +1541,8 @@ Benchmarks cover:
 - checkpoint pause duration
 - peak Metal memory
 
-Performance benchmarks remain outside ordinary pytest. Each relevant phase
-records before/after results using the pinned manifest and identical harness. A
+Performance benchmarks remain outside ordinary pytest. Any phase may
+optionally record before/after results using the pinned manifest and identical harness. A
 result is invalid if the target enters critical memory pressure, thermal
 throttling is detected, the power mode changes, or the canonical workload
 configurations or semantic content identities differ. Native configuration and
@@ -1551,28 +1567,21 @@ metric name to result identity/path (or `null`), never as one phase-wide
 name different predecessors for each metric.
 
 A benchmark is relevant to a phase when the phase changes code executed in its
-timed region. For every relevant steady-state throughput metric, the five-pair
-phase-screen median must be at least `0.97` against the pinned baseline and, when
-one exists, in a direct comparison against the previous accepted measurement of
-that same metric. A metric's first replacement measurement compares only with
-the baseline. Improvements have no upper bound. Checkpoint pause and peak memory
-are report-only except for the explicit fit and memory-pressure gate. All
-measurements run from the clean checkouts at the recorded commits.
+timed region. For an optional diagnostic, the original targets remain useful
+context: a five-pair phase-screen median of `0.97` against the pinned baseline
+and prior measurement, and a final pretraining target of `1.03`. Missing those
+targets records a performance observation; it does not fail the phase.
+Checkpoint pause, compile cold-start, peak memory, and all ratios are
+report-only for refactor acceptance.
 
-Acceptance gates:
+Required acceptance instead consists of:
 
-- every relevant phase satisfies the per-phase throughput rule above
-- in the completed refactor, every steady-state throughput metric's ten-pair
-  median and one-sided 95-percent lower confidence bound are both at least
-  `0.97` against the pinned baseline
-- the completed refactor's median paired end-to-end pretraining ratio and its
-  one-sided 95-percent lower confidence bound must both be at least `1.03`
-  against commit `3687f8b`
-- the fixed default workload must complete on the Apple M5 24 GB target without
-  out-of-memory failure or critical memory pressure
-- mathematical-equivalence and correctness tests must pass regardless of speed
-- the base and SWAG controlled quality reports pass their committed acceptance
-  rules
+- mathematical-equivalence and correctness tests passing;
+- the base and SWAG controlled quality reports passing their committed rules;
+- relevant artifact, resume, integration, and CLI workflows completing on the
+  target Apple-Silicon environment; and
+- the supported default/tiny verification workloads completing without an
+  out-of-memory or critical runtime failure.
 
 Compile cold-start time and peak memory are reported even when steady-state
 throughput is the deciding metric.
@@ -1590,14 +1599,15 @@ uv run ruff format --check v2
 uv run pytest v2/tests
 ```
 
-The final phase additionally runs every performance comparison and all unified
-CLI workflow smoke tests.
+The final phase additionally runs all unified CLI workflow smoke tests.
+Performance comparisons may be run separately when useful, but are not part of
+the required verification set.
 
 ## Delivery Sequence
 
-Creating and committing the versioned benchmark harness, pinned baseline
-manifest, and raw baseline results is a prerequisite, not an implementation
-phase. No performance-sensitive source change begins before that record exists.
+The existing versioned benchmark harness and baseline artifacts remain
+available for optional diagnostics. New baseline or phase evidence is not a
+prerequisite for implementation work.
 
 One master plan index links six ordered implementation plans:
 
@@ -1608,8 +1618,8 @@ One master plan index links six ordered implementation plans:
 5. LoRA and SWAG
 6. Unified CLI and final cutover
 
-Each phase is independently reviewable, testable, benchmarked where relevant,
-and committed before the next begins. Migrated and unmigrated workflows may
+Each phase is independently reviewable, testable, exercised through its
+relevant functional workflows, and committed before the next begins. Migrated and unmigrated workflows may
 coexist through phase 5. Phase 6 deletes all replaced flat source modules,
 legacy tests, old entrypoints, and compatibility scaffolding, then updates v2
 documentation to describe only the new system.

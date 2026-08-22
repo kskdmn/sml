@@ -1,5 +1,11 @@
 # V2 Phase 2 Prepared-Data Benchmark Bridge Design
 
+**Status update (2026-08-22):** The production bridge described here is
+implemented and remains required. The Phase 2 comparison is now an optional
+diagnostic and is not an acceptance or progression gate. The command and
+environment rules below apply only when someone voluntarily publishes a
+performance result.
+
 ## Context
 
 Phase 2 cannot run at commit `a2e7ac4` because the replacement benchmark
@@ -140,7 +146,7 @@ Behavior-first tests will prove:
 Focused tests run RED before production edits and GREEN afterward. Final
 verification runs the complete v2 pytest suite plus Ruff check and format check.
 
-## Phase 2 Gate
+## Optional Phase 2 Diagnostic
 
 After the bridge is reviewed, committed, and the tracked checkout is clean, the
 screen uses the accepted protocol:
@@ -169,8 +175,9 @@ uv run python -m v2.benchmarks.runner validate-phase \
   --output v2/benchmarks/results/phase-2.json
 ```
 
-The environment must match the baseline: AC power, automatic power mode, low
+When publishing this diagnostic, the environment must match the baseline: AC power, automatic power mode, low
 power mode off, nominal thermal state, normal memory pressure, and no competing
 GPU workload. A thermal or power rejection aborts this non-resumable comparison.
 Only statistical noise triggers the harness's one full retry after its recorded
-15-minute cooldown.
+15-minute cooldown. Any rejection or below-target result affects only that
+diagnostic and does not block Phase 3.

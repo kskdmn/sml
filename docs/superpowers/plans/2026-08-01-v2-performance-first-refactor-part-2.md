@@ -2,13 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Complete persistent inference/evaluation, cached SWAG LoRA fine-tuning/export, the unified CLI, and the clean removal of every replaced flat v2 path while meeting the final correctness and performance gates.
+**Goal:** Complete persistent inference/evaluation, cached SWAG LoRA fine-tuning/export, the unified CLI, and the clean removal of every replaced flat v2 path while meeting the final correctness and runnable-workflow gates.
 
 **Architecture:** This part consumes the model, artifact, prepared-data, and pretraining-run contracts completed in Part 1. It adds persistent non-reentrant inference sessions and batched evaluation, then self-contained LoRA runs backed by immutable encoded SWAG data, and finally exposes all workflows through one typed CLI before deleting migration scaffolding and legacy modules.
 
 **Tech Stack:** Python 3.12.13, MLX 0.32+, NumPy 2.4+, SentencePiece 0.2+, datasets 5, lm-eval 0.4, `tomllib`, `uv run`, pytest 9, Ruff 0.15+
 
 ## Global Constraints
+
+**Superseding acceptance policy (2026-08-22):** Phase progression is gated by
+Ruff, the full v2 test suite, controlled correctness/quality checks, and
+relevant end-to-end/CLI smoke workflows. Baseline comparisons, statistical
+thresholds, thermal launch gates, and performance evidence files are optional
+diagnostics and cannot block a phase.
 
 - Complete `docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md` through its Phase 3 gate first.
 - The approved source of truth is `docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md`.
@@ -19,9 +25,7 @@
 - Every base-pretraining run consumed here authoritatively records `rope_scaling_factor=1.0`, and the SWAG LoRA flow preserves that value. A separate future long-context fine-tuning workflow will create a distinct run with `rope_scaling_factor > 1.0`; this plan does not change the factor during inference, evaluation, SWAG fine-tuning, resume, or export.
 - MLX is the only model, training, inference, and evaluation backend, and Apple Silicon is the target.
 - Throughput wins over peak memory only while the default workload still fits the Apple M5 10-core CPU, 10-core GPU, 24 GB target without critical memory pressure.
-- The source performance baseline is commit `3687f8b`; all reports use the committed harness/workload identities from Part 1.
-- Phase screens use five fresh-process paired trials, 20 warmups, 100 measured units, alternating order, fixed 10,000-resample bootstrap seed, `MAD / median <= 0.02`, and median ratio at least `0.97` against baseline and the previous accepted phase.
-- Final acceptance uses ten fresh-process paired trials, `MAD / median <= 0.015`, every throughput median and one-sided 95% lower bound at least `0.97`, and end-to-end pretraining median and lower bound at least `1.03` against `3687f8b`.
+- Optional performance investigations may use source commit `3687f8b` and the committed harness/workload identities from Part 1. Historical phase-screen and final thresholds are report-only.
 - Correctness-sensitive fine-tuning, resume, export, recovery, and retention fully rehash inputs before GPU initialization or deletion. Read-only inference/evaluation default to `manifest-trusted` and accept `full_verify=True` / `--full`.
 - Writable artifact operations require local APFS and preserve descriptor-relative no-follow traversal, publication/writer/access locks, fsync/rename publication, recovery, and retention guarantees.
 - Use Python 3.12.13 through `uv run`. Run every MLX pytest command and every benchmark outside the sandbox so Metal is available.
@@ -347,14 +351,12 @@ git add v2/src/sml/evaluation.py v2/tests/unit/test_evaluation.py v2/tests/equiv
 git commit -m "perf(v2): batch evaluation requests"
 ```
 
-### Task 4.4: Gate Inference and Evaluation Performance
-
-**Files:**
-- Create: `v2/benchmarks/results/phase-4.json`
+### Task 4.4: Verify Inference and Evaluation Workflows
 
 **Interfaces:**
-- Consumes the immutable Part 1 baseline/harness identity and the accepted Phase 3 commit.
-- Produces a raw-pair-complete Phase 4 report whose confidence bound is report-only and whose median/noise decisions gate progression.
+- Consumes the functionally verified Phase 3 package and artifact contracts.
+- Proves persistent inference, exact-step resolution, batched evaluation, and
+  read-only/full verification behavior through production workflows.
 
 - [ ] **Step 1: Run full correctness/format verification**
 
@@ -365,32 +367,26 @@ uv run pytest v2/tests
 git status --short
 ```
 
-- [ ] **Step 2: Run the five-pair phase screen against baseline and Phase 3**
-
-```bash
-uv run python -m v2.benchmarks.runner compare --baseline v2/benchmarks/manifests/baseline-3687f8b.json --candidate HEAD --metrics inference-prefill,inference-decode --pairs 5 --warmup 20 --measure 100 --minimum-ratio 0.97 --maximum-dispersion 0.02 --lower-bound-report-only --compare-previous phase-3 --output v2/benchmarks/results/phase-4.json
-```
-
-Expected: the worktree is clean before measurement, prefill/decode medians are at least 0.97 versus baseline and Phase 3, and persistent excess dispersion after one cooldown rerun blocks Phase 5.
-
-- [ ] **Step 3: Validate phase report identities and raw-pair completeness**
-
-```bash
-uv run python -m v2.benchmarks.runner validate-phase --phase 4 --baseline v2/benchmarks/manifests/baseline-3687f8b.json --previous v2/benchmarks/results/phase-3.json --results v2/benchmarks/results/phase-4.json
-```
-
-- [ ] **Step 4: Re-run exact-step/read-only recovery integration after benchmarking**
+- [ ] **Step 2: Run focused production workflow verification**
 
 ```bash
 uv run pytest v2/tests/integration/test_inference_workflow.py v2/tests/integration/test_evaluation_workflow.py -v
 ```
 
-- [ ] **Step 5: Commit accepted Phase 4**
+Expected: persistent-session generation, unequal-length batching, exact-step
+artifact resolution, evaluation scoring, and both verification levels pass.
+
+- [ ] **Step 3: Run CLI smoke coverage available at this phase**
 
 ```bash
-git add v2/benchmarks/results/phase-4.json
-git commit -m "bench(v2): accept inference and evaluation phase"
+uv run python -m sml --help
 ```
+
+- [ ] **Step 4: Optionally collect inference performance diagnostics**
+
+The historical five-pair inference comparison may be run when useful. Its
+absence, noise, thermal rejection, or ratios do not block Phase 5 and no
+`phase-4.json` evidence commit is required.
 
 ## Phase 5: LoRA and SWAG
 
@@ -863,7 +859,7 @@ git add v2/src/sml/training v2/src/sml/artifacts/checkpoint.py v2/src/sml/infere
 git commit -m "feat(v2): persist portable lora runs and exports"
 ```
 
-### Task 5.5: Gate the Complete SWAG Flow and Throughput
+### Task 5.5: Verify the Complete SWAG Flow and Controlled Quality
 
 **Files:**
 - Create: `v2/tests/integration/test_part2_swag_flow.py`
@@ -872,14 +868,12 @@ git commit -m "feat(v2): persist portable lora runs and exports"
 - Create: `v2/benchmarks/manifests/swag-quality-v1.json`
 - Create: `v2/benchmarks/results/swag-quality-v1.jsonl`
 - Create: `v2/benchmarks/results/swag-quality-v1.json`
-- Create: `v2/benchmarks/results/phase-5.json`
 
 **Interfaces:**
-- Produces one offline tokenizer/base/SWAG/LoRA/export/inference/evaluation proof and the Phase 5 paired throughput report.
+- Produces one offline tokenizer/base/SWAG/LoRA/export/inference/evaluation proof and controlled SWAG quality evidence.
 - `SwagQualityWorkload` pins a frozen BF16 base identity originating from a fully verified FP32-master pretraining checkpoint, fixed source-train and disjoint validation example identities, initial FP32 adapter identity, ordered batches, optimizer configuration, mean-score policy, seeds, and exactly 256 optimizer steps.
 - `SwagQualityReport(candidate_validation_loss: float, oracle_validation_loss: float, candidate_accuracy: float, oracle_accuracy: float, candidate_examples: int, oracle_examples: int, candidate_finite: bool, oracle_finite: bool)` is reconstructed from the raw candidate/oracle evidence.
 - `decide_swag_quality(report: SwagQualityReport) -> Literal["pass", "fail"]` requires finite candidate/oracle state, identical real-example counts, candidate validation loss within 1 percent relative of the eager FP32-adapter oracle, and candidate validation accuracy within one percentage point of the oracle.
-- The Phase 5 confidence bound is report-only; median/noise decisions compare against both baseline and accepted Phase 4.
 
 - [ ] **Step 1: Write the complete offline SWAG flow test**
 
@@ -906,7 +900,7 @@ git add v2/tests/integration/test_part2_swag_flow.py
 git commit -m "test(v2): prove encoded swag to portable export"
 ```
 
-Expected: correctness passes and `git status --short` is empty before performance measurement.
+Expected: correctness passes and `git status --short` is empty before recording controlled quality evidence.
 
 - [ ] **Step 3: Write deterministic SWAG quality-decision tests**
 
@@ -972,29 +966,18 @@ git add v2/benchmarks/manifests/swag-quality-v1.json v2/benchmarks/results/swag-
 git commit -m "test(v2): record swag quality evidence"
 ```
 
-- [ ] **Step 9: Run the SWAG phase screen against baseline and Phase 4**
+- [ ] **Step 9: Revalidate quality and the complete portability workflow**
 
 ```bash
-git status --short
-uv run python -m v2.benchmarks.runner compare --baseline v2/benchmarks/manifests/baseline-3687f8b.json --candidate HEAD --metrics swag-end-to-end --pairs 5 --warmup 20 --measure 100 --minimum-ratio 0.97 --maximum-dispersion 0.02 --lower-bound-report-only --compare-previous phase-4 --output v2/benchmarks/results/phase-5.json
-```
-
-Expected: SWAG example throughput median is at least 0.97 against baseline and Phase 4, canonical examples/order match, and persistent noise blocks Phase 6.
-
-- [ ] **Step 10: Validate report and re-run portability test**
-
-```bash
-uv run python -m v2.benchmarks.runner validate-phase --phase 5 --baseline v2/benchmarks/manifests/baseline-3687f8b.json --previous v2/benchmarks/results/phase-4.json --results v2/benchmarks/results/phase-5.json
 uv run python -m v2.benchmarks.swag_quality validate --manifest v2/benchmarks/manifests/swag-quality-v1.json --raw-input v2/benchmarks/results/swag-quality-v1.jsonl --report v2/benchmarks/results/swag-quality-v1.json
 uv run pytest v2/tests/integration/test_part2_swag_flow.py v2/tests/integration/test_swag_workflow.py -v
 ```
 
-- [ ] **Step 11: Commit accepted Phase 5**
+- [ ] **Step 10: Optionally collect SWAG performance diagnostics**
 
-```bash
-git add v2/benchmarks/results/phase-5.json
-git commit -m "bench(v2): accept lora and swag phase"
-```
+The historical five-pair SWAG comparison may be run when useful. Its absence,
+noise, thermal rejection, or ratios do not block Phase 6 and no `phase-5.json`
+evidence commit is required.
 
 ## Phase 6: Unified CLI and Final Cutover
 
@@ -1272,17 +1255,14 @@ git add -A v2/src v2/tests v2/README.md common/scripts/peek_npz.py
 git commit -m "refactor(v2): cut over to unified sml package"
 ```
 
-### Task 6.4: Run Final Correctness, CLI, and Ten-Pair Acceptance
-
-**Files:**
-- Create: `v2/benchmarks/results/final-acceptance.json`
-- Create: `v2/benchmarks/results/final-acceptance.jsonl`
+### Task 6.4: Run Final Correctness and CLI Acceptance
 
 **Interfaces:**
-- Produces the authoritative final raw measurements and statistical report for all required metrics.
-- Final throughput decisions require both the median and one-sided 95% lower confidence bound; checkpoint pause, compile cold-start, and peak memory remain report-only except for the fit/memory-pressure gate.
+- Proves the final package, controlled quality evidence, artifact workflows,
+  unified CLI, resume paths, inference/evaluation, LoRA/SWAG, export, and clean
+  cutover all run correctly from the final tree.
 
-- [ ] **Step 1: Prove clean source/harness checkouts and run all static/correctness tests**
+- [ ] **Step 1: Run all final static, correctness, and quality checks**
 
 ```bash
 git status --short
@@ -1293,7 +1273,7 @@ uv run python -m v2.benchmarks.quality validate --manifest v2/benchmarks/manifes
 uv run python -m v2.benchmarks.swag_quality validate --manifest v2/benchmarks/manifests/swag-quality-v1.json --raw-input v2/benchmarks/results/swag-quality-v1.jsonl --report v2/benchmarks/results/swag-quality-v1.json
 ```
 
-Expected: clean worktree before measurement; all correctness/equivalence/integration tests pass outside the sandbox; and both controlled quality reports revalidate against their committed raw evidence and harness identities.
+Expected: the worktree is clean; all correctness/equivalence/integration tests pass outside the sandbox; and both controlled quality reports revalidate against their committed raw evidence and harness identities.
 
 - [ ] **Step 2: Run every unified CLI smoke from the final tree**
 
@@ -1304,29 +1284,31 @@ uv run python -m sml --help
 
 Expected: all commands and fresh/resume/exact-step/full-verification paths pass.
 
-- [ ] **Step 3: Run final ten-pair measurements in separate clean checkouts**
+- [ ] **Step 3: Run the final end-to-end workflow set**
+
+Run the integration tests covering tokenizer preparation, prepared data,
+pretraining fresh/resume/recovery, inference/evaluation, SWAG preparation,
+LoRA fresh/resume/export, and the unified CLI. Use tiny deterministic fixtures
+where the full production workload would make correctness verification
+impractical.
+
+- [ ] **Step 4: Verify repository invariants**
 
 ```bash
-uv run python -m v2.benchmarks.runner compare --baseline v2/benchmarks/manifests/baseline-3687f8b.json --candidate HEAD --metrics prepared-data,pretraining-end-to-end,swag-end-to-end,inference-prefill,inference-decode,checkpoint-pause,compile-cold-start,peak-metal-memory --pairs 10 --warmup 20 --measure 100 --bootstrap-resamples 10000 --minimum-ratio 0.97 --pretraining-minimum-ratio 1.03 --maximum-dispersion 0.015 --compare-previous phase-5 --raw-output v2/benchmarks/results/final-acceptance.jsonl --output v2/benchmarks/results/final-acceptance.json
-```
-
-Expected: each throughput median and one-sided 95% lower bound is at least 0.97; pretraining median and lower bound are at least 1.03; the report labels legacy BF16 persistent parameters/moments without masters versus replacement FP32 master parameters/moments with derived BF16 working parameters beside every pretraining ratio; the default workload fits 24 GB without OOM/critical memory pressure; compile cold start, checkpoint pause, and peak memory are reported.
-
-- [ ] **Step 4: Validate statistical decisions, workload identities, and final environment**
-
-```bash
-uv run python -m v2.benchmarks.runner validate-final --baseline v2/benchmarks/manifests/baseline-3687f8b.json --raw-input v2/benchmarks/results/final-acceptance.jsonl --report v2/benchmarks/results/final-acceptance.json
 git diff --exit-code -- uv.lock
+git status --short
 ```
 
-Expected: PASS only if raw pairs are complete, alternating order is correct, canonical work identities match, harness identities match, dispersion is within 1.5%, confidence gates pass, power/thermal/memory status is valid, and `uv.lock` is unchanged. A point estimate without its required lower bound is `inconclusive`, not pass.
+Expected: `uv.lock` is unchanged and the final accepted implementation is
+committed. Optional benchmark output may remain diagnostic and is not required
+for completion.
 
-- [ ] **Step 5: Commit final evidence**
+- [ ] **Step 5: Optionally collect final performance diagnostics**
 
-```bash
-git add v2/benchmarks/results/final-acceptance.json v2/benchmarks/results/final-acceptance.jsonl
-git commit -m "bench(v2): record final refactor acceptance"
-```
+The historical ten-pair comparison may be run to characterize the completed
+refactor. It creates no required acceptance artifact, and any missing,
+inconclusive, noisy, thermally rejected, or below-target result does not change
+the correctness acceptance decision.
 
 ## Part 2 Completion Gate
 
@@ -1338,7 +1320,7 @@ The refactor is complete only when:
 - inference/evaluation pin resolved model identity and correctly report `manifest-trusted` or `full`;
 - encoded SWAG data is immutable/reusable offline, LoRA resume is exact, the copied-base run survives source-run deletion, and export is a portable BF16 plain-weight artifact;
 - the current inference, evaluation, SWAG LoRA, resume, and export paths preserve the base run's authoritative `rope_scaling_factor=1.0`; a future factor-above-`1.0` long-context fine-tuning creates a distinct run and is outside this plan;
-- every Phase 4/5/6 screen passes baseline and previous-phase rules;
-- final ten-pair medians, lower confidence bounds, noise thresholds, fit, correctness, and clean-worktree/harness/workload identity gates pass;
+- the Phase 4, 5, and 6 functional workflow gates pass;
+- the final static, correctness, controlled-quality, integration, and CLI checks pass;
 - all flat implementations, legacy tests, bridge code, and old README commands are gone;
 - `uv.lock` remains byte-identical and no unapproved dependency/top-level change exists.

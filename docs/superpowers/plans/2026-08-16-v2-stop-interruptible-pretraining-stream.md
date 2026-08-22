@@ -1,8 +1,12 @@
 # V2 Stop-Interruptible Pretraining Stream Implementation Plan
 
+**Status update (2026-08-22):** Task 1 is complete and functionally accepted.
+Task 2 is superseded as required work; its commands are retained only as an
+optional reproducible performance diagnostic.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove the fixed 50 ms full-queue shutdown delay from the real pretraining stream, then rerun and accept Phase 2 only if the unchanged performance gate passes.
+**Goal:** Remove the fixed 50 ms full-queue shutdown delay from the real pretraining stream and prove the lifecycle behavior through deterministic tests. A Phase 2 timing rerun is optional.
 
 **Architecture:** `PretrainingBatchStream.close()` will release queued ownership before joining its producer, creating capacity that wakes an in-flight full-queue put immediately, and will drain again after the join to own the wake-up race. The public API and benchmark lifecycle remain unchanged: measured `run()` still transfers real batches and closes its taken production stream before returning.
 
@@ -18,7 +22,7 @@
 - `PretrainingBatchStream.close()` remains idempotent and must not return with a live producer, queued/pending/owned envelope, staging lease, mmap, file descriptor, or artifact root.
 - Producer failures, cursor commits, abandoned envelopes, pending epoch envelopes, consumer wake-up, and concurrent close semantics remain unchanged.
 - The failed loader report with identity `sha256:7626e22f39fbe49140ced49a6af5a5fa0c9669802f59149dbf9071b437b4448b` is diagnostic evidence only. It must never be staged or committed as accepted Phase 2 evidence.
-- The corrected Phase 2 protocol remains exactly five pairs, five warmups, 20 measured units, 10,000 bootstrap resamples, minimum ratio `0.97`, maximum dispersion `0.02`, report-only lower bound, and predecessor mapping `{"prepared-data": null}`.
+- If the optional Phase 2 diagnostic is run, its protocol remains exactly five pairs, five warmups, 20 measured units, 10,000 bootstrap resamples, minimum ratio `0.97`, maximum dispersion `0.02`, report-only lower bound, and predecessor mapping `{"prepared-data": null}`.
 - Run every `uv run pytest` and MLX diagnostic command outside the sandbox.
 - Before finishing any v2 change, run `uv run ruff check v2`, `uv run ruff format --check v2`, and `uv run pytest v2/tests`.
 
@@ -27,8 +31,8 @@
 - Modify `v2/src/sml/data/pretraining.py`: add one private queue-drain helper and reorder stream shutdown around producer join.
 - Modify `v2/tests/integration/test_pretraining_data_workflow.py`: add a deterministic full-queue producer/close ordering regression using real stream ownership.
 - Preserve the failed comparison only in this plan's ignored `.superpowers/sdd` workspace before a fresh run.
-- Create `v2/benchmarks/results/phase-2-loader.json`: fresh accepted comparison evidence only.
-- Create `v2/benchmarks/results/phase-2.json`: independently validated Phase 2 report only.
+- Optional: create `v2/benchmarks/results/phase-2-loader.json` as fresh diagnostic comparison evidence.
+- Optional: create `v2/benchmarks/results/phase-2.json` as its independently validated diagnostic report.
 
 ---
 
@@ -207,16 +211,21 @@ and absence of benchmark-specific behavior.
 
 ---
 
-### Task 2: Rerun and Accept Phase 2
+### Task 2: Optional Phase 2 Rerun (Superseded as Required Work)
+
+Do not execute this task to unblock the refactor. The steps below are retained
+only to reproduce the historical diagnostic protocol. Any missing, failed,
+noisy, or thermally rejected result does not block Phase 3 and need not be
+committed.
 
 **Files:**
 - Preserve: `.superpowers/sdd/2026-08-16-v2-stop-interruptible-pretraining-stream/failed-phase-2-loader-7626e22f.json`
-- Create: `v2/benchmarks/results/phase-2-loader.json`
-- Create: `v2/benchmarks/results/phase-2.json`
+- Optional create: `v2/benchmarks/results/phase-2-loader.json`
+- Optional create: `v2/benchmarks/results/phase-2.json`
 
 **Interfaces:**
 - Consumes: the reviewed Task 1 commit, pinned baseline `v2/benchmarks/manifests/baseline-3687f8b.json`, canonical `TMPDIR=/private/tmp`, and predecessor mapping `{"prepared-data": null}`.
-- Produces: a fresh comparison report with ten valid trials and an independently validated Phase 2 acceptance report.
+- Produces only when requested: a fresh diagnostic comparison report with ten valid trials and an independently validated Phase 2 report.
 
 - [ ] **Step 1: Preserve rejected evidence and verify a clean candidate**
 

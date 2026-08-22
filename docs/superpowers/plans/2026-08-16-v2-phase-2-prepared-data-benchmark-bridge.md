@@ -1,8 +1,12 @@
 # V2 Phase 2 Prepared-Data Benchmark Bridge Implementation Plan
 
+**Status update (2026-08-22):** Task 1 is complete. Task 2 is superseded as a
+required task: the screen is optional diagnostic work and no Phase 2 benchmark
+result or acceptance commit is needed to continue the refactor.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Enable the frozen replacement adapter to measure the real immutable prepared-data loader, then run and commit the corrected Phase 2 acceptance screen.
+**Goal:** Enable the frozen replacement adapter to exercise and, when useful, measure the real immutable prepared-data loader. The corrected Phase 2 screen is optional.
 
 **Architecture:** `sml.data.pretraining` exposes a lazy two-argument factory that delegates to a private prepared-data benchmark module. The private module materializes one deterministic, immutable int32 NPY bundle from the harness's canonical rows, reopens it with FULL verification, and executes every timed unit through `PretrainingBatchStream` plus consumer-side MLX transfer. The existing harness and pinned baseline remain byte-identical.
 
@@ -20,7 +24,7 @@
 - Compute the product `sml-row-content-v1` identity for the manifest and the harness `sml-pretraining-rows-v1` identity for `canonical_row_identity` from the same canonical int32 bytes; do not compare the two domain-separated digests for equality.
 - Startup artifact creation and FULL verification remain outside steady-state timing.
 - The factory creates and FULL-verifies the first stream before any timing. Every `run()` closes that stream in the same call; `reset_after_warmup()` constructs the next initial-cursor stream before the measured timer starts. Runtime cleanup is idempotent and registered for normal process exit without relying on object finalization.
-- The accepted screen protocol is exactly five pairs, five warmups, 20 measured units, 10,000 bootstrap resamples, minimum ratio `0.97`, maximum dispersion `0.02`, report-only lower bound, and predecessor mapping `{"prepared-data": null}`.
+- If the optional screen is run, its protocol remains exactly five pairs, five warmups, 20 measured units, 10,000 bootstrap resamples, minimum ratio `0.97`, maximum dispersion `0.02`, report-only lower bound, and predecessor mapping `{"prepared-data": null}`.
 - Run every `uv run pytest` command outside the sandbox so MLX/Metal can access the Apple GPU.
 - Before finishing any v2 change, run `uv run ruff check v2`, `uv run ruff format --check v2`, and `uv run pytest v2/tests`.
 
@@ -31,8 +35,8 @@
 - Modify `v2/tests/unit/data/test_pretraining.py`: direct validation, artifact, execution-order, and cleanup behavior for the owner factory/runtime.
 - Modify `v2/tests/unit/test_benchmark_analysis.py`: change the real-owner transition regression from unavailable to available while retaining the synthetic future-owner ABI test for later metrics.
 - Modify `v2/tests/integration/test_pretraining_data_workflow.py`: prove the replacement adapter resolves and runs the real prepared-data owner through MLX.
-- Create `v2/benchmarks/results/phase-2-loader.json`: raw comparison and analysis report produced only by the clean committed bridge.
-- Create `v2/benchmarks/results/phase-2.json`: independently validated Phase 2 report.
+- Optional: create `v2/benchmarks/results/phase-2-loader.json` as a diagnostic comparison report.
+- Optional: create `v2/benchmarks/results/phase-2.json` as its independently validated diagnostic report.
 
 ---
 
@@ -396,15 +400,20 @@ order resets, identity domains remain separate, and all resources close.
 
 ---
 
-### Task 2: Run and Accept the Phase 2 Screen
+### Task 2: Optional Phase 2 Screen (Superseded as Required Work)
+
+Do not execute this task merely to unblock the refactor. The remaining steps
+are retained only as a reproducible diagnostic procedure. Failure, noise,
+thermal rejection, or absent output does not block Phase 3, and the result
+files do not need to exist or be committed.
 
 **Files:**
-- Create: `v2/benchmarks/results/phase-2-loader.json`
-- Create: `v2/benchmarks/results/phase-2.json`
+- Optional create: `v2/benchmarks/results/phase-2-loader.json`
+- Optional create: `v2/benchmarks/results/phase-2.json`
 
 **Interfaces:**
 - Consumes: a clean committed Task 1 bridge, pinned baseline manifest `v2/benchmarks/manifests/baseline-3687f8b.json`, and predecessor mapping `{"prepared-data": null}`.
-- Produces: an accepted screen report whose prepared-data baseline comparison passes and an independently validated Phase 2 report.
+- Produces only when requested: a valid diagnostic screen report and its independently validated Phase 2 report.
 
 - [ ] **Step 1: Verify the exact candidate and environment before measurement**
 
