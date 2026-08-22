@@ -14,6 +14,12 @@ from sml.model.rope import (
     find_correction_range,
     resolve_attention_factor,
 )
+from sml.training.common import (
+    AdamState,
+    OptimizerConfig,
+    adamw_mixed_precision_update,
+    initialize_adam_state,
+)
 
 
 def assert_close(actual: mx.array, expected: mx.array, *, atol: float, rtol: float):
@@ -231,6 +237,41 @@ def test_explicit_parameter_forward_supports_consecutive_compiled_fixture_calls(
 
     assert_close(first, legacy_arrays["compiled_state.logits.0"], atol=2e-2, rtol=2e-2)
     assert_close(second, legacy_arrays["compiled_state.logits.1"], atol=2e-2, rtol=2e-2)
+
+
+def test_explicit_adam_state_carries_across_consecutive_compiled_calls():
+    """A compiled optimizer boundary must return state for its next invocation."""
+    masters = {"weight": mx.array([1.0], dtype=mx.float32)}
+    gradients = {"weight": mx.array([1.0], dtype=mx.bfloat16)}
+    config = OptimizerConfig(
+        schedule_steps=None,
+        warmup_steps=0,
+        learning_rate=0.1,
+        beta1=0.0,
+        beta2=0.0,
+    )
+
+    @mx.compile
+    def update(parameters, state_tree):
+        state = AdamState.from_tree(state_tree)
+        next_masters, _working, next_state = adamw_mixed_precision_update(
+            parameters, gradients, state, config, {"weight": False}
+        )
+        return next_masters, next_state.to_tree()
+
+    first_masters, first_state = update(
+        masters, initialize_adam_state(masters).to_tree()
+    )
+    second_masters, second_state = update(first_masters, first_state)
+
+    mx.eval(second_masters, second_state)
+    assert int(AdamState.from_tree(second_state).step.item()) == 2
+    assert_close(
+        second_masters["weight"],
+        mx.array([0.8], dtype=mx.float32),
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 def test_generation_sampling_matches_captured_legacy_primitive(legacy_arrays):
