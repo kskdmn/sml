@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 import socket
 from dataclasses import dataclass
 from pathlib import Path
@@ -188,6 +189,31 @@ def test_empty_context_without_prefix_fails_before_bucketing(
     assert compile_spy.scoring_keys == set()
 
 
+def test_nonempty_in_vocab_context_does_not_prepend_prefix(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[tuple[int, ...], int]] = []
+    original = tiny_session.score_encoded_loglikelihoods
+
+    def spy(items, *, padding: str):
+        captured.extend(items)
+        return original(items, padding=padding)
+
+    monkeypatch.setattr(tiny_session, "score_encoded_loglikelihoods", spy)
+    score_loglikelihood_batch(
+        tiny_session,
+        [LoglikelihoodRequest(context="alpha", continuation=" beta")],
+        padding="right",
+    )
+    assert captured
+    token_ids, continuation_start = captured[0]
+    processor = tiny_session.resolved_model.tokenizer.processor
+    context_ids = tuple(int(token) for token in processor.encode("alpha"))
+    assert token_ids[: len(context_ids)] == context_ids
+    assert continuation_start == len(context_ids)
+
+
 def test_generate_until_truncates_at_stop_strings(
     tiny_session: InferenceSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -331,3 +357,67 @@ def test_sml_eval_lm_loglikelihood_uses_batch_scorer(
     log_likelihood, greedy_match = scored[0]
     assert math.isfinite(log_likelihood)
     assert greedy_match in (True, False)
+
+
+def test_evaluate_passes_installed_lm_eval_lm(
+    tiny_pretraining_run: Path,
+    fake_lm_eval,
+    tmp_path: Path,
+) -> None:
+    from lm_eval.api.model import LM
+
+    evaluate(tiny_evaluation_config(tiny_pretraining_run, tmp_path))
+    model = fake_lm_eval.calls[0]["model"]
+    assert isinstance(model, LM)
+    assert getattr(model, "cache_hook", None) is not None
+
+
+def test_evaluation_publish_does_not_replace_destination(
+    tiny_pretraining_run: Path,
+    fake_lm_eval,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replaced: list[Path] = []
+    real_replace = os.replace
+
+    def tracking_replace(src, dst, *args, **kwargs):
+        replaced.append(Path(dst))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", tracking_replace)
+    result = evaluate(tiny_evaluation_config(tiny_pretraining_run, tmp_path))
+    assert all(path != result.output for path in replaced)
+    assert result.output.exists()
+
+
+def test_compiled_scoring_kernel_receives_request_mask(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    original = tiny_session._compiled_scoring_kernel
+
+    def wrapping(length_bucket: int, batch_size_bucket: int, padding: str):
+        compiled = original(length_bucket, batch_size_bucket, padding)
+
+        def spy(*args, **kwargs):
+            captured.append((args, kwargs))
+            return compiled(*args, **kwargs)
+
+        return spy
+
+    monkeypatch.setattr(tiny_session, "_compiled_scoring_kernel", wrapping)
+    score_loglikelihood_batch(tiny_session, scoring_requests(3), padding="right")
+    assert captured
+    args, kwargs = captured[0]
+    values = list(args) + list(kwargs.values())
+    found = False
+    for value in values:
+        if getattr(value, "ndim", None) != 1:
+            continue
+        converted = value.tolist()
+        if converted == [True, True, True, False]:
+            found = True
+            break
+    assert found, "compiled scoring kernel did not receive a boolean request mask"

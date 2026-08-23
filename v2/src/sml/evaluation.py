@@ -107,13 +107,13 @@ def _encode_loglikelihood_request(
     else:
         continuation_start = len(context_ids)
 
-    bos_id = int(processor.bos_id())
-    if bos_id >= 0:
+    if continuation_start == 0:
+        bos_id = int(processor.bos_id())
         prefix_id = session.resolved_model.model_config.bos_token_id
+        if bos_id < 0:
+            raise SMLRuntimeError("empty context requires a usable prefix token")
         full_ids = [prefix_id, *full_ids]
         continuation_start += 1
-    elif continuation_start == 0:
-        raise SMLRuntimeError("empty context requires a usable prefix token")
 
     if continuation_start < 0:
         raise SMLRuntimeError("invalid continuation boundary")
@@ -208,6 +208,29 @@ class SMLEvalLM:
         raise SMLRuntimeError("unsupported evaluation method: loglikelihood_rolling")
 
 
+def _lm_eval_model(
+    session: InferenceSession,
+    padding: Literal["left", "right"],
+):
+    from lm_eval.api.model import LM
+
+    class _SMLEvalLMAdapter(LM):
+        def __init__(self, inner: SMLEvalLM) -> None:
+            super().__init__()
+            self._inner = inner
+
+        def loglikelihood(self, requests):
+            return self._inner.loglikelihood(requests)
+
+        def generate_until(self, requests):
+            return self._inner.generate_until(requests)
+
+        def loglikelihood_rolling(self, requests):
+            return self._inner.loglikelihood_rolling(requests)
+
+    return _SMLEvalLMAdapter(SMLEvalLM(session, padding=padding))
+
+
 def _provider_versions() -> tuple[tuple[str, str], ...]:
     found: list[tuple[str, str]] = []
     for name in _PROVIDER_PACKAGES:
@@ -272,10 +295,6 @@ def _persist_evaluation_result(result: EvaluationResult) -> None:
     text = _dumps_result(result)
     path = result.output
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        if path.read_text(encoding="utf-8") == text:
-            return
-        raise SMLRuntimeError(f"evaluation output collision: {path}")
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -287,15 +306,18 @@ def _persist_evaluation_result(result: EvaluationResult) -> None:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp_path, path)
+        try:
+            os.link(tmp_path, path)
+        except FileExistsError:
+            if path.read_text(encoding="utf-8") != text:
+                raise SMLRuntimeError(f"evaluation output collision: {path}") from None
         dir_fd = os.open(path.parent, os.O_RDONLY)
         try:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
-    except Exception:
+    finally:
         tmp_path.unlink(missing_ok=True)
-        raise
 
 
 def evaluate(config: EvaluationConfig) -> EvaluationResult:
@@ -307,7 +329,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
         runtime=config.runtime,
     )
     lm_eval = _import_lm_eval()
-    lm = SMLEvalLM(session, padding=config.padding)
+    lm = _lm_eval_model(session, padding=config.padding)
     lm_eval.simple_evaluate(
         model=lm,
         tasks=list(config.tasks),

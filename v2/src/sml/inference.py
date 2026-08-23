@@ -715,6 +715,7 @@ class InferenceSession:
         rows: list[list[int]] = []
         attention_rows: list[list[bool]] = []
         target_rows: list[list[bool]] = []
+        request_rows: list[bool] = []
         for _caller_index, token_ids, continuation_start, _length_bucket in members:
             padded_ids, attention, target_mask = _pad_scoring_row(
                 token_ids,
@@ -726,6 +727,7 @@ class InferenceSession:
             rows.append(padded_ids)
             attention_rows.append(attention)
             target_rows.append(target_mask)
+            request_rows.append(True)
         while len(rows) < batch_size_bucket:
             synthetic_ids = [pad_id] * length_bucket
             synthetic_attention = [False] * length_bucket
@@ -733,10 +735,12 @@ class InferenceSession:
             rows.append(synthetic_ids)
             attention_rows.append(synthetic_attention)
             target_rows.append([False] * length_bucket)
+            request_rows.append(False)
 
         input_ids = mx.array(rows, dtype=mx.int32)
         attention_mask = mx.array(attention_rows, dtype=mx.bool_)
         target_mask = mx.array(target_rows, dtype=mx.bool_)
+        request_mask = mx.array(request_rows, dtype=mx.bool_)
         positions = mx.cumsum(attention_mask.astype(mx.int32), axis=1) - 1
         positions = mx.where(
             attention_mask,
@@ -757,6 +761,7 @@ class InferenceSession:
                 attention_mask,
                 positions,
                 target_mask,
+                request_mask,
             )
             mx.eval(log_likelihood, greedy_match)
         finally:
@@ -789,6 +794,7 @@ class InferenceSession:
             attention_mask,
             positions,
             target_mask,
+            request_mask,
         ):
             logits, _cache_state, _next_key = model.forward_arrays(
                 parameters,
@@ -810,10 +816,10 @@ class InferenceSession:
             log_likelihood = mx.sum(
                 gathered * continuation_mask.astype(mx.float32),
                 axis=-1,
-            )
+            ) * request_mask.astype(mx.float32)
             greedy = mx.argmax(predictor, axis=-1)
             matches = (greedy == targets) | (~continuation_mask)
-            greedy_match = mx.all(matches, axis=-1)
+            greedy_match = mx.all(matches, axis=-1) | (~request_mask)
             return log_likelihood, greedy_match
 
         compiled = mx.compile(_score)
