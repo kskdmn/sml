@@ -230,30 +230,24 @@ def _prepared_bundle_builder(*, mutation: str | None = None):
         tokenizer_path.mkdir()
         tokenizer_manifest = _bundle_builder()(tokenizer_path)
         if mutation == "nested-model-logical-path":
-            vocab_bytes = (tokenizer_path / "tokenizer.vocab").read_bytes()
-            (tokenizer_path / "tokenizer.model").write_bytes(vocab_bytes)
-            shared_ref = _payload_ref(
-                tokenizer_path / "tokenizer.vocab", "tokenizer.vocab"
-            )
+            wrong_model = tokenizer_path / "wrong.model"
+            wrong_model.write_bytes((tokenizer_path / "tokenizer.model").read_bytes())
             tokenizer_manifest = replace(
                 tokenizer_manifest,
                 identity="sha256:" + "0" * 64,
-                model=shared_ref,
+                model=_payload_ref(wrong_model, "wrong.model"),
             )
             tokenizer_manifest = replace(
                 tokenizer_manifest,
                 identity=tokenizer_manifest.recompute_identity(),
             )
         elif mutation == "nested-vocab-logical-path":
-            model_bytes = (tokenizer_path / "tokenizer.model").read_bytes()
-            (tokenizer_path / "tokenizer.vocab").write_bytes(model_bytes)
-            shared_ref = _payload_ref(
-                tokenizer_path / "tokenizer.model", "tokenizer.model"
-            )
+            wrong_vocab = tokenizer_path / "wrong.vocab"
+            wrong_vocab.write_bytes((tokenizer_path / "tokenizer.vocab").read_bytes())
             tokenizer_manifest = replace(
                 tokenizer_manifest,
                 identity="sha256:" + "0" * 64,
-                vocab=shared_ref,
+                vocab=_payload_ref(wrong_vocab, "wrong.vocab"),
             )
             tokenizer_manifest = replace(
                 tokenizer_manifest,

@@ -93,6 +93,26 @@ def test_casefolded_paths_collide(tmp_path):
         root.verify_payloads(references, full=False)
 
 
+def test_exact_duplicate_logical_paths_reject_before_open(tmp_path, monkeypatch):
+    """Deduplicating references would hide an ambiguous manifest payload list."""
+    data = b"weights"
+    (tmp_path / "model.bin").write_bytes(data)
+    reference = _payload_ref("model.bin", data)
+    opened = False
+
+    def forbidden_open(*_args, **_kwargs):
+        nonlocal opened
+        opened = True
+        raise AssertionError("duplicate detection reached the filesystem")
+
+    with artifacts.ArtifactRoot.open(tmp_path, writable=False) as root:
+        monkeypatch.setattr(root, "open_payload", forbidden_open)
+        with pytest.raises(SMLArtifactError, match="duplicate logical payload path"):
+            root.verify_payloads((reference, reference), full=False)
+
+    assert opened is False
+
+
 def test_two_logical_paths_cannot_share_inode(tmp_path, monkeypatch):
     """Omitting inode tracking would let distinct names alias one payload object."""
     data = b"weights"

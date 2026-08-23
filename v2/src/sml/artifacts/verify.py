@@ -11,11 +11,14 @@ from sml.artifacts.checkpoint import (
     run_access_lock,
 )
 from sml.artifacts.manifest import (
+    CHECKPOINT_MANIFEST_TYPES,
+    RUN_MANIFEST_TYPES,
     ArtifactRoot,
     BaseSnapshotManifest,
     CheckpointManifest,
     ExportManifest,
     PretrainingDataManifest,
+    PretrainingRunManifest,
     RunManifest,
     SwagDataManifest,
     TokenizerManifest,
@@ -60,8 +63,8 @@ class VerificationResult:
             (
                 TokenizerManifest,
                 PretrainingDataManifest,
-                CheckpointManifest,
-                RunManifest,
+                *CHECKPOINT_MANIFEST_TYPES,
+                *RUN_MANIFEST_TYPES,
                 BaseSnapshotManifest,
                 SwagDataManifest,
                 ExportManifest,
@@ -167,7 +170,7 @@ def verify_artifact(path: Path, full: bool) -> VerificationResult:
     if not isinstance(full, bool):
         raise TypeError("full must be a bool")
     level = VerificationLevel.FULL if full else VerificationLevel.MANIFEST_TRUSTED
-    if path.joinpath(RunManifest.MANIFEST_FILENAME).exists():
+    if path.joinpath(PretrainingRunManifest.MANIFEST_FILENAME).exists():
         return _verify_run(path, level)
     return _verify_bundle(path, level)
 

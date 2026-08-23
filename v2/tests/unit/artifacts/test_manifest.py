@@ -11,16 +11,19 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from sml.artifacts import manifest as manifest_module
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
     BaseSnapshotManifest,
-    CheckpointManifest,
     ExportManifest,
     LatestIndex,
+    LoRACheckpointManifest,
+    LoRARunManifest,
     PayloadRef,
+    PretrainingCheckpointManifest,
     PretrainingDataManifest,
-    RunManifest,
+    PretrainingRunManifest,
     SwagDataManifest,
     TokenizerManifest,
     VerificationLevel,
@@ -67,10 +70,12 @@ def tokenizer_manifest_fixture(**overrides: object) -> TokenizerManifest:
     return TokenizerManifest(**values)
 
 
-def _array_payload(path: str = "model.safetensors") -> ArrayPayloadRef:
+def _array_payload(
+    path: str = "model.safetensors", *, dtype: str = "float32"
+) -> ArrayPayloadRef:
     return ArrayPayloadRef(
         payload=PayloadRef(path, IDENTITY_A, 100),
-        arrays=(ArraySpec("weight", (2, 3), "float32"),),
+        arrays=(ArraySpec("weight", (2, 3), dtype),),
     )
 
 
@@ -95,31 +100,56 @@ def manifest_fixtures() -> tuple[object, ...]:
             diagnostic_source_locator="/corpus",
             row_content_identity=IDENTITY_C,
         ),
-        CheckpointManifest(
-            kind="checkpoint",
+        PretrainingCheckpointManifest(
+            kind="pretraining-checkpoint",
             version=1,
             identity=IDENTITY_A,
             owning_run_identity=IDENTITY_B,
-            checkpoint_kind="pretraining",
             step=4,
             scalar_state=PayloadRef("state.json", IDENTITY_C, 30),
-            arrays=(_array_payload(),),
+            model=_array_payload(dtype="bfloat16"),
+            master=_array_payload("master.safetensors"),
+            optimizer=_array_payload("optimizer.safetensors"),
+            trainer=_array_payload("trainer.safetensors"),
         ),
-        RunManifest(
-            kind="run",
+        LoRACheckpointManifest(
+            kind="lora-checkpoint",
             version=1,
             identity=IDENTITY_A,
-            run_kind="pretraining",
+            owning_run_identity=IDENTITY_B,
+            step=4,
+            scalar_state=PayloadRef("state.json", IDENTITY_C, 30),
+            adapters=_array_payload("adapters.safetensors"),
+            optimizer=_array_payload("optimizer.safetensors"),
+            trainer=_array_payload("trainer.safetensors"),
+        ),
+        PretrainingRunManifest(
+            kind="pretraining-run",
+            version=1,
+            identity=IDENTITY_A,
             model={"rope_scaling_factor": 1.0, "hidden_size": 8},
             precision={"compute": "bfloat16", "master": "float32"},
             optimizer={"kind": "adam"},
             loader={"batch_size": 1},
             checkpoint={"interval": 5},
             tokenizer_identity=IDENTITY_B,
-            base_identity=None,
             data_identity=IDENTITY_C,
             diagnostic_data_locator="/data",
-            diagnostic_source_locator="/source-run",
+        ),
+        LoRARunManifest(
+            kind="lora-run",
+            version=1,
+            identity=IDENTITY_A,
+            model={"rope_scaling_factor": 1.0, "hidden_size": 8},
+            lora={"rank": 16},
+            precision={"adapter": "float32"},
+            optimizer={"kind": "adam"},
+            loader={"batch_size": 1},
+            checkpoint={"interval": 5},
+            tokenizer_identity=IDENTITY_B,
+            base_identity=IDENTITY_A,
+            data_identity=IDENTITY_C,
+            diagnostic_data_locator="/swag-data",
         ),
         LatestIndex(
             kind="latest-index",
@@ -298,22 +328,48 @@ def test_all_manifest_outer_field_sets_are_frozen():
             "diagnostic_source_locator",
             "row_content_identity",
         },
-        CheckpointManifest: {
+        PretrainingCheckpointManifest: {
             "kind",
             "version",
             "identity",
             "owning_run_identity",
-            "checkpoint_kind",
             "step",
             "scalar_state",
-            "arrays",
+            "model",
+            "master",
+            "optimizer",
+            "trainer",
         },
-        RunManifest: {
+        LoRACheckpointManifest: {
             "kind",
             "version",
             "identity",
-            "run_kind",
+            "owning_run_identity",
+            "step",
+            "scalar_state",
+            "adapters",
+            "optimizer",
+            "trainer",
+        },
+        PretrainingRunManifest: {
+            "kind",
+            "version",
+            "identity",
             "model",
+            "precision",
+            "optimizer",
+            "loader",
+            "checkpoint",
+            "tokenizer_identity",
+            "data_identity",
+            "diagnostic_data_locator",
+        },
+        LoRARunManifest: {
+            "kind",
+            "version",
+            "identity",
+            "model",
+            "lora",
             "precision",
             "optimizer",
             "loader",
@@ -322,7 +378,6 @@ def test_all_manifest_outer_field_sets_are_frozen():
             "base_identity",
             "data_identity",
             "diagnostic_data_locator",
-            "diagnostic_source_locator",
         },
         LatestIndex: {
             "kind",
@@ -382,12 +437,97 @@ def test_all_manifest_outer_field_sets_are_frozen():
             manifest.identity = IDENTITY_B
 
 
+def test_run_and_checkpoint_schema_kinds_are_distinct_and_strict():
+    """One optional-field container cannot freeze pretraining and LoRA contracts."""
+    required = (
+        "PretrainingRunManifest",
+        "LoRARunManifest",
+        "PretrainingCheckpointManifest",
+        "LoRACheckpointManifest",
+    )
+    missing = [name for name in required if not hasattr(manifest_module, name)]
+    assert missing == []
+
+    run_kinds = {
+        manifest_module.PretrainingRunManifest.EXPECTED_KIND,
+        manifest_module.LoRARunManifest.EXPECTED_KIND,
+    }
+    checkpoint_kinds = {
+        manifest_module.PretrainingCheckpointManifest.EXPECTED_KIND,
+        manifest_module.LoRACheckpointManifest.EXPECTED_KIND,
+    }
+    assert run_kinds == {"pretraining-run", "lora-run"}
+    assert checkpoint_kinds == {"pretraining-checkpoint", "lora-checkpoint"}
+
+
+@pytest.mark.parametrize(
+    ("manifest_index", "manifest_type", "foreign_field"),
+    [
+        (2, PretrainingCheckpointManifest, "adapters"),
+        (4, PretrainingRunManifest, "base_identity"),
+    ],
+)
+def test_pretraining_schemas_reject_lora_only_fields(
+    tmp_path, manifest_index, manifest_type, foreign_field
+):
+    """A foreign-kind field must fail before it can alter a frozen schema."""
+    raw = json.loads(canonical_json_bytes(manifest_fixtures()[manifest_index]))
+    raw[foreign_field] = raw.get("model", raw.get("master"))
+    (tmp_path / manifest_type.MANIFEST_FILENAME).write_text(
+        json.dumps(raw), encoding="utf-8"
+    )
+
+    with pytest.raises(SMLArtifactError, match=f"unknown field.*{foreign_field}"):
+        read_manifest(tmp_path, manifest_type, VerificationLevel.MANIFEST_TRUSTED)
+
+
+def test_sequence_manifests_reject_exact_duplicate_payload_paths():
+    """Repeated shards or checkpoint groups must not acquire order semantics."""
+    shard = PayloadRef("shards/train-000000.npy", IDENTITY_A, 128)
+    with pytest.raises((SMLArtifactError, ValueError), match="duplicate.*payload"):
+        PretrainingDataManifest(
+            kind="pretraining-data",
+            version=1,
+            identity=IDENTITY_A,
+            sequence_length=3,
+            row_width=4,
+            dtype="int32",
+            shard_row_counts=(2, 2),
+            shards=(shard, shard),
+            preparation_seed=1729,
+            row_order_policy={"kind": "windowed-row-shuffle-v1", "rows": 32},
+            tokenizer_identity=IDENTITY_B,
+            tokenizer_model=PayloadRef("tokenizer/tokenizer.model", IDENTITY_B, 10),
+            tokenizer_vocab=PayloadRef("tokenizer/tokenizer.vocab", IDENTITY_C, 20),
+            source_summary={"files": 2, "documents": 5},
+            diagnostic_source_locator="/corpus",
+            row_content_identity=IDENTITY_C,
+        )
+
+    group = _array_payload()
+    with pytest.raises(SMLArtifactError, match="duplicate.*payload"):
+        PretrainingCheckpointManifest(
+            kind="pretraining-checkpoint",
+            version=1,
+            identity=IDENTITY_A,
+            owning_run_identity=IDENTITY_B,
+            step=4,
+            scalar_state=PayloadRef("state.json", IDENTITY_C, 30),
+            model=group,
+            master=group,
+            optimizer=_array_payload("optimizer.safetensors"),
+            trainer=_array_payload("trainer.safetensors"),
+        )
+
+
 def test_strict_manifest_parser_round_trips_every_schema(tmp_path):
     """A missing schema registration would make a declared artifact unreadable."""
     filenames = (
         "manifest.json",
         "manifest.json",
         "checkpoint.json",
+        "checkpoint.json",
+        "run.json",
         "run.json",
         "latest.json",
         "manifest.json",
@@ -475,35 +615,21 @@ def test_manifest_constructor_rejects_boolean_schema_version():
         tokenizer_manifest_fixture(version=True)
 
 
-@pytest.mark.parametrize(
-    ("run_kind", "base_identity", "rope_scaling_factor", "message"),
-    [
-        ("pretraining", None, 2.0, "rope_scaling_factor"),
-        ("pretraining", IDENTITY_A, 1.0, "base_identity"),
-        ("lora", None, 1.0, "base_identity"),
-        ("other", IDENTITY_A, 1.0, "run_kind"),
-    ],
-)
-def test_run_manifest_rejects_lineage_and_pretraining_rope_mutations(
-    run_kind, base_identity, rope_scaling_factor, message
-):
+def test_pretraining_run_manifest_rejects_noncanonical_rope_factor():
     """Relaxing run lineage or base RoPE would make resume semantics ambiguous."""
-    with pytest.raises((TypeError, ValueError, SMLArtifactError), match=message):
-        RunManifest(
-            kind="run",
+    with pytest.raises(ValueError, match="rope_scaling_factor"):
+        PretrainingRunManifest(
+            kind="pretraining-run",
             version=1,
             identity=IDENTITY_A,
-            run_kind=run_kind,
-            model={"rope_scaling_factor": rope_scaling_factor},
+            model={"rope_scaling_factor": 2.0},
             precision={},
             optimizer={},
             loader={},
             checkpoint={},
             tokenizer_identity=IDENTITY_B,
-            base_identity=base_identity,
             data_identity=IDENTITY_C,
             diagnostic_data_locator=None,
-            diagnostic_source_locator=None,
         )
 
 

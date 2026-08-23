@@ -163,7 +163,7 @@ def test_part1_tokenizer_to_resumed_pretraining(tmp_path: Path) -> None:
     assert verified.manifest.identity == exact.run.identity
     assert verified.verification is VerificationLevel.FULL
     assert {child.manifest.kind for child in verified.children} == {
-        "checkpoint",
+        "pretraining-checkpoint",
         "tokenizer",
     }
     assert [path.name for path in (resumed.run / "checkpoints").iterdir()] == [

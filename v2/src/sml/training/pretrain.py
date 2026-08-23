@@ -14,22 +14,21 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from sml.artifacts.checkpoint import (
     Published,
     ResolvedStep,
-    apply_retention,
+    open_checkpoint_reader,
+    prune_to_latest,
     publish_checkpoint,
     publish_run,
-    resolve_exact_step,
     resolve_latest_step,
-    run_access_lock,
     run_writer_lock,
 )
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
     ArtifactRoot,
-    CheckpointManifest,
     PayloadRef,
+    PretrainingCheckpointManifest,
     PretrainingDataManifest,
-    RunManifest,
+    PretrainingRunManifest,
     TokenizerManifest,
     VerificationLevel,
     canonical_json_bytes,
@@ -41,6 +40,7 @@ from sml.data.pretraining import (
     PretrainingBatchStream,
     PretrainingCursor,
     canonicalize_pretraining_cursor,
+    preflight_pretraining_bundle,
 )
 from sml.errors import SMLArtifactError, SMLConfigurationError, SMLDataError
 from sml.model.config import ModelConfig
@@ -405,26 +405,19 @@ def _parse_scalar_document(
         raise SMLArtifactError("invalid checkpoint scalar state") from error
 
 
-def _read_scalar_file(resolved: ResolvedStep) -> ScalarTrainingState:
-    with (
-        ArtifactRoot.open(resolved.step_directory, writable=False) as root,
-        root.open_payload("state.json") as payload,
-    ):
-        return _parse_scalar_document(payload.read(), resolved)
-
-
 def read_scalar_state(resolved: ResolvedStep) -> ScalarTrainingState:
     if not isinstance(resolved, ResolvedStep):
         raise TypeError("resolved must be a ResolvedStep")
-    with run_access_lock(resolved.step_directory.parent.parent, exclusive=False):
-        verified = resolve_exact_step(
-            resolved.step_directory.parent.parent,
-            step=resolved.step,
-            verification=VerificationLevel.FULL,
+    with open_checkpoint_reader(
+        resolved.step_directory.parent.parent,
+        step=resolved.step,
+        expected_checkpoint_identity=resolved.checkpoint.identity,
+    ) as reader:
+        contents = reader.read_contents()
+        return _parse_scalar_document(
+            canonical_json_bytes(dict(contents.scalar_state)),
+            reader.resolved,
         )
-        if verified.checkpoint.identity != resolved.checkpoint.identity:
-            raise SMLArtifactError("resolved checkpoint changed before scalar loading")
-        return _read_scalar_file(verified)
 
 
 def _dtype_name(array: mx.array) -> str:
@@ -502,7 +495,7 @@ def _require_empty_trainer_state(trainer: TrainerState) -> None:
 
 
 def _checkpoint_builder(
-    run_manifest: RunManifest,
+    run_manifest: PretrainingRunManifest,
     state: _RestoredTrainingState,
 ):
     parameters = BaseParameterState(
@@ -557,7 +550,7 @@ def _checkpoint_builder(
                     "optimizer/trainer checkpoint shapes must match master shapes"
                 )
 
-    def build(private_step: Path) -> CheckpointManifest:
+    def build(private_step: Path) -> PretrainingCheckpointManifest:
         references: list[ArrayPayloadRef] = []
         for logical_path in _CHECKPOINT_ARRAY_PATHS:
             arrays = groups[logical_path]
@@ -575,55 +568,28 @@ def _checkpoint_builder(
         )
         with state_path.open("rb") as payload:
             state_identity = file_identity(payload)
-        manifest = CheckpointManifest(
-            kind="checkpoint",
+        references_by_path = {
+            reference.payload.logical_path: reference for reference in references
+        }
+        manifest = PretrainingCheckpointManifest(
+            kind="pretraining-checkpoint",
             version=1,
             identity=_PLACEHOLDER_IDENTITY,
             owning_run_identity=run_manifest.identity,
-            checkpoint_kind="pretraining",
             step=state.scalar.step,
             scalar_state=PayloadRef(
                 "state.json",
                 state_identity,
                 state_path.stat().st_size,
             ),
-            arrays=tuple(references),
+            model=references_by_path["model.safetensors"],
+            master=references_by_path["master.safetensors"],
+            optimizer=references_by_path["optimizer.safetensors"],
+            trainer=references_by_path["trainer.safetensors"],
         )
         return replace(manifest, identity=manifest.recompute_identity())
 
     return build
-
-
-def _load_array_groups(resolved: ResolvedStep) -> dict[str, dict[str, mx.array]]:
-    references = {
-        array.payload.logical_path: array for array in resolved.checkpoint.arrays
-    }
-    if set(references) != set(_CHECKPOINT_ARRAY_PATHS):
-        raise SMLArtifactError("pretraining checkpoint has invalid array payloads")
-    loaded: dict[str, dict[str, mx.array]] = {}
-    with ArtifactRoot.open(resolved.step_directory, writable=False) as root:
-        for logical_path in _CHECKPOINT_ARRAY_PATHS:
-            with root.open_payload(logical_path) as payload:
-                arrays = mx.load(payload, format="safetensors")
-            if not isinstance(arrays, dict):
-                raise SMLArtifactError(
-                    "checkpoint array payload must contain a mapping"
-                )
-            reference = references[logical_path]
-            expected = {spec.name: spec for spec in reference.arrays}
-            if set(arrays) != set(expected):
-                raise SMLArtifactError(
-                    f"checkpoint array keys mismatch: {logical_path}"
-                )
-            for name, array in arrays.items():
-                spec = expected[name]
-                if tuple(array.shape) != spec.shape or _dtype_name(array) != spec.dtype:
-                    raise SMLArtifactError(
-                        f"checkpoint array metadata mismatch: {logical_path}:{name}"
-                    )
-            loaded[logical_path] = dict(sorted(arrays.items()))
-    mx.eval(*(array for group in loaded.values() for array in group.values()))
-    return loaded
 
 
 def _unflatten_prefixed(arrays: Mapping[str, mx.array], prefix: str) -> dict:
@@ -638,67 +604,78 @@ def _unflatten_prefixed(arrays: Mapping[str, mx.array], prefix: str) -> dict:
 
 
 def _restore_checkpoint(resolved: ResolvedStep) -> _RestoredTrainingState:
-    with run_access_lock(resolved.step_directory.parent.parent, exclusive=False):
-        verified = resolve_exact_step(
-            resolved.step_directory.parent.parent,
-            step=resolved.step,
-            verification=VerificationLevel.FULL,
+    with open_checkpoint_reader(
+        resolved.step_directory.parent.parent,
+        step=resolved.step,
+        expected_checkpoint_identity=resolved.checkpoint.identity,
+    ) as reader:
+        verified = reader.resolved
+        if not isinstance(verified.checkpoint, PretrainingCheckpointManifest):
+            raise SMLArtifactError("pretraining requires a pretraining checkpoint")
+        contents = reader.read_contents()
+        scalar = _parse_scalar_document(
+            canonical_json_bytes(dict(contents.scalar_state)),
+            verified,
         )
-        if verified.checkpoint.identity != resolved.checkpoint.identity:
-            raise SMLArtifactError("resolved checkpoint changed before state loading")
-        scalar = _read_scalar_file(verified)
-        groups = _load_array_groups(verified)
+        groups = {
+            logical_path: dict(contents.array_groups[logical_path])
+            for logical_path in _CHECKPOINT_ARRAY_PATHS
+        }
 
-    masters = groups["master.safetensors"]
-    working = groups["model.safetensors"]
-    try:
-        parameters = BaseParameterState(
-            tree_unflatten(list(masters.items())),
-            tree_unflatten(list(working.items())),
-        )
-        optimizer_arrays = groups["optimizer.safetensors"]
-        if set(optimizer_arrays) != {
-            "step",
-            *(f"first_moments.{name}" for name in masters),
-            *(f"second_moments.{name}" for name in masters),
-        }:
-            raise SMLArtifactError("optimizer checkpoint keys do not match masters")
-        for name, master in masters.items():
-            for prefix in ("first_moments.", "second_moments."):
-                if optimizer_arrays[f"{prefix}{name}"].shape != master.shape:
+        masters = groups["master.safetensors"]
+        working = groups["model.safetensors"]
+        try:
+            parameters = BaseParameterState(
+                tree_unflatten(list(masters.items())),
+                tree_unflatten(list(working.items())),
+            )
+            optimizer_arrays = groups["optimizer.safetensors"]
+            if set(optimizer_arrays) != {
+                "step",
+                *(f"first_moments.{name}" for name in masters),
+                *(f"second_moments.{name}" for name in masters),
+            }:
+                raise SMLArtifactError("optimizer checkpoint keys do not match masters")
+            for name, master in masters.items():
+                for prefix in ("first_moments.", "second_moments."):
+                    if optimizer_arrays[f"{prefix}{name}"].shape != master.shape:
+                        raise SMLArtifactError(
+                            "optimizer checkpoint shapes do not match masters"
+                        )
+            optimizer = AdamState(
+                optimizer_arrays["step"],
+                _unflatten_prefixed(optimizer_arrays, "first_moments."),
+                _unflatten_prefixed(optimizer_arrays, "second_moments."),
+            )
+            trainer_arrays = groups["trainer.safetensors"]
+            if set(trainer_arrays) != {
+                "accumulation_count",
+                "next_key",
+                "loss_numerator",
+                *(f"accumulators.{name}" for name in masters),
+            }:
+                raise SMLArtifactError("trainer checkpoint keys do not match masters")
+            for name, master in masters.items():
+                if trainer_arrays[f"accumulators.{name}"].shape != master.shape:
                     raise SMLArtifactError(
-                        "optimizer checkpoint shapes do not match masters"
+                        "trainer checkpoint shapes do not match masters"
                     )
-        optimizer = AdamState(
-            optimizer_arrays["step"],
-            _unflatten_prefixed(optimizer_arrays, "first_moments."),
-            _unflatten_prefixed(optimizer_arrays, "second_moments."),
-        )
-        trainer_arrays = groups["trainer.safetensors"]
-        if set(trainer_arrays) != {
-            "accumulation_count",
-            "next_key",
-            "loss_numerator",
-            *(f"accumulators.{name}" for name in masters),
-        }:
-            raise SMLArtifactError("trainer checkpoint keys do not match masters")
-        for name, master in masters.items():
-            if trainer_arrays[f"accumulators.{name}"].shape != master.shape:
-                raise SMLArtifactError("trainer checkpoint shapes do not match masters")
-        trainer = TrainerState(
-            _unflatten_prefixed(trainer_arrays, "accumulators."),
-            trainer_arrays["accumulation_count"],
-            trainer_arrays["next_key"],
-            trainer_arrays["loss_numerator"],
-        )
-        _require_empty_trainer_state(trainer)
-        if int(optimizer.step.item()) != scalar.step:
-            raise SMLArtifactError("checkpoint Adam step does not match scalar step")
-        return _RestoredTrainingState(parameters, optimizer, trainer, scalar)
-    except SMLArtifactError:
-        raise
-    except (SMLConfigurationError, TypeError, ValueError) as error:
-        raise SMLArtifactError("invalid pretraining checkpoint arrays") from error
+            trainer = TrainerState(
+                _unflatten_prefixed(trainer_arrays, "accumulators."),
+                trainer_arrays["accumulation_count"],
+                trainer_arrays["next_key"],
+                trainer_arrays["loss_numerator"],
+            )
+            _require_empty_trainer_state(trainer)
+            if int(optimizer.step.item()) != scalar.step:
+                raise SMLArtifactError(
+                    "checkpoint Adam step does not match scalar step"
+                )
+            return _RestoredTrainingState(parameters, optimizer, trainer, scalar)
+        except SMLArtifactError:
+            raise
+        except (SMLConfigurationError, TypeError, ValueError) as error:
+            raise SMLArtifactError("invalid pretraining checkpoint arrays") from error
 
 
 def _copy_run_tokenizer(data: Path, private_run: Path) -> None:
@@ -752,9 +729,9 @@ def _verified_data(
         model.unk_token_id,
     ):
         raise SMLArtifactError("prepared-data tokenizer metadata does not match model")
-    if sum(manifest.shard_row_counts) < loader.microbatch_size:
-        raise SMLArtifactError("prepared data has no full runtime batch")
-    return PreparedDataBundle(path, manifest, VerificationLevel.FULL)
+    bundle = PreparedDataBundle(path, manifest, VerificationLevel.FULL)
+    preflight_pretraining_bundle(bundle, batch_size=loader.microbatch_size)
+    return bundle
 
 
 def _resolved_fresh_config(config: PretrainingConfig) -> PretrainingConfig:
@@ -773,7 +750,9 @@ def _resolved_fresh_config(config: PretrainingConfig) -> PretrainingConfig:
     return config
 
 
-def _run_manifest(config: PretrainingConfig, data: PreparedDataBundle) -> RunManifest:
+def _run_manifest(
+    config: PretrainingConfig, data: PreparedDataBundle
+) -> PretrainingRunManifest:
     checkpoint = {
         "interval": config.checkpoint.interval,
         "maximum_steps": config.maximum_steps,
@@ -782,21 +761,18 @@ def _run_manifest(config: PretrainingConfig, data: PreparedDataBundle) -> RunMan
         "seed": config.seed,
         "compile": config.compile,
     }
-    manifest = RunManifest(
-        kind="run",
+    manifest = PretrainingRunManifest(
+        kind="pretraining-run",
         version=1,
         identity=_PLACEHOLDER_IDENTITY,
-        run_kind="pretraining",
         model=dataclasses.asdict(config.model),
         precision=dataclasses.asdict(config.precision),
         optimizer=dataclasses.asdict(config.optimizer),
         loader=dataclasses.asdict(config.loader),
         checkpoint=checkpoint,
         tokenizer_identity=data.manifest.tokenizer_identity,
-        base_identity=None,
         data_identity=data.manifest.identity,
         diagnostic_data_locator=str(config.data),
-        diagnostic_source_locator=None,
     )
     return replace(manifest, identity=manifest.recompute_identity())
 
@@ -810,7 +786,7 @@ def _mapping_dict(value: object, name: str) -> dict[str, object]:
 def _config_from_run(
     run: Path,
     data: Path,
-    manifest: RunManifest,
+    manifest: PretrainingRunManifest,
     overrides: ResumeOverrides,
 ) -> PretrainingConfig:
     try:
@@ -900,11 +876,11 @@ def _limit_reached(config: PretrainingConfig, state: ScalarTrainingState) -> boo
 
 def _publish_training_state(
     run: Path,
-    manifest: RunManifest,
+    manifest: PretrainingRunManifest,
     state: _RestoredTrainingState,
 ) -> ResolvedStep:
     published = publish_checkpoint(run, _checkpoint_builder(manifest, state))
-    retained = apply_retention(run, keep_last=1)
+    retained = prune_to_latest(run)
     _require_retained_publication(published, retained)
     if retained.step != published.step:
         raise SMLArtifactError("retention did not preserve the published latest step")
@@ -930,7 +906,7 @@ def _training_result(run: Path, state: ScalarTrainingState) -> TrainingResult:
 
 def _run_training(
     run: Path,
-    manifest: RunManifest,
+    manifest: PretrainingRunManifest,
     config: PretrainingConfig,
     model: SMLLanguageModel,
     restored: _RestoredTrainingState,
@@ -1026,7 +1002,7 @@ def train(config: PretrainingConfig) -> TrainingResult:
             )
             manifest = _run_manifest(config, data)
 
-            def build(private_run: Path) -> RunManifest:
+            def build(private_run: Path) -> PretrainingRunManifest:
                 nonlocal runtime
                 _copy_run_tokenizer(config.data, private_run)
                 (private_run / "checkpoints").mkdir()
@@ -1038,7 +1014,9 @@ def train(config: PretrainingConfig) -> TrainingResult:
                 )
                 return manifest
 
-            published: Published[RunManifest] = publish_run(config.output_run, build)
+            published: Published[PretrainingRunManifest] = publish_run(
+                config.output_run, build
+            )
             if runtime is None:
                 raise SMLArtifactError("fresh run builder did not return runtime state")
             if published.manifest.identity != manifest.identity:
@@ -1074,8 +1052,10 @@ def resume(
             resolved = resolve_latest_step(
                 run,
                 writable=False,
-                verification=VerificationLevel.FULL,
+                verification=VerificationLevel.MANIFEST_TRUSTED,
             )
+            if not isinstance(resolved.run, PretrainingRunManifest):
+                raise SMLArtifactError("pretraining resume requires a pretraining run")
             diagnostic = resolved.run.diagnostic_data_locator
             data_path = (
                 data if data is not None else (Path(diagnostic) if diagnostic else None)
@@ -1107,7 +1087,7 @@ def resume(
                 raise SMLArtifactError(
                     "checkpoint cursor is not in canonical prepared-data form"
                 )
-            retained = apply_retention(run, keep_last=1)
+            retained = prune_to_latest(run)
             if retained.checkpoint.identity != resolved.checkpoint.identity:
                 raise SMLArtifactError(
                     "latest checkpoint changed during writable recovery"

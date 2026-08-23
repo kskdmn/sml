@@ -155,26 +155,30 @@ def test_harness_identity_hashes_only_the_two_reviewed_files_in_order():
     assert harness_content_identity(ROOT) == f"sha256:{expected.hexdigest()}"
 
 
-def test_workload_separately_binds_the_complete_sml_production_source_tree(
+def test_workload_binds_an_exact_closed_base_training_import_surface(
     canonical_workload,
     tmp_path,
 ):
     expected_components = tuple(
-        path.as_posix()
-        for path in sorted(
-            {
-                Path("v2/src/sml.py"),
-                Path("v2/benchmarks/schema.py"),
-                Path("v2/benchmarks/workload.py"),
-                *(
-                    path.relative_to(ROOT)
-                    for path in (ROOT / "v2/src/sml").rglob("*.py")
-                ),
-            },
-            key=lambda path: path.as_posix(),
-        )
+        path.as_posix() for path in production_dependency_components(ROOT)
     )
     assert canonical_workload.production_dependency_components == expected_components
+    assert "v2/src/sml/training/pretrain.py" in expected_components
+    assert "v2/src/sml/model/language_model.py" in expected_components
+    assert "v2/src/sml/artifacts/checkpoint.py" in expected_components
+    assert "v2/src/sml/inference.py" not in expected_components
+    assert "v2/src/sml/cli.py" not in expected_components
+    quality_module._validate_production_dependency_closure(
+        ROOT,
+        tuple(Path(path) for path in expected_components),
+    )
+    omitted = tuple(
+        Path(path)
+        for path in expected_components
+        if path != "v2/src/sml/model/layers.py"
+    )
+    with pytest.raises(ValueError, match="closure|omitted|incomplete"):
+        quality_module._validate_production_dependency_closure(ROOT, omitted)
     assert (
         tuple(path.as_posix() for path in production_dependency_components(ROOT))
         == expected_components
@@ -197,6 +201,58 @@ def test_workload_separately_binds_the_complete_sml_production_source_tree(
     assert harness_content_identity(tmp_path) == original_harness
     assert production_dependency_content_identity(tmp_path) != (
         canonical_workload.production_dependency_identity
+    )
+
+
+def test_production_provenance_ignores_an_unrelated_future_sml_module(tmp_path):
+    components = production_dependency_components(ROOT)
+    for relative in (
+        *quality_module.HARNESS_COMPONENTS,
+        *quality_module.PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
+        *components,
+    ):
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, destination)
+
+    before_components = production_dependency_components(tmp_path)
+    before_identity = production_dependency_content_identity(tmp_path)
+    unrelated = tmp_path / "v2/src/sml/inference.py"
+    unrelated.write_text("UNRELATED_FUTURE_MODULE = True\n")
+
+    assert production_dependency_components(tmp_path) == before_components
+    assert production_dependency_content_identity(tmp_path) == before_identity
+
+
+def test_recording_command_and_session_identity_are_checkout_portable(tmp_path):
+    left_root = tmp_path / "left"
+    right_root = tmp_path / "a-much-longer-relocated-checkout"
+    left_destinations = quality_module._canonical_evidence_destinations(
+        left_root,
+        left_root / quality_module.CANONICAL_MANIFEST_PATH,
+        left_root / quality_module.CANONICAL_RAW_PATH,
+        left_root / quality_module.CANONICAL_REPORT_PATH,
+    )
+    right_destinations = quality_module._canonical_evidence_destinations(
+        right_root,
+        right_root / quality_module.CANONICAL_MANIFEST_PATH,
+        right_root / quality_module.CANONICAL_RAW_PATH,
+        right_root / quality_module.CANONICAL_REPORT_PATH,
+    )
+
+    left = quality_module._recording_command_document(left_root, left_destinations)
+    right = quality_module._recording_command_document(right_root, right_destinations)
+
+    assert left == right
+    assert "resolved_destinations" not in left
+    assert quality_module._recording_session_identity(
+        "a" * 40,
+        "sha256:" + "b" * 64,
+        left,
+    ) == quality_module._recording_session_identity(
+        "a" * 40,
+        "sha256:" + "b" * 64,
+        right,
     )
 
 
@@ -280,7 +336,7 @@ def test_re_signed_descendant_cannot_reuse_evidence_after_artifact_source_change
         recording_session_identity=session_identity,
     )
 
-    with pytest.raises(ValueError, match="production source tree"):
+    with pytest.raises(ValueError, match="production import closure"):
         quality_module._validate_manifest(
             re_signed,
             canonical_workload,
@@ -860,9 +916,9 @@ def test_manifest_fields_and_output_paths_fail_closed(canonical_workload, tmp_pa
     assert manifest["artifact_byte_sizes"]["manifest"] == len(
         quality_module.canonical_json_bytes(manifest)
     )
-    changed_resolved_destinations = {
-        **command["resolved_destinations"],
-        "report": (tmp_path / "forged-report.json").resolve().as_posix(),
+    changed_destinations = {
+        **command["destinations"],
+        "report": "v2/benchmarks/results/forged-report.json",
     }
     for name, value in (
         ("recording_command", {**command, "argv": ["record", "--steps", "10"]}),
@@ -870,7 +926,7 @@ def test_manifest_fields_and_output_paths_fail_closed(canonical_workload, tmp_pa
             "recording_command",
             {
                 **command,
-                "resolved_destinations": changed_resolved_destinations,
+                "destinations": changed_destinations,
             },
         ),
         (
@@ -896,7 +952,7 @@ def test_manifest_fields_and_output_paths_fail_closed(canonical_workload, tmp_pa
         forged = {**manifest, name: value}
         body = {key: item for key, item in forged.items() if key != "identity"}
         forged["identity"] = quality_module.structured_identity(
-            "sml-pretraining-quality-manifest-v2", body
+            "sml-pretraining-quality-manifest-v3", body
         )
         with pytest.raises(ValueError):
             quality_module._validate_manifest_fields(

@@ -995,7 +995,7 @@ evidence commit is required.
 - The only accepted TOML root tables are exactly `[tokenize]`, `[prepare.pretraining]`, `[prepare.swag]`, `[train]`, `[infer]`, `[evaluate]`, `[finetune]`, `[export]`, and `[verify]`. A file passed to one command must contain exactly that command table and its documented nested policy tables; sibling command tables and unknown keys fail.
 - CLI functions parse to frozen command-specific DTOs, construct the owner module's domain dataclasses, import the owner workflow functions only after validation, print typed results, and map focused domain exceptions to stable nonzero exit codes. A DTO may contain CLI-only selection fields such as `resume`, `step`, `full`, or `output`, but domain dataclasses contain only the fields defined by their owner tasks.
 - `argparse.Namespace` never enters a domain API.
-- Resume accepts only maximum steps/epochs, logging interval, checkpoint interval, retention, and optional identity-matching `--data` location.
+- Resume accepts only maximum steps/epochs, logging interval, checkpoint interval, and an optional identity-matching `--data` location; checkpoint storage is always pruned to latest-only.
 - The overlay mapper uses the exact domain paths below; it never relies on same-named flat attributes:
 
 | TOML/CLI field | Domain destination |
@@ -1005,7 +1005,6 @@ evidence commit is required.
 | `*.prefetch_depth` / `--prefetch-depth` | `loader.prefetch_depth` |
 | `*.learning_rate` / `--learning-rate` | `optimizer.learning_rate` |
 | `*.checkpoint_interval` / `--checkpoint-interval` | `checkpoint.interval` on fresh runs; `ResumeOverrides.checkpoint_interval` on resume |
-| `*.keep_last` / `--keep-last` | `checkpoint.keep_last` on fresh runs; `ResumeOverrides.retention` on resume |
 | `*.maximum_steps`, `*.maximum_epochs`, `*.log_interval` | the same field on fresh training configs or `ResumeOverrides` on resume |
 | `prepare.swag.revision` / `--revision` | `source.revision` |
 

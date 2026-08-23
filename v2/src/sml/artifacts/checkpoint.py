@@ -5,6 +5,7 @@ import dataclasses
 import errno
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -16,26 +17,38 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast, runtime_checkable
+from types import ModuleType
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
+
+if TYPE_CHECKING:
+    import mlx.core as mx
 
 from sml.artifacts.manifest import (
+    CHECKPOINT_MANIFEST_TYPES,
+    RUN_MANIFEST_TYPES,
     ArrayPayloadRef,
     ArtifactRoot,
     BaseSnapshotManifest,
     CheckpointManifest,
     ExportManifest,
     LatestIndex,
+    LoRACheckpointManifest,
+    LoRARunManifest,
     PayloadRef,
+    PretrainingCheckpointManifest,
     PretrainingDataManifest,
+    PretrainingRunManifest,
     RunManifest,
     SwagDataManifest,
     TokenizerManifest,
     VerificationLevel,
     _descriptor_is_local_apfs,
     _json_object_no_duplicates,
+    _manifest_type_for_raw,
     _parse_manifest,
     _reject_json_constant,
     canonical_json_bytes,
+    file_identity,
     parse_logical_path,
     structured_identity,
 )
@@ -77,8 +90,8 @@ _RENAME_EXCL = 0x00000004
 _MANIFEST_TYPES = (
     TokenizerManifest,
     PretrainingDataManifest,
-    CheckpointManifest,
-    RunManifest,
+    *CHECKPOINT_MANIFEST_TYPES,
+    *RUN_MANIFEST_TYPES,
     LatestIndex,
     BaseSnapshotManifest,
     SwagDataManifest,
@@ -295,6 +308,7 @@ class _OwnedStep:
     name: str
     descriptor: int
     opened_stat: os.stat_result
+    contents: VerifiedCheckpointContents | None = None
 
     def close(self) -> None:
         descriptor = self.descriptor
@@ -824,6 +838,17 @@ def _payload_references(value: object) -> Iterator[PayloadRef]:
             yield from _payload_references(item)
 
 
+def checkpoint_array_payloads(
+    manifest: CheckpointManifest,
+) -> tuple[ArrayPayloadRef, ...]:
+    """Return the exact ordered payload groups for one checkpoint kind."""
+    if isinstance(manifest, PretrainingCheckpointManifest):
+        return (manifest.model, manifest.master, manifest.optimizer, manifest.trainer)
+    if isinstance(manifest, LoRACheckpointManifest):
+        return (manifest.adapters, manifest.optimizer, manifest.trainer)
+    raise TypeError("manifest must be a strict checkpoint manifest")
+
+
 def _expected_closed_world(
     references: Sequence[PayloadRef],
 ) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
@@ -1121,6 +1146,12 @@ def _validate_builder_result(
         manifest,
         manifest_present=False,
     )
+    if isinstance(manifest, CHECKPOINT_MANIFEST_TYPES):
+        _verify_checkpoint_semantics(
+            temporary_descriptor,
+            manifest,
+            VerificationLevel.FULL,
+        )
     return manifest
 
 
@@ -1358,9 +1389,9 @@ def _validate_private_run(
         )
     manifest = _read_manifest_from_descriptor(
         run_descriptor,
-        RunManifest,
+        RUN_MANIFEST_TYPES,
         VerificationLevel.FULL,
-        context=str(run / RunManifest.MANIFEST_FILENAME),
+        context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
     )
     if manifest != expected:
         raise SMLArtifactError("private run manifest changed during creation")
@@ -1461,7 +1492,7 @@ def publish_run(
         )
         temporary_path = parent / temporary_name
         manifest = build(temporary_path)
-        if not isinstance(manifest, RunManifest):
+        if not isinstance(manifest, RUN_MANIFEST_TYPES):
             raise SMLArtifactError("run builder returned the wrong manifest type")
         if manifest.identity != manifest.recompute_identity():
             raise SMLArtifactError("run builder returned a manifest identity mismatch")
@@ -1586,24 +1617,32 @@ def _open_directory(
 
 def _read_manifest_from_descriptor[M](
     descriptor: int,
-    manifest_type: type[M],
+    manifest_type: type[M] | tuple[type[M], ...],
     verification: VerificationLevel,
     *,
     context: str,
 ) -> M:
     try:
+        manifest_types = (
+            manifest_type if isinstance(manifest_type, tuple) else (manifest_type,)
+        )
+        filenames = {candidate.MANIFEST_FILENAME for candidate in manifest_types}
+        if len(filenames) != 1:
+            raise SMLArtifactError(
+                "discriminated manifest types must share one filename"
+            )
+        filename = next(iter(filenames))
         local_apfs = _descriptor_is_local_apfs(descriptor)
         with ArtifactRoot(os.dup(descriptor), local_apfs=local_apfs) as artifact_root:
-            with artifact_root.open_payload(
-                manifest_type.MANIFEST_FILENAME
-            ) as manifest_file:
+            with artifact_root.open_payload(filename) as manifest_file:
                 manifest_bytes = manifest_file.read()
             raw = json.loads(
                 manifest_bytes.decode("utf-8"),
                 parse_constant=_reject_json_constant,
                 object_pairs_hook=_json_object_no_duplicates,
             )
-            manifest = _parse_manifest(raw, manifest_type)
+            resolved_type = _manifest_type_for_raw(raw, manifest_types)
+            manifest = _parse_manifest(raw, resolved_type)
             if manifest.recompute_identity() != manifest.identity:
                 raise SMLArtifactError(f"manifest identity mismatch in {context}")
             if manifest_bytes != canonical_json_bytes(manifest):
@@ -1625,6 +1664,332 @@ def _read_manifest_from_descriptor[M](
         raise SMLArtifactError(f"invalid manifest in {context}: {error}") from error
 
 
+@dataclass(frozen=True, slots=True)
+class VerifiedCheckpointContents:
+    scalar_state: Mapping[str, object]
+    array_groups: Mapping[str, Mapping[str, mx.array]]
+
+
+def _mlx_core() -> ModuleType:
+    return importlib.import_module("mlx.core")
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointReader:
+    """Own a FULL-proven checkpoint inode and its eagerly materialized contents."""
+
+    resolved: ResolvedStep
+    _owned_step: _OwnedStep
+    _checkpoints_descriptor: int
+    _fs: FilesystemOps
+
+    def read_contents(self) -> VerifiedCheckpointContents:
+        """Return identity-bound contents only while the step name remains bound."""
+        contents = self._owned_step.contents
+        if self._owned_step.descriptor < 0 or contents is None:
+            raise SMLArtifactError("checkpoint reader is closed")
+        _require_named_directory_inode(
+            self._fs,
+            self._owned_step.name,
+            parent_descriptor=self._checkpoints_descriptor,
+            directory_descriptor=self._owned_step.descriptor,
+            context="named checkpoint step before state return",
+        )
+        return contents
+
+
+def _checkpoint_dtype_name(array: mx.array) -> str:
+    mx = _mlx_core()
+    names = {
+        mx.bfloat16: "bfloat16",
+        mx.float32: "float32",
+        mx.int32: "int32",
+        mx.uint32: "uint32",
+        mx.bool_: "bool",
+    }
+    try:
+        return names[array.dtype]
+    except KeyError as error:
+        raise SMLArtifactError(
+            f"unsupported checkpoint array dtype: {array.dtype}"
+        ) from error
+
+
+def _load_checkpoint_array_payload(
+    root: ArtifactRoot,
+    reference: ArrayPayloadRef,
+    *,
+    full: bool,
+) -> dict[str, mx.array]:
+    mx = _mlx_core()
+    logical_path = reference.payload.logical_path
+    try:
+        with root.open_payload(logical_path) as payload:
+            opened = os.fstat(payload.fileno())
+            if opened.st_size != reference.payload.byte_size:
+                raise SMLArtifactError(
+                    f"checkpoint payload byte size mismatch: {logical_path}"
+                )
+            if full:
+                payload.seek(0)
+                if file_identity(payload) != reference.payload.identity:
+                    raise SMLArtifactError(
+                        f"checkpoint payload identity mismatch: {logical_path}"
+                    )
+            payload.seek(0)
+            arrays = mx.load(payload, format="safetensors")
+            if not isinstance(arrays, dict):
+                raise SMLArtifactError(
+                    f"checkpoint array payload must be a mapping: {logical_path}"
+                )
+            mx.eval(*arrays.values())
+            if full:
+                payload.seek(0)
+                if file_identity(payload) != reference.payload.identity:
+                    raise SMLArtifactError(
+                        "checkpoint payload changed while being consumed: "
+                        f"{logical_path}"
+                    )
+    except SMLArtifactError:
+        raise
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise SMLArtifactError(
+            f"invalid checkpoint safetensors payload: {logical_path}"
+        ) from error
+
+    expected = {spec.name: spec for spec in reference.arrays}
+    if set(arrays) != set(expected):
+        raise SMLArtifactError(f"checkpoint array keys mismatch: {logical_path}")
+    for name, array in arrays.items():
+        spec = expected[name]
+        if (
+            tuple(array.shape) != spec.shape
+            or _checkpoint_dtype_name(array) != spec.dtype
+        ):
+            raise SMLArtifactError(
+                f"checkpoint array metadata mismatch: {logical_path}:{name}"
+            )
+    return dict(sorted(arrays.items()))
+
+
+def _plain_nonnegative(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SMLArtifactError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _read_checkpoint_scalar_payload(
+    root: ArtifactRoot,
+    manifest: CheckpointManifest,
+    *,
+    full: bool,
+) -> dict[str, object]:
+    reference = manifest.scalar_state
+    try:
+        with root.open_payload(reference.logical_path) as payload:
+            opened = os.fstat(payload.fileno())
+            raw_bytes = payload.read()
+        if (
+            opened.st_size != reference.byte_size
+            or len(raw_bytes) != reference.byte_size
+        ):
+            raise SMLArtifactError("checkpoint scalar state byte size mismatch")
+        if (
+            full
+            and f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}" != reference.identity
+        ):
+            raise SMLArtifactError("checkpoint scalar state identity mismatch")
+        raw = json.loads(
+            raw_bytes.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_json_object_no_duplicates,
+        )
+    except SMLArtifactError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise SMLArtifactError("invalid checkpoint scalar state") from error
+    if not isinstance(raw, dict) or canonical_json_bytes(raw) != raw_bytes:
+        raise SMLArtifactError(
+            "checkpoint scalar state must be a canonical JSON object"
+        )
+
+    if isinstance(manifest, PretrainingCheckpointManifest):
+        expected_fields = {
+            "kind",
+            "version",
+            "owning_run_identity",
+            "step",
+            "rows",
+            "microsteps",
+            "cursor",
+        }
+        expected_kind = "pretraining-state"
+        cursor_fields = {"epoch", "shard_order_position", "row_offset"}
+        progress_fields = ("rows", "microsteps")
+    else:
+        expected_fields = {
+            "kind",
+            "version",
+            "owning_run_identity",
+            "step",
+            "examples",
+            "microsteps",
+            "cursor",
+        }
+        expected_kind = "lora-state"
+        cursor_fields = {"epoch", "bucket_order_position", "row_offset"}
+        progress_fields = ("examples", "microsteps")
+    if set(raw) != expected_fields:
+        raise SMLArtifactError("checkpoint scalar state has invalid fields")
+    if raw["kind"] != expected_kind or raw["version"] != 1:
+        raise SMLArtifactError("checkpoint scalar state has invalid owner-kind schema")
+    if raw["owning_run_identity"] != manifest.owning_run_identity:
+        raise SMLArtifactError("checkpoint scalar state belongs to another run")
+    if _plain_nonnegative(raw["step"], "checkpoint scalar step") != manifest.step:
+        raise SMLArtifactError("checkpoint scalar step does not match checkpoint")
+    for name in progress_fields:
+        _plain_nonnegative(raw[name], f"checkpoint scalar {name}")
+    cursor = raw["cursor"]
+    if not isinstance(cursor, dict) or set(cursor) != cursor_fields:
+        raise SMLArtifactError("checkpoint scalar cursor has invalid fields")
+    for name in cursor_fields:
+        _plain_nonnegative(cursor[name], f"checkpoint cursor {name}")
+    return raw
+
+
+def _require_array_contract(
+    array: mx.array,
+    *,
+    shape: tuple[int, ...],
+    dtype: str,
+    context: str,
+) -> None:
+    if tuple(array.shape) != shape or _checkpoint_dtype_name(array) != dtype:
+        raise SMLArtifactError(f"checkpoint {context} has invalid shape or dtype")
+
+
+def _verify_optimizer_and_trainer_groups(
+    trainable: Mapping[str, mx.array],
+    optimizer: Mapping[str, mx.array],
+    trainer: Mapping[str, mx.array],
+    *,
+    step: int,
+) -> None:
+    names = set(trainable)
+    expected_optimizer = {
+        "step",
+        *(f"first_moments.{name}" for name in names),
+        *(f"second_moments.{name}" for name in names),
+    }
+    expected_trainer = {
+        "accumulation_count",
+        "next_key",
+        "loss_numerator",
+        *(f"accumulators.{name}" for name in names),
+    }
+    if set(optimizer) != expected_optimizer:
+        raise SMLArtifactError("checkpoint optimizer keys do not match trainable state")
+    if set(trainer) != expected_trainer:
+        raise SMLArtifactError("checkpoint trainer keys do not match trainable state")
+    _require_array_contract(
+        optimizer["step"], shape=(), dtype="int32", context="optimizer step"
+    )
+    if int(optimizer["step"].item()) != step:
+        raise SMLArtifactError("checkpoint optimizer step does not match manifest")
+    _require_array_contract(
+        trainer["accumulation_count"],
+        shape=(),
+        dtype="int32",
+        context="trainer accumulation count",
+    )
+    _require_array_contract(
+        trainer["next_key"], shape=(2,), dtype="uint32", context="trainer PRNG key"
+    )
+    _require_array_contract(
+        trainer["loss_numerator"],
+        shape=(),
+        dtype="float32",
+        context="trainer loss numerator",
+    )
+    for name, array in trainable.items():
+        if _checkpoint_dtype_name(array) != "float32":
+            raise SMLArtifactError("checkpoint trainable state must be float32")
+        shape = tuple(array.shape)
+        for prefix in ("first_moments.", "second_moments."):
+            _require_array_contract(
+                optimizer[f"{prefix}{name}"],
+                shape=shape,
+                dtype="float32",
+                context=f"optimizer state for {name}",
+            )
+        _require_array_contract(
+            trainer[f"accumulators.{name}"],
+            shape=shape,
+            dtype="float32",
+            context=f"trainer accumulator for {name}",
+        )
+
+
+def _verify_checkpoint_semantics(
+    descriptor: int,
+    manifest: CheckpointManifest,
+    verification: VerificationLevel,
+) -> VerifiedCheckpointContents:
+    mx = _mlx_core()
+    local_apfs = _descriptor_is_local_apfs(descriptor)
+    full = verification is VerificationLevel.FULL
+    with ArtifactRoot(os.dup(descriptor), local_apfs=local_apfs) as root:
+        scalar = _read_checkpoint_scalar_payload(root, manifest, full=full)
+        groups = {
+            reference.payload.logical_path: _load_checkpoint_array_payload(
+                root, reference, full=full
+            )
+            for reference in checkpoint_array_payloads(manifest)
+        }
+
+    if isinstance(manifest, PretrainingCheckpointManifest):
+        working = groups["model.safetensors"]
+        masters = groups["master.safetensors"]
+        if set(working) != set(masters):
+            raise SMLArtifactError("checkpoint model and master keys do not match")
+        for name, master in masters.items():
+            model = working[name]
+            if _checkpoint_dtype_name(master) != "float32":
+                raise SMLArtifactError("checkpoint master parameters must be float32")
+            if _checkpoint_dtype_name(model) != "bfloat16" or tuple(
+                model.shape
+            ) != tuple(master.shape):
+                raise SMLArtifactError(
+                    "checkpoint working parameters must be BF16 master-shaped arrays"
+                )
+            if full and not bool(mx.array_equal(model, master.astype(mx.bfloat16))):
+                raise SMLArtifactError(
+                    "checkpoint working parameter is not the exact BF16 cast of master: "
+                    f"{name}"
+                )
+        _verify_optimizer_and_trainer_groups(
+            masters,
+            groups["optimizer.safetensors"],
+            groups["trainer.safetensors"],
+            step=manifest.step,
+        )
+    else:
+        adapters = groups["adapters.safetensors"]
+        _verify_optimizer_and_trainer_groups(
+            adapters,
+            groups["optimizer.safetensors"],
+            groups["trainer.safetensors"],
+            step=manifest.step,
+        )
+    return VerifiedCheckpointContents(scalar, groups)
+
+
 def _validate_checkpoint_owner(
     run_manifest: RunManifest,
     manifest: CheckpointManifest,
@@ -1633,15 +1998,18 @@ def _validate_checkpoint_owner(
 ) -> None:
     if manifest.owning_run_identity != run_manifest.identity:
         raise SMLArtifactError("checkpoint belongs to a different run")
-    if manifest.checkpoint_kind != run_manifest.run_kind:
+    matching_kinds = (
+        isinstance(run_manifest, PretrainingRunManifest)
+        and isinstance(manifest, PretrainingCheckpointManifest)
+    ) or (
+        isinstance(run_manifest, LoRARunManifest)
+        and isinstance(manifest, LoRACheckpointManifest)
+    )
+    if not matching_kinds:
         raise SMLArtifactError("checkpoint kind does not match the owning run")
     if manifest.step != expected_step:
         raise SMLArtifactError(
             "checkpoint logical step does not match its canonical directory"
-        )
-    if manifest.scalar_state.logical_path != "state.json":
-        raise SMLArtifactError(
-            "checkpoint scalar state logical path must be exactly 'state.json'"
         )
 
 
@@ -1732,7 +2100,7 @@ def _open_verified_step_from_descriptor(
             raise SMLArtifactError(f"checkpoint candidate is not a directory: {name}")
         manifest = _read_manifest_from_descriptor(
             descriptor,
-            CheckpointManifest,
+            CHECKPOINT_MANIFEST_TYPES,
             verification,
             context=str(run / "checkpoints" / name),
         )
@@ -1747,6 +2115,11 @@ def _open_verified_step_from_descriptor(
             manifest,
             manifest_present=True,
             full=verification is VerificationLevel.FULL,
+        )
+        contents = (
+            _verify_checkpoint_semantics(descriptor, manifest, verification)
+            if verification is VerificationLevel.FULL
+            else None
         )
         _require_named_directory_inode(
             fs,
@@ -1767,6 +2140,7 @@ def _open_verified_step_from_descriptor(
             name=name,
             descriptor=descriptor,
             opened_stat=opened_stat,
+            contents=contents,
         )
         descriptor = -1
         return owned
@@ -1779,6 +2153,81 @@ def _open_verified_step_from_descriptor(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+@contextmanager
+def open_checkpoint_reader(
+    run: Path,
+    *,
+    step: int,
+    expected_checkpoint_identity: str | None = None,
+    fs: FilesystemOps = OS_FILESYSTEM,
+) -> Iterator[CheckpointReader]:
+    """Open a FULL-verified checkpoint without a pathname reopen after proof."""
+    if not isinstance(run, Path):
+        raise TypeError("run must be a Path")
+    requested_step = _require_step(step)
+    if expected_checkpoint_identity is not None and not isinstance(
+        expected_checkpoint_identity, str
+    ):
+        raise TypeError("expected_checkpoint_identity must be a string or None")
+    if not isinstance(fs, FilesystemOps):
+        raise TypeError("fs must implement FilesystemOps")
+
+    with _protected_lock(
+        run,
+        category="run-access",
+        exclusive=False,
+        wait=True,
+    ):
+        run_descriptor = _open_directory(
+            run,
+            fs,
+            writable=False,
+            context="run directory",
+        )
+        checkpoints_descriptor = -1
+        owned: _OwnedStep | None = None
+        try:
+            run_manifest = _read_manifest_from_descriptor(
+                run_descriptor,
+                RUN_MANIFEST_TYPES,
+                VerificationLevel.FULL,
+                context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
+            )
+            checkpoints_descriptor = _open_checkpoints_directory(
+                run,
+                fs,
+                run_descriptor,
+                writable=False,
+            )
+            owned = _open_verified_step_from_descriptor(
+                run,
+                run_manifest,
+                checkpoints_descriptor,
+                step=requested_step,
+                verification=VerificationLevel.FULL,
+                fs=fs,
+            )
+            if (
+                expected_checkpoint_identity is not None
+                and owned.resolved.checkpoint.identity != expected_checkpoint_identity
+            ):
+                raise SMLArtifactError(
+                    "resolved checkpoint changed before state loading"
+                )
+            yield CheckpointReader(
+                resolved=owned.resolved,
+                _owned_step=owned,
+                _checkpoints_descriptor=checkpoints_descriptor,
+                _fs=fs,
+            )
+        finally:
+            if owned is not None:
+                owned.close()
+            if checkpoints_descriptor >= 0:
+                os.close(checkpoints_descriptor)
+            os.close(run_descriptor)
 
 
 def _resolve_step_from_descriptor(
@@ -1823,9 +2272,9 @@ def resolve_exact_step(
     try:
         run_manifest = _read_manifest_from_descriptor(
             run_descriptor,
-            RunManifest,
+            RUN_MANIFEST_TYPES,
             verification,
-            context=str(run / RunManifest.MANIFEST_FILENAME),
+            context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
         )
         checkpoints_descriptor = _open_checkpoints_directory(
             run,
@@ -2062,9 +2511,9 @@ def recover_latest_index(
     try:
         run_manifest = _read_manifest_from_descriptor(
             run_descriptor,
-            RunManifest,
+            RUN_MANIFEST_TYPES,
             verification,
-            context=str(run / RunManifest.MANIFEST_FILENAME),
+            context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
         )
         checkpoints_descriptor = _open_checkpoints_directory(
             run,
@@ -2241,9 +2690,9 @@ def publish_checkpoint(
     try:
         run_manifest = _read_manifest_from_descriptor(
             run_descriptor,
-            RunManifest,
+            RUN_MANIFEST_TYPES,
             VerificationLevel.FULL,
-            context=str(run / RunManifest.MANIFEST_FILENAME),
+            context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
         )
         checkpoints_descriptor = _open_checkpoints_directory(
             run,
@@ -2260,7 +2709,7 @@ def publish_checkpoint(
         )
         temporary_path = run / "checkpoints" / temporary_name
         manifest = build(temporary_path)
-        if not isinstance(manifest, CheckpointManifest):
+        if not isinstance(manifest, CHECKPOINT_MANIFEST_TYPES):
             raise SMLArtifactError(
                 "checkpoint builder returned the wrong manifest type"
             )
@@ -2324,7 +2773,9 @@ def publish_checkpoint(
                 )
             return current_latest
 
-        array_references = tuple(array.payload for array in manifest.arrays)
+        array_references = tuple(
+            array.payload for array in checkpoint_array_payloads(manifest)
+        )
         _make_checkpoint_group_durable(
             fs,
             temporary_descriptor,
@@ -2373,7 +2824,7 @@ def publish_checkpoint(
         )
         committed_manifest = _read_manifest_from_descriptor(
             temporary_descriptor,
-            CheckpointManifest,
+            CHECKPOINT_MANIFEST_TYPES,
             VerificationLevel.FULL,
             context=str(run / "checkpoints" / target_name),
         )
@@ -2392,6 +2843,11 @@ def publish_checkpoint(
             committed_manifest,
             manifest_present=True,
             full=True,
+        )
+        _verify_checkpoint_semantics(
+            temporary_descriptor,
+            committed_manifest,
+            VerificationLevel.FULL,
         )
         _require_named_directory_inode(
             fs,
@@ -2714,19 +3170,13 @@ def _detach_and_delete_owned_step(
     )
 
 
-def apply_retention(
+def prune_to_latest(
     run: Path,
     *,
-    keep_last: int | None,
     fs: FilesystemOps = OS_FILESYSTEM,
 ) -> ResolvedStep:
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
-    if keep_last is not None:
-        if isinstance(keep_last, bool) or not isinstance(keep_last, int):
-            raise TypeError("keep_last must be a positive integer or None")
-        if keep_last <= 0:
-            raise ValueError("keep_last must be positive")
     if not isinstance(fs, FilesystemOps):
         raise TypeError("fs must implement FilesystemOps")
 
@@ -2748,9 +3198,9 @@ def apply_retention(
         try:
             run_manifest = _read_manifest_from_descriptor(
                 run_descriptor,
-                RunManifest,
+                RUN_MANIFEST_TYPES,
                 VerificationLevel.FULL,
-                context=str(run / RunManifest.MANIFEST_FILENAME),
+                context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
             )
             checkpoints_descriptor = _open_checkpoints_directory(
                 run,
@@ -2770,27 +3220,20 @@ def apply_retention(
             )
             if latest is None:
                 raise SMLArtifactError("run has no published checkpoints")
-            if keep_last is not None:
-                entries = _retention_entries(checkpoints_descriptor, fs=fs)
-                retained_names = {name for _step, name in sorted(entries)[-keep_last:]}
-                latest_name = _step_name(latest.step)
-                retained_names.add(latest_name)
-                deletions = [
-                    (step, name)
-                    for step, name in entries
-                    if name not in retained_names and name != latest_name
-                ]
-                for step, _name in deletions:
-                    owned_deletions.append(
-                        _open_verified_step_from_descriptor(
-                            run,
-                            latest.run,
-                            checkpoints_descriptor,
-                            step=step,
-                            verification=VerificationLevel.FULL,
-                            fs=fs,
-                        )
+            entries = _retention_entries(checkpoints_descriptor, fs=fs)
+            latest_name = _step_name(latest.step)
+            deletions = [(step, name) for step, name in entries if name != latest_name]
+            for step, _name in deletions:
+                owned_deletions.append(
+                    _open_verified_step_from_descriptor(
+                        run,
+                        latest.run,
+                        checkpoints_descriptor,
+                        step=step,
+                        verification=VerificationLevel.FULL,
+                        fs=fs,
                     )
+                )
 
             owned_latest = _open_verified_step_from_descriptor(
                 run,
@@ -2815,8 +3258,6 @@ def apply_retention(
                 latest=owned_latest,
                 fs=fs,
             )
-            if keep_last is None:
-                return latest
             for candidate in owned_deletions:
                 _detach_and_delete_owned_step(
                     checkpoints_descriptor,
@@ -2839,10 +3280,13 @@ __all__ = [
     "CHECKPOINT_PUBLICATION_STAGES",
     "IMMUTABLE_PUBLICATION_STAGES",
     "OS_FILESYSTEM",
+    "CheckpointReader",
     "FilesystemOps",
     "Published",
     "ResolvedStep",
-    "apply_retention",
+    "VerifiedCheckpointContents",
+    "open_checkpoint_reader",
+    "prune_to_latest",
     "publication_lock",
     "publish_checkpoint",
     "publish_immutable_bundle",

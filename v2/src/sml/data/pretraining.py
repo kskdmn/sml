@@ -85,6 +85,13 @@ class PreparedDataBundle:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedDataPreflight:
+    bundle: PreparedDataBundle
+    row_count: int
+    batch_size: int
+
+
+@dataclass(frozen=True, slots=True)
 class PretrainingCursor:
     """Canonical location of the next row eligible for a runtime batch."""
 
@@ -452,6 +459,153 @@ def _map_npy_payload(
         ) from error
 
 
+def _validate_prepared_tokenizer_binding(
+    manifest: PretrainingDataManifest,
+    tokenizer: TokenizerManifest,
+) -> None:
+    if tokenizer.identity != manifest.tokenizer_identity:
+        raise SMLArtifactError(
+            "copied tokenizer identity does not match prepared manifest"
+        )
+    expected = (
+        (
+            manifest.tokenizer_model,
+            tokenizer.model,
+            "tokenizer/tokenizer.model",
+        ),
+        (
+            manifest.tokenizer_vocab,
+            tokenizer.vocab,
+            "tokenizer/tokenizer.vocab",
+        ),
+    )
+    for outer, nested, logical_path in expected:
+        if nested.logical_path != logical_path.removeprefix("tokenizer/"):
+            raise SMLArtifactError(
+                "copied tokenizer payload path does not match canonical layout"
+            )
+        if outer != replace(nested, logical_path=logical_path):
+            raise SMLArtifactError(
+                "copied tokenizer payload reference does not match prepared manifest"
+            )
+
+
+def _close_prepared_resources(
+    root: ArtifactRoot | None,
+    shard_files: list[BinaryIO],
+    mappings: list[mmap.mmap],
+    shard_arrays: list[np.ndarray],
+) -> None:
+    shard_arrays.clear()
+    while mappings:
+        mappings.pop().close()
+    while shard_files:
+        shard_files.pop().close()
+    if root is not None:
+        root.close()
+
+
+def _open_validated_prepared_resources(
+    bundle: PreparedDataBundle,
+) -> tuple[
+    ArtifactRoot,
+    list[BinaryIO],
+    list[mmap.mmap],
+    list[np.ndarray],
+    PretrainingDataManifest,
+]:
+    verified = read_manifest(
+        bundle.path,
+        PretrainingDataManifest,
+        VerificationLevel.FULL,
+    )
+    if verified.manifest != bundle.manifest:
+        raise SMLArtifactError(
+            "supplied prepared bundle manifest does not match the verified manifest"
+        )
+    manifest = verified.manifest
+    root: ArtifactRoot | None = None
+    shard_files: list[BinaryIO] = []
+    mappings: list[mmap.mmap] = []
+    shard_arrays: list[np.ndarray] = []
+    try:
+        root = ArtifactRoot.open(bundle.path, writable=False)
+        with root.open_payload("manifest.json") as manifest_file:
+            manifest_bytes = manifest_file.read()
+        if manifest_bytes != canonical_json_bytes(manifest):
+            raise SMLArtifactError("prepared bundle manifest is not canonical")
+
+        with root.open_payload("tokenizer/manifest.json") as tokenizer_file:
+            tokenizer_manifest = _parse_canonical_tokenizer_manifest(
+                tokenizer_file.read()
+            )
+        _validate_prepared_tokenizer_binding(manifest, tokenizer_manifest)
+
+        for reference in (manifest.tokenizer_model, manifest.tokenizer_vocab):
+            with root.open_payload(reference.logical_path) as payload:
+                _verify_open_payload(payload, reference)
+
+        for reference, row_count in zip(
+            manifest.shards,
+            manifest.shard_row_counts,
+            strict=True,
+        ):
+            payload = root.open_payload(reference.logical_path)
+            shard_files.append(payload)
+            _verify_open_payload(payload, reference)
+            mapping, array = _map_npy_payload(
+                payload,
+                reference,
+                declared_rows=row_count,
+                row_width=manifest.row_width,
+            )
+            mappings.append(mapping)
+            shard_arrays.append(array)
+
+        if not shard_arrays:
+            raise SMLDataError("prepared bundle contains no shards")
+        minimum = min(int(array.min()) for array in shard_arrays)
+        maximum = max(int(array.max()) for array in shard_arrays)
+        if minimum < 0 or maximum >= tokenizer_manifest.vocab_size:
+            raise SMLArtifactError(
+                "prepared bundle token IDs must be in "
+                f"[0, {tokenizer_manifest.vocab_size})"
+            )
+        return root, shard_files, mappings, shard_arrays, manifest
+    except BaseException:
+        _close_prepared_resources(root, shard_files, mappings, shard_arrays)
+        raise
+
+
+def preflight_pretraining_bundle(
+    bundle: PreparedDataBundle,
+    *,
+    batch_size: int,
+) -> PreparedDataPreflight:
+    """Synchronously prove prepared bytes and semantics without starting a stream."""
+    if not isinstance(bundle, PreparedDataBundle):
+        raise TypeError("bundle must be a PreparedDataBundle")
+    _require_plain_int(batch_size, "batch_size", minimum=1)
+    if bundle.verification is not VerificationLevel.FULL:
+        raise SMLArtifactError("prepared bundle must have FULL verification")
+    root = None
+    shard_files: list[BinaryIO] = []
+    mappings: list[mmap.mmap] = []
+    shard_arrays: list[np.ndarray] = []
+    try:
+        root, shard_files, mappings, shard_arrays, manifest = (
+            _open_validated_prepared_resources(bundle)
+        )
+        row_count = sum(manifest.shard_row_counts)
+        if row_count < batch_size:
+            raise SMLDataError(
+                "prepared bundle does not contain one full runtime batch"
+            )
+        return PreparedDataPreflight(bundle, row_count, batch_size)
+    finally:
+        _close_prepared_resources(root, shard_files, mappings, shard_arrays)
+
+
 class PretrainingBatchStream(Iterator[BatchEnvelope]):
     """Bounded deterministic NumPy prefetch over memory-mapped epochs."""
 
@@ -543,90 +697,13 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
             return self._committed_cursor
 
     def _open_and_validate_bundle(self, bundle: PreparedDataBundle) -> None:
-        verified = read_manifest(
-            bundle.path,
-            PretrainingDataManifest,
-            VerificationLevel.FULL,
-        )
-        if verified.manifest != bundle.manifest:
-            raise SMLArtifactError(
-                "supplied prepared bundle manifest does not match the verified manifest"
-            )
-        self._manifest = verified.manifest
-        root = ArtifactRoot.open(bundle.path, writable=False)
-        self._artifact_root = root
-
-        with root.open_payload("manifest.json") as manifest_file:
-            manifest_bytes = manifest_file.read()
-        if manifest_bytes != canonical_json_bytes(self._manifest):
-            raise SMLArtifactError("prepared bundle manifest is not canonical")
-
-        with root.open_payload("tokenizer/manifest.json") as tokenizer_file:
-            tokenizer_manifest = _parse_canonical_tokenizer_manifest(
-                tokenizer_file.read()
-            )
-        self._validate_tokenizer_binding(tokenizer_manifest)
-
-        for reference in (
-            self._manifest.tokenizer_model,
-            self._manifest.tokenizer_vocab,
-        ):
-            with root.open_payload(reference.logical_path) as payload:
-                _verify_open_payload(payload, reference)
-
-        for reference, row_count in zip(
-            self._manifest.shards,
-            self._manifest.shard_row_counts,
-            strict=True,
-        ):
-            payload = root.open_payload(reference.logical_path)
-            self._shard_files.append(payload)
-            _verify_open_payload(payload, reference)
-            mapping, array = _map_npy_payload(
-                payload,
-                reference,
-                declared_rows=row_count,
-                row_width=self._manifest.row_width,
-            )
-            self._mappings.append(mapping)
-            self._shard_arrays.append(array)
-
-        if not self._shard_arrays:
-            raise SMLDataError("prepared bundle contains no shards")
-        minimum = min(int(array.min()) for array in self._shard_arrays)
-        maximum = max(int(array.max()) for array in self._shard_arrays)
-        if minimum < 0 or maximum >= tokenizer_manifest.vocab_size:
-            raise SMLArtifactError(
-                "prepared bundle token IDs must be in "
-                f"[0, {tokenizer_manifest.vocab_size})"
-            )
-
-    def _validate_tokenizer_binding(self, tokenizer: TokenizerManifest) -> None:
-        if tokenizer.identity != self._manifest.tokenizer_identity:
-            raise SMLArtifactError(
-                "copied tokenizer identity does not match prepared manifest"
-            )
-        expected = (
-            (
-                self._manifest.tokenizer_model,
-                tokenizer.model,
-                "tokenizer/tokenizer.model",
-            ),
-            (
-                self._manifest.tokenizer_vocab,
-                tokenizer.vocab,
-                "tokenizer/tokenizer.vocab",
-            ),
-        )
-        for outer, nested, logical_path in expected:
-            if nested.logical_path != logical_path.removeprefix("tokenizer/"):
-                raise SMLArtifactError(
-                    "copied tokenizer payload path does not match canonical layout"
-                )
-            if outer != replace(nested, logical_path=logical_path):
-                raise SMLArtifactError(
-                    "copied tokenizer payload reference does not match prepared manifest"
-                )
+        (
+            self._artifact_root,
+            self._shard_files,
+            self._mappings,
+            self._shard_arrays,
+            self._manifest,
+        ) = _open_validated_prepared_resources(bundle)
 
     def _shard_order(self, epoch: int) -> tuple[int, ...]:
         if epoch == self._order_cache_epoch:
@@ -1270,11 +1347,13 @@ __all__ = [
     "WINDOWED_ROW_SHUFFLE_V1",
     "BatchEnvelope",
     "PreparedDataBundle",
+    "PreparedDataPreflight",
     "PretrainingBatchStream",
     "PretrainingCursor",
     "PretrainingPreparationConfig",
     "build_benchmark_workload",
     "canonicalize_pretraining_cursor",
     "pack_token_ranges",
+    "preflight_pretraining_bundle",
     "prepare_pretraining_bundle",
 ]

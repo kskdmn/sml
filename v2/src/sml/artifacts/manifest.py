@@ -275,6 +275,29 @@ def parse_logical_path(value: str) -> tuple[str, ...]:
     return components
 
 
+def _logical_path_collision_key(logical_path: str) -> tuple[str, ...]:
+    return tuple(component.casefold() for component in parse_logical_path(logical_path))
+
+
+def _require_unique_payload_paths(
+    references: Sequence[PayloadRef | ArrayPayloadRef],
+    name: str,
+) -> None:
+    seen: dict[tuple[str, ...], str] = {}
+    for value in references:
+        reference = value.payload if isinstance(value, ArrayPayloadRef) else value
+        if not isinstance(reference, PayloadRef):
+            raise TypeError(f"{name} must contain payload references")
+        key = _logical_path_collision_key(reference.logical_path)
+        previous = seen.get(key)
+        if previous is not None:
+            raise SMLArtifactError(
+                f"duplicate or colliding payload path in {name}: "
+                f"{previous!r} and {reference.logical_path!r}"
+            )
+        seen[key] = reference.logical_path
+
+
 class ArtifactRoot:
     """An artifact directory owned and traversed through open descriptors."""
 
@@ -413,7 +436,11 @@ class ArtifactRoot:
             components = parse_logical_path(reference.logical_path)
             collision_key = tuple(component.casefold() for component in components)
             previous = collision_paths.get(collision_key)
-            if previous is not None and previous[0] != reference.logical_path:
+            if previous is not None:
+                if previous[0] == reference.logical_path:
+                    raise SMLArtifactError(
+                        f"duplicate logical payload path: {reference.logical_path!r}"
+                    )
                 category = (
                     "normalized path collision"
                     if previous[1] == components
@@ -598,6 +625,7 @@ class PretrainingDataManifest(_Manifest):
             _require_plain_int(count, "shard row count", minimum=1)
         if not all(isinstance(shard, PayloadRef) for shard in shards):
             raise TypeError("shards must contain PayloadRef values")
+        _require_unique_payload_paths(shards, "shards")
         _require_plain_int(self.preparation_seed, "preparation_seed")
         object.__setattr__(
             self,
@@ -622,83 +650,175 @@ class PretrainingDataManifest(_Manifest):
         _require_identity(self.row_content_identity, "row_content_identity")
 
 
+def _require_array_payload_path(
+    value: ArrayPayloadRef,
+    name: str,
+    logical_path: str,
+) -> None:
+    if not isinstance(value, ArrayPayloadRef):
+        raise TypeError(f"{name} must be an ArrayPayloadRef")
+    if value.payload.logical_path != logical_path:
+        raise ValueError(f"{name} logical path must be exactly {logical_path!r}")
+
+
 @dataclass(frozen=True, slots=True)
-class CheckpointManifest(_Manifest):
+class PretrainingCheckpointManifest(_Manifest):
     kind: str
     version: int
     identity: str
     owning_run_identity: str
-    checkpoint_kind: str
     step: int
     scalar_state: PayloadRef
-    arrays: tuple[ArrayPayloadRef, ...]
+    model: ArrayPayloadRef
+    master: ArrayPayloadRef
+    optimizer: ArrayPayloadRef
+    trainer: ArrayPayloadRef
 
-    EXPECTED_KIND: ClassVar[str] = "checkpoint"
-    IDENTITY_DOMAIN: ClassVar[str] = "sml-checkpoint-manifest-v1"
+    EXPECTED_KIND: ClassVar[str] = "pretraining-checkpoint"
+    IDENTITY_DOMAIN: ClassVar[str] = "sml-pretraining-checkpoint-manifest-v1"
     MANIFEST_FILENAME: ClassVar[str] = "checkpoint.json"
 
     def __post_init__(self) -> None:
         self._validate_common()
         _require_identity(self.owning_run_identity, "owning_run_identity")
-        if self.checkpoint_kind not in {"pretraining", "lora"}:
-            raise ValueError("checkpoint_kind must be 'pretraining' or 'lora'")
         _require_plain_int(self.step, "step")
         if not isinstance(self.scalar_state, PayloadRef):
             raise TypeError("scalar_state must be a PayloadRef")
-        arrays = _require_tuple(self.arrays, "arrays")
-        if not all(isinstance(array, ArrayPayloadRef) for array in arrays):
-            raise TypeError("arrays must contain ArrayPayloadRef values")
+        if self.scalar_state.logical_path != "state.json":
+            raise ValueError("scalar_state logical path must be exactly 'state.json'")
+        _require_unique_payload_paths(
+            (self.model, self.master, self.optimizer, self.trainer),
+            "pretraining checkpoint array groups",
+        )
+        for name, logical_path in (
+            ("model", "model.safetensors"),
+            ("master", "master.safetensors"),
+            ("optimizer", "optimizer.safetensors"),
+            ("trainer", "trainer.safetensors"),
+        ):
+            _require_array_payload_path(getattr(self, name), name, logical_path)
 
 
 @dataclass(frozen=True, slots=True)
-class RunManifest(_Manifest):
+class LoRACheckpointManifest(_Manifest):
     kind: str
     version: int
     identity: str
-    run_kind: str
+    owning_run_identity: str
+    step: int
+    scalar_state: PayloadRef
+    adapters: ArrayPayloadRef
+    optimizer: ArrayPayloadRef
+    trainer: ArrayPayloadRef
+
+    EXPECTED_KIND: ClassVar[str] = "lora-checkpoint"
+    IDENTITY_DOMAIN: ClassVar[str] = "sml-lora-checkpoint-manifest-v1"
+    MANIFEST_FILENAME: ClassVar[str] = "checkpoint.json"
+
+    def __post_init__(self) -> None:
+        self._validate_common()
+        _require_identity(self.owning_run_identity, "owning_run_identity")
+        _require_plain_int(self.step, "step")
+        if not isinstance(self.scalar_state, PayloadRef):
+            raise TypeError("scalar_state must be a PayloadRef")
+        if self.scalar_state.logical_path != "state.json":
+            raise ValueError("scalar_state logical path must be exactly 'state.json'")
+        _require_unique_payload_paths(
+            (self.adapters, self.optimizer, self.trainer),
+            "LoRA checkpoint array groups",
+        )
+        for name, logical_path in (
+            ("adapters", "adapters.safetensors"),
+            ("optimizer", "optimizer.safetensors"),
+            ("trainer", "trainer.safetensors"),
+        ):
+            _require_array_payload_path(getattr(self, name), name, logical_path)
+
+
+type CheckpointManifest = PretrainingCheckpointManifest | LoRACheckpointManifest
+
+
+@dataclass(frozen=True, slots=True)
+class PretrainingRunManifest(_Manifest):
+    kind: str
+    version: int
+    identity: str
     model: Mapping[str, object]
     precision: Mapping[str, object]
     optimizer: Mapping[str, object]
     loader: Mapping[str, object]
     checkpoint: Mapping[str, object]
     tokenizer_identity: str
-    base_identity: str | None
     data_identity: str
     diagnostic_data_locator: str | None
-    diagnostic_source_locator: str | None
 
-    EXPECTED_KIND: ClassVar[str] = "run"
-    IDENTITY_DOMAIN: ClassVar[str] = "sml-run-manifest-v1"
+    EXPECTED_KIND: ClassVar[str] = "pretraining-run"
+    IDENTITY_DOMAIN: ClassVar[str] = "sml-pretraining-run-manifest-v1"
     MANIFEST_FILENAME: ClassVar[str] = "run.json"
 
     def __post_init__(self) -> None:
         self._validate_common()
-        if self.run_kind not in {"pretraining", "lora"}:
-            raise ValueError("run_kind must be 'pretraining' or 'lora'")
         for name in ("model", "precision", "optimizer", "loader", "checkpoint"):
             object.__setattr__(
                 self, name, _freeze_json_mapping(getattr(self, name), name)
             )
-        if self.run_kind == "pretraining":
-            if self.base_identity is not None:
-                raise ValueError("base_identity must be None for pretraining")
-            rope_factor = self.model.get("rope_scaling_factor")
-            if not isinstance(rope_factor, float) or rope_factor != 1.0:
-                raise ValueError(
-                    "pretraining model rope_scaling_factor must be exactly 1.0"
-                )
-        elif self.base_identity is None:
-            raise ValueError("base_identity must identify the base for lora")
+        rope_factor = self.model.get("rope_scaling_factor")
+        if not isinstance(rope_factor, float) or rope_factor != 1.0:
+            raise ValueError(
+                "pretraining model rope_scaling_factor must be exactly 1.0"
+            )
         _require_identity(self.tokenizer_identity, "tokenizer_identity")
-        if self.base_identity is not None:
-            _require_identity(self.base_identity, "base_identity")
         _require_identity(self.data_identity, "data_identity")
         _require_optional_string(
             self.diagnostic_data_locator, "diagnostic_data_locator"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class LoRARunManifest(_Manifest):
+    kind: str
+    version: int
+    identity: str
+    model: Mapping[str, object]
+    lora: Mapping[str, object]
+    precision: Mapping[str, object]
+    optimizer: Mapping[str, object]
+    loader: Mapping[str, object]
+    checkpoint: Mapping[str, object]
+    tokenizer_identity: str
+    base_identity: str
+    data_identity: str
+    diagnostic_data_locator: str | None
+
+    EXPECTED_KIND: ClassVar[str] = "lora-run"
+    IDENTITY_DOMAIN: ClassVar[str] = "sml-lora-run-manifest-v1"
+    MANIFEST_FILENAME: ClassVar[str] = "run.json"
+
+    def __post_init__(self) -> None:
+        self._validate_common()
+        for name in (
+            "model",
+            "lora",
+            "precision",
+            "optimizer",
+            "loader",
+            "checkpoint",
+        ):
+            object.__setattr__(
+                self, name, _freeze_json_mapping(getattr(self, name), name)
+            )
+        rope_factor = self.model.get("rope_scaling_factor")
+        if not isinstance(rope_factor, float) or rope_factor != 1.0:
+            raise ValueError("LoRA model rope_scaling_factor must be exactly 1.0")
+        _require_identity(self.tokenizer_identity, "tokenizer_identity")
+        _require_identity(self.base_identity, "base_identity")
+        _require_identity(self.data_identity, "data_identity")
         _require_optional_string(
-            self.diagnostic_source_locator, "diagnostic_source_locator"
+            self.diagnostic_data_locator, "diagnostic_data_locator"
         )
+
+
+type RunManifest = PretrainingRunManifest | LoRARunManifest
 
 
 @dataclass(frozen=True, slots=True)
@@ -796,6 +916,7 @@ class SwagDataManifest(_Manifest):
             raise TypeError(
                 "buckets must be a nonempty tuple of ArrayPayloadRef values"
             )
+        _require_unique_payload_paths(buckets, "buckets")
 
 
 @dataclass(frozen=True, slots=True)
@@ -839,12 +960,20 @@ class ExportManifest(_Manifest):
 _MANIFEST_TYPES: tuple[type[_Manifest], ...] = (
     TokenizerManifest,
     PretrainingDataManifest,
-    CheckpointManifest,
-    RunManifest,
+    PretrainingCheckpointManifest,
+    LoRACheckpointManifest,
+    PretrainingRunManifest,
+    LoRARunManifest,
     LatestIndex,
     BaseSnapshotManifest,
     SwagDataManifest,
     ExportManifest,
+)
+
+RUN_MANIFEST_TYPES = (PretrainingRunManifest, LoRARunManifest)
+CHECKPOINT_MANIFEST_TYPES = (
+    PretrainingCheckpointManifest,
+    LoRACheckpointManifest,
 )
 
 
@@ -973,20 +1102,44 @@ def _parse_manifest[M: _Manifest](raw: object, manifest_type: type[M]) -> M:
             diagnostic_source_locator=raw["diagnostic_source_locator"],
             row_content_identity=raw["row_content_identity"],
         )
-    elif manifest_type is CheckpointManifest:
-        manifest = CheckpointManifest(
+    elif manifest_type is PretrainingCheckpointManifest:
+        manifest = PretrainingCheckpointManifest(
             **common,
             owning_run_identity=raw["owning_run_identity"],
-            checkpoint_kind=raw["checkpoint_kind"],
             step=raw["step"],
             scalar_state=_parse_payload_ref(raw["scalar_state"]),
-            arrays=_parse_array_payload_tuple(raw["arrays"], "arrays"),
+            model=_parse_array_payload_ref(raw["model"]),
+            master=_parse_array_payload_ref(raw["master"]),
+            optimizer=_parse_array_payload_ref(raw["optimizer"]),
+            trainer=_parse_array_payload_ref(raw["trainer"]),
         )
-    elif manifest_type is RunManifest:
-        manifest = RunManifest(
+    elif manifest_type is LoRACheckpointManifest:
+        manifest = LoRACheckpointManifest(
             **common,
-            run_kind=raw["run_kind"],
+            owning_run_identity=raw["owning_run_identity"],
+            step=raw["step"],
+            scalar_state=_parse_payload_ref(raw["scalar_state"]),
+            adapters=_parse_array_payload_ref(raw["adapters"]),
+            optimizer=_parse_array_payload_ref(raw["optimizer"]),
+            trainer=_parse_array_payload_ref(raw["trainer"]),
+        )
+    elif manifest_type is PretrainingRunManifest:
+        manifest = PretrainingRunManifest(
+            **common,
             model=raw["model"],
+            precision=raw["precision"],
+            optimizer=raw["optimizer"],
+            loader=raw["loader"],
+            checkpoint=raw["checkpoint"],
+            tokenizer_identity=raw["tokenizer_identity"],
+            data_identity=raw["data_identity"],
+            diagnostic_data_locator=raw["diagnostic_data_locator"],
+        )
+    elif manifest_type is LoRARunManifest:
+        manifest = LoRARunManifest(
+            **common,
+            model=raw["model"],
+            lora=raw["lora"],
             precision=raw["precision"],
             optimizer=raw["optimizer"],
             loader=raw["loader"],
@@ -995,7 +1148,6 @@ def _parse_manifest[M: _Manifest](raw: object, manifest_type: type[M]) -> M:
             base_identity=raw["base_identity"],
             data_identity=raw["data_identity"],
             diagnostic_data_locator=raw["diagnostic_data_locator"],
-            diagnostic_source_locator=raw["diagnostic_source_locator"],
         )
     elif manifest_type is LatestIndex:
         manifest = LatestIndex(
@@ -1073,28 +1225,51 @@ def _payload_refs(value: object) -> Iterator[PayloadRef]:
             yield from _payload_refs(item)
 
 
-def read_manifest[M: _Manifest](
-    root: Path, manifest_type: type[M], verification: VerificationLevel
+def _manifest_type_for_raw[M: _Manifest](
+    raw: object,
+    manifest_types: tuple[type[M], ...],
+) -> type[M]:
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("kind"), str):
+        raise SMLArtifactError("manifest must contain a string kind discriminator")
+    by_kind = {
+        manifest_type.EXPECTED_KIND: manifest_type for manifest_type in manifest_types
+    }
+    try:
+        return by_kind[raw["kind"]]
+    except KeyError as error:
+        raise SMLArtifactError(
+            f"unsupported manifest kind for this owner: {raw['kind']!r}"
+        ) from error
+
+
+def _read_manifest_types[M: _Manifest](
+    root: Path,
+    manifest_types: tuple[type[M], ...],
+    verification: VerificationLevel,
 ) -> Verified[M]:
-    """Read an exact version-1 schema and verify its structured identity."""
     if not isinstance(root, Path):
         raise TypeError("root must be a Path")
     if not isinstance(verification, VerificationLevel):
         raise TypeError("verification must be a VerificationLevel")
-    if manifest_type not in _MANIFEST_TYPES:
-        raise SMLArtifactError(f"unsupported manifest type: {manifest_type!r}")
-    manifest_path = root / manifest_type.MANIFEST_FILENAME
+    if not manifest_types or any(
+        manifest_type not in _MANIFEST_TYPES for manifest_type in manifest_types
+    ):
+        raise SMLArtifactError(f"unsupported manifest types: {manifest_types!r}")
+    filenames = {manifest_type.MANIFEST_FILENAME for manifest_type in manifest_types}
+    if len(filenames) != 1:
+        raise SMLArtifactError("discriminated manifest types must share one filename")
+    filename = next(iter(filenames))
+    manifest_path = root / filename
     with ArtifactRoot.open(root, writable=False) as artifact_root:
         try:
-            with artifact_root.open_payload(
-                manifest_type.MANIFEST_FILENAME
-            ) as manifest_file:
+            with artifact_root.open_payload(filename) as manifest_file:
                 text = manifest_file.read().decode("utf-8")
             raw = json.loads(
                 text,
                 parse_constant=_reject_json_constant,
                 object_pairs_hook=_json_object_no_duplicates,
             )
+            manifest_type = _manifest_type_for_raw(raw, manifest_types)
             manifest = _parse_manifest(raw, manifest_type)
         except SMLArtifactError:
             raise
@@ -1106,7 +1281,7 @@ def read_manifest[M: _Manifest](
             ValueError,
         ) as error:
             raise SMLArtifactError(
-                f"invalid {manifest_type.__name__} at {manifest_path}: {error}"
+                f"invalid manifest at {manifest_path}: {error}"
             ) from error
 
         recomputed = manifest.recompute_identity()
@@ -1122,7 +1297,30 @@ def read_manifest[M: _Manifest](
         return Verified(manifest=manifest, verification=verification)
 
 
+def read_manifest[M: _Manifest](
+    root: Path, manifest_type: type[M], verification: VerificationLevel
+) -> Verified[M]:
+    """Read one exact version-1 schema and verify its structured identity."""
+    return _read_manifest_types(root, (manifest_type,), verification)
+
+
+def read_run_manifest(
+    root: Path, verification: VerificationLevel
+) -> Verified[RunManifest]:
+    """Dispatch one strict run kind from ``run.json``."""
+    return _read_manifest_types(root, RUN_MANIFEST_TYPES, verification)
+
+
+def read_checkpoint_manifest(
+    root: Path, verification: VerificationLevel
+) -> Verified[CheckpointManifest]:
+    """Dispatch one strict checkpoint kind from ``checkpoint.json``."""
+    return _read_manifest_types(root, CHECKPOINT_MANIFEST_TYPES, verification)
+
+
 __all__ = [
+    "CHECKPOINT_MANIFEST_TYPES",
+    "RUN_MANIFEST_TYPES",
     "ArrayPayloadRef",
     "ArraySpec",
     "ArtifactRoot",
@@ -1130,8 +1328,12 @@ __all__ = [
     "CheckpointManifest",
     "ExportManifest",
     "LatestIndex",
+    "LoRACheckpointManifest",
+    "LoRARunManifest",
     "PayloadRef",
+    "PretrainingCheckpointManifest",
     "PretrainingDataManifest",
+    "PretrainingRunManifest",
     "RunManifest",
     "SwagDataManifest",
     "TokenizerManifest",
@@ -1140,7 +1342,9 @@ __all__ = [
     "canonical_json_bytes",
     "file_identity",
     "parse_logical_path",
+    "read_checkpoint_manifest",
     "read_manifest",
+    "read_run_manifest",
     "row_content_identity",
     "structured_identity",
 ]

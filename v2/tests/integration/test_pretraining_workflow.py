@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from mlx.utils import tree_unflatten
+from sml.artifacts import checkpoint as checkpoint_module
 from sml.artifacts.checkpoint import (
     publish_immutable_bundle,
     resolve_latest_step,
@@ -19,13 +21,16 @@ from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
     ArtifactRoot,
-    CheckpointManifest,
+    LatestIndex,
     PayloadRef,
+    PretrainingCheckpointManifest,
     PretrainingDataManifest,
+    PretrainingRunManifest,
     TokenizerManifest,
     VerificationLevel,
     canonical_json_bytes,
     file_identity,
+    read_manifest,
     row_content_identity,
 )
 from sml.data.pretraining import PretrainingCursor
@@ -225,17 +230,18 @@ def _rewrite_array_group(
             for name, array in sorted(arrays.items())
         ),
     )
-    manifest = replace(
-        resolved.checkpoint,
-        arrays=tuple(
-            replacement if ref.payload.logical_path == logical_path else ref
-            for ref in resolved.checkpoint.arrays
-        ),
-    )
+    assert isinstance(resolved.checkpoint, PretrainingCheckpointManifest)
+    field_name = {
+        "model.safetensors": "model",
+        "master.safetensors": "master",
+        "optimizer.safetensors": "optimizer",
+        "trainer.safetensors": "trainer",
+    }[logical_path]
+    manifest = replace(resolved.checkpoint, **{field_name: replacement})
     manifest = replace(manifest, identity=manifest.recompute_identity())
-    (resolved.step_directory / CheckpointManifest.MANIFEST_FILENAME).write_bytes(
-        canonical_json_bytes(manifest)
-    )
+    (
+        resolved.step_directory / PretrainingCheckpointManifest.MANIFEST_FILENAME
+    ).write_bytes(canonical_json_bytes(manifest))
 
 
 def _rewrite_scalar_state(resolved, mutate) -> None:
@@ -248,9 +254,9 @@ def _rewrite_scalar_state(resolved, mutate) -> None:
         scalar_state=_payload_ref(path, "state.json"),
     )
     manifest = replace(manifest, identity=manifest.recompute_identity())
-    (resolved.step_directory / CheckpointManifest.MANIFEST_FILENAME).write_bytes(
-        canonical_json_bytes(manifest)
-    )
+    (
+        resolved.step_directory / PretrainingCheckpointManifest.MANIFEST_FILENAME
+    ).write_bytes(canonical_json_bytes(manifest))
 
 
 def _run_with_unpruned_latest(
@@ -258,12 +264,12 @@ def _run_with_unpruned_latest(
     run: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    real_retention = pretrain.apply_retention
+    real_retention = pretrain.prune_to_latest
 
     def interrupt_retention(*_args, **_kwargs):
         raise InjectedFailure("before retention")
 
-    monkeypatch.setattr(pretrain, "apply_retention", interrupt_retention)
+    monkeypatch.setattr(pretrain, "prune_to_latest", interrupt_retention)
     with pytest.raises(InjectedFailure, match="before retention"):
         pretrain.train(
             replace(
@@ -271,7 +277,7 @@ def _run_with_unpruned_latest(
                 checkpoint=CheckpointPolicy(interval=1),
             )
         )
-    monkeypatch.setattr(pretrain, "apply_retention", real_retention)
+    monkeypatch.setattr(pretrain, "prune_to_latest", real_retention)
     assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
         "step-000000000",
         "step-000000001",
@@ -281,6 +287,92 @@ def _run_with_unpruned_latest(
         writable=False,
         verification=VerificationLevel.FULL,
     )
+
+
+def _bind_run_to_token_invalid_data(
+    run: Path,
+    source_data: Path,
+    invalid_data: Path,
+) -> None:
+    shutil.copytree(source_data, invalid_data)
+    data_manifest = read_manifest(
+        invalid_data,
+        PretrainingDataManifest,
+        VerificationLevel.FULL,
+    ).manifest
+    shard_path = invalid_data / data_manifest.shards[0].logical_path
+    rows = np.load(shard_path, allow_pickle=False)
+    rows[0, 0] = 32
+    with shard_path.open("wb") as payload:
+        np.save(payload, rows, allow_pickle=False)
+    shards = (
+        replace(
+            data_manifest.shards[0],
+            identity=_payload_ref(
+                shard_path, data_manifest.shards[0].logical_path
+            ).identity,
+            byte_size=shard_path.stat().st_size,
+        ),
+        *data_manifest.shards[1:],
+    )
+    data_manifest = replace(
+        data_manifest,
+        shards=shards,
+        row_content_identity=row_content_identity(
+            (
+                row
+                for reference in shards
+                for row in np.load(
+                    invalid_data / reference.logical_path,
+                    allow_pickle=False,
+                )
+            ),
+            sum(data_manifest.shard_row_counts),
+            data_manifest.row_width,
+        ),
+    )
+    data_manifest = replace(data_manifest, identity=data_manifest.recompute_identity())
+    (invalid_data / "manifest.json").write_bytes(canonical_json_bytes(data_manifest))
+
+    resolved = resolve_latest_step(
+        run, writable=False, verification=VerificationLevel.FULL
+    )
+    assert isinstance(resolved.run, PretrainingRunManifest)
+    assert isinstance(resolved.checkpoint, PretrainingCheckpointManifest)
+    run_manifest = replace(
+        resolved.run,
+        data_identity=data_manifest.identity,
+        diagnostic_data_locator=str(invalid_data),
+    )
+    run_manifest = replace(run_manifest, identity=run_manifest.recompute_identity())
+    (run / "run.json").write_bytes(canonical_json_bytes(run_manifest))
+
+    state_path = resolved.step_directory / "state.json"
+    scalar = json.loads(state_path.read_bytes())
+    scalar["owning_run_identity"] = run_manifest.identity
+    state_path.write_bytes(canonical_json_bytes(scalar))
+    checkpoint_manifest = replace(
+        resolved.checkpoint,
+        owning_run_identity=run_manifest.identity,
+        scalar_state=_payload_ref(state_path, "state.json"),
+    )
+    checkpoint_manifest = replace(
+        checkpoint_manifest,
+        identity=checkpoint_manifest.recompute_identity(),
+    )
+    (resolved.step_directory / "checkpoint.json").write_bytes(
+        canonical_json_bytes(checkpoint_manifest)
+    )
+    latest = LatestIndex(
+        kind="latest-index",
+        version=1,
+        identity="sha256:" + "0" * 64,
+        owning_run_identity=run_manifest.identity,
+        step=checkpoint_manifest.step,
+        checkpoint_identity=checkpoint_manifest.identity,
+    )
+    latest = replace(latest, identity=latest.recompute_identity())
+    (run / "latest.json").write_bytes(canonical_json_bytes(latest))
 
 
 def _assert_run_states_equal(left: Path, right: Path) -> None:
@@ -495,6 +587,101 @@ def test_completed_limit_returns_before_stream_model_or_kernel_construction(
     assert result == completed
 
 
+def test_resume_semantic_data_preflight_precedes_restore_prune_and_early_return(
+    prepared_data: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hash-consistent invalid NPY bundle must fail before checkpoint consumption."""
+    completed = pretrain.train(
+        _config(prepared_data, tmp_path / "run", maximum_steps=1)
+    )
+    invalid_data = tmp_path / "token-invalid-data"
+    _bind_run_to_token_invalid_data(completed.run, prepared_data, invalid_data)
+    reached: list[str] = []
+
+    def forbidden(name):
+        def call(*_args, **_kwargs):
+            reached.append(name)
+            raise AssertionError(f"{name} reached before semantic data preflight")
+
+        return call
+
+    monkeypatch.setattr(pretrain, "_restore_checkpoint", forbidden("restore"))
+    monkeypatch.setattr(pretrain, "prune_to_latest", forbidden("retention"))
+    monkeypatch.setattr(pretrain, "PretrainingBatchStream", forbidden("stream"))
+    monkeypatch.setattr(pretrain, "SMLLanguageModel", forbidden("model"))
+    monkeypatch.setattr(
+        pretrain, "build_pretraining_kernels", forbidden("compiled kernel")
+    )
+
+    with pytest.raises(SMLArtifactError, match="token IDs"):
+        pretrain.resume(
+            completed.run,
+            data=invalid_data,
+            overrides=_overrides(maximum_steps=1),
+        )
+
+    assert reached == []
+
+
+def test_resume_reader_rejects_named_step_swap_before_retention(
+    prepared_data: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A replaced step name must not redirect consumed state after FULL proof."""
+    completed = pretrain.train(
+        _config(prepared_data, tmp_path / "run", maximum_steps=1)
+    )
+    resolved = resolve_latest_step(
+        completed.run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+    replacement = tmp_path / "replacement-step"
+    shutil.copytree(resolved.step_directory, replacement)
+    replacement_state = replacement / "state.json"
+    state = json.loads(replacement_state.read_bytes())
+    state["rows"] = 999
+    replacement_state.write_bytes(canonical_json_bytes(state))
+
+    real_opener = getattr(checkpoint_module, "open_checkpoint_reader", None)
+    assert real_opener is not None
+    original = tmp_path / "opened-original-step"
+    swapped = False
+
+    @contextmanager
+    def swap_after_open(*args, **kwargs):
+        nonlocal swapped
+        with real_opener(*args, **kwargs) as reader:
+            resolved.step_directory.rename(original)
+            replacement.rename(resolved.step_directory)
+            swapped = True
+            yield reader
+
+    retentions = 0
+
+    def forbidden_retention(*_args, **_kwargs):
+        nonlocal retentions
+        retentions += 1
+        raise AssertionError("retention reached after a hostile step-name swap")
+
+    monkeypatch.setattr(
+        pretrain, "open_checkpoint_reader", swap_after_open, raising=False
+    )
+    monkeypatch.setattr(pretrain, "prune_to_latest", forbidden_retention)
+    with pytest.raises(SMLArtifactError, match="inode|named step|swapped"):
+        pretrain.resume(
+            completed.run,
+            data=prepared_data,
+            overrides=_overrides(maximum_steps=1),
+        )
+
+    assert swapped is True
+    assert retentions == 0
+
+
 def test_corrupt_inputs_fail_before_model_allocation(
     prepared_data: Path,
     tmp_path: Path,
@@ -632,8 +819,8 @@ def test_checkpoint_retention_rejects_same_step_identity_substitution(
 
     monkeypatch.setattr(
         pretrain,
-        "apply_retention",
-        lambda _run, *, keep_last: substituted,
+        "prune_to_latest",
+        lambda _run: substituted,
     )
     with pytest.raises(SMLArtifactError, match="identity"):
         pretrain.train(
@@ -713,7 +900,7 @@ def test_structural_checkpoint_corruption_fails_before_allocation_or_retention(
         raise AssertionError("stream construction reached")
 
     monkeypatch.setattr(pretrain, "SMLLanguageModel", forbidden_allocation)
-    monkeypatch.setattr(pretrain, "apply_retention", forbidden_retention)
+    monkeypatch.setattr(pretrain, "prune_to_latest", forbidden_retention)
     monkeypatch.setattr(pretrain, "PretrainingBatchStream", forbidden_stream)
     with pytest.raises(SMLArtifactError, match="checkpoint|parameter|working|master"):
         pretrain.resume(
@@ -831,7 +1018,7 @@ def test_restored_state_corruption_fails_before_pruning_stream_or_model(
         raise AssertionError("stream construction reached")
 
     monkeypatch.setattr(pretrain, "SMLLanguageModel", forbidden_allocation)
-    monkeypatch.setattr(pretrain, "apply_retention", forbidden_retention)
+    monkeypatch.setattr(pretrain, "prune_to_latest", forbidden_retention)
     monkeypatch.setattr(pretrain, "PretrainingBatchStream", forbidden_stream)
     with pytest.raises(SMLArtifactError, match="checkpoint|cursor|optimizer|trainer"):
         pretrain.resume(

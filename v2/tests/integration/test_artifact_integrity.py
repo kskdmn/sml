@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
+import mlx.core as mx
 import pytest
 from sml.artifacts.checkpoint import (
     IMMUTABLE_PUBLICATION_STAGES,
@@ -21,9 +22,9 @@ from sml.artifacts.checkpoint import (
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
-    CheckpointManifest,
     PayloadRef,
-    RunManifest,
+    PretrainingCheckpointManifest,
+    PretrainingRunManifest,
     TokenizerManifest,
     VerificationLevel,
     canonical_json_bytes,
@@ -201,6 +202,86 @@ def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
     return PayloadRef(logical_path, identity, path.stat().st_size)
 
 
+def _array_ref(
+    path: Path, logical_path: str, arrays: dict[str, mx.array]
+) -> ArrayPayloadRef:
+    return ArrayPayloadRef(
+        _payload_ref(path, logical_path),
+        tuple(
+            ArraySpec(
+                name,
+                tuple(array.shape),
+                {
+                    mx.bfloat16: "bfloat16",
+                    mx.float32: "float32",
+                    mx.int32: "int32",
+                    mx.uint32: "uint32",
+                }[array.dtype],
+            )
+            for name, array in sorted(arrays.items())
+        ),
+    )
+
+
+def _pretraining_checkpoint(
+    private_step: Path,
+    run: PretrainingRunManifest,
+    *,
+    step: int,
+) -> PretrainingCheckpointManifest:
+    groups = {
+        "model.safetensors": {"model.weight": mx.array([step], dtype=mx.bfloat16)},
+        "master.safetensors": {"model.weight": mx.array([step], dtype=mx.float32)},
+        "optimizer.safetensors": {
+            "step": mx.array(step, dtype=mx.int32),
+            "first_moments.model.weight": mx.zeros((1,), dtype=mx.float32),
+            "second_moments.model.weight": mx.zeros((1,), dtype=mx.float32),
+        },
+        "trainer.safetensors": {
+            "accumulation_count": mx.array(0, dtype=mx.int32),
+            "next_key": mx.random.key(step),
+            "loss_numerator": mx.array(0.0, dtype=mx.float32),
+            "accumulators.model.weight": mx.zeros((1,), dtype=mx.float32),
+        },
+    }
+    references = {}
+    for logical_path, arrays in groups.items():
+        path = private_step / logical_path
+        mx.save_safetensors(path, arrays)
+        references[logical_path] = _array_ref(path, logical_path, arrays)
+    state_path = private_step / "state.json"
+    state_path.write_bytes(
+        canonical_json_bytes(
+            {
+                "kind": "pretraining-state",
+                "version": 1,
+                "owning_run_identity": run.identity,
+                "step": step,
+                "rows": step,
+                "microsteps": step,
+                "cursor": {
+                    "epoch": 0,
+                    "shard_order_position": 0,
+                    "row_offset": 0,
+                },
+            }
+        )
+    )
+    checkpoint = PretrainingCheckpointManifest(
+        kind="pretraining-checkpoint",
+        version=1,
+        identity="sha256:" + "0" * 64,
+        owning_run_identity=run.identity,
+        step=step,
+        scalar_state=_payload_ref(state_path, "state.json"),
+        model=references["model.safetensors"],
+        master=references["master.safetensors"],
+        optimizer=references["optimizer.safetensors"],
+        trainer=references["trainer.safetensors"],
+    )
+    return replace(checkpoint, identity=checkpoint.recompute_identity())
+
+
 def _tokenizer_manifest_with_payloads(root, *, payload_directory: str | None = None):
     payload_root = root
     logical_prefix = ""
@@ -255,51 +336,29 @@ def _immutable_bundle_builder(private_path: Path) -> TokenizerManifest:
     )
 
 
-def _complete_run_builder(private_path: Path) -> RunManifest:
+def _complete_run_builder(private_path: Path) -> PretrainingRunManifest:
     tokenizer_path = private_path / "tokenizer"
     tokenizer_path.mkdir()
     tokenizer = _published_tokenizer_manifest(tokenizer_path)
-    run = RunManifest(
-        kind="run",
+    run = PretrainingRunManifest(
+        kind="pretraining-run",
         version=1,
         identity="sha256:" + "0" * 64,
-        run_kind="pretraining",
         model={"rope_scaling_factor": 1.0},
         precision={"working": "bfloat16"},
         optimizer={"name": "adamw"},
         loader={"batch_size": 1},
         checkpoint={"interval": 1},
         tokenizer_identity=tokenizer.identity,
-        base_identity=None,
         data_identity="sha256:" + "2" * 64,
         diagnostic_data_locator="/portable/data",
-        diagnostic_source_locator=None,
     )
     run = replace(run, identity=run.recompute_identity())
     (private_path / "run.json").write_bytes(canonical_json_bytes(run))
     (private_path / "checkpoints").mkdir()
 
-    def build_step(private_step: Path) -> CheckpointManifest:
-        arrays_path = private_step / "arrays.safetensors"
-        state_path = private_step / "state.json"
-        arrays_path.write_bytes(b"step-zero-arrays")
-        state_path.write_bytes(b'{"step":0}')
-        checkpoint = CheckpointManifest(
-            kind="checkpoint",
-            version=1,
-            identity="sha256:" + "0" * 64,
-            owning_run_identity=run.identity,
-            checkpoint_kind="pretraining",
-            step=0,
-            scalar_state=_payload_ref(state_path, "state.json"),
-            arrays=(
-                ArrayPayloadRef(
-                    _payload_ref(arrays_path, "arrays.safetensors"),
-                    (ArraySpec("model.weight", (1,), "float32"),),
-                ),
-            ),
-        )
-        return replace(checkpoint, identity=checkpoint.recompute_identity())
+    def build_step(private_step: Path) -> PretrainingCheckpointManifest:
+        return _pretraining_checkpoint(private_step, run, step=0)
 
     publish_checkpoint(private_path, build_step)
     return run
@@ -501,21 +560,18 @@ def test_checkpoint_full_verification_rehashes_payloads(tmp_path):
     run = tmp_path / "run-0001"
     run.mkdir()
     (run / "checkpoints").mkdir()
-    run_manifest = RunManifest(
-        kind="run",
+    run_manifest = PretrainingRunManifest(
+        kind="pretraining-run",
         version=1,
         identity="sha256:" + "0" * 64,
-        run_kind="pretraining",
         model={"rope_scaling_factor": 1.0},
         precision={"working": "bfloat16"},
         optimizer={"name": "adamw"},
         loader={"batch_size": 1},
-        checkpoint={"keep_last": None},
+        checkpoint={"interval": 1},
         tokenizer_identity="sha256:" + "1" * 64,
-        base_identity=None,
         data_identity="sha256:" + "2" * 64,
         diagnostic_data_locator=None,
-        diagnostic_source_locator=None,
     )
     run_manifest = replace(
         run_manifest,
@@ -523,43 +579,12 @@ def test_checkpoint_full_verification_rehashes_payloads(tmp_path):
     )
     (run / "run.json").write_bytes(canonical_json_bytes(run_manifest))
 
-    def build(private_step: Path) -> CheckpointManifest:
-        arrays_path = private_step / "arrays.safetensors"
-        state_path = private_step / "state.json"
-        arrays_path.write_bytes(b"array bytes")
-        state_path.write_bytes(b'{"step":1}')
-        with arrays_path.open("rb") as arrays_file:
-            arrays_identity = file_identity(arrays_file)
-        with state_path.open("rb") as state_file:
-            state_identity = file_identity(state_file)
-        manifest = CheckpointManifest(
-            kind="checkpoint",
-            version=1,
-            identity="sha256:" + "0" * 64,
-            owning_run_identity=run_manifest.identity,
-            checkpoint_kind="pretraining",
-            step=1,
-            scalar_state=PayloadRef(
-                "state.json",
-                state_identity,
-                state_path.stat().st_size,
-            ),
-            arrays=(
-                ArrayPayloadRef(
-                    PayloadRef(
-                        "arrays.safetensors",
-                        arrays_identity,
-                        arrays_path.stat().st_size,
-                    ),
-                    (ArraySpec("model.weight", (1,), "float32"),),
-                ),
-            ),
-        )
-        return replace(manifest, identity=manifest.recompute_identity())
+    def build(private_step: Path) -> PretrainingCheckpointManifest:
+        return _pretraining_checkpoint(private_step, run_manifest, step=1)
 
     with run_writer_lock(run):
         publish_checkpoint(run, build)
-    arrays_path = run / "checkpoints" / "step-000000001" / "arrays.safetensors"
+    arrays_path = run / "checkpoints" / "step-000000001" / "model.safetensors"
     arrays_path.write_bytes(b"tampered!!!")
 
     with pytest.raises(SMLArtifactError, match="payload identity|byte size"):

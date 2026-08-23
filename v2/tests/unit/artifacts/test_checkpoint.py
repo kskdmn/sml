@@ -6,17 +6,19 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from inspect import signature
 from pathlib import Path
 
+import mlx.core as mx
 import pytest
 from sml.artifacts import checkpoint
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
-    CheckpointManifest,
     LatestIndex,
     PayloadRef,
-    RunManifest,
+    PretrainingCheckpointManifest,
+    PretrainingRunManifest,
     VerificationLevel,
     canonical_json_bytes,
     file_identity,
@@ -35,6 +37,13 @@ CHECKPOINT_STAGES = (
     "latest-replaced",
     "latest-parent-fsynced",
 )
+
+
+def test_checkpoint_public_retention_surface_is_latest_only() -> None:
+    """Callers must not be able to select arbitrary checkpoint history depth."""
+    assert "apply_retention" not in checkpoint.__all__
+    assert not hasattr(checkpoint, "apply_retention")
+    assert "keep_last" not in signature(checkpoint.prune_to_latest).parameters
 
 
 class InjectedFailure(RuntimeError):
@@ -287,7 +296,7 @@ class _MutateAfterStepParentFsyncFilesystemOps(RecordingFilesystemOps):
                 self._run
                 / "checkpoints"
                 / f"step-{self._step:09d}"
-                / "arrays.safetensors"
+                / "model.safetensors"
             ).write_bytes(b"mutated-after-commit")
 
 
@@ -464,7 +473,7 @@ class _MutateLatestBeforeFreshProofFilesystemOps(RecordingFilesystemOps):
             self._latest_open_count += 1
             if self._latest_open_count == 2:
                 (
-                    self._run / "checkpoints" / self._latest / "arrays.safetensors"
+                    self._run / "checkpoints" / self._latest / "model.safetensors"
                 ).write_bytes(b"mutated-before-fresh-proof")
         return super().open(path, flags, mode, dir_fd=dir_fd)
 
@@ -502,57 +511,99 @@ def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
     return PayloadRef(logical_path, identity, path.stat().st_size)
 
 
-def _run_manifest() -> RunManifest:
-    manifest = RunManifest(
-        kind="run",
+def _run_manifest() -> PretrainingRunManifest:
+    manifest = PretrainingRunManifest(
+        kind="pretraining-run",
         version=1,
         identity="sha256:" + "0" * 64,
-        run_kind="pretraining",
         model={"rope_scaling_factor": 1.0},
         precision={"working": "bfloat16"},
         optimizer={"name": "adamw"},
         loader={"batch_size": 2},
-        checkpoint={"keep_last": None},
+        checkpoint={"interval": 1},
         tokenizer_identity="sha256:" + "1" * 64,
-        base_identity=None,
         data_identity="sha256:" + "2" * 64,
         diagnostic_data_locator="/relocatable/data",
-        diagnostic_source_locator="/relocatable/run",
     )
     return replace(manifest, identity=manifest.recompute_identity())
 
 
 def _checkpoint_builder(
-    run_manifest: RunManifest,
+    run_manifest: PretrainingRunManifest,
     *,
     step: int,
-    array_bytes: bytes | None = None,
-    array_logical_path: str = "arrays.safetensors",
     scalar_logical_path: str = "state.json",
-) -> Callable[[Path], CheckpointManifest]:
-    materialized_array_bytes = array_bytes or f"array-{step}".encode()
+) -> Callable[[Path], PretrainingCheckpointManifest]:
 
-    def build(private_step: Path) -> CheckpointManifest:
-        arrays_path = private_step / array_logical_path
+    def build(private_step: Path) -> PretrainingCheckpointManifest:
         state_path = private_step / scalar_logical_path
-        arrays_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        arrays_path.write_bytes(materialized_array_bytes)
-        state_path.write_bytes(f'{{"step":{step}}}'.encode())
-        manifest = CheckpointManifest(
-            kind="checkpoint",
+        working = {"model.weight": mx.array([step], dtype=mx.bfloat16)}
+        master = {"model.weight": working["model.weight"].astype(mx.float32)}
+        optimizer = {
+            "step": mx.array(step, dtype=mx.int32),
+            "first_moments.model.weight": mx.zeros((1,), dtype=mx.float32),
+            "second_moments.model.weight": mx.zeros((1,), dtype=mx.float32),
+        }
+        trainer = {
+            "accumulation_count": mx.array(0, dtype=mx.int32),
+            "next_key": mx.random.key(step),
+            "loss_numerator": mx.array(0.0, dtype=mx.float32),
+            "accumulators.model.weight": mx.zeros((1,), dtype=mx.float32),
+        }
+        references: dict[str, ArrayPayloadRef] = {}
+        for logical_path, arrays in (
+            ("model.safetensors", working),
+            ("master.safetensors", master),
+            ("optimizer.safetensors", optimizer),
+            ("trainer.safetensors", trainer),
+        ):
+            path = private_step / logical_path
+            mx.save_safetensors(path, arrays)
+            references[logical_path] = ArrayPayloadRef(
+                payload=_payload_ref(path, logical_path),
+                arrays=tuple(
+                    ArraySpec(
+                        name,
+                        tuple(array.shape),
+                        {
+                            mx.bfloat16: "bfloat16",
+                            mx.float32: "float32",
+                            mx.int32: "int32",
+                            mx.uint32: "uint32",
+                        }[array.dtype],
+                    )
+                    for name, array in sorted(arrays.items())
+                ),
+            )
+        state_path.write_bytes(
+            canonical_json_bytes(
+                {
+                    "kind": "pretraining-state",
+                    "version": 1,
+                    "owning_run_identity": run_manifest.identity,
+                    "step": step,
+                    "rows": step,
+                    "microsteps": step,
+                    "cursor": {
+                        "epoch": 0,
+                        "shard_order_position": 0,
+                        "row_offset": 0,
+                    },
+                }
+            )
+        )
+        manifest = PretrainingCheckpointManifest(
+            kind="pretraining-checkpoint",
             version=1,
             identity="sha256:" + "0" * 64,
             owning_run_identity=run_manifest.identity,
-            checkpoint_kind=run_manifest.run_kind,
             step=step,
             scalar_state=_payload_ref(state_path, scalar_logical_path),
-            arrays=(
-                ArrayPayloadRef(
-                    payload=_payload_ref(arrays_path, array_logical_path),
-                    arrays=(ArraySpec("model.weight", (1,), "float32"),),
-                ),
-            ),
+            model=references["model.safetensors"],
+            master=references["master.safetensors"],
+            optimizer=references["optimizer.safetensors"],
+            trainer=references["trainer.safetensors"],
         )
         return replace(manifest, identity=manifest.recompute_identity())
 
@@ -746,18 +797,18 @@ def test_checkpoint_interruption_recovery(stage: str, valid_run: Path) -> None:
     ):
         checkpoint.publish_checkpoint(
             valid_run,
-            _checkpoint_builder(
-                run_manifest,
-                step=2,
-                array_logical_path="nested/arrays.safetensors",
-            ),
+            _checkpoint_builder(run_manifest, step=2),
             fs=fs,
         )
 
     completed_index = CHECKPOINT_STAGES.index(stage)
     assert fs.completed_stages == list(CHECKPOINT_STAGES[: completed_index + 1])
-    assert ("nested", "arrays.safetensors") in fs.fsynced_files
-    assert ("nested",) in fs.fsynced_directories
+    assert {
+        ("model.safetensors",),
+        ("master.safetensors",),
+        ("optimizer.safetensors",),
+        ("trainer.safetensors",),
+    }.issubset(fs.fsynced_files)
     assert () in fs.fsynced_directories
     if completed_index >= 1:
         assert ("state.json",) in fs.fsynced_files
@@ -781,7 +832,7 @@ def test_checkpoint_scalar_state_must_be_named_state_json(valid_run: Path) -> No
 
     with (
         checkpoint.run_writer_lock(valid_run),
-        pytest.raises(SMLArtifactError, match="state.json|scalar"),
+        pytest.raises((SMLArtifactError, ValueError), match="state.json|scalar"),
     ):
         checkpoint.publish_checkpoint(
             valid_run,
@@ -908,7 +959,7 @@ def test_retention_waits_for_active_reader(
 
     def retain_owned() -> checkpoint.ResolvedStep:
         with checkpoint.run_writer_lock(valid_run):
-            return checkpoint.apply_retention(valid_run, keep_last=1)
+            return checkpoint.prune_to_latest(valid_run)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         reader = executor.submit(hold_reader)
@@ -932,7 +983,7 @@ def test_retention_never_deletes_latest(valid_run: Path) -> None:
     _publish_step(valid_run, 3)
 
     with checkpoint.run_writer_lock(valid_run):
-        retained = checkpoint.apply_retention(valid_run, keep_last=1)
+        retained = checkpoint.prune_to_latest(valid_run)
 
     assert retained.step == 3
     assert sorted(path.name for path in (valid_run / "checkpoints").iterdir()) == [
@@ -946,7 +997,7 @@ def test_retention_reports_persisted_latest_recovery(valid_run: Path) -> None:
     (valid_run / "latest.json").unlink()
 
     with checkpoint.run_writer_lock(valid_run):
-        retained = checkpoint.apply_retention(valid_run, keep_last=1)
+        retained = checkpoint.prune_to_latest(valid_run)
 
     assert retained.step == 2
     assert retained.latest_recovered is True
@@ -965,7 +1016,7 @@ def test_retention_run_path_swap_uses_retained_original_descriptor(
     fs = _SwapRunDuringRecoveryFilesystemOps(valid_run, replacement)
 
     with checkpoint.run_writer_lock(valid_run):
-        retained = checkpoint.apply_retention(valid_run, keep_last=1, fs=fs)
+        retained = checkpoint.prune_to_latest(valid_run, fs=fs)
 
     assert retained.step == 2
     assert fs.swapped is True
@@ -1000,7 +1051,7 @@ def test_retention_candidate_swap_at_detach_preserves_replacement(
         checkpoint.run_writer_lock(valid_run),
         pytest.raises(SMLArtifactError, match="inode|bound|swapped|candidate"),
     ):
-        checkpoint.apply_retention(valid_run, keep_last=2, fs=fs)
+        checkpoint.prune_to_latest(valid_run, fs=fs)
 
     assert fs.swapped is True
     assert (valid_run / "checkpoints" / "parked-original-candidate").is_dir()
@@ -1030,7 +1081,7 @@ def test_retention_latest_swap_never_deletes_proved_latest(valid_run: Path) -> N
         checkpoint.run_writer_lock(valid_run),
         pytest.raises(SMLArtifactError, match="inode|bound|swapped|latest|candidate"),
     ):
-        checkpoint.apply_retention(valid_run, keep_last=2, fs=fs)
+        checkpoint.prune_to_latest(valid_run, fs=fs)
 
     assert fs.swapped is True
     surviving_inodes = {
@@ -1068,7 +1119,7 @@ def test_retention_cleanup_never_deletes_latest_swapped_under_exact_temp(
         checkpoint.run_writer_lock(valid_run),
         pytest.raises(SMLArtifactError, match="inode|bound|swapped|latest|temporary"),
     ):
-        checkpoint.apply_retention(valid_run, keep_last=None, fs=fs)
+        checkpoint.prune_to_latest(valid_run, fs=fs)
 
     assert fs.swapped is True
     assert fs.delete_count == 0
@@ -1095,7 +1146,7 @@ def test_retention_mutated_latest_before_fresh_proof_deletes_nothing(
         checkpoint.run_writer_lock(valid_run),
         pytest.raises(SMLArtifactError, match="payload identity|byte size"),
     ):
-        checkpoint.apply_retention(valid_run, keep_last=2, fs=fs)
+        checkpoint.prune_to_latest(valid_run, fs=fs)
 
     assert fs.delete_count == 0
     assert (valid_run / "checkpoints" / "step-000000001").is_dir()
@@ -1113,7 +1164,7 @@ def test_retention_mid_delete_failure_detaches_and_retry_cleans(
         checkpoint.run_writer_lock(valid_run),
         pytest.raises(InjectedFailure, match="mid-delete"),
     ):
-        checkpoint.apply_retention(valid_run, keep_last=1, fs=fs)
+        checkpoint.prune_to_latest(valid_run, fs=fs)
 
     checkpoint_names = sorted(
         entry.name for entry in (valid_run / "checkpoints").iterdir()
@@ -1130,7 +1181,7 @@ def test_retention_mid_delete_failure_detaches_and_retry_cleans(
             )
 
     with checkpoint.run_writer_lock(valid_run):
-        retained = checkpoint.apply_retention(valid_run, keep_last=1)
+        retained = checkpoint.prune_to_latest(valid_run)
 
     assert retained.step == 3
     assert sorted(entry.name for entry in (valid_run / "checkpoints").iterdir()) == [
@@ -1143,7 +1194,7 @@ def test_retention_requires_current_full_proof_before_first_delete(
 ) -> None:
     """Corrupt retained bytes must abort retention before any deletion syscall."""
     _publish_step(valid_run, 2)
-    (valid_run / "checkpoints" / "step-000000002" / "arrays.safetensors").write_bytes(
+    (valid_run / "checkpoints" / "step-000000002" / "model.safetensors").write_bytes(
         b"tampered"
     )
     fs = RecordingFilesystemOps(valid_run)
@@ -1152,7 +1203,7 @@ def test_retention_requires_current_full_proof_before_first_delete(
         checkpoint.run_writer_lock(valid_run),
         pytest.raises(SMLArtifactError, match="payload identity|byte size"),
     ):
-        checkpoint.apply_retention(valid_run, keep_last=1, fs=fs)
+        checkpoint.prune_to_latest(valid_run, fs=fs)
 
     assert fs.delete_count == 0
     assert (valid_run / "checkpoints" / "step-000000001").is_dir()
@@ -1174,22 +1225,9 @@ def test_retention_validates_all_candidates_before_first_delete(
         checkpoint.run_writer_lock(valid_run),
         pytest.raises(SMLArtifactError, match="payload identity|byte size"),
     ):
-        checkpoint.apply_retention(valid_run, keep_last=1, fs=fs)
+        checkpoint.prune_to_latest(valid_run, fs=fs)
 
     assert fs.delete_count == 0
     assert all(
         (valid_run / "checkpoints" / f"step-{step:09d}").is_dir() for step in (1, 2, 3)
     )
-
-
-@pytest.mark.parametrize("keep_last", [0, -1, True, 1.5])
-def test_retention_rejects_nonpositive_or_noninteger_keep_last(
-    valid_run: Path,
-    keep_last: object,
-) -> None:
-    """Invalid retention limits must fail before inspecting deletion targets."""
-    with (
-        checkpoint.run_writer_lock(valid_run),
-        pytest.raises((TypeError, ValueError)),
-    ):
-        checkpoint.apply_retention(valid_run, keep_last=keep_last)  # type: ignore[arg-type]
