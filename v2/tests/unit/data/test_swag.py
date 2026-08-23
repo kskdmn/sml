@@ -4,13 +4,17 @@ import sys
 from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from sml.artifacts.manifest import (
     PayloadRef,
+    SwagDataManifest,
     TokenizerManifest,
     VerificationLevel,
+    canonical_json_bytes,
+    read_manifest,
 )
 from sml.errors import SMLArtifactError, SMLDataError
 from sml.inference import ResolvedModel
@@ -70,6 +74,9 @@ class FakeSwagProvider:
         self.resolve_calls = 0
         self.iter_calls = 0
         self.fail_resolve = False
+        self.fail_iter = False
+        self.fail_iter_after_rows = False
+        self.resolved_namespace = None
 
     def resolve(self, source):
         self.resolve_calls += 1
@@ -77,9 +84,14 @@ class FakeSwagProvider:
             raise RuntimeError("provider unavailable")
         from sml.data.swag import ResolvedSwagSource
 
+        namespace = (
+            source.namespace
+            if self.resolved_namespace is None
+            else self.resolved_namespace
+        )
         return ResolvedSwagSource(
             backend=source.backend,
-            namespace=source.namespace,
+            namespace=namespace,
             name=source.name,
             dataset_config=source.dataset_config,
             revision=source.revision,
@@ -92,7 +104,11 @@ class FakeSwagProvider:
 
     def iter_rows(self, resolved) -> Iterator[Mapping[str, object]]:
         self.iter_calls += 1
+        if self.fail_iter:
+            raise RuntimeError("provider unavailable")
         yield from self.rows
+        if self.fail_iter_after_rows:
+            raise RuntimeError("provider unavailable")
 
 
 class RecordingTokenizer:
@@ -504,3 +520,224 @@ def test_runtime_provider_is_not_part_of_bundle_identity(tmp_path):
     assert first.manifest.identity == second.manifest.identity
     assert "provider" not in first.manifest.source
     assert first.manifest.source["provider_fingerprint"] == "fingerprint-v1"
+    assert first.manifest.source["commit"] == first_provider.commit
+    assert first.manifest.source["provider_package"] == first_provider.package
+    assert first.manifest.source["provider_version"] == first_provider.version
+
+
+def _rewrite_swag_manifest(path: Path, **overrides: object) -> None:
+    verified = read_manifest(path, SwagDataManifest, VerificationLevel.FULL)
+    manifest = replace(verified.manifest, **overrides)
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (path / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+
+def test_huggingface_provider_pins_main_revision_to_commit_sha(monkeypatch):
+    from sml.data import swag
+    from sml.data.swag import HuggingFaceDatasetsSwagProvider, SwagSourceConfig
+
+    pinned = "abcdef0123456789abcdef0123456789abcdef01"
+    load_revisions: list[object] = []
+
+    class FakeApi:
+        def dataset_info(self, repo_id, revision=None, timeout=None, **kwargs):
+            assert repo_id == "allenai/swag"
+            assert revision == "main"
+            return SimpleNamespace(sha=pinned)
+
+    class FakeDataset:
+        _fingerprint = "fp-1"
+
+        def __iter__(self):
+            return iter(())
+
+    def fake_load_dataset(path, name, split=None, revision=None, **kwargs):
+        del path, name, split, kwargs
+        load_revisions.append(revision)
+        return FakeDataset()
+
+    monkeypatch.setattr(
+        swag,
+        "_import_huggingface_hub",
+        lambda: SimpleNamespace(HfApi=FakeApi),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        swag,
+        "_import_datasets",
+        lambda: SimpleNamespace(load_dataset=fake_load_dataset),
+    )
+
+    provider = HuggingFaceDatasetsSwagProvider()
+    source = SwagSourceConfig(revision="main")
+    resolved = provider.resolve(source)
+    assert resolved.commit == pinned
+    assert resolved.commit != source.revision
+    assert resolved.revision == "main"
+    list(provider.iter_rows(resolved))
+    assert load_revisions
+    assert all(revision == pinned for revision in load_revisions)
+
+
+def test_resolved_source_mismatch_is_rejected_before_rows(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    provider.resolved_namespace = "normalized-org"
+    with pytest.raises(SMLDataError, match="correspond"):
+        prepare_swag_bundle(
+            tiny_swag_config(provider),
+            tiny_base_model(),
+            tmp_path / "swag",
+        )
+    assert provider.iter_calls == 0
+
+
+def test_load_swag_bundle_rejects_unsupported_policy_before_opening_arrays(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepare_swag_bundle(
+        change_identity_field(tiny_swag_config(provider), "join_policy"),
+        tiny_base_model(),
+        output,
+    )
+
+    def fail_open(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("arrays opened before projection validation")
+
+    monkeypatch.setattr(swag, "_open_buckets", fail_open)
+    with pytest.raises(SMLArtifactError, match="join"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_swag_bundle_rejects_unsupported_schema_before_opening_arrays(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepare_swag_bundle(
+        change_identity_field(
+            tiny_swag_config(provider), "preprocessing_schema_version"
+        ),
+        tiny_base_model(),
+        output,
+    )
+
+    def fail_open(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("arrays opened before projection validation")
+
+    monkeypatch.setattr(swag, "_open_buckets", fail_open)
+    with pytest.raises(SMLArtifactError, match="schema"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_swag_bundle_rejects_bucket_policy_that_misses_maximum_length(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    preprocessing = dict(prepared.manifest.preprocessing)
+    preprocessing["maximum_length"] = 10_000
+    _rewrite_swag_manifest(output, preprocessing=preprocessing)
+
+    def fail_open(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("arrays opened before projection validation")
+
+    monkeypatch.setattr(swag, "_open_buckets", fail_open)
+    with pytest.raises(SMLArtifactError, match="bucket|maximum_length"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_swag_bundle_rejects_duplicate_special_ids_before_opening_arrays(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+
+    def fail_open(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("arrays opened before projection validation")
+
+    monkeypatch.setattr(swag, "_open_buckets", fail_open)
+    _rewrite_swag_manifest(output, pad_token_id=prepared.manifest.bos_token_id)
+    with pytest.raises(SMLArtifactError, match="special"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_prepare_rejects_non_full_base_before_provider_access(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    provider.fail_resolve = True
+    base = replace(tiny_base_model(), verification=VerificationLevel.MANIFEST_TRUSTED)
+    with pytest.raises(SMLArtifactError, match="FULL"):
+        prepare_swag_bundle(tiny_swag_config(provider), base, tmp_path / "swag")
+    assert provider.resolve_calls == 0
+    assert provider.iter_calls == 0
+
+
+def test_prepare_rejects_tokenizer_model_mismatch_before_provider_access(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    provider.fail_resolve = True
+    base = tiny_base_model(model_overrides={"vocab_size": 32})
+    with pytest.raises(SMLDataError, match="vocab|tokenizer|special"):
+        prepare_swag_bundle(tiny_swag_config(provider), base, tmp_path / "swag")
+    assert provider.resolve_calls == 0
+    assert provider.iter_calls == 0
+
+
+def test_iter_rows_start_failure_names_source_and_cache_key(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    provider.fail_iter = True
+    config = tiny_swag_config(provider)
+    with pytest.raises(SMLDataError) as caught:
+        prepare_swag_bundle(config, tiny_base_model(), tmp_path / "swag")
+    message = str(caught.value)
+    assert config.source.namespace in message
+    assert config.source.dataset_config in message
+    assert config.source.revision in message
+    assert "sha256:" in message
+
+
+def test_iter_rows_consumption_failure_names_source_and_cache_key(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    provider.fail_iter_after_rows = True
+    config = tiny_swag_config(provider)
+    with pytest.raises(SMLDataError) as caught:
+        prepare_swag_bundle(config, tiny_base_model(), tmp_path / "swag")
+    message = str(caught.value)
+    assert config.source.namespace in message
+    assert config.source.dataset_config in message
+    assert config.source.revision in message
+    assert "sha256:" in message
+    assert "four" not in message
+    assert "usable" not in message

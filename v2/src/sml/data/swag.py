@@ -189,8 +189,9 @@ class HuggingFaceDatasetsSwagProvider:
     """SWAG rows from Hugging Face datasets, imported only when used."""
 
     def resolve(self, source: SwagSourceConfig) -> ResolvedSwagSource:
-        dataset = _load_huggingface_split(source)
-        fingerprint = getattr(dataset, "_fingerprint", source.revision)
+        commit = _huggingface_commit(source)
+        dataset = _load_huggingface_split(source, revision=commit)
+        fingerprint = getattr(dataset, "_fingerprint", commit)
         return ResolvedSwagSource(
             backend=source.backend,
             namespace=source.namespace,
@@ -198,21 +199,24 @@ class HuggingFaceDatasetsSwagProvider:
             dataset_config=source.dataset_config,
             revision=source.revision,
             split=source.split,
-            commit=_huggingface_commit(dataset, source.revision),
+            commit=commit,
             provider_fingerprint=str(fingerprint),
             provider_package="datasets",
             provider_version=importlib.metadata.version("datasets"),
         )
 
     def iter_rows(self, resolved: ResolvedSwagSource) -> Iterator[Mapping[str, object]]:
-        source = SwagSourceConfig(
-            revision=resolved.revision,
-            namespace=resolved.namespace,
-            name=resolved.name,
-            dataset_config=resolved.dataset_config,
-            split=resolved.split,
+        dataset = _load_huggingface_split(
+            SwagSourceConfig(
+                revision=resolved.revision,
+                backend=resolved.backend,
+                namespace=resolved.namespace,
+                name=resolved.name,
+                dataset_config=resolved.dataset_config,
+                split=resolved.split,
+            ),
+            revision=resolved.commit,
         )
-        dataset = _load_huggingface_split(source)
         for row in dataset:
             yield _normalize_huggingface_row(row)
 
@@ -227,19 +231,38 @@ def _import_datasets():
     return datasets
 
 
-def _load_huggingface_split(source: SwagSourceConfig):
+def _import_huggingface_hub():
+    try:
+        import huggingface_hub
+    except ImportError as error:
+        raise SMLDataError(
+            "the huggingface_hub package is required for "
+            "HuggingFaceDatasetsSwagProvider"
+        ) from error
+    return huggingface_hub
+
+
+def _load_huggingface_split(source: SwagSourceConfig, *, revision: str | None = None):
     datasets = _import_datasets()
     return datasets.load_dataset(
         f"{source.namespace}/{source.name}",
         source.dataset_config,
         split=source.split,
-        revision=source.revision,
+        revision=source.revision if revision is None else revision,
     )
 
 
-def _huggingface_commit(dataset: object, revision: str) -> str:
-    del dataset
-    return revision
+def _huggingface_commit(source: SwagSourceConfig) -> str:
+    huggingface_hub = _import_huggingface_hub()
+    info = huggingface_hub.HfApi().dataset_info(
+        f"{source.namespace}/{source.name}",
+        revision=source.revision,
+        timeout=100.0,
+    )
+    commit = getattr(info, "sha", None)
+    if not isinstance(commit, str) or not commit:
+        raise SMLDataError("Hugging Face dataset_info did not return a commit SHA")
+    return commit
 
 
 def _normalize_huggingface_row(row: Mapping[str, object]) -> Mapping[str, object]:
@@ -272,6 +295,29 @@ def _source_request_projection(source: SwagSourceConfig) -> dict[str, object]:
         "revision": source.revision,
         "split": source.split,
     }
+
+
+def _resolved_source_projection(resolved: ResolvedSwagSource) -> dict[str, object]:
+    return {
+        "backend": resolved.backend,
+        "namespace": resolved.namespace,
+        "name": resolved.name,
+        "dataset_config": resolved.dataset_config,
+        "revision": resolved.revision,
+        "split": resolved.split,
+        "commit": resolved.commit,
+        "provider_fingerprint": resolved.provider_fingerprint,
+        "provider_package": resolved.provider_package,
+        "provider_version": resolved.provider_version,
+    }
+
+
+def _require_resolved_matches_request(
+    resolved: ResolvedSwagSource, source: SwagSourceConfig
+) -> None:
+    actual = {name: getattr(resolved, name) for name in _SOURCE_REQUEST_FIELDS}
+    if actual != _source_request_projection(source):
+        raise SMLDataError("resolved SWAG source does not correspond to the request")
 
 
 def _source_manifest_projection(source: Mapping[str, object]) -> dict[str, object]:
@@ -314,6 +360,88 @@ def _special_ids(base: ResolvedModel) -> dict[str, int]:
         "pad_token_id": manifest.pad_token_id,
         "unk_token_id": manifest.unk_token_id,
     }
+
+
+def _require_full_base(base: ResolvedModel) -> None:
+    if base.verification is not VerificationLevel.FULL:
+        raise SMLArtifactError("SWAG preparation requires a FULL-verified base")
+
+
+def _require_tokenizer_matches_model(base: ResolvedModel) -> None:
+    manifest = base.tokenizer.manifest
+    model_config = base.model_config
+    if manifest.vocab_size != model_config.vocab_size:
+        raise SMLDataError("SWAG tokenizer vocab_size does not match the base model")
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id"):
+        if getattr(manifest, name) != getattr(model_config, name):
+            raise SMLDataError("SWAG tokenizer special IDs do not match the base model")
+
+
+def _recorded_identity_is_valid(value: object) -> bool:
+    if not isinstance(value, str) or not value.startswith("sha256:"):
+        return False
+    digest = value.removeprefix("sha256:")
+    return len(digest) == 64 and set(digest) <= set("0123456789abcdef")
+
+
+def _validate_recorded_projections(manifest: SwagDataManifest) -> None:
+    preprocessing = manifest.preprocessing
+    if preprocessing.get("schema_version") != 1:
+        raise SMLArtifactError("unsupported SWAG preprocessing schema")
+    expected_policies = {
+        "join_policy": JOIN_POLICY_V1,
+        "overlength_policy": OVERLENGTH_POLICY_V1,
+        "bos_policy": BOS_POLICY_V1,
+        "eos_policy": EOS_POLICY_V1,
+    }
+    for name, expected in expected_policies.items():
+        if preprocessing.get(name) != expected:
+            raise SMLArtifactError(f"unsupported SWAG {name}")
+    maximum_length = preprocessing.get("maximum_length")
+    if (
+        isinstance(maximum_length, bool)
+        or not isinstance(maximum_length, int)
+        or maximum_length < 1
+    ):
+        raise SMLArtifactError("invalid SWAG maximum_length")
+    boundaries = preprocessing.get("bucket_boundaries")
+    if not isinstance(boundaries, (list, tuple)) or not boundaries:
+        raise SMLArtifactError("invalid SWAG bucket_boundaries")
+    previous = 0
+    for boundary in boundaries:
+        if (
+            isinstance(boundary, bool)
+            or not isinstance(boundary, int)
+            or boundary <= previous
+        ):
+            raise SMLArtifactError("invalid SWAG bucket_boundaries")
+        previous = boundary
+    if boundaries[-1] < maximum_length:
+        raise SMLArtifactError("SWAG bucket_boundaries do not cover maximum_length")
+    if not _recorded_identity_is_valid(manifest.tokenizer_identity):
+        raise SMLArtifactError("invalid SWAG tokenizer identity")
+    vocab_size = manifest.vocab_size
+    if (
+        isinstance(vocab_size, bool)
+        or not isinstance(vocab_size, int)
+        or vocab_size < 1
+    ):
+        raise SMLArtifactError("invalid SWAG vocab_size")
+    special_ids = {
+        "bos_token_id": manifest.bos_token_id,
+        "eos_token_id": manifest.eos_token_id,
+        "pad_token_id": manifest.pad_token_id,
+        "unk_token_id": manifest.unk_token_id,
+    }
+    for name, token_id in special_ids.items():
+        if (
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or not 0 <= token_id < vocab_size
+        ):
+            raise SMLArtifactError(f"invalid SWAG {name}")
+    if len(set(special_ids.values())) != len(special_ids):
+        raise SMLArtifactError("SWAG special token IDs must be unique")
 
 
 def _cache_key(config: SwagPreparationConfig, base: ResolvedModel) -> str:
@@ -579,6 +707,7 @@ def load_swag_bundle(path: Path, verification: VerificationLevel) -> SwagDataBun
     if not isinstance(verification, VerificationLevel):
         raise TypeError("verification must be a VerificationLevel")
     verified = read_manifest(path, SwagDataManifest, verification)
+    _validate_recorded_projections(verified.manifest)
     return SwagDataBundle(
         path=path,
         manifest=verified.manifest,
@@ -600,6 +729,25 @@ def _provider_failure_message(
     )
 
 
+def _iter_resolved_rows(
+    config: SwagPreparationConfig,
+    base: ResolvedModel,
+    resolved: ResolvedSwagSource,
+) -> Iterator[Mapping[str, object]]:
+    try:
+        rows = config.provider.iter_rows(resolved)
+    except SMLDataError:
+        raise
+    except Exception as error:
+        raise SMLDataError(_provider_failure_message(config, base, error)) from error
+    try:
+        yield from rows
+    except SMLDataError:
+        raise
+    except Exception as error:
+        raise SMLDataError(_provider_failure_message(config, base, error)) from error
+
+
 def _build_encoded_rows(
     config: SwagPreparationConfig,
     base: ResolvedModel,
@@ -612,7 +760,7 @@ def _build_encoded_rows(
     }
     dropped = 0
     kept = 0
-    for row in config.provider.iter_rows(resolved):
+    for row in _iter_resolved_rows(config, base, resolved):
         context, endings, label = _parse_row(row)
         encoded = _encode_candidates(
             context=context,
@@ -706,6 +854,9 @@ def prepare_swag_bundle(
     if not isinstance(output, Path):
         raise TypeError("output must be a Path")
 
+    _require_full_base(base)
+    _require_tokenizer_matches_model(base)
+
     if config.maximum_length > base.model_config.effective_context_length:
         raise SMLDataError(
             "SWAG maximum_length exceeds the base model effective context length"
@@ -727,19 +878,14 @@ def prepare_swag_bundle(
         resolved = config.provider.resolve(config.source)
     except Exception as error:
         raise SMLDataError(_provider_failure_message(config, base, error)) from error
+    _require_resolved_matches_request(resolved, config.source)
 
     special = _special_ids(base)
 
     def build(private_path: Path) -> SwagDataManifest:
         grouped, dropped = _build_encoded_rows(config, base, resolved)
         bucket_refs, example_count = _write_buckets(grouped, private_path)
-        source = {
-            **_source_request_projection(config.source),
-            "commit": resolved.commit,
-            "provider_fingerprint": resolved.provider_fingerprint,
-            "provider_package": resolved.provider_package,
-            "provider_version": resolved.provider_version,
-        }
+        source = _resolved_source_projection(resolved)
         manifest = SwagDataManifest(
             kind="swag-data",
             version=1,
