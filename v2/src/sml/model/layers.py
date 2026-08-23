@@ -49,8 +49,14 @@ def keyed_dropout(
     return mx.where(mask, x / keep_probability, 0.0).astype(x.dtype), next_key
 
 
-def _linear(x: mx.array, parameters: dict[str, mx.array]) -> mx.array:
-    return x @ parameters["weight"].T
+def _linear(x: mx.array, parameters: dict[str, object]) -> mx.array:
+    if "weight" in parameters:
+        return x @ parameters["weight"].T
+    base_output = x @ parameters["base"]["weight"].T
+    adapter = parameters["scale"].astype(mx.float32) * (
+        (x.astype(mx.float32) @ parameters["lora_a"].T) @ parameters["lora_b"].T
+    )
+    return (base_output + adapter.astype(mx.bfloat16)).astype(mx.bfloat16)
 
 
 def _apply_rotary_batched(

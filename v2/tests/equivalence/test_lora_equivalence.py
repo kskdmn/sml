@@ -60,24 +60,22 @@ def test_lora_forward_matches_weight_pinned_legacy_reference(
     load_legacy_model_state(model, legacy_arrays, legacy_control)
     adapted = apply_lora(model, tiny_lora_config(dropout=0.0), key=mx.random.key(5))
     load_legacy_lora_state(adapted, legacy_arrays, legacy_control)
-    layer = adapted.layers[0].self_attn.q_proj
-    x = mx.ones((1, 2, layer.base.weight.shape[1]), dtype=mx.bfloat16)
-    actual, _next_key = layer(x, key=mx.random.key(8), training=False)
-    expected_adapter = layer.scale.astype(mx.float32) * (
-        (x.astype(mx.float32) @ layer.lora_a.T) @ layer.lora_b.T
+
+    live_logits = adapted(legacy_arrays["lora.input_ids"], training=False).logits
+    mx.eval(live_logits)
+    assert_close(
+        live_logits, legacy_arrays["lora.forward_logits"], atol=2e-2, rtol=2e-2
     )
-    expected = layer.base(x) + expected_adapter.astype(mx.bfloat16)
-    mx.eval(actual, expected)
-    assert_close(actual, expected, atol=0.0, rtol=0.0)
 
     merged = merged_model_weights(adapted)
     inference = SMLLanguageModel(tiny_model_config, key=mx.random.key(9))
     inference.load_weights(list(merged.items()), strict=True)
     mx.eval(inference.parameters())
-    logits = inference(legacy_arrays["lora.input_ids"], training=False).logits
-    mx.eval(logits)
-    assert_close(logits, legacy_arrays["lora.merged_logits"], atol=2e-2, rtol=2e-2)
-    assert_close(logits, legacy_arrays["lora.forward_logits"], atol=2e-2, rtol=2e-2)
+    merged_logits = inference(legacy_arrays["lora.input_ids"], training=False).logits
+    mx.eval(merged_logits)
+    assert_close(
+        merged_logits, legacy_arrays["lora.merged_logits"], atol=2e-2, rtol=2e-2
+    )
 
 
 def test_live_and_merged_layer_outputs_match_captured_adapters_within_bf16_tolerance(

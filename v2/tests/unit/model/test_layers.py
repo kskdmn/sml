@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 
 import mlx.core as mx
-from sml.model.layers import GroupedQueryAttention, RMSNorm, keyed_dropout
+from sml.model.layers import GroupedQueryAttention, RMSNorm, _linear, keyed_dropout
 
 
 def _assert_close(
@@ -67,3 +67,26 @@ def test_grouped_query_attention_uses_fused_gqa_without_tiling_kv_heads():
     assert "mx.fast.scaled_dot_product_attention" in source
     assert "mx.tile" not in source
     assert "mx.repeat" not in source
+
+
+def test_linear_applies_live_lora_formula_when_projection_is_wrapped():
+    x = mx.ones((1, 2, 4), dtype=mx.bfloat16)
+    base_weight = mx.arange(12, dtype=mx.bfloat16).reshape((3, 4))
+    lora_a = mx.arange(8, dtype=mx.float32).reshape((2, 4))
+    lora_b = mx.arange(6, dtype=mx.float32).reshape((3, 2))
+    scale = mx.array(0.5, dtype=mx.float32)
+
+    actual = _linear(
+        x,
+        {
+            "base": {"weight": base_weight},
+            "lora_a": lora_a,
+            "lora_b": lora_b,
+            "scale": scale,
+        },
+    )
+    adapter = scale.astype(mx.float32) * ((x.astype(mx.float32) @ lora_a.T) @ lora_b.T)
+    expected = ((x @ base_weight.T) + adapter.astype(mx.bfloat16)).astype(mx.bfloat16)
+
+    assert actual.dtype == mx.bfloat16
+    _assert_close(actual, expected)

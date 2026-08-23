@@ -125,7 +125,8 @@ class LoRALinear(nn.Module):
         self.base = linear
         self.base.freeze()
         self.dropout = config.dropout
-        self._scale = _lora_scale(config)
+        self.scale = _lora_scale(config)
+        self.freeze(keys=["scale"], recurse=False)
 
         key, adapter_a_key = mx.random.split(key)
         _, adapter_b_key = mx.random.split(key)
@@ -142,10 +143,6 @@ class LoRALinear(nn.Module):
                 scale=config.initializer.lora_b,
                 key=adapter_b_key,
             ).astype(mx.float32)
-
-    @property
-    def scale(self) -> mx.array:
-        return self._scale
 
     def __call__(
         self,
@@ -246,7 +243,7 @@ def merged_model_weights(model) -> dict[str, mx.array]:
     }
     merged: dict[str, mx.array] = {}
     for name, value in tree_flatten(model.parameters()):
-        if name.endswith((".lora_a", ".lora_b")):
+        if name.endswith((".lora_a", ".lora_b", ".scale")):
             continue
         if name.endswith(".base.weight"):
             prefix = name[: -len(".base.weight")]

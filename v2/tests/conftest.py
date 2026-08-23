@@ -99,9 +99,15 @@ def load_legacy_lora_state(model, legacy_arrays, legacy_control) -> None:
         packaged = _package_lora_destination(source_destination)
         expected[packaged] = (source_destination, mapping)
     actual = dict(tree_flatten(model.parameters()))
-    if set(actual) != set(expected):
-        missing = sorted(set(expected) - set(actual))
-        unexpected = sorted(set(actual) - set(expected))
+    scale_leaves = {
+        name: value for name, value in actual.items() if name.endswith(".scale")
+    }
+    comparable = {
+        name: value for name, value in actual.items() if name not in scale_leaves
+    }
+    if set(comparable) != set(expected):
+        missing = sorted(set(expected) - set(comparable))
+        unexpected = sorted(set(comparable) - set(expected))
         raise ValueError(
             f"legacy LoRA destination mismatch: missing={missing}, "
             f"unexpected={unexpected}"
@@ -121,6 +127,7 @@ def load_legacy_lora_state(model, legacy_arrays, legacy_control) -> None:
         if list(array.shape) != record["shape"] or str(array.dtype) != record["dtype"]:
             raise ValueError(f"captured legacy LoRA metadata mismatch for {name}")
         weights.append((name, array))
+    weights.extend(sorted(scale_leaves.items()))
     model.load_weights(weights, strict=True)
     mx.eval(model.parameters())
 

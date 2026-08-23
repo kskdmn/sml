@@ -213,7 +213,7 @@ def test_merged_weights_use_plain_inference_parameter_names(tiny_adapted_model):
     assert "layers.0.mlp.gate_proj.weight" in names
     assert "embed_tokens.weight" in names
     assert not any(name.endswith(".base.weight") for name in names)
-    assert not any(name.endswith((".lora_a", ".lora_b")) for name in names)
+    assert not any(name.endswith((".lora_a", ".lora_b", ".scale")) for name in names)
 
 
 def test_apply_lora_wraps_only_configured_linear_targets(tiny_model, tiny_lora_config):
@@ -233,16 +233,35 @@ def test_apply_lora_wraps_only_configured_linear_targets(tiny_model, tiny_lora_c
 def test_apply_lora_leaves_only_adapter_arrays_trainable(tiny_adapted_model):
     trainable = dict(tree_flatten(tiny_adapted_model.trainable_parameters()))
     parameters = dict(tree_flatten(tiny_adapted_model.parameters()))
+    scale_names = {name for name in parameters if name.endswith(".scale")}
 
+    assert scale_names
     assert set(trainable) == {
         name for name in parameters if name.endswith((".lora_a", ".lora_b"))
     }
     assert all(value.dtype == mx.float32 for value in trainable.values())
+    assert all(parameters[name].dtype == mx.float32 for name in scale_names)
+    assert all(name not in trainable for name in scale_names)
     assert all(
         value.dtype == mx.bfloat16
         for name, value in parameters.items()
-        if not name.endswith((".lora_a", ".lora_b"))
+        if not name.endswith((".lora_a", ".lora_b", ".scale"))
     )
+
+
+def test_adapted_language_model_forward_returns_bf16_logits(
+    tiny_model, tiny_lora_config
+):
+    adapted = apply_lora(
+        tiny_model, tiny_lora_config(dropout=0.0), key=mx.random.key(4)
+    )
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+
+    output = adapted(input_ids, training=False)
+    mx.eval(output.logits)
+
+    assert output.logits.dtype == mx.bfloat16
+    assert tuple(output.logits.shape) == (1, 4, tiny_model.config.vocab_size)
 
 
 def test_lora_dropout_replays_from_the_same_explicit_key(tiny_model, tiny_lora_config):
