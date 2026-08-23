@@ -41,8 +41,8 @@ they verify correctness rather than speed.
 ## Current Repository Snapshot
 
 - Branch: main, tracking origin/main.
-- Part 1 implementation and evidence HEAD before this documentation handoff:
-  dba8e1d (test(v2): record pretraining quality evidence).
+- Latest Part 1 repair/evidence HEAD before this documentation handoff:
+  0538b3a (bench(v2): regenerate portable quality evidence).
 - The first tracked handoff was committed as 24b3ba4.
 - The functional acceptance-policy update was committed as 8970a16.
 - Task 3.1 was implemented at 243d168 and hardened at 5856e9d and 589a2f1.
@@ -61,7 +61,13 @@ they verify correctness rather than speed.
   and the tracked worktree was clean.
 - The subsequent broad Part 1 architecture review over `aa6bb43..79a46d4`
   found 0 Critical, 5 Important, and 1 Minor issue. Part 2 Task 4.1 is paused
-  until one consolidated repair wave and scoped re-review close them.
+  pending the residual provenance decision below.
+- The consolidated repair was committed at 54f1749 and regenerated evidence
+  at 0538b3a. Fresh Ruff passed, 92 files were already formatted, all 1,062
+  v2 tests passed, standalone/current-relocated quality validation passed, and
+  `uv.lock` remained unchanged. Scoped re-review closed four Important issues
+  and the original Minor, but kept one Important quality-provenance issue open
+  and found one new non-blocking shallow-immutability Minor.
 - Independent reviews for Tasks 3.1 through 3.5 are clean. One non-blocking
   Task 3.1 Minor is deferred: an
   extremely large Python integer passed to scalar validation can surface
@@ -148,8 +154,8 @@ benchmark recapture is required.
 | 3.2: compiled pretraining microstep and optimizer step | Complete and independently reviewed | 882314b, 5eb977a |
 | 3.3: pretraining create/checkpoint/exact resume/latest-only retention | Complete and independently reviewed | 0d8ad69, 4a47221 |
 | 3.4: complete tokenizer-to-resumed-pretraining integration | Complete and independently reviewed | 2b4e9d2 |
-| 3.5: controlled pretraining-quality gate | Complete and independently reviewed | 8ccf4b6, 4acc76d, 10338f3, dba8e1d |
-| 3.6: Phase 3 correctness and workflow gate | Complete | Gate passed on dba8e1d; no implementation commit |
+| 3.5: controlled pretraining-quality gate | Numerical gate passed; final portable-provenance review open | 8ccf4b6, 4acc76d, 10338f3, dba8e1d, 54f1749, 0538b3a |
+| 3.6: Phase 3 correctness and workflow gate | Functional gate repeated successfully | Latest gate passed on 0538b3a; no separate implementation commit |
 
 Task 3.3 now supplies fresh training and exact resume around the reviewed
 compiled kernels. A committed checkpoint is a closed six-file bundle:
@@ -177,24 +183,26 @@ and 1,000. The public recorder accepts exactly 1,000 optimizer steps, preserves
 the default 12-layer/768-hidden/1,024-token workload, accumulation of 8, and
 the actual 268,000-step optimizer schedule while terminating this controlled
 run after 1,000 optimizer updates. Harness identity remains a separate
-two-file identity; repository production provenance binds every Python source
-file below `v2/src/sml`, the legacy bridge, and benchmark identity support.
+two-file identity. The regenerated harness uses an AST-derived local import
+closure and repository-relative destinations, but the residual review below
+explains why that closure is not yet stable across the written Part 2 edits.
 
 The canonical run passed. Candidate final validation NLL is
 `10.743444323539734`; the FP32 oracle is `10.729785919189453`; their ratio is
 `1.0012729428576812`, below the required `1.01`. All recorded state is finite,
 RMSNorm FP32 masters moved, and sub-BF16-ULP master updates survived into later
-working state. Measured wall time was `4132.980411748053` seconds, peak Metal
-allocation was `19804956538` bytes, and fixtures plus evidence total 1,115,006
-bytes. These resource values are evidence metadata, not performance gates.
-The recorder's post-publication validation and the standalone validator both
-returned `pass`; independent evidence review found no findings.
+working state. The regenerated evidence at 0538b3a measured
+`5683.967791709001` seconds, peak Metal allocation `19804952442` bytes, and
+1,114,535 bytes for fixtures plus evidence. These resource values are evidence
+metadata, not performance gates. The recorder's post-publication validation,
+standalone validator, unrelated-module probe, and relocated-checkout validator
+all returned `pass`; the residual concern is guaranteed future-source
+stability, not the numerical experiment or current/relocated byte integrity.
 
-## Part 1 Final Architecture Review Blockers
+## Part 1 Final Architecture Review Status
 
 The whole-plan review found cross-task issues not caught by the task-scoped
-reviews. One consolidated fix wave must close all five Important findings
-before Part 2:
+reviews. The consolidated repair and scoped re-review closed these findings:
 
 1. Replace generic run/checkpoint schemas with the design's distinct strict
    pretraining and LoRA kinds, and make recursive FULL verification perform
@@ -208,14 +216,31 @@ before Part 2:
    bytes actually loaded.
 4. Reject exact duplicate logical payload paths as well as Unicode/case-fold
    collisions, including duplicate prepared shards and checkpoint groups.
-5. Make controlled-quality provenance stable under unrelated future package
-   modules and repository relocation, then regenerate the canonical 1,000-step
-   evidence once under the corrected harness.
+The original Minor was also closed: arbitrary public `keep_last` retention is
+gone, with only parameterless latest-only pruning exposed.
 
-The review's one Minor asks that arbitrary public `keep_last` retention be
-replaced by a private latest-only primitive. Include it in the same repair
-wave. The eight older deferred Minors remain non-blocking under the deadlines
-recorded in the final review workspace.
+One Important finding remains open. The regenerated evidence is repository-
+relative and validates from a relocated checkout, but its source closure still
+hashes `artifacts/checkpoint.py`, which Task 4.1 must edit, and requires the
+temporary flat `v2/src/sml.py` bridge, which Phase 6 must delete. Rebuilding the
+workload from current bytes therefore guarantees that the final Part 2 gate
+will reject this evidence. The closure also omits executed legacy
+`v2/src/config.py`. The numerical result is accepted as internally coherent,
+but the artifact is rejected as the promised portable Part 2/final acceptance
+proof.
+
+This residual needs an explicit provenance policy before another fix attempt.
+The recommended policy is to treat quality evidence as immutable historical
+evidence bound to its recorded source commit, and make validation reconstruct
+and verify that recorded source boundary rather than compare with unrelated
+current-worktree bytes. The alternative is to amend Part 2 to regenerate the
+95-minute controlled run at every relevant source boundary.
+
+The scoped re-review's new Minor is that `VerifiedCheckpointContents` is only
+shallowly frozen because it exposes mutable outer/inner dictionaries. Current
+pretraining copies them and is safe; freeze these mappings before Task 4.1
+retains or exposes that reader result. The eight older deferred Minors remain
+non-blocking under the deadlines recorded in the final review workspace.
 
 ## Cancelled Required Benchmark Work
 
@@ -242,9 +267,9 @@ new empty external journal and follow the optional prepared-data-100 protocol.
 | 3.2: compiled pretraining microstep and optimizer step | Complete and reviewed | 37 focused tests and all 984 v2 tests passed on 5eb977a; Ruff clean; unchanged uv.lock |
 | 3.3: pretraining create/checkpoint/exact resume/latest-only retention | Complete and reviewed | 194 focused tests and all 1,022 v2 tests passed on 4a47221; Ruff clean; unchanged uv.lock |
 | 3.4: complete Part 1 integration | Complete and reviewed | 133 focused tests and all 1,024 v2 tests passed on 2b4e9d2; Ruff clean; unchanged uv.lock |
-| 3.5: controlled pretraining-quality gate | Functionally complete; regeneration required | Current canonical validator passed at dba8e1d, but the portability/provenance repair changes the harness and requires one replacement evidence set |
-| 3.6: Phase 3 correctness and workflow gate | Passed before final review; repeat after repair | Ruff clean; all 1,058 v2 tests passed; quality validation passed; unchanged uv.lock |
-| Part 1 completion | Blocked by final review | Close 5 Important and 1 Minor findings, regenerate evidence, pass scoped re-review, and repeat the functional gate |
+| 3.5: controlled pretraining-quality gate | Numerically passed; portable acceptance semantics blocked | Regenerated evidence at 0538b3a passes current/relocated validation, but scoped review rejects its guaranteed stability through Tasks 4.1 and 6.4 |
+| 3.6: Phase 3 correctness and workflow gate | Repeated after repair | Ruff clean; all 1,062 v2 tests passed; current standalone quality validation passed; unchanged uv.lock |
+| Part 1 completion | Blocked by one residual Important | Decide and implement stable quality provenance, regenerate only if the chosen contract requires it, pass scoped review, and freeze checkpoint-content mappings before Task 4.1 exposes them |
 
 ## Remaining Part 2 Tasks
 
@@ -278,12 +303,13 @@ The absent files are not blockers and should not be fabricated.
    Task 4.1 consumer contract.
 2. Confirm the latest main commit and inspect git status. Preserve unrelated
    user changes if any exist.
-3. Resume the single consolidated Part 1 final-review repair wave described
-   above. Do not start Task 4.1 until its scoped re-review is clean.
-4. Use strict test-driven fixes for schema separation, prepared-data preflight,
-   descriptor-bound checkpoint consumption, duplicate rejection, latest-only
-   retention, and portable quality provenance. Run MLX pytest and canonical
-   quality commands outside the sandbox.
+3. Resolve the residual quality-provenance policy described above. Do not start
+   Task 4.1 until a reviewed contract can survive its required checkpoint-file
+   edit and the Phase 6 bridge deletion.
+4. Use a strict test-first repair for the selected provenance contract and the
+   shallow checkpoint-content mapping Minor. Run MLX pytest outside the
+   sandbox; rerun canonical quality only if the selected policy changes the
+   recorded evidence identity.
 5. Follow the updated functional gate at the end of each phase. Do not pause
    for baseline capture or performance comparison.
 6. Keep this handoff current with completed commits, fresh test evidence, and
