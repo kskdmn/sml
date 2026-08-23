@@ -1,11 +1,11 @@
-# V2 Refactor Handoff After Phase 2
+# V2 Refactor Handoff After Part 1
 
 **Recorded:** 2026-08-22 (Asia/Shanghai)
 
 **Last updated:** 2026-08-23 (Asia/Shanghai)
 
-**Purpose:** Give a fresh session enough repository-backed context to continue
-the v2 refactor without reading the prior conversation.
+**Purpose:** Give a fresh session enough repository-backed context to begin
+Part 2 of the v2 refactor without reading the prior conversation.
 
 ## Superseding Acceptance Policy
 
@@ -40,8 +40,8 @@ they verify correctness rather than speed.
 ## Current Repository Snapshot
 
 - Branch: main, tracking origin/main.
-- Refactor implementation HEAD before the documentation handoff:
-  2b4e9d2 (test(v2): prove tokenizer to pretraining workflow).
+- Part 1 implementation and evidence HEAD before this documentation handoff:
+  dba8e1d (test(v2): record pretraining quality evidence).
 - The first tracked handoff was committed as 24b3ba4.
 - The functional acceptance-policy update was committed as 8970a16.
 - Task 3.1 was implemented at 243d168 and hardened at 5856e9d and 589a2f1.
@@ -50,11 +50,15 @@ they verify correctness rather than speed.
 - Task 3.3 was implemented at 0d8ad69 and its review findings were fixed at
   4a47221.
 - Task 3.4 was implemented and reviewed at 2b4e9d2.
-- Fresh controller verification on 2b4e9d2 passed on 2026-08-23:
-  `uv run ruff check v2`, `uv run ruff format --check v2`, 133 focused
-  integration and artifact tests, and all 1,024 v2 tests.
-  `uv.lock` was unchanged and `git diff --check` passed.
-- Independent reviews for Tasks 3.1 through 3.4 are clean. One non-blocking
+- Task 3.5's controlled-quality harness was implemented at 8ccf4b6, hardened
+  at 4acc76d, and given complete local source-tree provenance at 10338f3.
+  Canonical evidence was committed at dba8e1d.
+- Task 3.6 and the Part 1 completion gate passed on dba8e1d on 2026-08-23:
+  `uv run ruff check v2`, `uv run ruff format --check v2`, and all 1,058 v2
+  tests passed in 60.21 seconds. The standalone controlled-quality validator
+  exited 0 with `pass`; `uv.lock` was unchanged, `git diff --check` passed,
+  and the tracked worktree was clean.
+- Independent reviews for Tasks 3.1 through 3.5 are clean. One non-blocking
   Task 3.1 Minor is deferred: an
   extremely large Python integer passed to scalar validation can surface
   `OverflowError` instead of the project configuration-error type.
@@ -75,8 +79,8 @@ they verify correctness rather than speed.
 
 | File | Role | Done | Remaining under current policy |
 | --- | --- | --- | --- |
-| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Foundation, model, artifacts, tokenizer, prepared data, and pretraining integration are implemented through Task 3.4 | Tasks 3.5-3.6 and Phases 4-6; performance section is optional diagnostic guidance |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | Phase 1 tasks 1.1-1.5, Phase 2 tasks 2.1-2.7, the Phase 2 functional preflight, and Tasks 3.1-3.4 are complete | Tasks 3.5-3.6 |
+| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Part 1 foundation, model, artifacts, tokenizer, prepared data, pretraining, integration, and controlled quality are complete | Phases 4-6; performance section is optional diagnostic guidance |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | All Phase 1-3 tasks and the Part 1 completion gate are complete | Nothing required |
 | docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning only | All Tasks 4.1-4.4, 5.1-5.5, and 6.1-6.4 |
 | docs/superpowers/specs/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge-design.md | Real prepared-data benchmark owner design | Production goal implemented at ffb29f97b7770d06a95df41c2b612c07a9fa6c1b | Nothing required; screen is optional |
 | docs/superpowers/plans/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge.md | Bridge implementation plan | Task 1 complete at ffb29f9 | Task 2 retained only as an optional diagnostic |
@@ -84,7 +88,7 @@ they verify correctness rather than speed.
 | docs/superpowers/plans/2026-08-16-v2-stop-interruptible-pretraining-stream.md | Shutdown fix plan | Task 1 complete at 8e2291f | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-prepared-data-100-unit-measurement-design.md | Versioned 20/100 benchmark protocol | Harness design implemented | Baseline capture/comparison only if explicitly desired |
 | docs/superpowers/plans/2026-08-16-v2-prepared-data-100-unit-measurement.md | Versioned protocol implementation plan | Task 1 complete and reviewed at 8c3b1be | Tasks 2 and 3 cancelled as required work; Task 4 is functional handoff maintenance |
-| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated to the functional acceptance policy | Keep current as later tasks complete |
+| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through Part 1 completion | Keep current as later tasks complete |
 
 ## Supporting Benchmark Documents
 
@@ -140,6 +144,8 @@ benchmark recapture is required.
 | 3.2: compiled pretraining microstep and optimizer step | Complete and independently reviewed | 882314b, 5eb977a |
 | 3.3: pretraining create/checkpoint/exact resume/latest-only retention | Complete and independently reviewed | 0d8ad69, 4a47221 |
 | 3.4: complete tokenizer-to-resumed-pretraining integration | Complete and independently reviewed | 2b4e9d2 |
+| 3.5: controlled pretraining-quality gate | Complete and independently reviewed | 8ccf4b6, 4acc76d, 10338f3, dba8e1d |
+| 3.6: Phase 3 correctness and workflow gate | Complete | Gate passed on dba8e1d; no implementation commit |
 
 Task 3.3 now supplies fresh training and exact resume around the reviewed
 compiled kernels. A committed checkpoint is a closed six-file bundle:
@@ -160,6 +166,26 @@ FP32-master/BF16-working cast, and latest-only retention path. It also exposes
 canonical paths, identities, and byte sizes; run verification holds the shared
 access lock while FULL-verifying the copied tokenizer and latest checkpoint.
 
+Task 3.5 adds an immutable candidate-versus-FP32-oracle quality harness with
+two checked-in row-source-disjoint int32 fixtures. Canonical evidence contains
+exactly eight records: candidate then oracle at optimizer steps 0, 10, 100,
+and 1,000. The public recorder accepts exactly 1,000 optimizer steps, preserves
+the default 12-layer/768-hidden/1,024-token workload, accumulation of 8, and
+the actual 268,000-step optimizer schedule while terminating this controlled
+run after 1,000 optimizer updates. Harness identity remains a separate
+two-file identity; repository production provenance binds every Python source
+file below `v2/src/sml`, the legacy bridge, and benchmark identity support.
+
+The canonical run passed. Candidate final validation NLL is
+`10.743444323539734`; the FP32 oracle is `10.729785919189453`; their ratio is
+`1.0012729428576812`, below the required `1.01`. All recorded state is finite,
+RMSNorm FP32 masters moved, and sub-BF16-ULP master updates survived into later
+working state. Measured wall time was `4132.980411748053` seconds, peak Metal
+allocation was `19804956538` bytes, and fixtures plus evidence total 1,115,006
+bytes. These resource values are evidence metadata, not performance gates.
+The recorder's post-publication validation and the standalone validator both
+returned `pass`; independent evidence review found no findings.
+
 ## Cancelled Required Benchmark Work
 
 The old prepared-data-100 Task 2 capture reached 44 of 45 accepted temporary
@@ -176,7 +202,7 @@ Under the current policy:
 If the user later explicitly requests comparable performance evidence, use a
 new empty external journal and follow the optional prepared-data-100 protocol.
 
-## Remaining Part 1 Tasks
+## Part 1 Completion Status
 
 | Task | Status | Required completion evidence |
 | --- | --- | --- |
@@ -185,15 +211,15 @@ new empty external journal and follow the optional prepared-data-100 protocol.
 | 3.2: compiled pretraining microstep and optimizer step | Complete and reviewed | 37 focused tests and all 984 v2 tests passed on 5eb977a; Ruff clean; unchanged uv.lock |
 | 3.3: pretraining create/checkpoint/exact resume/latest-only retention | Complete and reviewed | 194 focused tests and all 1,022 v2 tests passed on 4a47221; Ruff clean; unchanged uv.lock |
 | 3.4: complete Part 1 integration | Complete and reviewed | 133 focused tests and all 1,024 v2 tests passed on 2b4e9d2; Ruff clean; unchanged uv.lock |
-| 3.5: controlled pretraining-quality gate | Next | Required correctness/quality evidence |
-| 3.6: Phase 3 correctness and workflow gate | Not started | Ruff, full v2 pytest, quality validation, integration smoke |
-| Part 1 completion | Not started | Functionally verified committed Phase 3 tree |
+| 3.5: controlled pretraining-quality gate | Complete and reviewed | Canonical validator passed; evidence committed at dba8e1d |
+| 3.6: Phase 3 correctness and workflow gate | Complete | Ruff clean; all 1,058 v2 tests passed; quality validation passed; unchanged uv.lock |
+| Part 1 completion | Complete | Functionally verified committed Phase 3 tree at dba8e1d |
 
 ## Remaining Part 2 Tasks
 
 | Phase | Tasks | Status | Required gate |
 | --- | --- | --- | --- |
-| 4: inference and evaluation | 4.1-4.4 | Not started | Correctness, inference/evaluation integration, applicable CLI smoke |
+| 4: inference and evaluation | 4.1-4.4 | Task 4.1 is next | Correctness, inference/evaluation integration, applicable CLI smoke |
 | 5: LoRA and SWAG | 5.1-5.5 | Not started | Correctness, controlled SWAG quality, resume/export/inference workflow |
 | 6: unified CLI and cutover | 6.1-6.4 | Not started | Full Ruff/pytest, all CLI workflows, clean cutover, unchanged uv.lock |
 
@@ -209,18 +235,23 @@ No Phase 4, 5, 6, or final performance result file is required.
 | v2/benchmarks/results/baseline-3687f8b-prepared100.jsonl | Absent | None |
 | v2/benchmarks/results/phase-2-loader.json | Absent | None |
 | v2/benchmarks/results/phase-2.json | Absent | None |
+| v2/benchmarks/manifests/pretraining-quality-v1.json | Present, immutable Task 3.5 evidence | Preserve |
+| v2/benchmarks/results/pretraining-quality-v1.jsonl | Present, immutable Task 3.5 raw evidence | Preserve |
+| v2/benchmarks/results/pretraining-quality-v1.json | Present, immutable Task 3.5 report | Preserve |
 
 The absent files are not blockers and should not be fabricated.
 
 ## Takeover Procedure
 
-1. Read this handoff, the umbrella design, and Part 1 plan.
+1. Read this handoff, the umbrella design, and Part 2 plan.
 2. Confirm the latest main commit and inspect git status. Preserve unrelated
    user changes if any exist.
-3. Begin Part 1 Task 3.5, the deterministic controlled pretraining-quality
-   harness and committed candidate/oracle correctness evidence.
-4. Use test-driven implementation for the quality decision and harness, then
-   run its MLX execution and pytest commands outside the sandbox.
+3. Begin Part 2 Task 4.1: resolve pretraining model artifacts into a persistent,
+   non-reentrant inference session. Consume the committed Part 1 artifact and
+   checkpoint contracts; do not recreate or reinterpret them.
+4. Use test-driven implementation for artifact resolution, owned inference
+   loading, session reuse/cleanup, buffer leasing, and the nonblocking call
+   guard. Run MLX pytest commands outside the sandbox.
 5. Follow the updated functional gate at the end of each phase. Do not pause
    for baseline capture or performance comparison.
 6. Keep this handoff current with completed commits, fresh test evidence, and
