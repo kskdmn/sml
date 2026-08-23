@@ -142,6 +142,13 @@ class GenerationKernelKey:
 
 
 @dataclass(frozen=True, slots=True)
+class ScoringKernelKey:
+    length_bucket: int
+    batch_size_bucket: int
+    padding: str
+
+
+@dataclass(frozen=True, slots=True)
 class _PreparedRequest:
     caller_index: int
     prompt_ids: tuple[int, ...]
@@ -332,6 +339,28 @@ def _length_buckets(effective_context_length: int) -> tuple[int, ...]:
     return tuple(buckets)
 
 
+def _pad_scoring_row(
+    token_ids: tuple[int, ...],
+    continuation_start: int,
+    capacity: int,
+    padding: str,
+    pad_id: int,
+) -> tuple[list[int], list[bool], list[bool]]:
+    length = len(token_ids)
+    pad_count = capacity - length
+    offset = 0 if padding == "right" else pad_count
+    padded_ids = [pad_id] * capacity
+    attention = [False] * capacity
+    target_mask = [False] * capacity
+    for index, token_id in enumerate(token_ids):
+        position = offset + index
+        padded_ids[position] = token_id
+        attention[position] = True
+        if index >= continuation_start:
+            target_mask[position] = True
+    return padded_ids, attention, target_mask
+
+
 def _require_run_path(path: Path) -> Path:
     if not isinstance(path, Path):
         raise TypeError("path must be a Path")
@@ -419,6 +448,7 @@ class InferenceSession:
         self._model = SMLLanguageModel(resolved.model_config, key=mx.random.key(0))
         self._parameters = tree_unflatten(sorted(resolved.model_arrays.items()))
         self._compiled: dict[tuple[object, ...], object] = {}
+        self._scoring_compiled: dict[ScoringKernelKey, object] = {}
 
     @classmethod
     def from_checkpoint(
@@ -460,6 +490,19 @@ class InferenceSession:
             self._require_generate_args(text, request)
         with self._call_guard.acquire():
             return self._generate_batch(items)
+
+    def score_encoded_loglikelihoods(
+        self,
+        items: Sequence[tuple[tuple[int, ...], int]],
+        *,
+        padding: str,
+    ) -> tuple[tuple[float, bool], ...]:
+        if padding not in ("left", "right"):
+            raise ValueError("padding must be 'left' or 'right'")
+        if not items:
+            return ()
+        with self._call_guard.acquire():
+            return self._score_encoded_loglikelihoods(items, padding=padding)
 
     def _require_generate_args(self, text: object, request: object) -> None:
         if not isinstance(text, str):
@@ -614,6 +657,168 @@ class InferenceSession:
         raise SMLRuntimeError(
             "prompt overflow: required capacity exceeds effective context length"
         )
+
+    def _score_encoded_loglikelihoods(
+        self,
+        items: Sequence[tuple[tuple[int, ...], int]],
+        *,
+        padding: str,
+    ) -> tuple[tuple[float, bool], ...]:
+        prepared: list[tuple[int, tuple[int, ...], int, int]] = []
+        for caller_index, (token_ids, continuation_start) in enumerate(items):
+            if continuation_start < 0 or continuation_start > len(token_ids):
+                raise SMLRuntimeError("invalid continuation start")
+            length_bucket = self._select_length_bucket(len(token_ids))
+            prepared.append(
+                (caller_index, token_ids, continuation_start, length_bucket)
+            )
+
+        groups: dict[int, list[tuple[int, tuple[int, ...], int, int]]] = {}
+        group_order: list[int] = []
+        for item in prepared:
+            length_bucket = item[3]
+            if length_bucket not in groups:
+                groups[length_bucket] = []
+                group_order.append(length_bucket)
+            groups[length_bucket].append(item)
+
+        results: list[tuple[float, bool] | None] = [None] * len(items)
+        max_batch = self._runtime.batch_size_buckets[-1]
+        for length_bucket in group_order:
+            members = groups[length_bucket]
+            for start in range(0, len(members), max_batch):
+                chunk = members[start : start + max_batch]
+                batch_size_bucket = self._select_batch_size_bucket(len(chunk))
+                scored = self._score_chunk(
+                    chunk,
+                    length_bucket,
+                    batch_size_bucket,
+                    padding,
+                )
+                for (caller_index, _token_ids, _start, _bucket), result in zip(
+                    chunk, scored, strict=True
+                ):
+                    results[caller_index] = result
+        return tuple(results)
+
+    def _score_chunk(
+        self,
+        members: Sequence[tuple[int, tuple[int, ...], int, int]],
+        length_bucket: int,
+        batch_size_bucket: int,
+        padding: str,
+    ) -> tuple[tuple[float, bool], ...]:
+        compiled = self._compiled_scoring_kernel(
+            length_bucket, batch_size_bucket, padding
+        )
+        pad_id = self._resolved.model_config.pad_token_id
+        rows: list[list[int]] = []
+        attention_rows: list[list[bool]] = []
+        target_rows: list[list[bool]] = []
+        for _caller_index, token_ids, continuation_start, _length_bucket in members:
+            padded_ids, attention, target_mask = _pad_scoring_row(
+                token_ids,
+                continuation_start,
+                length_bucket,
+                padding,
+                pad_id,
+            )
+            rows.append(padded_ids)
+            attention_rows.append(attention)
+            target_rows.append(target_mask)
+        while len(rows) < batch_size_bucket:
+            synthetic_ids = [pad_id] * length_bucket
+            synthetic_attention = [False] * length_bucket
+            synthetic_attention[0] = True
+            rows.append(synthetic_ids)
+            attention_rows.append(synthetic_attention)
+            target_rows.append([False] * length_bucket)
+
+        input_ids = mx.array(rows, dtype=mx.int32)
+        attention_mask = mx.array(attention_rows, dtype=mx.bool_)
+        target_mask = mx.array(target_rows, dtype=mx.bool_)
+        positions = mx.cumsum(attention_mask.astype(mx.int32), axis=1) - 1
+        positions = mx.where(
+            attention_mask,
+            positions,
+            mx.zeros(positions.shape, dtype=mx.int32),
+        )
+        lease = None
+        try:
+            lease = self.buffer_pool.lease(
+                batch_size=batch_size_bucket,
+                capacity=length_bucket,
+                config=self._resolved.model_config,
+            )
+            lease.token_storage[:, :] = input_ids
+            log_likelihood, greedy_match = compiled(
+                self._parameters,
+                lease.token_storage,
+                attention_mask,
+                positions,
+                target_mask,
+            )
+            mx.eval(log_likelihood, greedy_match)
+        finally:
+            if lease is not None:
+                self.buffer_pool.release(lease)
+
+        likelihoods = log_likelihood.tolist()
+        matches = greedy_match.tolist()
+        return tuple(
+            (float(likelihoods[index]), bool(matches[index]))
+            for index in range(len(members))
+        )
+
+    def _compiled_scoring_kernel(
+        self,
+        length_bucket: int,
+        batch_size_bucket: int,
+        padding: str,
+    ):
+        key = ScoringKernelKey(length_bucket, batch_size_bucket, padding)
+        compiled = self._scoring_compiled.get(key)
+        if compiled is not None:
+            return compiled
+
+        model = self._model
+
+        def _score(
+            parameters,
+            input_ids,
+            attention_mask,
+            positions,
+            target_mask,
+        ):
+            logits, _cache_state, _next_key = model.forward_arrays(
+                parameters,
+                input_ids,
+                attention_mask=attention_mask,
+                positions=positions,
+                cache_state=None,
+                training=False,
+                key=None,
+            )
+            predictor = logits[:, :-1, :].astype(mx.float32)
+            targets = input_ids[:, 1:]
+            log_z = mx.logsumexp(predictor, axis=-1, keepdims=True)
+            log_probs = predictor - log_z
+            gathered = mx.take_along_axis(log_probs, targets[..., None], axis=-1)[
+                ..., 0
+            ]
+            continuation_mask = target_mask[:, 1:]
+            log_likelihood = mx.sum(
+                gathered * continuation_mask.astype(mx.float32),
+                axis=-1,
+            )
+            greedy = mx.argmax(predictor, axis=-1)
+            matches = (greedy == targets) | (~continuation_mask)
+            greedy_match = mx.all(matches, axis=-1)
+            return log_likelihood, greedy_match
+
+        compiled = mx.compile(_score)
+        self._scoring_compiled[key] = compiled
+        return compiled
 
     def _compiled_kernels(
         self,
@@ -865,6 +1070,7 @@ __all__ = (
     "InferenceSession",
     "ModelIdentity",
     "ResolvedModel",
+    "ScoringKernelKey",
     "allocate_generation_seed",
     "infer",
     "load_owned_model_arrays",
