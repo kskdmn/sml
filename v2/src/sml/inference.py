@@ -205,7 +205,6 @@ class BufferPool:
             config.num_kv_heads,
             config.head_dim,
         )
-        self._active += 1
         available = self._free.get(key)
         if available:
             token_storage, cache_state = available.pop()
@@ -213,6 +212,7 @@ class BufferPool:
             token_storage = mx.zeros((batch_size, capacity), dtype=mx.int32)
             cache_state = allocate_kv_state(config, batch_size, capacity, mx.bfloat16)
             mx.eval(token_storage, cache_state)
+        self._active += 1
         return _Lease(self, token_storage, cache_state, key)
 
     def release(self, lease: _Lease) -> None:
@@ -220,13 +220,10 @@ class BufferPool:
 
     def _reset_cache(self, cache_state: object) -> object:
         keys, values, lengths = cache_state
-        reset = (
-            tuple(mx.zeros_like(layer) for layer in keys),
-            tuple(mx.zeros_like(layer) for layer in values),
-            mx.zeros_like(lengths),
-        )
-        mx.eval(reset)
-        return reset
+        for layer in (*keys, *values, lengths):
+            layer[:] = 0
+        mx.eval(*keys, *values, lengths)
+        return cache_state
 
     def _return(self, lease: _Lease) -> None:
         self._active = max(0, self._active - 1)

@@ -369,6 +369,62 @@ def test_session_reuses_pooled_token_storage_for_same_bucket(
     assert leased[1] is released[0]
 
 
+def _kv_arrays(cache_state: object) -> tuple[object, ...]:
+    keys, values, lengths = cache_state
+    return (*keys, *values, lengths)
+
+
+def test_session_reuses_pooled_kv_arrays_for_same_bucket(
+    tiny_session: InferenceSession,
+) -> None:
+    leased: list[tuple[object, ...]] = []
+    released: list[tuple[object, ...]] = []
+    pool = tiny_session.buffer_pool
+    real_lease = pool.lease
+    real_release = pool.release
+
+    def wrapped_lease(**kwargs):
+        lease = real_lease(**kwargs)
+        leased.append(_kv_arrays(lease.cache_state))
+        return lease
+
+    def wrapped_release(lease):
+        released.append(_kv_arrays(lease.cache_state))
+        return real_release(lease)
+
+    pool.lease = wrapped_lease
+    pool.release = wrapped_release
+    request = GenerationRequest(max_new_tokens=1)
+    tiny_session.generate("alpha", request)
+    tiny_session.generate("alpha", request)
+    assert pool.active_leases == 0
+    assert len(leased) == 2
+    assert len(released) == 2
+    assert len(leased[1]) == len(released[0])
+    for reused, previous in zip(leased[1], released[0], strict=True):
+        assert reused is previous
+
+
+def test_failed_lease_does_not_increment_active_leases(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool = tiny_session.buffer_pool
+    assert pool.active_leases == 0
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("alloc failed")
+
+    monkeypatch.setattr(inference.mx, "zeros", boom)
+    with pytest.raises(RuntimeError, match="alloc failed"):
+        pool.lease(
+            batch_size=1,
+            capacity=8,
+            config=tiny_session.resolved_model.model_config,
+        )
+    assert pool.active_leases == 0
+
+
 def test_load_owned_model_arrays_does_not_nest_run_access_lock(
     tiny_pretraining_run: Path,
     monkeypatch: pytest.MonkeyPatch,
