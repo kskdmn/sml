@@ -3,9 +3,10 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Execution status (2026-08-24):** Part 1 remediation closed at `4c190f3`.
-Tasks 4.1-4.3 are complete with scoped review approved (`7cc45ed`, `28c50df`,
-`5199b8a`). Tasks 4.4, 5.1-5.5, and 6.1-6.4 have not started. Task 4.4 is
-the next live task. The checkboxes below are the live remaining-task procedure.
+Phase 4 (Tasks 4.1-4.4) is complete with scoped review approved (`7cc45ed`,
+`28c50df`, `5199b8a`, `0d95441`). Tasks 5.1-5.5 and 6.1-6.4 have not started.
+Task 5.1 is the next live task. The checkboxes below are the live remaining-task
+procedure.
 
 **Goal:** Complete persistent inference/evaluation, cached SWAG LoRA fine-tuning/export, the unified CLI, and the clean removal of every replaced flat v2 path while meeting the final correctness and runnable-workflow gates.
 
