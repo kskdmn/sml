@@ -1165,6 +1165,63 @@ def test_load_rejects_score_mask_hole_in_valid_prefix(tmp_path):
         load_swag_bundle(output, VerificationLevel.FULL)
 
 
+def test_load_rejects_candidate_that_does_not_start_with_bos(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    logical = _array_logical_path(prepared.manifest, "input_ids")
+    input_ids = np.load(output / logical)
+    assert int(input_ids[0, 0, 0]) == prepared.manifest.bos_token_id
+
+    def mutate(array: np.ndarray) -> np.ndarray:
+        mutated = np.array(array, copy=True)
+        mutated[0, 0, 0] = 10
+        return mutated
+
+    _rewrite_swag_array(output, logical, mutate)
+    with pytest.raises(SMLArtifactError, match="BOS|bos"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_rejects_bucket_length_that_is_not_a_declared_boundary(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    bucket_length = prepared.buckets[0].length
+    preprocessing = dict(prepared.manifest.preprocessing)
+    preprocessing["bucket_boundaries"] = [8, 32]
+    assert bucket_length not in preprocessing["bucket_boundaries"]
+    _rewrite_swag_manifest(output, preprocessing=preprocessing)
+    with pytest.raises(SMLArtifactError, match="bucket"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_rejects_valid_sequence_longer_than_maximum_length(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    valid = np.load(output / _array_logical_path(prepared.manifest, "valid_token_mask"))
+    valid_length = int(np.asarray(valid[0, 0]).sum())
+    assert valid_length > 4
+    preprocessing = dict(prepared.manifest.preprocessing)
+    preprocessing["maximum_length"] = 4
+    _rewrite_swag_manifest(output, preprocessing=preprocessing)
+    with pytest.raises(SMLArtifactError, match="maximum_length"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
 def test_chunked_ingest_does_not_stack_all_examples_at_once(tmp_path, monkeypatch):
     from sml.data import swag
     from sml.data.swag import prepare_swag_bundle

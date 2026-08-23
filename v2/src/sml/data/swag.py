@@ -685,7 +685,13 @@ def _validate_bucket_arrays(
     vocab_size: int,
     pad_token_id: int,
     eos_token_id: int,
+    bos_token_id: int,
+    maximum_length: int,
+    bucket_length: int,
+    bucket_boundaries: Sequence[int],
 ) -> None:
+    if bucket_length not in bucket_boundaries:
+        raise SMLArtifactError("SWAG bucket length is not a declared boundary")
     if np.any(input_ids < 0) or np.any(input_ids >= vocab_size):
         raise SMLArtifactError("SWAG token id is outside the tokenizer vocabulary")
     invalid = ~valid_token_mask
@@ -707,6 +713,10 @@ def _validate_bucket_arrays(
     last_scored = score_mask[example_index, candidate_index, last_index]
     if input_ids.shape[0] and np.any(lengths <= 0):
         raise SMLArtifactError("SWAG candidate is missing scored continuation tokens")
+    if input_ids.shape[0] and np.any(input_ids[:, :, 0] != bos_token_id):
+        raise SMLArtifactError("SWAG candidate does not start with BOS")
+    if input_ids.shape[0] and np.any(lengths > maximum_length):
+        raise SMLArtifactError("SWAG valid sequence exceeds maximum_length")
     if input_ids.shape[0] and np.any(last_tokens != eos_token_id):
         raise SMLArtifactError("SWAG candidate does not end with EOS")
     if input_ids.shape[0] and np.any(~last_scored):
@@ -766,6 +776,10 @@ def _open_buckets(path: Path, manifest: SwagDataManifest) -> tuple[SwagBucket, .
             vocab_size=manifest.vocab_size,
             pad_token_id=manifest.pad_token_id,
             eos_token_id=manifest.eos_token_id,
+            bos_token_id=manifest.bos_token_id,
+            maximum_length=manifest.preprocessing["maximum_length"],
+            bucket_length=length,
+            bucket_boundaries=manifest.preprocessing["bucket_boundaries"],
         )
         buckets.append(
             SwagBucket(
