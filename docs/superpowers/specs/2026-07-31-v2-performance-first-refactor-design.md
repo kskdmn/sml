@@ -5,11 +5,9 @@
 Approved umbrella design for a clean replacement of the entire `v2` tree.
 This specification supersedes the former checkpoint/SWAG-only design and plan.
 
-**Execution update (2026-08-23):** Phases 1-3 are functionally implemented
-and their current Ruff, full-test, integration, and numerical quality gates
-pass. Part 1 remains open only for the controlled-quality provenance correction
-and the shallow checkpoint-content immutability fix described in the tracked
-handoff. Phases 4-6 have not started.
+**Execution update (2026-08-23):** Phases 1-3 are complete, including the
+recorded-source quality validator and deeply immutable checkpoint-reader
+contents at `4c190f3`. Phases 4-6 have not started; Task 4.1 is next.
 
 **Acceptance-policy update (2026-08-22):** Functional correctness is the
 required refactor gate. Ruff, the full v2 test suite, controlled mathematical

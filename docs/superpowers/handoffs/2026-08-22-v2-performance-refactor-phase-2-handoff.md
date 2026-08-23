@@ -1,12 +1,11 @@
-# V2 Refactor Handoff: Part 1 Remediation and Part 2 Pending
+# V2 Refactor Handoff: Part 2 Task 4.1 Next
 
 **Recorded:** 2026-08-22 (Asia/Shanghai)
 
 **Last updated:** 2026-08-23 (Asia/Shanghai)
 
-**Purpose:** Give a fresh session enough repository-backed context to finish
-Part 1 remediation before beginning Part 2, without reading the prior
-conversation.
+**Purpose:** Give a fresh session enough repository-backed context to continue
+Part 2 at Task 4.1, without reading the prior conversation.
 
 ## Superseding Acceptance Policy
 
@@ -42,13 +41,14 @@ they verify correctness rather than speed.
 
 - Audit starting point: 4225c54 (docs(v2): align refactor plans and handoff),
   with a clean tracked worktree on 2026-08-23.
-- Branch: main, tracking origin/main. At the audit starting point, local main is
-  24 commits ahead of origin/main at 8c3b1be; do not reset or replace the local
-  history with the older remote tip.
+- Branch: main, tracking origin/main. Do not reset or replace the local history
+  with an older remote tip. After provenance close, local main is at 4c190f3.
 - Documentation-audit base before this consistency update:
   ddad9a8 (docs(v2): record residual Part 1 provenance blocker).
-- Latest Part 1 repair/evidence HEAD before this documentation handoff:
+- Latest Part 1 repair/evidence HEAD before provenance remediation:
   0538b3a (bench(v2): regenerate portable quality evidence).
+- Latest Part 1 HEAD: 4c190f3 (fix(v2): bind quality evidence to its recorded
+  source). Canonical quality evidence files were preserved byte-for-byte.
 - The first tracked handoff was committed as 24b3ba4.
 - The functional acceptance-policy update was committed as 8970a16.
 - Task 3.1 was implemented at 243d168 and hardened at 5856e9d and 589a2f1.
@@ -66,14 +66,16 @@ they verify correctness rather than speed.
   exited 0 with `pass`; `uv.lock` was unchanged, `git diff --check` passed,
   and the tracked worktree was clean.
 - The subsequent broad Part 1 architecture review over `aa6bb43..79a46d4`
-  found 0 Critical, 5 Important, and 1 Minor issue. Part 2 Task 4.1 is paused
-  pending implementation and review of the approved provenance policy below.
+  found 0 Critical, 5 Important, and 1 Minor issue. Those findings were
+  repaired at 54f1749/0538b3a; the residual provenance Important and the
+  shallow-immutability Minor closed at 4c190f3.
 - The consolidated repair was committed at 54f1749 and regenerated evidence
   at 0538b3a. Fresh Ruff passed, 92 files were already formatted, all 1,062
   v2 tests passed, standalone/current-relocated quality validation passed, and
   `uv.lock` remained unchanged. Scoped re-review closed four Important issues
-  and the original Minor, but kept one Important quality-provenance issue open
-  and found one new non-blocking shallow-immutability Minor.
+  and the original Minor, but at that point kept one Important
+  quality-provenance issue open and found one new non-blocking
+  shallow-immutability Minor. Both residual findings later closed at 4c190f3.
 - Independent reviews for Tasks 3.1 through 3.5 are clean. One non-blocking
   Task 3.1 Minor is deferred: an
   extremely large Python integer passed to scalar validation can surface
@@ -101,21 +103,30 @@ they verify correctness rather than speed.
   links resolve and Markdown code fences are balanced. Fresh verification on
   the resulting documentation tree passed Ruff check, Ruff format check (92
   files already formatted), and all 1,062 v2 tests in 65.04 seconds.
+- Part 1 provenance remediation implemented at 4c190f3 and scoped-reviewed
+  clean: 0 Critical, 0 Important, 4 deferred Minors. `validate` decodes the
+  recorded manifest and reconstructs harness/production/fixture bytes from
+  `source_commit`; it does not rebuild a current-tree workload. Canonical
+  evidence files were preserved byte-for-byte. `VerifiedCheckpointContents`
+  now deeply freezes scalar and outer/inner array-group mappings. Focused
+  remediation tests passed (76), standalone quality validation exited 0 with
+  `pass`, Ruff was clean, all 1,069 v2 tests passed in 73.91 seconds, and
+  `uv.lock` was unchanged versus 4225c54. Task 4.1 is unblocked.
 
 ## Related Specifications and Plans
 
 | File | Role | Done | Remaining under current policy |
 | --- | --- | --- | --- |
-| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Part 1 foundation, model, artifacts, tokenizer, prepared data, pretraining, integration, and numerical quality run are functionally implemented | Implement the approved source-bound quality-evidence validator and checkpoint-content immutability fix, then Phases 4-6; performance remains optional |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | All task bodies, the controlled run, and the repeated functional gate ran successfully | Correct quality validation to use the recorded source boundary, pass scoped review, and freeze checkpoint-content mappings |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning is complete; implementation has not started | All Tasks 4.1-4.4, 5.1-5.5, and 6.1-6.4 after Part 1 remediation |
+| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Part 1 foundation, model, artifacts, tokenizer, prepared data, pretraining, integration, numerical quality run, recorded-source validator, and frozen checkpoint contents | Phases 4-6; performance remains optional |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | All task bodies, the controlled run, the repeated functional gate, recorded-source validation, and checkpoint-content freeze | None required under the current policy |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning is complete; Part 1 no longer blocks | All Tasks 4.1-4.4, 5.1-5.5, and 6.1-6.4 |
 | docs/superpowers/specs/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge-design.md | Real prepared-data benchmark owner design | Production goal implemented at ffb29f97b7770d06a95df41c2b612c07a9fa6c1b | Nothing required; screen is optional |
 | docs/superpowers/plans/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge.md | Bridge implementation plan | Task 1 complete at ffb29f9 | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-stop-interruptible-pretraining-stream-design.md | Full-queue shutdown correctness design | Implemented and reviewed at 8e2291f1c87244fa8acd33d375c9e49961bb70fa | Nothing required; timing rerun is optional |
 | docs/superpowers/plans/2026-08-16-v2-stop-interruptible-pretraining-stream.md | Shutdown fix plan | Task 1 complete at 8e2291f | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-prepared-data-100-unit-measurement-design.md | Versioned 20/100 benchmark protocol | Harness design implemented | Baseline capture/comparison only if explicitly desired |
 | docs/superpowers/plans/2026-08-16-v2-prepared-data-100-unit-measurement.md | Versioned protocol implementation plan | Required Tasks 1 and 4 complete; Task 1 reviewed at 8c3b1be | Tasks 2 and 3 remain optional diagnostic procedures only |
-| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through the approved quality-provenance ruling | Keep current as remediation and later tasks complete |
+| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through Part 1 remediation close at 4c190f3 | Keep current as Task 4.1 and later tasks complete |
 
 ## Supporting Benchmark Documents
 
@@ -182,8 +193,8 @@ benchmark recapture is required.
 | 3.2: compiled pretraining microstep and optimizer step | Complete and independently reviewed | 882314b, 5eb977a |
 | 3.3: pretraining create/checkpoint/exact resume/latest-only retention | Complete and independently reviewed | 0d8ad69, 4a47221 |
 | 3.4: complete tokenizer-to-resumed-pretraining integration | Complete and independently reviewed | 2b4e9d2 |
-| 3.5: controlled pretraining-quality gate | Numerical gate passed; final portable-provenance review open | 8ccf4b6, 4acc76d, 10338f3, dba8e1d, 54f1749, 0538b3a |
-| 3.6: Phase 3 correctness and workflow gate | Functional gate repeated successfully | Latest gate passed on 0538b3a; no separate implementation commit |
+| 3.5: controlled pretraining-quality gate | Complete and independently reviewed | 8ccf4b6, 4acc76d, 10338f3, dba8e1d, 54f1749, 0538b3a, 4c190f3 |
+| 3.6: Phase 3 correctness and workflow gate | Functional gate repeated successfully | Latest gate passed on 4c190f3; no separate implementation commit |
 
 Task 3.3 now supplies fresh training and exact resume around the reviewed
 compiled kernels. A committed checkpoint is a closed six-file bundle:
@@ -212,8 +223,10 @@ the default 12-layer/768-hidden/1,024-token workload, accumulation of 8, and
 the actual 268,000-step optimizer schedule while terminating this controlled
 run after 1,000 optimizer updates. Harness identity remains a separate
 two-file identity. The regenerated harness uses an AST-derived local import
-closure and repository-relative destinations, but the residual review below
-explains why that closure is not yet stable across the written Part 2 edits.
+closure and repository-relative destinations. Validation reconstructs that
+recorded source boundary from Git instead of hashing unrelated current-tree
+bytes, so later Task 4.1 edits to `checkpoint.py` and the Phase 6 deletion of
+`v2/src/sml.py` do not invalidate the committed numerical evidence.
 
 The canonical run passed. Candidate final validation NLL is
 `10.743444323539734`; the FP32 oracle is `10.729785919189453`; their ratio is
@@ -224,8 +237,8 @@ working state. The regenerated evidence at 0538b3a measured
 1,114,535 bytes for fixtures plus evidence. These resource values are evidence
 metadata, not performance gates. The recorder's post-publication validation,
 standalone validator, unrelated-module probe, and relocated-checkout validator
-all returned `pass`; the residual concern is guaranteed future-source
-stability, not the numerical experiment or current/relocated byte integrity.
+all returned `pass`. The residual future-source concern is closed: validation
+no longer rebuilds an expected workload from current-tree bytes.
 
 ## Part 1 Final Architecture Review Status
 
@@ -247,29 +260,21 @@ reviews. The consolidated repair and scoped re-review closed these findings:
 The original Minor was also closed: arbitrary public `keep_last` retention is
 gone, with only parameterless latest-only pruning exposed.
 
-One Important finding remains open. The regenerated evidence is repository-
-relative and validates from a relocated checkout, but its source closure still
-hashes `artifacts/checkpoint.py`, which Task 4.1 must edit, and requires the
-temporary flat `v2/src/sml.py` bridge, which Phase 6 must delete. Rebuilding the
-workload from current bytes therefore guarantees that the final Part 2 gate
-will reject this evidence. The closure also omits executed legacy
-`v2/src/config.py`. The numerical result is accepted as internally coherent,
-but the artifact is rejected as the promised portable Part 2/final acceptance
-proof.
+The residual Important and the later shallow-immutability Minor closed at
+4c190f3. Validation no longer rebuilds an expected workload from current-tree
+bytes. It decodes the recorded manifest, binds evidence to the recorded
+`source_commit`, and reconstructs harness, production-closure, and fixture
+blobs from that Git commit. `VerifiedCheckpointContents` now deeply freezes
+scalar and outer/inner array-group mappings before `CheckpointReader` retains
+the instance. The eight older deferred Minors plus four new provenance-test
+Minors remain non-blocking under the deadlines recorded in the final review
+workspace.
 
 The user approved the source-bound provenance policy on 2026-08-23. Treat the
 quality evidence as immutable historical evidence bound to its recorded source
-commit. Validation must reconstruct and verify that recorded source boundary
-rather than compare with unrelated current-worktree bytes. Do not regenerate
-the approximately 95-minute controlled run unless implementing the policy
-changes the recorded evidence identity or a later change alters the controlled
-numerical execution contract.
-
-The scoped re-review's new Minor is that `VerifiedCheckpointContents` is only
-shallowly frozen because it exposes mutable outer/inner dictionaries. Current
-pretraining copies them and is safe; freeze these mappings before Task 4.1
-retains or exposes that reader result. The eight older deferred Minors remain
-non-blocking under the deadlines recorded in the final review workspace.
+commit. Do not regenerate the approximately 95-minute controlled run unless a
+later change alters the controlled numerical execution contract, harness,
+fixtures, telemetry, or decision rule.
 
 ## Cancelled Required Benchmark Work
 
@@ -296,86 +301,34 @@ new empty external journal and follow the optional prepared-data-100 protocol.
 | 3.2: compiled pretraining microstep and optimizer step | Complete and reviewed | 37 focused tests and all 984 v2 tests passed on 5eb977a; Ruff clean; unchanged uv.lock |
 | 3.3: pretraining create/checkpoint/exact resume/latest-only retention | Complete and reviewed | 194 focused tests and all 1,022 v2 tests passed on 4a47221; Ruff clean; unchanged uv.lock |
 | 3.4: complete Part 1 integration | Complete and reviewed | 133 focused tests and all 1,024 v2 tests passed on 2b4e9d2; Ruff clean; unchanged uv.lock |
-| 3.5: controlled pretraining-quality gate | Numerically passed; validator remediation remains | Regenerated evidence at 0538b3a passes current/relocated validation; implement the approved recorded-source validation rule so it remains valid through Tasks 4.1 and 6.3 |
-| 3.6: Phase 3 correctness and workflow gate | Repeated after repair | Ruff clean; all 1,062 v2 tests passed; current standalone quality validation passed; unchanged uv.lock |
-| Part 1 completion | Blocked by one residual Important | Implement the approved stable quality-provenance contract, regenerate only if that changes evidence identity, pass scoped review, and freeze checkpoint-content mappings before Task 4.1 exposes them |
+| 3.5: controlled pretraining-quality gate | Complete and independently reviewed | Regenerated evidence at 0538b3a; recorded-source validator and frozen checkpoint contents at 4c190f3; standalone quality validation `pass`; all 1,069 v2 tests passed; unchanged uv.lock |
+| 3.6: Phase 3 correctness and workflow gate | Repeated after provenance close | Ruff clean; all 1,069 v2 tests passed in 73.91s; standalone quality validation `pass`; unchanged uv.lock |
+| Part 1 completion | Complete | Provenance review over `2f073f4..4c190f3` approved with 0 Critical, 0 Important, and 4 deferred Minors |
 
-## Immediate Part 1 Remediation Contract
+## Closed Part 1 Remediation Contract
 
-The remaining work is deliberately narrower than Task 4.1. Modify only the
-quality validator/checkpoint-reader seams and their lasting tests unless a
-test-first discovery proves another production file is required:
+The recorded-source validator and checkpoint freeze shipped at 4c190f3. The
+implementation kept `record` bound to the clean current tree, made `validate`
+decode the canonical manifest first, and treated the embedded workload plus
+full `source_commit` as the recorded boundary. Canonical quality evidence
+files were preserved byte-for-byte. `VerifiedCheckpointContents` now freezes
+scalar and outer/inner array-group mappings before `CheckpointReader` retains
+the instance.
 
-- `v2/benchmarks/quality.py`
-- `v2/tests/unit/test_pretraining_quality.py`
-- `v2/src/sml/artifacts/checkpoint.py`
-- the focused checkpoint-reader test under `v2/tests/unit/artifacts/` or
-  `v2/tests/integration/test_pretraining_workflow.py`
+Deferred provenance-test Minors (do not block Task 4.1):
 
-For controlled-quality provenance, keep `record` bound to the clean current
-tree, but make `validate` decode the canonical manifest first and treat its
-embedded workload plus full `source_commit` as the recorded boundary. Verify
-the workload's own identity, reconstruct the recorded harness, production-
-dependency closure, and fixture blobs from that Git commit, and compare their
-component lists and identities with the manifest before validating raw records
-and the report. The validation path must not first call
-`build_pretraining_quality_workload(root)`, derive an expected workload from
-current-tree bytes, or require `v2/src/sml.py` to exist in the current tree.
-Continue to reject a missing/non-ancestor recorded commit, a changed historical
-production blob or mode, changed historical harness/fixture bytes, a malformed
-or internally inconsistent manifest, and any raw/report mismatch.
-
-Lasting provenance regressions must prove all of the following without running
-the 1,000-step recorder:
-
-1. The checked-in evidence still validates after a current-tree edit to
-   `v2/src/sml/artifacts/checkpoint.py`.
-2. It still validates when the current-tree `v2/src/sml.py` bridge is absent,
-   matching the Task 6.3 cutover.
-3. It fails if the recorded commit's harness bytes, production dependency
-   closure bytes/modes, fixture bytes, or embedded identity does not match the
-   manifest.
-4. The existing standalone validator returns `pass` against the unchanged
-   three canonical evidence files.
-
-For `VerifiedCheckpointContents`, freeze the scalar mapping and both the outer
-and inner array-group mappings before the value is retained by
-`CheckpointReader`; do not rely on the frozen dataclass wrapper alone. Freeze
-any nested scalar mapping as well, or otherwise ensure no alias reachable from
-the returned value can add, remove, or replace verified entries. Add direct
-mutation tests and retain the existing exact-resume workflow to prove consumers
-can still copy/read the frozen contents.
-
-Run the focused remediation gate outside the sandbox where pytest needs
-MLX/Metal:
-
-```bash
-uv run pytest v2/tests/unit/test_pretraining_quality.py v2/tests/unit/artifacts/test_checkpoint_semantics.py v2/tests/integration/test_pretraining_workflow.py -v
-uv run python -m v2.benchmarks.quality validate --manifest v2/benchmarks/manifests/pretraining-quality-v1.json --raw-input v2/benchmarks/results/pretraining-quality-v1.jsonl --report v2/benchmarks/results/pretraining-quality-v1.json
-```
-
-Then run the full Part 1 gate from the repository root:
-
-```bash
-uv run ruff check v2
-uv run ruff format --check v2
-uv run pytest v2/tests
-git diff --check
-git diff --exit-code 4225c54 -- uv.lock
-```
-
-The final lockfile comparison uses this audited handoff base, so it detects a
-lockfile change even if remediation commits have already been created. Do not
-start Task 4.1 until the focused review closes the provenance Important and
-confirms the checkpoint mappings are immutable. Preserve the canonical quality
-manifest, raw JSONL, and report byte-for-byte unless the implementation proves
-that the approved contract necessarily changes their identity.
+1. The new mismatch table omits production closure bytes/modes; the sibling
+   descendant test still covers them.
+2. Provenance tests mutate the live checkout of `checkpoint.py` / `sml.py`.
+3. The embedded-identity rejection matches broad `identity` rather than
+   `workload identity mismatch`.
+4. Near-duplicate git-repo fixtures in quality provenance tests.
 
 ## Remaining Part 2 Tasks
 
 | Phase | Tasks | Status | Required gate |
 | --- | --- | --- | --- |
-| 4: inference and evaluation | 4.1-4.4 | Blocked until Part 1 remediation closes | Correctness, inference/evaluation integration, applicable CLI smoke |
+| 4: inference and evaluation | 4.1-4.4 | Next: Task 4.1 | Correctness, inference/evaluation integration, applicable CLI smoke |
 | 5: LoRA and SWAG | 5.1-5.5 | Not started | Correctness, controlled SWAG quality, resume/export/inference workflow |
 | 6: unified CLI and cutover | 6.1-6.4 | Not started | Full Ruff/pytest, all CLI workflows, clean cutover, unchanged uv.lock |
 
@@ -399,15 +352,15 @@ The absent files are not blockers and should not be fabricated.
 
 ## Takeover Procedure
 
-1. Read this handoff, the umbrella design, the Part 1 plan, and the Part 2
-   Task 4.1 consumer contract.
+1. Read this handoff, the umbrella design, and the Part 2 Task 4.1 contract.
 2. Confirm the latest main commit and inspect git status. Preserve unrelated
-   user changes if any exist, and preserve the 24 local commits recorded above
+   user changes if any exist, and preserve the local commits recorded above
    that are not on the audited origin/main tip.
-3. Execute the Immediate Part 1 Remediation Contract above test-first. Do not
-   start Task 4.1 until its focused review closes both named findings.
-4. Run MLX pytest outside the sandbox; rerun canonical quality only if the
-   approved policy necessarily changes the recorded evidence identity.
+3. Execute Task 4.1 test-first. Part 1 already froze checkpoint-content
+   mappings; consume those frozen contents rather than reopening shallow
+   mutability. Do not regenerate canonical quality evidence.
+4. Run MLX pytest outside the sandbox; rerun canonical quality only if a later
+   change necessarily alters the recorded evidence identity.
 5. Follow the updated functional gate at the end of each phase. Do not pause
    for baseline capture or performance comparison.
 6. Keep this handoff current with completed commits, fresh test evidence, and
@@ -430,9 +383,9 @@ The absent files are not blockers and should not be fabricated.
 The active Part 1 final-review evidence is preserved in
 .superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-1/, especially
 `part1-final-review.md`, `part1-final-fix-report.md`,
-`part1-final-re-review.md`, and `progress.md`. Keep that workspace until Part 1
-remediation closes; it is supporting evidence, while this tracked handoff is
-the authoritative status.
+`part1-final-re-review.md`, `part1-provenance-review.md`, and `progress.md`.
+That workspace is supporting evidence; this tracked handoff is the
+authoritative status.
 
 The historical benchmark workspace
 .superpowers/sdd/2026-08-16-v2-prepared-data-100-unit-measurement/
