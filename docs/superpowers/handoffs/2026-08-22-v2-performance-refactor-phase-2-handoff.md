@@ -41,7 +41,7 @@ they verify correctness rather than speed.
 
 - Branch: main, tracking origin/main.
 - Refactor implementation HEAD before the documentation handoff:
-  4a47221 (fix(v2): harden portable pretraining recovery).
+  2b4e9d2 (test(v2): prove tokenizer to pretraining workflow).
 - The first tracked handoff was committed as 24b3ba4.
 - The functional acceptance-policy update was committed as 8970a16.
 - Task 3.1 was implemented at 243d168 and hardened at 5856e9d and 589a2f1.
@@ -49,11 +49,12 @@ they verify correctness rather than speed.
   5eb977a.
 - Task 3.3 was implemented at 0d8ad69 and its review findings were fixed at
   4a47221.
-- Fresh controller verification on 4a47221 passed on 2026-08-23:
-  `uv run ruff check v2`, `uv run ruff format --check v2`, 194 focused
-  training, workflow, artifact, and cursor tests, and all 1,022 v2 tests.
+- Task 3.4 was implemented and reviewed at 2b4e9d2.
+- Fresh controller verification on 2b4e9d2 passed on 2026-08-23:
+  `uv run ruff check v2`, `uv run ruff format --check v2`, 133 focused
+  integration and artifact tests, and all 1,024 v2 tests.
   `uv.lock` was unchanged and `git diff --check` passed.
-- Independent reviews for Tasks 3.1, 3.2, and 3.3 are clean. One non-blocking
+- Independent reviews for Tasks 3.1 through 3.4 are clean. One non-blocking
   Task 3.1 Minor is deferred: an
   extremely large Python integer passed to scalar validation can surface
   `OverflowError` instead of the project configuration-error type.
@@ -65,13 +66,17 @@ they verify correctness rather than speed.
   public retention/history control, and `ResumeOverrides` has exactly four
   fields: `maximum_steps`, `maximum_epochs`, `log_interval`, and
   `checkpoint_interval`.
+- Task 3.4 ruling: its stale example of reopening step 1 after reaching step 3
+  conflicts with the authoritative latest-only design. The integration instead
+  FULL-reopens exact latest step 3, proves step 1 is unavailable, and proves
+  only the canonical latest checkpoint remains.
 
 ## Related Specifications and Plans
 
 | File | Role | Done | Remaining under current policy |
 | --- | --- | --- | --- |
-| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Foundation, model, artifacts, tokenizer, prepared data, and benchmark-owner architecture are implemented through Phase 2 | Phases 3-6; performance section is optional diagnostic guidance |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | Phase 1 tasks 1.1-1.5, Phase 2 tasks 2.1-2.7, the Phase 2 functional preflight, and Tasks 3.1-3.3 are complete | Tasks 3.4-3.6 |
+| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Foundation, model, artifacts, tokenizer, prepared data, and pretraining integration are implemented through Task 3.4 | Tasks 3.5-3.6 and Phases 4-6; performance section is optional diagnostic guidance |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | Phase 1 tasks 1.1-1.5, Phase 2 tasks 2.1-2.7, the Phase 2 functional preflight, and Tasks 3.1-3.4 are complete | Tasks 3.5-3.6 |
 | docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning only | All Tasks 4.1-4.4, 5.1-5.5, and 6.1-6.4 |
 | docs/superpowers/specs/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge-design.md | Real prepared-data benchmark owner design | Production goal implemented at ffb29f97b7770d06a95df41c2b612c07a9fa6c1b | Nothing required; screen is optional |
 | docs/superpowers/plans/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge.md | Bridge implementation plan | Task 1 complete at ffb29f9 | Task 2 retained only as an optional diagnostic |
@@ -134,10 +139,11 @@ benchmark recapture is required.
 | 3.1: training policies and project-owned mixed-precision Adam | Complete and independently reviewed | 243d168, 5856e9d, 589a2f1 |
 | 3.2: compiled pretraining microstep and optimizer step | Complete and independently reviewed | 882314b, 5eb977a |
 | 3.3: pretraining create/checkpoint/exact resume/latest-only retention | Complete and independently reviewed | 0d8ad69, 4a47221 |
+| 3.4: complete tokenizer-to-resumed-pretraining integration | Complete and independently reviewed | 2b4e9d2 |
 
 Task 3.3 now supplies fresh training and exact resume around the reviewed
 compiled kernels. A committed checkpoint is a closed six-file bundle:
-`manifest.json`, `state.json`, `model.safetensors`, `master.safetensors`,
+`checkpoint.json`, `state.json`, `model.safetensors`, `master.safetensors`,
 `optimizer.safetensors`, and `trainer.safetensors`. Resume validates the full
 run/checkpoint identity, tensor keys/shapes/dtypes, scalar state, canonical
 prepared-data cursor, and empty accumulation boundary before latest-only
@@ -145,6 +151,14 @@ pruning. Interrupted uncommitted work replays from the last committed cursor.
 The portable model payload was also FULL-resolved after relocating the run and
 removing the original prepared-data path, then exercised through a real model
 forward pass; the future public model-only consumer remains owned by Task 4.
+
+Task 3.4 exercises the real raw-corpus, SentencePiece tokenizer, deterministic
+int32 preparation, two-step training, resume-to-three, exact latest resolution,
+FP32-master/BF16-working cast, and latest-only retention path. It also exposes
+`verify_artifact(path, full)` and recursive `VerificationResult` from
+`sml.artifacts`. Prepared-data verification binds its copied tokenizer's
+canonical paths, identities, and byte sizes; run verification holds the shared
+access lock while FULL-verifying the copied tokenizer and latest checkpoint.
 
 ## Cancelled Required Benchmark Work
 
@@ -170,8 +184,8 @@ new empty external journal and follow the optional prepared-data-100 protocol.
 | 3.1: training policies and project-owned mixed-precision Adam | Complete and reviewed | 27 focused tests and all 974 v2 tests passed on 589a2f1; Ruff clean; unchanged uv.lock |
 | 3.2: compiled pretraining microstep and optimizer step | Complete and reviewed | 37 focused tests and all 984 v2 tests passed on 5eb977a; Ruff clean; unchanged uv.lock |
 | 3.3: pretraining create/checkpoint/exact resume/latest-only retention | Complete and reviewed | 194 focused tests and all 1,022 v2 tests passed on 4a47221; Ruff clean; unchanged uv.lock |
-| 3.4: complete Part 1 integration | Next | End-to-end tiny production workflow |
-| 3.5: controlled pretraining-quality gate | Not started | Required correctness/quality evidence |
+| 3.4: complete Part 1 integration | Complete and reviewed | 133 focused tests and all 1,024 v2 tests passed on 2b4e9d2; Ruff clean; unchanged uv.lock |
+| 3.5: controlled pretraining-quality gate | Next | Required correctness/quality evidence |
 | 3.6: Phase 3 correctness and workflow gate | Not started | Ruff, full v2 pytest, quality validation, integration smoke |
 | Part 1 completion | Not started | Functionally verified committed Phase 3 tree |
 
@@ -203,11 +217,10 @@ The absent files are not blockers and should not be fabricated.
 1. Read this handoff, the umbrella design, and Part 1 plan.
 2. Confirm the latest main commit and inspect git status. Preserve unrelated
    user changes if any exist.
-3. Begin Part 1 Task 3.4, the complete tiny production pretraining integration
-   over the reviewed Task 3.3 run/checkpoint/resume workflow in
-   `v2/src/sml/training/pretrain.py` and the canonical four-item trainer tree.
-4. Use test-driven implementation and verify the end-to-end production
-   workflow contract. Run MLX pytest commands outside the sandbox.
+3. Begin Part 1 Task 3.5, the deterministic controlled pretraining-quality
+   harness and committed candidate/oracle correctness evidence.
+4. Use test-driven implementation for the quality decision and harness, then
+   run its MLX execution and pytest commands outside the sandbox.
 5. Follow the updated functional gate at the end of each phase. Do not pause
    for baseline capture or performance comparison.
 6. Keep this handoff current with completed commits, fresh test evidence, and
