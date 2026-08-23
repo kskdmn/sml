@@ -1,6 +1,7 @@
 # ruff: noqa: F811
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -10,7 +11,13 @@ if str(_UNIT_DIR) not in sys.path:
 
 import pytest
 from sml.errors import SMLRuntimeError
-from sml.evaluation import evaluate, read_evaluation_result
+from sml.evaluation import (
+    LoglikelihoodRequest,
+    evaluate,
+    read_evaluation_result,
+    score_loglikelihood_batch,
+)
+from sml.inference import InferenceSession
 from test_evaluation import fake_lm_eval, tiny_evaluation_config  # noqa: F401
 from test_inference import (  # noqa: F401
     _tiny_run_template,
@@ -83,3 +90,18 @@ def test_evaluate_supports_repeated_tasks(
         "winogrande",
         "hellaswag",
     ]
+
+
+def test_score_loglikelihood_batch_returns_finite_boolean_scores(
+    tiny_session: InferenceSession,
+) -> None:
+    requests = (
+        LoglikelihoodRequest(context="alpha", continuation=" beta"),
+        LoglikelihoodRequest(context="alpha beta", continuation=" gamma"),
+        LoglikelihoodRequest(context="alpha beta gamma", continuation=" delta"),
+    )
+    results = score_loglikelihood_batch(tiny_session, requests, padding="right")
+    assert len(results) == len(requests)
+    for result in results:
+        assert math.isfinite(result.log_likelihood)
+        assert isinstance(result.greedy_match, bool)

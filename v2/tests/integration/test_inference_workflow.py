@@ -38,8 +38,9 @@ from sml.training.common import (
     LoaderConfig,
     OptimizerConfig,
     PretrainingConfig,
+    ResumeOverrides,
 )
-from sml.training.pretrain import train
+from sml.training.pretrain import resume, train
 
 
 def _write_tiny_corpus(path: Path) -> Path:
@@ -155,6 +156,10 @@ def tiny_pretraining_run(tmp_path: Path, _tiny_run_template: Path) -> Path:
 @pytest.fixture
 def tiny_session(tiny_pretraining_run: Path) -> InferenceSession:
     return InferenceSession.from_checkpoint(tiny_pretraining_run)
+
+
+def publish_new_valid_step(run: Path, step: int) -> None:
+    resume(run, data=None, overrides=ResumeOverrides(maximum_steps=step))
 
 
 def _latest_step_directory(run: Path) -> Path:
@@ -339,3 +344,33 @@ def test_session_generate_batch_restores_caller_order(
         result.token_ids for result in serial
     )
     assert tiny_session.buffer_pool.active_leases == 0
+
+
+def test_resolve_rejects_direct_step_path(tmp_path: Path) -> None:
+    step_path = tmp_path / "checkpoints" / "step-000000001"
+    step_path.mkdir(parents=True)
+    with pytest.raises(SMLArtifactError, match="step"):
+        resolve_model_artifact(step_path, full_verify=False)
+
+
+def test_resolve_rejects_historical_selector_on_step_directory(
+    tiny_pretraining_run: Path,
+) -> None:
+    step_path = next((tiny_pretraining_run / "checkpoints").glob("step-*"))
+    with pytest.raises(SMLArtifactError, match="step"):
+        resolve_model_artifact(step_path, full_verify=False)
+
+
+def test_new_session_resolves_published_step_under_latest_only(
+    tiny_pretraining_run: Path,
+) -> None:
+    session = InferenceSession.from_checkpoint(tiny_pretraining_run)
+    original_step = session.model_identity.step
+    publish_new_valid_step(tiny_pretraining_run, step=original_step + 1)
+    latest = InferenceSession.from_checkpoint(tiny_pretraining_run)
+    assert latest.model_identity.step == original_step + 1
+    step_dirs = list((tiny_pretraining_run / "checkpoints").glob("step-*"))
+    assert len(step_dirs) == 1
+    assert int(step_dirs[0].name.split("-")[1]) == original_step + 1
+    with pytest.raises(SMLArtifactError, match="step"):
+        InferenceSession.from_checkpoint(step_dirs[0])
