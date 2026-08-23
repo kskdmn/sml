@@ -23,12 +23,6 @@ def _require_finite(value: object, field_name: str) -> float:
     return normalized
 
 
-def _require_positive_int(value: object, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise SMLConfigurationError(f"{field_name} must be a positive integer")
-    return value
-
-
 def _require_int32_counter(
     value: object, field_name: str, *, allow_zero: bool = False
 ) -> int:
@@ -311,12 +305,28 @@ class LoaderConfig:
 @dataclass(frozen=True, slots=True)
 class CheckpointPolicy:
     interval: int = 1_000
-    keep_last: int | None = None
 
     def __post_init__(self) -> None:
         _require_int32_counter(self.interval, "interval")
-        if self.keep_last is not None:
-            _require_positive_int(self.keep_last, "keep_last")
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeOverrides:
+    maximum_steps: int | None = None
+    maximum_epochs: int | None = None
+    log_interval: int | None = None
+    checkpoint_interval: int | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "maximum_steps",
+            "maximum_epochs",
+            "log_interval",
+            "checkpoint_interval",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                _require_int32_counter(value, field_name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -959,6 +969,7 @@ __all__ = (
     "OptimizerConfig",
     "PrecisionConfig",
     "PretrainingConfig",
+    "ResumeOverrides",
     "TrainerState",
     "WeightDecayPolicy",
     "accumulate_fp32",

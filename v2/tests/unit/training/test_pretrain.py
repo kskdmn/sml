@@ -13,6 +13,7 @@ from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel, causal_lm_loss
 from sml.training.common import (
     BaseParameterState,
+    CheckpointPolicy,
     LoaderConfig,
     OptimizerConfig,
     PretrainingConfig,
@@ -370,3 +371,24 @@ def test_enabled_dropout_advances_explicit_prng_key(tmp_path: Path):
 
     mx.eval(state.trainer.next_key, runtime.trainer.next_key)
     assert not bool(mx.array_equal(state.trainer.next_key, runtime.trainer.next_key))
+
+
+def test_resume_overrides_and_checkpoint_policy_expose_only_reviewed_controls():
+    """A retention override would reintroduce unsupported checkpoint history."""
+    from sml.training import common as common_module
+
+    ResumeOverrides = common_module.ResumeOverrides
+    assert tuple(ResumeOverrides.__dataclass_fields__) == (
+        "maximum_steps",
+        "maximum_epochs",
+        "log_interval",
+        "checkpoint_interval",
+    )
+    assert ResumeOverrides() == ResumeOverrides(None, None, None, None)
+    assert tuple(CheckpointPolicy.__dataclass_fields__) == ("interval",)
+    assert tuple(pretrain_module.TrainingResult.__dataclass_fields__) == (
+        "run",
+        "step",
+        "epoch",
+        "rows",
+    )

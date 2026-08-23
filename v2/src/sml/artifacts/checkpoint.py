@@ -1341,6 +1341,189 @@ def publish_immutable_bundle[M](
         return _publish_with_lock(target, build, fs=fs)
 
 
+def _validate_private_run(
+    run: Path,
+    run_descriptor: int,
+    expected: RunManifest,
+    *,
+    fs: FilesystemOps,
+) -> RunManifest:
+    expected_entries = {"run.json", "tokenizer", "latest.json", "checkpoints"}
+    actual_entries = set(fs.listdir(run_descriptor))
+    if actual_entries != expected_entries:
+        raise SMLArtifactError(
+            "private run has an invalid closed-world layout: "
+            f"missing={sorted(expected_entries - actual_entries)}, "
+            f"unexpected={sorted(actual_entries - expected_entries)}"
+        )
+    manifest = _read_manifest_from_descriptor(
+        run_descriptor,
+        RunManifest,
+        VerificationLevel.FULL,
+        context=str(run / RunManifest.MANIFEST_FILENAME),
+    )
+    if manifest != expected:
+        raise SMLArtifactError("private run manifest changed during creation")
+
+    tokenizer_descriptor = -1
+    checkpoints_descriptor = -1
+    try:
+        tokenizer_descriptor, tokenizer_stat = _opened_entry(
+            fs,
+            "tokenizer",
+            parent_descriptor=run_descriptor,
+            flags=_OPEN_DIRECTORY,
+        )
+        if not stat.S_ISDIR(tokenizer_stat.st_mode):
+            raise SMLArtifactError("run tokenizer is not a directory")
+        tokenizer = _read_manifest_from_descriptor(
+            tokenizer_descriptor,
+            TokenizerManifest,
+            VerificationLevel.FULL,
+            context=str(run / "tokenizer"),
+        )
+        _verify_closed_world(
+            fs,
+            tokenizer_descriptor,
+            tokenizer,
+            manifest_present=True,
+            full=True,
+        )
+        if tokenizer.identity != manifest.tokenizer_identity:
+            raise SMLArtifactError("run tokenizer identity does not match run.json")
+
+        checkpoints_descriptor = _open_checkpoints_directory(
+            run,
+            fs,
+            run_descriptor,
+            writable=True,
+        )
+        latest = _recover_latest_open(
+            run,
+            manifest,
+            run_descriptor,
+            checkpoints_descriptor,
+            writable=False,
+            verification=VerificationLevel.FULL,
+            fs=fs,
+            allow_empty=False,
+        )
+        if latest is None or latest.step != 0:
+            raise SMLArtifactError("fresh run must publish checkpoint step zero")
+        if latest.latest_recovered:
+            raise SMLArtifactError("fresh run latest index does not name step zero")
+        if set(fs.listdir(checkpoints_descriptor)) != {_step_name(0)}:
+            raise SMLArtifactError("fresh run must contain only checkpoint step zero")
+        return manifest
+    finally:
+        if checkpoints_descriptor >= 0:
+            os.close(checkpoints_descriptor)
+        if tokenizer_descriptor >= 0:
+            os.close(tokenizer_descriptor)
+
+
+def publish_run(
+    target: Path,
+    build: Callable[[Path], RunManifest],
+    *,
+    fs: FilesystemOps = OS_FILESYSTEM,
+) -> Published[RunManifest]:
+    """Atomically create a new run containing its complete step-zero state.
+
+    The caller owns the nonblocking run-writer lock for ``target``. Unlike an
+    immutable bundle publication, an existing target is always an error.
+    """
+    if not isinstance(target, Path):
+        raise TypeError("target must be a Path")
+    if not callable(build):
+        raise TypeError("build must be callable")
+    if not isinstance(fs, FilesystemOps):
+        raise TypeError("fs must implement FilesystemOps")
+
+    parent, target_name = _path_parts(target)
+    parent_descriptor = _open_writable_parent(parent, fs)
+    temporary_name = f"{_temporary_prefix(target_name)}{uuid.uuid4().hex}"
+    temporary_descriptor = -1
+    created = False
+    committed = False
+    try:
+        _cleanup_stale_temporaries(fs, parent_descriptor, target_name)
+        if _stat_if_present(fs, target_name, parent_descriptor=parent_descriptor):
+            raise SMLArtifactError(f"fresh run target already exists: {target}")
+        fs.mkdir(temporary_name, 0o700, dir_fd=parent_descriptor)
+        created = True
+        temporary_descriptor = fs.open(
+            temporary_name,
+            _OPEN_DIRECTORY,
+            dir_fd=parent_descriptor,
+        )
+        temporary_path = parent / temporary_name
+        manifest = build(temporary_path)
+        if not isinstance(manifest, RunManifest):
+            raise SMLArtifactError("run builder returned the wrong manifest type")
+        if manifest.identity != manifest.recompute_identity():
+            raise SMLArtifactError("run builder returned a manifest identity mismatch")
+        validated = _validate_private_run(
+            temporary_path,
+            temporary_descriptor,
+            manifest,
+            fs=fs,
+        )
+        _make_payload_tree_durable(fs, temporary_descriptor)
+        _require_named_directory_inode(
+            fs,
+            temporary_name,
+            parent_descriptor=parent_descriptor,
+            directory_descriptor=temporary_descriptor,
+            context="private run directory",
+        )
+        if _stat_if_present(fs, target_name, parent_descriptor=parent_descriptor):
+            raise SMLArtifactError(f"fresh run target appeared concurrently: {target}")
+        try:
+            fs.rename(
+                temporary_name,
+                target_name,
+                source_dir_fd=parent_descriptor,
+                destination_dir_fd=parent_descriptor,
+            )
+        except FileExistsError as error:
+            raise SMLArtifactError(
+                f"fresh run target appeared concurrently: {target}"
+            ) from error
+        committed = True
+        fs.fsync_directory(parent_descriptor)
+        _require_named_directory_inode(
+            fs,
+            target_name,
+            parent_descriptor=parent_descriptor,
+            directory_descriptor=temporary_descriptor,
+            context="committed fresh run",
+        )
+        _validate_private_run(target, temporary_descriptor, validated, fs=fs)
+        return Published(
+            path=target,
+            manifest=validated,
+            verification=VerificationLevel.FULL,
+        )
+    except SMLArtifactError:
+        raise
+    except OSError as error:
+        raise SMLArtifactError(f"fresh run publication failed: {target}") from error
+    finally:
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        try:
+            if created and not committed:
+                _cleanup_temporary(
+                    fs,
+                    parent_descriptor,
+                    target_name,
+                    temporary_name,
+                )
+        finally:
+            os.close(parent_descriptor)
+
+
 def _require_step(step: object) -> int:
     if isinstance(step, bool) or not isinstance(step, int):
         raise TypeError("step must be an integer")
@@ -2661,6 +2844,7 @@ __all__ = [
     "publication_lock",
     "publish_checkpoint",
     "publish_immutable_bundle",
+    "publish_run",
     "recover_latest_index",
     "resolve_exact_step",
     "resolve_latest_step",
