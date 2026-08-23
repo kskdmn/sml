@@ -40,7 +40,11 @@ they verify correctness rather than speed.
 
 ## Current Repository Snapshot
 
-- Branch: main, tracking origin/main.
+- Audit starting point: 4225c54 (docs(v2): align refactor plans and handoff),
+  with a clean tracked worktree on 2026-08-23.
+- Branch: main, tracking origin/main. At the audit starting point, local main is
+  24 commits ahead of origin/main at 8c3b1be; do not reset or replace the local
+  history with the older remote tip.
 - Documentation-audit base before this consistency update:
   ddad9a8 (docs(v2): record residual Part 1 provenance blocker).
 - Latest Part 1 repair/evidence HEAD before this documentation handoff:
@@ -296,6 +300,77 @@ new empty external journal and follow the optional prepared-data-100 protocol.
 | 3.6: Phase 3 correctness and workflow gate | Repeated after repair | Ruff clean; all 1,062 v2 tests passed; current standalone quality validation passed; unchanged uv.lock |
 | Part 1 completion | Blocked by one residual Important | Implement the approved stable quality-provenance contract, regenerate only if that changes evidence identity, pass scoped review, and freeze checkpoint-content mappings before Task 4.1 exposes them |
 
+## Immediate Part 1 Remediation Contract
+
+The remaining work is deliberately narrower than Task 4.1. Modify only the
+quality validator/checkpoint-reader seams and their lasting tests unless a
+test-first discovery proves another production file is required:
+
+- `v2/benchmarks/quality.py`
+- `v2/tests/unit/test_pretraining_quality.py`
+- `v2/src/sml/artifacts/checkpoint.py`
+- the focused checkpoint-reader test under `v2/tests/unit/artifacts/` or
+  `v2/tests/integration/test_pretraining_workflow.py`
+
+For controlled-quality provenance, keep `record` bound to the clean current
+tree, but make `validate` decode the canonical manifest first and treat its
+embedded workload plus full `source_commit` as the recorded boundary. Verify
+the workload's own identity, reconstruct the recorded harness, production-
+dependency closure, and fixture blobs from that Git commit, and compare their
+component lists and identities with the manifest before validating raw records
+and the report. The validation path must not first call
+`build_pretraining_quality_workload(root)`, derive an expected workload from
+current-tree bytes, or require `v2/src/sml.py` to exist in the current tree.
+Continue to reject a missing/non-ancestor recorded commit, a changed historical
+production blob or mode, changed historical harness/fixture bytes, a malformed
+or internally inconsistent manifest, and any raw/report mismatch.
+
+Lasting provenance regressions must prove all of the following without running
+the 1,000-step recorder:
+
+1. The checked-in evidence still validates after a current-tree edit to
+   `v2/src/sml/artifacts/checkpoint.py`.
+2. It still validates when the current-tree `v2/src/sml.py` bridge is absent,
+   matching the Task 6.3 cutover.
+3. It fails if the recorded commit's harness bytes, production dependency
+   closure bytes/modes, fixture bytes, or embedded identity does not match the
+   manifest.
+4. The existing standalone validator returns `pass` against the unchanged
+   three canonical evidence files.
+
+For `VerifiedCheckpointContents`, freeze the scalar mapping and both the outer
+and inner array-group mappings before the value is retained by
+`CheckpointReader`; do not rely on the frozen dataclass wrapper alone. Freeze
+any nested scalar mapping as well, or otherwise ensure no alias reachable from
+the returned value can add, remove, or replace verified entries. Add direct
+mutation tests and retain the existing exact-resume workflow to prove consumers
+can still copy/read the frozen contents.
+
+Run the focused remediation gate outside the sandbox where pytest needs
+MLX/Metal:
+
+```bash
+uv run pytest v2/tests/unit/test_pretraining_quality.py v2/tests/unit/artifacts/test_checkpoint_semantics.py v2/tests/integration/test_pretraining_workflow.py -v
+uv run python -m v2.benchmarks.quality validate --manifest v2/benchmarks/manifests/pretraining-quality-v1.json --raw-input v2/benchmarks/results/pretraining-quality-v1.jsonl --report v2/benchmarks/results/pretraining-quality-v1.json
+```
+
+Then run the full Part 1 gate from the repository root:
+
+```bash
+uv run ruff check v2
+uv run ruff format --check v2
+uv run pytest v2/tests
+git diff --check
+git diff --exit-code 4225c54 -- uv.lock
+```
+
+The final lockfile comparison uses this audited handoff base, so it detects a
+lockfile change even if remediation commits have already been created. Do not
+start Task 4.1 until the focused review closes the provenance Important and
+confirms the checkpoint mappings are immutable. Preserve the canonical quality
+manifest, raw JSONL, and report byte-for-byte unless the implementation proves
+that the approved contract necessarily changes their identity.
+
 ## Remaining Part 2 Tasks
 
 | Phase | Tasks | Status | Required gate |
@@ -327,14 +402,12 @@ The absent files are not blockers and should not be fabricated.
 1. Read this handoff, the umbrella design, the Part 1 plan, and the Part 2
    Task 4.1 consumer contract.
 2. Confirm the latest main commit and inspect git status. Preserve unrelated
-   user changes if any exist.
-3. Implement the approved recorded-source quality-provenance policy described
-   above. Do not start Task 4.1 until the reviewed validator survives its
-   required checkpoint-file edit and the Phase 6 bridge deletion.
-4. Use a strict test-first repair for the selected provenance contract and the
-   shallow checkpoint-content mapping Minor. Run MLX pytest outside the
-   sandbox; rerun canonical quality only if the approved policy changes the
-   recorded evidence identity.
+   user changes if any exist, and preserve the 24 local commits recorded above
+   that are not on the audited origin/main tip.
+3. Execute the Immediate Part 1 Remediation Contract above test-first. Do not
+   start Task 4.1 until its focused review closes both named findings.
+4. Run MLX pytest outside the sandbox; rerun canonical quality only if the
+   approved policy necessarily changes the recorded evidence identity.
 5. Follow the updated functional gate at the end of each phase. Do not pause
    for baseline capture or performance comparison.
 6. Keep this handoff current with completed commits, fresh test evidence, and
