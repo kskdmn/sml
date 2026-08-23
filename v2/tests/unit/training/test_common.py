@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 from sml.errors import SMLConfigurationError
@@ -689,3 +690,180 @@ def test_state_tree_validation_preserves_nested_containers_keys_shapes_and_rando
         )
     )
     assert tied == {"embed_tokens.weight": 0.11}
+
+
+def _numpy_leaf(value: object) -> np.ndarray:
+    if isinstance(value, mx.array):
+        return np.array(value.astype(mx.float32), dtype=np.float64)
+    raise TypeError(f"oracle expected an MLX array leaf, got {type(value)!r}")
+
+
+def _decay_rate(flag: object, config: OptimizerConfig) -> float:
+    if flag is True:
+        return float(config.weight_decay.other)
+    if flag is False:
+        return 0.0
+    if isinstance(flag, (int, float)) and not isinstance(flag, bool):
+        rate = float(flag)
+        if math.isfinite(rate) and rate >= 0.0:
+            return rate
+    raise AssertionError(
+        "oracle weight-decay leaves must be bool or non-negative floats"
+    )
+
+
+def _adamw_leaf(
+    parameter: object,
+    gradient: object,
+    first: object,
+    second: object,
+    decay_flag: object,
+    *,
+    config: OptimizerConfig,
+    learning_rate: float,
+    completed: float,
+) -> tuple[mx.array, mx.array, mx.array]:
+    parameter_np = _numpy_leaf(parameter)
+    gradient_np = _numpy_leaf(gradient)
+    first_np = _numpy_leaf(first)
+    second_np = _numpy_leaf(second)
+    next_first_np = config.beta1 * first_np + (1.0 - config.beta1) * gradient_np
+    next_second_np = config.beta2 * second_np + (1.0 - config.beta2) * np.square(
+        gradient_np
+    )
+    first_for_update = next_first_np
+    second_for_update = next_second_np
+    if config.bias_correction:
+        first_for_update = next_first_np / (1.0 - config.beta1**completed)
+        second_for_update = next_second_np / (1.0 - config.beta2**completed)
+    decay = _decay_rate(decay_flag, config)
+    updated_np = parameter_np - learning_rate * (
+        first_for_update / (np.sqrt(second_for_update) + config.epsilon)
+        + decay * parameter_np
+    )
+    return (
+        mx.array(updated_np.astype(np.float32), dtype=mx.float32),
+        mx.array(next_first_np.astype(np.float32), dtype=mx.float32),
+        mx.array(next_second_np.astype(np.float32), dtype=mx.float32),
+    )
+
+
+def _map_adamw_oracle(
+    parameters: object,
+    gradients: object,
+    first_moments: object,
+    second_moments: object,
+    weight_decay_tree: object,
+    *,
+    config: OptimizerConfig,
+    learning_rate: float,
+    completed: float,
+) -> tuple[object, object, object]:
+    if isinstance(parameters, dict):
+        updated = {}
+        next_first = {}
+        next_second = {}
+        for key, parameter in parameters.items():
+            updated[key], next_first[key], next_second[key] = _map_adamw_oracle(
+                parameter,
+                gradients[key],
+                first_moments[key],
+                second_moments[key],
+                weight_decay_tree[key],
+                config=config,
+                learning_rate=learning_rate,
+                completed=completed,
+            )
+        return updated, next_first, next_second
+    return _adamw_leaf(
+        parameters,
+        gradients,
+        first_moments,
+        second_moments,
+        weight_decay_tree,
+        config=config,
+        learning_rate=learning_rate,
+        completed=completed,
+    )
+
+
+def direct_fp32_adamw_oracle(
+    parameters: dict,
+    gradients: dict,
+    state: AdamState,
+    config: OptimizerConfig,
+    weight_decay_tree: dict,
+) -> tuple[dict, AdamState]:
+    """Independent NumPy AdamW using the saved config and boolean decay tree."""
+    step = int(np.array(state.step.astype(mx.int32)))
+    learning_rate = float(np.array(numpy_schedule_oracle([step], config)).reshape(()))
+    completed = float(step + 1)
+    updated, next_first, next_second = _map_adamw_oracle(
+        parameters,
+        gradients,
+        state.first_moments,
+        state.second_moments,
+        weight_decay_tree,
+        config=config,
+        learning_rate=learning_rate,
+        completed=completed,
+    )
+    return updated, AdamState(
+        step=mx.array(step + 1, dtype=mx.int32),
+        first_moments=next_first,
+        second_moments=next_second,
+    )
+
+
+def test_fp32_adam_preserves_adapter_dtype_and_formula():
+    from sml.training.common import adamw_fp32_update
+
+    parameters = {"lora_a": mx.array([[1.0, -2.0]], dtype=mx.float32)}
+    gradients = {"lora_a": mx.array([[0.25, -0.5]], dtype=mx.float32)}
+    state = initialize_adam_state(parameters)
+    config = optimizer_config(weight_decay=WeightDecayPolicy(other=0.1))
+    weight_decay_tree = {"lora_a": True}
+    updated, next_state = adamw_fp32_update(
+        parameters,
+        gradients,
+        state,
+        config,
+        weight_decay_tree,
+    )
+    expected, expected_state = direct_fp32_adamw_oracle(
+        parameters,
+        gradients,
+        state,
+        config,
+        weight_decay_tree,
+    )
+    mx.eval(updated, next_state.to_tree(), expected, expected_state.to_tree())
+    assert updated["lora_a"].dtype == mx.float32
+    assert next_state.first_moments["lora_a"].dtype == mx.float32
+    assert next_state.second_moments["lora_a"].dtype == mx.float32
+    assert_tree_close(updated, expected, atol=1e-6, rtol=1e-6)
+    assert_tree_close(
+        next_state.first_moments, expected_state.first_moments, atol=1e-6, rtol=1e-6
+    )
+    assert_tree_close(
+        next_state.second_moments, expected_state.second_moments, atol=1e-6, rtol=1e-6
+    )
+    source = inspect.getsource(common_module.adamw_fp32_update)
+    assert "adamw_mixed_precision_update(" not in source
+    assert ".astype(mx.bfloat16)" not in source
+    oracle_source = inspect.getsource(direct_fp32_adamw_oracle)
+    assert ("adamw_" + "fp32_update") not in oracle_source
+    assert ("adamw_" + "mixed_precision_update") not in oracle_source
+    mixed_source = inspect.getsource(common_module.adamw_mixed_precision_update)
+    assert updated["lora_a"].dtype == mx.float32
+    masters, working, _state = adamw_mixed_precision_update(
+        {"weight": mx.array([[1.0, -2.0]], dtype=mx.float32)},
+        {"weight": mx.array([[0.25, -0.5]], dtype=mx.float32)},
+        initialize_adam_state({"weight": mx.array([[1.0, -2.0]], dtype=mx.float32)}),
+        config,
+        {"weight": True},
+    )
+    mx.eval(masters, working)
+    assert masters["weight"].dtype == mx.float32
+    assert working["weight"].dtype == mx.bfloat16
+    assert mixed_source is not None

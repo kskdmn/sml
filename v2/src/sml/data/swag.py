@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import queue
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, Self
 
 import numpy as np
 
@@ -25,6 +27,7 @@ from sml.artifacts.manifest import (
 )
 from sml.errors import SMLArtifactError, SMLDataError
 from sml.inference import ResolvedModel
+from sml.training.common import LoaderConfig
 
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
 _INT32 = np.dtype("<i4")
@@ -1115,6 +1118,457 @@ def prepare_swag_bundle(
     )
 
 
+_EMPTY_INT = np.empty((0, 0, 0), dtype=_INT32)
+_EMPTY_INT.setflags(write=False)
+_EMPTY_BOOL = np.empty((0, 0, 0), dtype=_BOOL)
+_EMPTY_BOOL.setflags(write=False)
+_EMPTY_LABELS = np.empty((0,), dtype=_INT32)
+_EMPTY_LABELS.setflags(write=False)
+_EMPTY_MASK = np.empty((0,), dtype=_BOOL)
+_EMPTY_MASK.setflags(write=False)
+_QUEUE_STOP = object()
+
+
+def _owned_readonly(array: np.ndarray) -> np.ndarray:
+    owned = np.array(array, copy=True)
+    owned.setflags(write=False)
+    return owned
+
+
+@dataclass(frozen=True, slots=True)
+class SwagCursor:
+    """Canonical location of the next real SWAG example, never a padded slot."""
+
+    epoch: int
+    bucket_order_position: int
+    row_offset: int
+
+    def __post_init__(self) -> None:
+        _require_plain_int(self.epoch, "epoch")
+        _require_plain_int(self.bucket_order_position, "bucket_order_position")
+        _require_plain_int(self.row_offset, "row_offset")
+
+    @classmethod
+    def initial(cls) -> SwagCursor:
+        return cls(epoch=0, bucket_order_position=0, row_offset=0)
+
+
+def _epoch_bucket_plan(
+    buckets: tuple[SwagBucket, ...],
+    *,
+    epoch_seed: int,
+    epoch: int,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    generator = np.random.Generator(
+        np.random.PCG64(np.random.SeedSequence([epoch_seed, epoch]))
+    )
+    bucket_order = tuple(int(index) for index in generator.permutation(len(buckets)))
+    plan: list[tuple[int, tuple[int, ...]]] = []
+    for bucket_index in bucket_order:
+        row_count = int(buckets[bucket_index].input_ids.shape[0])
+        if row_count == 0:
+            continue
+        row_permutation = tuple(
+            int(index) for index in generator.permutation(row_count)
+        )
+        plan.append((bucket_index, row_permutation))
+    return tuple(plan)
+
+
+def _synthetic_candidates(
+    length: int, manifest: SwagDataManifest
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    input_ids = np.full((4, length), manifest.pad_token_id, dtype=_INT32)
+    input_ids[:, 0] = manifest.bos_token_id
+    input_ids[:, 1] = manifest.eos_token_id
+    valid_token_mask = np.zeros((4, length), dtype=_BOOL)
+    valid_token_mask[:, :2] = True
+    score_mask = np.zeros((4, length), dtype=_BOOL)
+    score_mask[:, 1] = True
+    return input_ids, valid_token_mask, score_mask
+
+
+def _assemble_batch_arrays(
+    bucket: SwagBucket,
+    row_indices: tuple[int, ...],
+    *,
+    batch_size: int,
+    manifest: SwagDataManifest,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    length = bucket.length
+    input_ids = np.empty((batch_size, 4, length), dtype=_INT32)
+    valid_token_mask = np.empty((batch_size, 4, length), dtype=_BOOL)
+    score_mask = np.empty((batch_size, 4, length), dtype=_BOOL)
+    labels = np.empty((batch_size,), dtype=_INT32)
+    example_mask = np.zeros((batch_size,), dtype=_BOOL)
+    for slot, row_index in enumerate(row_indices):
+        input_ids[slot] = np.array(bucket.input_ids[row_index], copy=True)
+        valid_token_mask[slot] = np.array(bucket.valid_token_mask[row_index], copy=True)
+        score_mask[slot] = np.array(bucket.score_mask[row_index], copy=True)
+        labels[slot] = int(bucket.labels[row_index])
+        example_mask[slot] = True
+    if len(row_indices) < batch_size:
+        syn_ids, syn_valid, syn_score = _synthetic_candidates(length, manifest)
+        for slot in range(len(row_indices), batch_size):
+            input_ids[slot] = syn_ids
+            valid_token_mask[slot] = syn_valid
+            score_mask[slot] = syn_score
+            labels[slot] = 0
+            example_mask[slot] = False
+    return (
+        _owned_readonly(input_ids),
+        _owned_readonly(valid_token_mask),
+        _owned_readonly(score_mask),
+        _owned_readonly(labels),
+        _owned_readonly(example_mask),
+    )
+
+
+def _advance_cursor(
+    cursor: SwagCursor,
+    *,
+    consumed: int,
+    remaining_in_bucket: int,
+    remaining_buckets: int,
+) -> SwagCursor:
+    if consumed < remaining_in_bucket:
+        return SwagCursor(
+            cursor.epoch, cursor.bucket_order_position, cursor.row_offset + consumed
+        )
+    if remaining_buckets > 0:
+        return SwagCursor(cursor.epoch, cursor.bucket_order_position + 1, 0)
+    return SwagCursor(cursor.epoch + 1, 0, 0)
+
+
+class SwagBatchEnvelope:
+    """A read-only NumPy SWAG batch whose owned storage has explicit lifetime."""
+
+    __slots__ = (
+        "_cursor_after",
+        "_example_mask",
+        "_input_ids",
+        "_labels",
+        "_release_callback",
+        "_release_lock",
+        "_released",
+        "_score_mask",
+        "_source_epoch",
+        "_valid_token_mask",
+    )
+
+    def __init__(
+        self,
+        input_ids: np.ndarray,
+        score_mask: np.ndarray,
+        labels: np.ndarray,
+        example_mask: np.ndarray,
+        valid_token_mask: np.ndarray,
+        cursor_after: SwagCursor,
+        *,
+        source_epoch: int,
+    ) -> None:
+        if not isinstance(cursor_after, SwagCursor):
+            raise TypeError("cursor_after must be a SwagCursor")
+        _require_plain_int(source_epoch, "source_epoch")
+        self._input_ids = input_ids
+        self._score_mask = score_mask
+        self._labels = labels
+        self._example_mask = example_mask
+        self._valid_token_mask = valid_token_mask
+        self._cursor_after = cursor_after
+        self._source_epoch = source_epoch
+        self._release_callback: Callable[[], None] | None = None
+        self._release_lock = threading.Lock()
+        self._released = False
+
+    @property
+    def input_ids(self) -> np.ndarray:
+        return self._input_ids
+
+    @property
+    def score_mask(self) -> np.ndarray:
+        return self._score_mask
+
+    @property
+    def labels(self) -> np.ndarray:
+        return self._labels
+
+    @property
+    def example_mask(self) -> np.ndarray:
+        return self._example_mask
+
+    @property
+    def valid_token_mask(self) -> np.ndarray:
+        return self._valid_token_mask
+
+    @property
+    def cursor_after(self) -> SwagCursor:
+        return self._cursor_after
+
+    def _set_release_callback(self, callback: Callable[[], None]) -> None:
+        self._release_callback = callback
+
+    def release(self) -> None:
+        callback: Callable[[], None] | None
+        with self._release_lock:
+            if self._released:
+                return
+            self._released = True
+            self._input_ids = _EMPTY_INT
+            self._score_mask = _EMPTY_BOOL
+            self._labels = _EMPTY_LABELS
+            self._example_mask = _EMPTY_MASK
+            self._valid_token_mask = _EMPTY_BOOL
+            callback = self._release_callback
+            self._release_callback = None
+        if callback is not None:
+            callback()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        self.release()
+
+
+class SwagBatch:
+    """On-device SWAG batch transferred on the main thread."""
+
+    __slots__ = (
+        "cursor_after",
+        "example_mask",
+        "input_ids",
+        "labels",
+        "score_mask",
+        "valid_token_mask",
+    )
+
+    def __init__(
+        self,
+        input_ids: object,
+        score_mask: object,
+        labels: object,
+        example_mask: object,
+        valid_token_mask: object,
+        cursor_after: SwagCursor,
+    ) -> None:
+        self.input_ids = input_ids
+        self.score_mask = score_mask
+        self.labels = labels
+        self.example_mask = example_mask
+        self.valid_token_mask = valid_token_mask
+        self.cursor_after = cursor_after
+
+    @classmethod
+    def from_envelope(cls, envelope: SwagBatchEnvelope) -> SwagBatch:
+        import mlx.core as mx
+
+        batch = cls(
+            mx.array(envelope.input_ids),
+            mx.array(envelope.score_mask),
+            mx.array(envelope.labels),
+            mx.array(envelope.example_mask),
+            mx.array(envelope.valid_token_mask),
+            envelope.cursor_after,
+        )
+        envelope.release()
+        return batch
+
+
+class _ProducerFailure:
+    def __init__(self, error: SMLDataError) -> None:
+        self.error = error
+
+
+class SwagBatchStream:
+    """Bounded CPU prefetch over permuted SWAG buckets with fixed-shape tails."""
+
+    def __init__(
+        self,
+        bundle: SwagDataBundle,
+        loader: LoaderConfig,
+        *,
+        cursor: SwagCursor,
+    ) -> None:
+        if not isinstance(bundle, SwagDataBundle):
+            raise TypeError("bundle must be a SwagDataBundle")
+        if not isinstance(loader, LoaderConfig):
+            raise TypeError("loader must be a LoaderConfig")
+        if not isinstance(cursor, SwagCursor):
+            raise TypeError("cursor must be a SwagCursor")
+        self._bundle = bundle
+        self._loader = loader
+        self._stop = threading.Event()
+        self._queue: queue.Queue[SwagBatchEnvelope | _ProducerFailure | object] = (
+            queue.Queue(maxsize=loader.prefetch_depth)
+        )
+        self._consumer_lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._committed_cursor = cursor
+        self._initial_epoch = cursor.epoch
+        self._epoch_complete = False
+        self._closed = False
+        self._producer = threading.Thread(
+            target=self._produce,
+            name="sml-swag-prefetch",
+            daemon=True,
+        )
+        self._producer.start()
+
+    @property
+    def committed_cursor(self) -> SwagCursor:
+        with self._state_lock:
+            return self._committed_cursor
+
+    def _next_from_cursor(
+        self, cursor: SwagCursor
+    ) -> tuple[SwagBatchEnvelope, SwagCursor]:
+        plan = _epoch_bucket_plan(
+            self._bundle.buckets,
+            epoch_seed=self._loader.epoch_seed,
+            epoch=cursor.epoch,
+        )
+        if not plan:
+            raise SMLDataError("SWAG bundle does not contain any examples")
+        if cursor.bucket_order_position >= len(plan):
+            return self._next_from_cursor(SwagCursor(cursor.epoch + 1, 0, 0))
+        _bucket_index, row_permutation = plan[cursor.bucket_order_position]
+        if cursor.row_offset >= len(row_permutation):
+            if cursor.bucket_order_position + 1 < len(plan):
+                next_cursor = SwagCursor(
+                    cursor.epoch, cursor.bucket_order_position + 1, 0
+                )
+            else:
+                next_cursor = SwagCursor(cursor.epoch + 1, 0, 0)
+            return self._next_from_cursor(next_cursor)
+        remaining = row_permutation[cursor.row_offset :]
+        take = min(self._loader.microbatch_size, len(remaining))
+        selected = remaining[:take]
+        bucket = self._bundle.buckets[plan[cursor.bucket_order_position][0]]
+        arrays = _assemble_batch_arrays(
+            bucket,
+            selected,
+            batch_size=self._loader.microbatch_size,
+            manifest=self._bundle.manifest,
+        )
+        cursor_after = _advance_cursor(
+            cursor,
+            consumed=take,
+            remaining_in_bucket=len(remaining),
+            remaining_buckets=len(plan) - cursor.bucket_order_position - 1,
+        )
+        input_ids, valid_token_mask, score_mask, labels, example_mask = arrays
+        envelope = SwagBatchEnvelope(
+            input_ids,
+            score_mask,
+            labels,
+            example_mask,
+            valid_token_mask,
+            cursor_after,
+            source_epoch=cursor.epoch,
+        )
+        return envelope, cursor_after
+
+    def _put(self, item: SwagBatchEnvelope | _ProducerFailure | object) -> bool:
+        while not self._stop.is_set():
+            try:
+                self._queue.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _produce(self) -> None:
+        try:
+            cursor = self._committed_cursor
+            while not self._stop.is_set():
+                envelope, cursor = self._next_from_cursor(cursor)
+                if not self._put(envelope):
+                    envelope.release()
+                    return
+        except BaseException as error:  # noqa: BLE001 - cross-thread error boundary
+            failure = SMLDataError("SWAG batch producer failed")
+            failure.__cause__ = error
+            self._put(_ProducerFailure(failure))
+        finally:
+            self._put(_QUEUE_STOP)
+
+    def _pull(self) -> SwagBatchEnvelope:
+        while True:
+            if self._closed:
+                raise StopIteration
+            try:
+                item = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                producer = self._producer
+                if (
+                    producer is not None
+                    and not producer.is_alive()
+                    and self._queue.empty()
+                ):
+                    raise StopIteration
+                continue
+            if isinstance(item, SwagBatchEnvelope):
+                return item
+            if isinstance(item, _ProducerFailure):
+                self.close()
+                raise item.error
+            if item is _QUEUE_STOP:
+                raise StopIteration
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(self) -> SwagBatchEnvelope:
+        with self._consumer_lock:
+            if self._epoch_complete:
+                raise StopIteration
+            envelope = self._pull()
+            if envelope._source_epoch > self._initial_epoch:
+                envelope.release()
+                self._epoch_complete = True
+                raise StopIteration
+            if envelope.cursor_after.epoch > self._initial_epoch:
+                self._epoch_complete = True
+            return envelope
+
+    def commit(self, cursor_after: SwagCursor) -> None:
+        if not isinstance(cursor_after, SwagCursor):
+            raise TypeError("cursor_after must be a SwagCursor")
+        with self._state_lock:
+            self._committed_cursor = cursor_after
+
+    def close(self) -> None:
+        self._stop.set()
+        self._closed = True
+        producer = self._producer
+        if producer is not None and producer is not threading.current_thread():
+            producer.join(timeout=1.0)
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(item, SwagBatchEnvelope):
+                item.release()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        self.close()
+
+
 __all__ = [
     "BOS_POLICY_V1",
     "EOS_POLICY_V1",
@@ -1123,7 +1577,11 @@ __all__ = [
     "SWAG_IDENTITY_FIELDS",
     "HuggingFaceDatasetsSwagProvider",
     "ResolvedSwagSource",
+    "SwagBatch",
+    "SwagBatchEnvelope",
+    "SwagBatchStream",
     "SwagBucket",
+    "SwagCursor",
     "SwagDataBundle",
     "SwagPreparationConfig",
     "SwagProvider",
