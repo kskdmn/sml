@@ -1,11 +1,11 @@
-# V2 Refactor Handoff: Part 2 Task 5.2 Next
+# V2 Refactor Handoff: Part 2 Task 5.3 Next
 
 **Recorded:** 2026-08-22 (Asia/Shanghai)
 
 **Last updated:** 2026-08-24 (Asia/Shanghai)
 
 **Purpose:** Give a fresh session enough repository-backed context to continue
-Part 2 at Task 5.2, without reading the prior conversation.
+Part 2 at Task 5.3, without reading the prior conversation.
 
 ## Superseding Acceptance Policy
 
@@ -133,7 +133,13 @@ they verify correctness rather than speed.
 - Task 5.1 complete at 232918c (`feat(v2): add strict fp32 lora adapters` plus
   live wrapped-forward fix). Scoped review over `ee62486..232918c` approved
   with 0 Critical, 0 Important, 0 Minor. Focused LoRA tests 22 passed; full
-  v2 suite 1155 passed; Ruff clean. Task 5.2 is next.
+  v2 suite 1155 passed; Ruff clean.
+- Task 5.2 complete at 4a8e469 (`feat(v2): cache encoded swag buckets` plus four
+  review-fix commits). Scoped review over `36a3891..4a8e469` approved with
+  0 Critical, 0 Important. Deferred Minor: `int()` token coercion in encode.
+  Identity-field mutation prepares remain plan-mandated (encoding stays v1).
+  Focused SWAG tests 51 passed; full v2 suite 1206 passed; Ruff clean.
+  Task 5.3 is next.
 
 ## Related Specifications and Plans
 
@@ -141,14 +147,14 @@ they verify correctness rather than speed.
 | --- | --- | --- | --- |
 | docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Part 1 foundation, model, artifacts, tokenizer, prepared data, pretraining, integration, numerical quality run, recorded-source validator, and frozen checkpoint contents | Phases 4-6; performance remains optional |
 | docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | All task bodies, the controlled run, the repeated functional gate, recorded-source validation, and checkpoint-content freeze | None required under the current policy |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning is complete; Phase 4 and Task 5.1 are implemented and reviewed | Tasks 5.2-5.5 and 6.1-6.4 |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning is complete; Phase 4 and Tasks 5.1-5.2 are implemented and reviewed | Tasks 5.3-5.5 and 6.1-6.4 |
 | docs/superpowers/specs/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge-design.md | Real prepared-data benchmark owner design | Production goal implemented at ffb29f97b7770d06a95df41c2b612c07a9fa6c1b | Nothing required; screen is optional |
 | docs/superpowers/plans/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge.md | Bridge implementation plan | Task 1 complete at ffb29f9 | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-stop-interruptible-pretraining-stream-design.md | Full-queue shutdown correctness design | Implemented and reviewed at 8e2291f1c87244fa8acd33d375c9e49961bb70fa | Nothing required; timing rerun is optional |
 | docs/superpowers/plans/2026-08-16-v2-stop-interruptible-pretraining-stream.md | Shutdown fix plan | Task 1 complete at 8e2291f | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-prepared-data-100-unit-measurement-design.md | Versioned 20/100 benchmark protocol | Harness design implemented | Baseline capture/comparison only if explicitly desired |
 | docs/superpowers/plans/2026-08-16-v2-prepared-data-100-unit-measurement.md | Versioned protocol implementation plan | Required Tasks 1 and 4 complete; Task 1 reviewed at 8c3b1be | Tasks 2 and 3 remain optional diagnostic procedures only |
-| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through Task 5.1 close at 232918c | Keep current as Task 5.2 and later tasks complete |
+| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through Task 5.2 close at 4a8e469 | Keep current as Task 5.3 and later tasks complete |
 
 ## Supporting Benchmark Documents
 
@@ -351,7 +357,7 @@ Deferred provenance-test Minors (do not block Task 4.1):
 | Phase | Tasks | Status | Required gate |
 | --- | --- | --- | --- |
 | 4: inference and evaluation | 4.1-4.4 | Complete at 0d95441 | Correctness, inference/evaluation integration, applicable CLI smoke |
-| 5: LoRA and SWAG | 5.1-5.5 | 5.1 complete; next: Task 5.2 | Correctness, controlled SWAG quality, resume/export/inference workflow |
+| 5: LoRA and SWAG | 5.1-5.5 | 5.1-5.2 complete; next: Task 5.3 | Correctness, controlled SWAG quality, resume/export/inference workflow |
 | 6: unified CLI and cutover | 6.1-6.4 | Not started | Full Ruff/pytest, all CLI workflows, clean cutover, unchanged uv.lock |
 
 No Phase 4, 5, 6, or final performance result file is required.
@@ -374,14 +380,14 @@ The absent files are not blockers and should not be fabricated.
 
 ## Takeover Procedure
 
-1. Read this handoff, the umbrella design, and the Part 2 Task 5.2 contract.
+1. Read this handoff, the umbrella design, and the Part 2 Task 5.3 contract.
 2. Confirm the latest main commit and inspect git status. Preserve unrelated
    user changes if any exist, and preserve the local commits recorded above
    that are not on the audited origin/main tip.
-3. Execute Task 5.2 test-first. Implement immutable encoded SWAG buckets
-   only. Do not implement ranking kernels, LoRA runs, or export. Do not
-   download SWAG in the normal test suite. Do not regenerate canonical
-   quality evidence.
+3. Execute Task 5.3 test-first. Implement mean-normalized SWAG ranking,
+   fixed-shape bucket batches, and FP32 adapter AdamW only. Do not implement
+   LoRA run create/resume/export. Do not download SWAG. Do not regenerate
+   canonical quality evidence.
 4. Run MLX pytest outside the sandbox; rerun canonical quality only if a later
    change necessarily alters the recorded evidence identity.
 5. Follow the updated functional gate at the end of each phase. Do not pause
