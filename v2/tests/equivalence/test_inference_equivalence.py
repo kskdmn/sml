@@ -6,8 +6,10 @@ from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
 import zstandard as zstd
+from sml import inference
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
     PretrainingPreparationConfig,
@@ -136,10 +138,21 @@ def tiny_pretraining_run(tmp_path: Path, _tiny_run_template: Path) -> Path:
     return dest
 
 
+POLICY_PROMPT = "alpha beta alpha beta"
+# Last prompt bigram continues with 275; 264 is seen but not that successor.
+GREEDY_WINNER = 275
+REPETITION_WINNER = 40
+NGRAM_WINNER = 264
+# Seeded top-p first token after the designed logits (probed, then hardcoded).
+SAMPLED_WINNER = 219
+EOS_PROMPTS = ("zeta", "eta theta")
+
+
 @pytest.fixture
 def tiny_session(tiny_pretraining_run: Path) -> InferenceSession:
     session = InferenceSession.from_checkpoint(tiny_pretraining_run)
-    _install_distinct_policy_logits(session, "alpha beta alpha beta")
+    _install_distinct_policy_logits(session, POLICY_PROMPT)
+    _install_early_eos_logits(session, POLICY_PROMPT)
     return session
 
 
@@ -177,20 +190,51 @@ def _set_token_logit(
     weight[token] = (row + ((target - current) / denom) * hidden).astype(weight.dtype)
 
 
+def _set_token_logit_for_hiddens(
+    weight: mx.array,
+    hiddens: list[mx.array],
+    token: int,
+    targets: list[float],
+) -> None:
+    stacked = np.stack(
+        [np.array(hidden.astype(mx.float32)) for hidden in hiddens]
+    ).astype(np.float32)
+    row = np.array(weight[token].astype(mx.float32), dtype=np.float32)
+    residual = np.asarray(targets, dtype=np.float32) - stacked @ row
+    gram = stacked @ stacked.T + (1e-6 * np.eye(len(targets), dtype=np.float32))
+    delta = np.linalg.solve(gram, residual) @ stacked
+    weight[token] = mx.array(row + delta).astype(weight.dtype)
+
+
 def _install_distinct_policy_logits(session: InferenceSession, prompt: str) -> None:
     """Give greedy, repetition, n-gram, and sampling distinct safe-margin winners."""
     hidden = _last_hidden(session, list(session._encode_prompt(prompt)))
     mx.eval(hidden)
     weight = session._parameters["embed_tokens"]["weight"]
+    # First-token split on POLICY_PROMPT:
+    # greedy keeps 275; n-gram size 2 bans that successor so 264 wins;
+    # repetition 1.2 drops seen 275/264 below unseen 40 (2.6).
     for token, target in (
-        (10, 3.0),
-        (20, 2.65),
-        (30, 2.2),
-        (40, 1.4),
-        (50, 0.4),
-        (60, -1.0),
+        (GREEDY_WINNER, 3.0),
+        (NGRAM_WINNER, 2.8),
+        (REPETITION_WINNER, 2.6),
     ):
         _set_token_logit(weight, hidden, token, target)
+    mx.eval(weight)
+
+
+def _install_early_eos_logits(session: InferenceSession, policy_prompt: str) -> None:
+    """Force EOS-only prompts to emit eos_token_id without stealing other winners."""
+    eos_id = session.resolved_model.model_config.eos_token_id
+    weight = session._parameters["embed_tokens"]["weight"]
+    prompts = (*EOS_PROMPTS, policy_prompt)
+    hiddens = [
+        _last_hidden(session, list(session._encode_prompt(prompt)))
+        for prompt in prompts
+    ]
+    mx.eval(*hiddens)
+    targets = [8.0] * len(EOS_PROMPTS) + [-2.0]
+    _set_token_logit_for_hiddens(weight, hiddens, eos_id, targets)
     mx.eval(weight)
 
 
@@ -275,11 +319,11 @@ def requests_for_mode(mode: str) -> list[tuple[str, GenerationRequest]]:
     if mode == "eos":
         return [
             (
-                "alpha",
-                GenerationRequest(max_new_tokens=1, config=GenerationConfig(seed=9)),
+                "zeta",
+                GenerationRequest(max_new_tokens=4, config=GenerationConfig(seed=9)),
             ),
             (
-                "alpha beta gamma",
+                "eta theta",
                 GenerationRequest(max_new_tokens=6, config=GenerationConfig(seed=10)),
             ),
         ]
@@ -323,6 +367,12 @@ def test_heterogeneous_batch_matches_serial_with_margin_rule(
     )
     batched = tiny_session.generate_batch(requests_for_mode)
     assert_results_margin_aware_equal(serial, batched)
+    if mode == "eos":
+        eos_id = tiny_session.resolved_model.model_config.eos_token_id
+        for result, (_text, request) in zip(serial, requests_for_mode, strict=True):
+            assert eos_id in result.token_ids
+            assert result.token_ids[-1] == eos_id
+            assert len(result.token_ids) < request.max_new_tokens
 
 
 def test_seed_stream_is_invariant_to_bucket_neighbors(tiny_session):
@@ -341,17 +391,41 @@ def test_seed_stream_is_invariant_to_bucket_neighbors(tiny_session):
     assert mixed.token_ids == alone.token_ids
 
 
-def test_omitted_seed_is_allocated_before_reordering(tiny_session):
-    result = tiny_session.generate_batch([unseeded_request("a"), unseeded_request("b")])
-    assert all(item.seed is not None for item in result)
+def test_omitted_seed_is_allocated_before_reordering(
+    tiny_session, monkeypatch: pytest.MonkeyPatch
+):
+    allocated: list[int] = []
+    planned = (101, 102, 103)
+    remaining = iter(planned)
+
+    def allocator() -> int:
+        seed = next(remaining)
+        allocated.append(seed)
+        return seed
+
+    monkeypatch.setattr(inference, "allocate_generation_seed", allocator)
+    items = [
+        unseeded_request("a"),
+        (
+            "alpha beta gamma delta",
+            GenerationRequest(
+                max_new_tokens=4,
+                config=GenerationConfig(temperature=0.8, top_p=0.9),
+            ),
+        ),
+        unseeded_request("b"),
+    ]
+    result = tiny_session.generate_batch(items)
+    assert allocated == list(planned)
+    assert [item.seed for item in result] == list(planned)
     replay = tiny_session.generate(
-        "a", replace_request_seed(unseeded_request("a")[1], result[0].seed)
+        "a", replace_request_seed(items[0][1], result[0].seed)
     )
     assert replay.token_ids == result[0].token_ids
 
 
 def test_one_batch_preserves_distinct_generation_policies(tiny_session):
-    prompt = "alpha beta alpha beta"
+    prompt = POLICY_PROMPT
     items = [
         (prompt, GenerationRequest(4, GenerationConfig(temperature=0.0, seed=1))),
         (
@@ -372,6 +446,12 @@ def test_one_batch_preserves_distinct_generation_policies(tiny_session):
         ),
     ]
     serial = tuple(tiny_session.generate(text, request) for text, request in items)
+    assert [result.token_ids[0] for result in serial] == [
+        GREEDY_WINNER,
+        SAMPLED_WINNER,
+        REPETITION_WINNER,
+        NGRAM_WINNER,
+    ]
     assert len({result.token_ids for result in serial}) == len(items)
     batched = tiny_session.generate_batch(items)
     assert_results_margin_aware_equal(serial, batched)
