@@ -323,3 +323,19 @@ def test_session_length_buckets_are_powers_of_two_including_context(
     tiny_session: InferenceSession,
 ) -> None:
     assert tiny_session.length_buckets == (1, 2, 4, 8, 16, 32)
+
+
+def test_session_generate_batch_restores_caller_order(
+    tiny_session: InferenceSession,
+) -> None:
+    items = [
+        ("alpha", GenerationRequest(max_new_tokens=1)),
+        ("beta", GenerationRequest(max_new_tokens=2)),
+        ("gamma", GenerationRequest(max_new_tokens=1)),
+    ]
+    serial = tuple(tiny_session.generate(text, request) for text, request in items)
+    batched = tiny_session.generate_batch(items)
+    assert tuple(result.token_ids for result in batched) == tuple(
+        result.token_ids for result in serial
+    )
+    assert tiny_session.buffer_pool.active_leases == 0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import threading
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
@@ -24,7 +25,7 @@ from sml.artifacts.manifest import (
 )
 from sml.data.tokenizer import LoadedTokenizer, load_tokenizer_bundle
 from sml.errors import SMLArtifactError, SMLRuntimeError
-from sml.model.cache import allocate_kv_state
+from sml.model.cache import allocate_kv_state, reset_kv_state
 from sml.model.config import GenerationConfig, ModelConfig
 from sml.model.generation import (
     apply_no_repeat_ngram,
@@ -103,11 +104,104 @@ _DEFAULT_RUNTIME = InferenceRuntimeConfig()
 
 
 @dataclass(frozen=True, slots=True)
+class InferenceConfig:
+    checkpoint: Path
+    prompt: str
+    request: GenerationRequest
+    full_verify: bool = False
+    runtime: InferenceRuntimeConfig = _DEFAULT_RUNTIME
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.checkpoint, Path):
+            raise TypeError("checkpoint must be a Path")
+        if not isinstance(self.prompt, str):
+            raise TypeError("prompt must be a string")
+        if not isinstance(self.request, GenerationRequest):
+            raise TypeError("request must be a GenerationRequest")
+        if not isinstance(self.full_verify, bool):
+            raise TypeError("full_verify must be a bool")
+        if not isinstance(self.runtime, InferenceRuntimeConfig):
+            raise TypeError("runtime must be an InferenceRuntimeConfig")
+
+
+@dataclass(frozen=True, slots=True)
 class GenerationKernelKey:
     temperature: float
     top_p: float
     repetition_penalty: float
     no_repeat_ngram_size: int
+
+    @classmethod
+    def from_config(cls, config: GenerationConfig) -> GenerationKernelKey:
+        return cls(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            repetition_penalty=config.repetition_penalty,
+            no_repeat_ngram_size=config.no_repeat_ngram_size,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRequest:
+    caller_index: int
+    prompt_ids: tuple[int, ...]
+    length_bucket: int
+    kernel_key: GenerationKernelKey
+    seed: int
+    key: mx.array
+    max_new_tokens: int
+    include_prompt: bool
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationBucket:
+    length_bucket: int
+    batch_size_bucket: int
+    kernel_key: GenerationKernelKey
+    keys: mx.array
+    request_mask: mx.array
+    prompt_ids: tuple[tuple[int, ...], ...]
+    prompt_lengths: mx.array
+    max_new_tokens: mx.array
+    seeds: tuple[int, ...]
+    caller_indices: tuple[int, ...]
+    include_prompt: tuple[bool, ...]
+    host_max_new: int
+
+
+def allocate_generation_seed() -> int:
+    return secrets.randbits(32)
+
+
+def vmapped_select_one_token(
+    logits: mx.array,
+    keys: mx.array,
+    request_mask: mx.array,
+    kernel_key: GenerationKernelKey,
+) -> tuple[mx.array, mx.array]:
+    def select_one_token(logits_row, key):
+        return select_next_token_arrays(
+            logits_row,
+            key,
+            temperature=kernel_key.temperature,
+            top_p=kernel_key.top_p,
+        )
+
+    selected, next_keys = mx.vmap(select_one_token, in_axes=(0, 0))(logits, keys)
+    selected = mx.where(request_mask, selected, mx.zeros_like(selected))
+    next_keys = mx.where(request_mask[:, None], next_keys, keys)
+    return selected, next_keys
+
+
+def infer(config: InferenceConfig) -> GenerationResult:
+    if not isinstance(config, InferenceConfig):
+        raise TypeError("config must be an InferenceConfig")
+    session = InferenceSession.from_checkpoint(
+        config.checkpoint,
+        full_verify=config.full_verify,
+        runtime=config.runtime,
+    )
+    return session.generate(config.prompt, config.request)
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,11 +313,7 @@ class BufferPool:
         lease.discard()
 
     def _reset_cache(self, cache_state: object) -> object:
-        keys, values, lengths = cache_state
-        for layer in (*keys, *values, lengths):
-            layer[:] = 0
-        mx.eval(*keys, *values, lengths)
-        return cache_state
+        return reset_kv_state(cache_state)
 
     def _return(self, lease: _Lease) -> None:
         self._active = max(0, self._active - 1)
@@ -358,14 +448,18 @@ class InferenceSession:
     def generate(self, text: str, request: GenerationRequest) -> GenerationResult:
         self._require_generate_args(text, request)
         with self._call_guard.acquire():
-            return self._generate_one(text, request)
+            return self._generate_batch(((text, request),))[0]
 
     def generate_batch(
         self,
         items: Sequence[tuple[str, GenerationRequest]],
     ) -> tuple[GenerationResult, ...]:
+        if not items:
+            return ()
+        for text, request in items:
+            self._require_generate_args(text, request)
         with self._call_guard.acquire():
-            return tuple(self._generate_one(text, request) for text, request in items)
+            return self._generate_batch(items)
 
     def _require_generate_args(self, text: object, request: object) -> None:
         if not isinstance(text, str):
@@ -373,31 +467,133 @@ class InferenceSession:
         if not isinstance(request, GenerationRequest):
             raise TypeError("request must be a GenerationRequest")
 
-    def _generate_one(self, text: str, request: GenerationRequest) -> GenerationResult:
-        lease = None
-        try:
+    def _generate_batch(
+        self,
+        items: Sequence[tuple[str, GenerationRequest]],
+    ) -> tuple[GenerationResult, ...]:
+        results: list[GenerationResult | None] = [None] * len(items)
+        for bucket in self._bucketize(items):
+            lease = None
+            try:
+                lease = self.buffer_pool.lease(
+                    batch_size=bucket.batch_size_bucket,
+                    capacity=bucket.length_bucket,
+                    config=self._resolved.model_config,
+                )
+                bucket_results = self._decode_chunk(bucket, lease)
+                for caller_index, result in bucket_results:
+                    results[caller_index] = result
+            finally:
+                if lease is not None:
+                    self.buffer_pool.release(lease)
+        return tuple(results)
+
+    def _bucketize(
+        self,
+        items: Sequence[tuple[str, GenerationRequest]],
+    ) -> tuple[GenerationBucket, ...]:
+        prepared: list[_PreparedRequest] = []
+        for caller_index, (text, request) in enumerate(items):
             prompt_ids = self._encode_prompt(text)
-            required = len(prompt_ids) + request.max_new_tokens
-            capacity = self._select_length_bucket(required)
-            lease = self.buffer_pool.lease(
-                batch_size=1,
-                capacity=capacity,
-                config=self._resolved.model_config,
+            length_bucket = self._select_length_bucket(
+                len(prompt_ids) + request.max_new_tokens
             )
-            generated = self._decode_chunk(prompt_ids, request, lease, capacity)
-            token_ids = tuple(int(token) for token in generated)
-            if request.include_prompt:
-                token_ids = prompt_ids + token_ids
-            decoded = self._resolved.tokenizer.processor.decode(list(token_ids))
-            return GenerationResult(
-                text=decoded,
-                token_ids=token_ids,
-                seed=request.config.seed,
-                model=self.model_identity,
+            seed = request.config.seed
+            if seed is None:
+                seed = allocate_generation_seed()
+            prepared.append(
+                _PreparedRequest(
+                    caller_index=caller_index,
+                    prompt_ids=prompt_ids,
+                    length_bucket=length_bucket,
+                    kernel_key=GenerationKernelKey.from_config(request.config),
+                    seed=seed,
+                    key=mx.random.key(seed),
+                    max_new_tokens=request.max_new_tokens,
+                    include_prompt=request.include_prompt,
+                )
             )
-        finally:
-            if lease is not None:
-                self.buffer_pool.release(lease)
+
+        groups: dict[tuple[int, GenerationKernelKey], list[_PreparedRequest]] = {}
+        group_order: list[tuple[int, GenerationKernelKey]] = []
+        for item in prepared:
+            group_key = (item.length_bucket, item.kernel_key)
+            if group_key not in groups:
+                groups[group_key] = []
+                group_order.append(group_key)
+            groups[group_key].append(item)
+
+        max_batch = self._runtime.batch_size_buckets[-1]
+        buckets: list[GenerationBucket] = []
+        for group_key in group_order:
+            members = groups[group_key]
+            for start in range(0, len(members), max_batch):
+                chunk = members[start : start + max_batch]
+                batch_size_bucket = self._select_batch_size_bucket(len(chunk))
+                buckets.append(
+                    self._pad_bucket(
+                        chunk, group_key[0], batch_size_bucket, group_key[1]
+                    )
+                )
+        return tuple(buckets)
+
+    def _select_batch_size_bucket(self, group_size: int) -> int:
+        for bucket in self._runtime.batch_size_buckets:
+            if group_size <= bucket:
+                return bucket
+        return self._runtime.batch_size_buckets[-1]
+
+    def _pad_bucket(
+        self,
+        members: Sequence[_PreparedRequest],
+        length_bucket: int,
+        batch_size_bucket: int,
+        kernel_key: GenerationKernelKey,
+    ) -> GenerationBucket:
+        pad_id = self._resolved.model_config.pad_token_id
+        prompt_ids: list[tuple[int, ...]] = []
+        prompt_lengths: list[int] = []
+        max_new: list[int] = []
+        seeds: list[int] = []
+        caller_indices: list[int] = []
+        include_prompt: list[bool] = []
+        keys: list[mx.array] = []
+        real_mask: list[bool] = []
+        for item in members:
+            prompt_ids.append(item.prompt_ids)
+            prompt_lengths.append(len(item.prompt_ids))
+            max_new.append(item.max_new_tokens)
+            seeds.append(item.seed)
+            caller_indices.append(item.caller_index)
+            include_prompt.append(item.include_prompt)
+            keys.append(item.key)
+            real_mask.append(True)
+        while len(prompt_ids) < batch_size_bucket:
+            prompt_ids.append((pad_id,))
+            prompt_lengths.append(1)
+            max_new.append(0)
+            seeds.append(0)
+            caller_indices.append(-1)
+            include_prompt.append(False)
+            keys.append(mx.random.key(0))
+            real_mask.append(False)
+        return GenerationBucket(
+            length_bucket=length_bucket,
+            batch_size_bucket=batch_size_bucket,
+            kernel_key=kernel_key,
+            keys=mx.stack(keys),
+            request_mask=mx.array(real_mask, dtype=mx.bool_),
+            prompt_ids=tuple(prompt_ids),
+            prompt_lengths=mx.array(prompt_lengths, dtype=mx.int32),
+            max_new_tokens=mx.array(max_new, dtype=mx.int32),
+            seeds=tuple(seeds),
+            caller_indices=tuple(caller_indices),
+            include_prompt=tuple(include_prompt),
+            host_max_new=max(
+                (item.max_new_tokens for item in members),
+                default=0,
+            ),
+        )
 
     def _encode_prompt(self, text: str) -> tuple[int, ...]:
         processor = self._resolved.tokenizer.processor
@@ -419,7 +615,7 @@ class InferenceSession:
             "prompt overflow: required capacity exceeds effective context length"
         )
 
-    def _compiled_forward(
+    def _compiled_kernels(
         self,
         length_bucket: int,
         batch_size_bucket: int,
@@ -427,125 +623,251 @@ class InferenceSession:
     ):
         key = (length_bucket, batch_size_bucket, kernel_key)
         compiled = self._compiled.get(key)
-        if compiled is None:
-            model = self._model
+        if compiled is not None:
+            return compiled
 
-            def _forward(
+        model = self._model
+        chunk_size = self._runtime.decode_chunk_size
+        eos_id = self._resolved.model_config.eos_token_id
+        temperature = kernel_key.temperature
+        top_p = kernel_key.top_p
+        repetition_penalty = kernel_key.repetition_penalty
+        ngram_size = kernel_key.no_repeat_ngram_size
+
+        def _forward(parameters, input_ids, attention_mask, positions, cache_state):
+            logits, cache_state, _next_key = model.forward_arrays(
                 parameters,
                 input_ids,
-                attention_mask,
-                positions,
-                cache_state,
-            ):
-                logits, cache_state, _next_key = model.forward_arrays(
-                    parameters,
-                    input_ids,
-                    attention_mask=attention_mask,
-                    positions=positions,
-                    cache_state=cache_state,
-                    training=False,
-                    key=None,
-                )
-                return logits, cache_state
+                attention_mask=attention_mask,
+                positions=positions,
+                cache_state=cache_state,
+                training=False,
+                key=None,
+            )
+            return logits, cache_state
 
-            compiled = mx.compile(_forward)
-            self._compiled[key] = compiled
+        def select_one_token(logits_row, key):
+            return select_next_token_arrays(
+                logits_row,
+                key,
+                temperature=temperature,
+                top_p=top_p,
+            )
+
+        select_batch = mx.vmap(select_one_token, in_axes=(0, 0))
+
+        def _decode_chunk_core(
+            parameters,
+            tokens,
+            cache_state,
+            logits,
+            lengths,
+            generated,
+            finished,
+            max_new,
+            keys,
+            request_mask,
+        ):
+            for _ in range(chunk_size):
+                active = request_mask & (~finished) & (generated < max_new)
+                scored = logits.astype(mx.float32)
+                scored = apply_repetition_penalty(
+                    scored, tokens, lengths, repetition_penalty
+                )
+                scored = apply_no_repeat_ngram(scored, tokens, lengths, ngram_size)
+                selected, next_keys = select_batch(scored, keys)
+                selected = mx.where(request_mask, selected, mx.zeros_like(selected))
+                next_keys = mx.where(request_mask[:, None], next_keys, keys)
+                selected_i32 = selected.astype(mx.int32)
+                capacity = tokens.shape[1]
+                positions = mx.clip(lengths, 0, capacity - 1)
+                slot = (
+                    mx.arange(capacity, dtype=mx.int32)[None, :] == positions[:, None]
+                )
+                write = slot & active[:, None]
+                tokens = mx.where(
+                    write,
+                    mx.broadcast_to(selected_i32[:, None], tokens.shape),
+                    tokens,
+                )
+                wrote = active
+                new_lengths = mx.where(wrote, lengths + 1, lengths)
+                new_generated = mx.where(wrote, generated + 1, generated)
+                hit_eos = wrote & (selected_i32 == eos_id)
+                finished = (
+                    finished | ~request_mask | hit_eos | (new_generated >= max_new)
+                )
+                step_ids = selected_i32[:, None]
+                step_mask = wrote[:, None]
+                step_positions = lengths[:, None]
+                logits, cache_state = _forward(
+                    parameters,
+                    step_ids,
+                    step_mask,
+                    step_positions,
+                    cache_state,
+                )
+                logits = logits[:, 0]
+                lengths = new_lengths
+                generated = new_generated
+                keys = next_keys
+            return (
+                tokens,
+                cache_state,
+                logits,
+                lengths,
+                generated,
+                finished,
+                keys,
+            )
+
+        compiled = (mx.compile(_forward), mx.compile(_decode_chunk_core))
+        self._compiled[key] = compiled
         return compiled
 
-    def _decode_chunk(
-        self,
-        prompt_ids,
-        request: GenerationRequest,
-        lease: _Lease,
-        length_bucket: int,
-    ):
-        config = request.config
-        kernel_key = GenerationKernelKey(
-            temperature=config.temperature,
-            top_p=config.top_p,
-            repetition_penalty=config.repetition_penalty,
-            no_repeat_ngram_size=config.no_repeat_ngram_size,
+    def _decode_chunk(self, bucket: GenerationBucket, lease: _Lease):
+        prefill, decode_chunk = self._compiled_kernels(
+            bucket.length_bucket,
+            bucket.batch_size_bucket,
+            bucket.kernel_key,
         )
-        forward = self._compiled_forward(length_bucket, 1, kernel_key)
-        parameters = self._parameters
-        prompt_len = len(prompt_ids)
-        prompt = mx.array(list(prompt_ids), dtype=mx.int32)
-        lease.token_storage[0, :prompt_len] = prompt
-        prompt_mask = mx.ones((1, prompt_len), dtype=mx.bool_)
-        logits, cache_state = forward(
-            parameters,
-            lease.token_storage[:, :prompt_len],
-            prompt_mask,
-            None,
+        pad_id = self._resolved.model_config.pad_token_id
+        capacity = bucket.length_bucket
+        batch_size = bucket.batch_size_bucket
+        rows = []
+        for prompt in bucket.prompt_ids:
+            row = [pad_id] * capacity
+            row[: len(prompt)] = list(prompt)
+            rows.append(row)
+        lease.token_storage[:, :] = mx.array(rows, dtype=mx.int32)
+        token_range = mx.arange(capacity, dtype=mx.int32)[None, :]
+        real_mask = (
+            token_range < bucket.prompt_lengths[:, None]
+        ) & bucket.request_mask[:, None]
+        synthetic_mask = (~bucket.request_mask)[:, None] & (token_range == 0)
+        attention_mask = real_mask | synthetic_mask
+        positions = mx.where(
+            attention_mask,
+            mx.broadcast_to(token_range, (batch_size, capacity)),
+            mx.zeros((batch_size, capacity), dtype=mx.int32),
+        )
+        logits, cache_state = prefill(
+            self._parameters,
+            lease.token_storage,
+            attention_mask,
+            positions,
             lease.cache_state,
         )
-        lease.cache_state = cache_state
-        generated: list[int] = []
-        eos_id = self._resolved.model_config.eos_token_id
-        rng = mx.random.key(0 if config.seed is None else config.seed)
-        next_logits = logits[0, prompt_len - 1]
+        last_index = mx.clip(bucket.prompt_lengths - 1, 0, capacity - 1)
+        gather_index = mx.broadcast_to(
+            last_index[:, None, None],
+            (batch_size, 1, logits.shape[-1]),
+        )
+        next_logits = mx.take_along_axis(logits, gather_index, axis=1)[:, 0, :]
+        lengths = bucket.prompt_lengths.astype(mx.int32)
+        generated = mx.zeros((batch_size,), dtype=mx.int32)
+        finished = ~bucket.request_mask
+        keys = bucket.keys
+        max_new = bucket.max_new_tokens
+        mx.eval(
+            lease.token_storage,
+            cache_state,
+            next_logits,
+            lengths,
+            generated,
+            finished,
+            keys,
+        )
+
+        max_steps = bucket.host_max_new
         chunk_size = self._runtime.decode_chunk_size
-        remaining = request.max_new_tokens
-        logical = prompt_len
-        while remaining > 0:
-            steps = min(remaining, chunk_size)
-            chunk_tokens = []
-            for step in range(steps):
-                lengths = mx.array([logical], dtype=mx.int32)
-                scored = next_logits.astype(mx.float32)[None, :]
-                scored = apply_repetition_penalty(
-                    scored,
-                    lease.token_storage,
-                    lengths,
-                    config.repetition_penalty,
+        n_chunks = (max_steps + chunk_size - 1) // chunk_size if max_steps else 0
+        tokens = lease.token_storage
+        for _chunk in range(n_chunks):
+            (
+                tokens,
+                cache_state,
+                next_logits,
+                lengths,
+                generated,
+                finished,
+                keys,
+            ) = decode_chunk(
+                self._parameters,
+                tokens,
+                cache_state,
+                next_logits,
+                lengths,
+                generated,
+                finished,
+                max_new,
+                keys,
+                bucket.request_mask,
+            )
+            mx.eval(
+                tokens,
+                cache_state,
+                next_logits,
+                lengths,
+                generated,
+                finished,
+                keys,
+            )
+        lease.token_storage = tokens
+        lease.cache_state = cache_state
+        return self._host_results(bucket, tokens, generated)
+
+    def _host_results(
+        self,
+        bucket: GenerationBucket,
+        tokens: mx.array,
+        generated: mx.array,
+    ) -> tuple[tuple[int, GenerationResult], ...]:
+        token_rows = tokens.tolist()
+        generated_counts = generated.tolist()
+        results: list[tuple[int, GenerationResult]] = []
+        identity = self.model_identity
+        processor = self._resolved.tokenizer.processor
+        for index, caller_index in enumerate(bucket.caller_indices):
+            if caller_index < 0:
+                continue
+            prompt = bucket.prompt_ids[index]
+            start = len(prompt)
+            count = int(generated_counts[index])
+            continuation = tuple(
+                int(token) for token in token_rows[index][start : start + count]
+            )
+            token_ids = (
+                prompt + continuation if bucket.include_prompt[index] else continuation
+            )
+            results.append(
+                (
+                    caller_index,
+                    GenerationResult(
+                        text=processor.decode(list(token_ids)),
+                        token_ids=token_ids,
+                        seed=bucket.seeds[index],
+                        model=identity,
+                    ),
                 )
-                scored = apply_no_repeat_ngram(
-                    scored,
-                    lease.token_storage,
-                    lengths,
-                    config.no_repeat_ngram_size,
-                )
-                token_id, rng = select_next_token_arrays(
-                    scored[0],
-                    rng,
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                )
-                lease.token_storage[0, logical] = token_id
-                chunk_tokens.append(token_id)
-                logical += 1
-                if step + 1 < steps or remaining > steps:
-                    step_ids = mx.reshape(token_id, (1, 1))
-                    step_mask = mx.ones((1, 1), dtype=mx.bool_)
-                    logits, cache_state = forward(
-                        parameters,
-                        step_ids,
-                        step_mask,
-                        None,
-                        cache_state,
-                    )
-                    lease.cache_state = cache_state
-                    next_logits = logits[0, 0]
-            stacked = mx.stack(chunk_tokens)
-            mx.eval(stacked, cache_state, rng, lease.token_storage)
-            for token in stacked.tolist():
-                host_token = int(token)
-                generated.append(host_token)
-                if host_token == eos_id:
-                    return tuple(generated)
-            remaining -= steps
-        return tuple(generated)
+            )
+        return tuple(results)
 
 
 __all__ = (
     "BufferPool",
+    "GenerationBucket",
     "GenerationKernelKey",
     "GenerationRequest",
     "GenerationResult",
+    "InferenceConfig",
     "InferenceRuntimeConfig",
     "InferenceSession",
     "ModelIdentity",
     "ResolvedModel",
+    "allocate_generation_seed",
+    "infer",
     "load_owned_model_arrays",
     "resolve_model_artifact",
+    "vmapped_select_one_token",
 )

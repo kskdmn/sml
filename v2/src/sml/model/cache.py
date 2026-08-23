@@ -20,6 +20,14 @@ class KVView:
     valid_mask: mx.array
 
 
+def reset_kv_state(state: KVArrayState) -> KVArrayState:
+    keys, values, lengths = state
+    for layer in (*keys, *values, lengths):
+        layer[:] = 0
+    mx.eval(*keys, *values, lengths)
+    return keys, values, lengths
+
+
 def allocate_kv_state(
     config: ModelConfig,
     batch_size: int,

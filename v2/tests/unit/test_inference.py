@@ -4,6 +4,7 @@ import inspect
 import json
 import shutil
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import mlx.core as mx
@@ -22,6 +23,7 @@ from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.inference import (
     GenerationKernelKey,
     GenerationRequest,
+    GenerationResult,
     InferenceRuntimeConfig,
     InferenceSession,
     resolve_model_artifact,
@@ -41,10 +43,6 @@ EXPECTED_SECOND_TOKENS = (7, 11)
 
 def raise_after_one_token(*_args, **_kwargs):
     raise SMLRuntimeError("decode failed after one token")
-
-
-def deterministic_decode(*_args, **_kwargs):
-    return EXPECTED_SECOND_TOKENS
 
 
 def expected_second_tokens() -> tuple[int, ...]:
@@ -241,10 +239,22 @@ def test_session_loads_latest_once_and_pins_identity(
 def test_failed_call_cannot_contaminate_next_call(
     tiny_session: InferenceSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(tiny_session, "_decode_chunk", raise_after_one_token)
+    monkeypatch.setattr(tiny_session, "_generate_batch", raise_after_one_token)
     with pytest.raises(SMLRuntimeError, match="decode"):
         tiny_session.generate("first", GenerationRequest(max_new_tokens=2))
-    monkeypatch.setattr(tiny_session, "_decode_chunk", deterministic_decode)
+
+    def deterministic_batch(items):
+        return tuple(
+            GenerationResult(
+                text="",
+                token_ids=EXPECTED_SECOND_TOKENS,
+                seed=request.config.seed,
+                model=tiny_session.model_identity,
+            )
+            for _text, request in items
+        )
+
+    monkeypatch.setattr(tiny_session, "_generate_batch", deterministic_batch)
     assert (
         tiny_session.generate("second", GenerationRequest(max_new_tokens=2)).token_ids
         == expected_second_tokens()
@@ -454,3 +464,157 @@ def test_load_owned_model_arrays_does_not_nest_run_access_lock(
     monkeypatch.setattr(checkpoint, "_protected_lock", tracking)
     inference.load_owned_model_arrays(tiny_pretraining_run, full_verify=False)
     assert max_depth == 1
+
+
+inference_module = inference
+
+
+@dataclass(frozen=True, slots=True)
+class _CompileSpyKey:
+    length_bucket: int
+    batch_size_bucket: int
+    kernel_key: GenerationKernelKey
+
+
+class _CompileSpy:
+    def __init__(self, session: InferenceSession) -> None:
+        self._session = session
+
+    @property
+    def keys(self) -> set[_CompileSpyKey]:
+        compiled = self._session._compiled
+        keys: set[_CompileSpyKey] = set()
+        for key in compiled:
+            if isinstance(key, tuple) and len(key) == 3:
+                keys.add(_CompileSpyKey(key[0], key[1], key[2]))
+            else:
+                keys.add(
+                    _CompileSpyKey(
+                        key.length_bucket,
+                        key.batch_size_bucket,
+                        key.kernel_key,
+                    )
+                )
+        return keys
+
+
+@pytest.fixture
+def compile_spy(tiny_session: InferenceSession) -> _CompileSpy:
+    return _CompileSpy(tiny_session)
+
+
+def source_contains(module: object, snippet: str) -> bool:
+    return snippet in inspect.getsource(module)
+
+
+def source_has_none_of(module: object, forbidden: list[str]) -> bool:
+    source = inspect.getsource(module)
+    return all(token not in source for token in forbidden)
+
+
+def seed_requests(count: int) -> list[tuple[str, GenerationRequest]]:
+    return [
+        (
+            "alpha",
+            GenerationRequest(
+                max_new_tokens=2,
+                config=GenerationConfig(temperature=0.8, top_p=0.9, seed=21 + index),
+            ),
+        )
+        for index in range(count)
+    ]
+
+
+def fixed_bucket_logits(*, batch_size: int) -> mx.array:
+    peak = mx.array([8.0, 0.0, -8.0, -8.0], dtype=mx.float32)
+    return mx.broadcast_to(peak[None, :], (batch_size, peak.shape[0]))
+
+
+def vmapped_select_one_token(logits, keys, request_mask, kernel_key):
+    return inference.vmapped_select_one_token(
+        logits,
+        keys,
+        request_mask,
+        kernel_key,
+    )
+
+
+def test_empty_batch_returns_before_taking_the_call_guard(
+    tiny_session: InferenceSession,
+) -> None:
+    with tiny_session._call_guard.acquire():
+        assert tiny_session.generate_batch([]) == ()
+    assert tiny_session.buffer_pool.active_leases == 0
+
+
+def test_infer_constructs_one_session_and_delegates_once_to_generate(
+    tiny_pretraining_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sml.inference import InferenceConfig, infer
+
+    calls: list[tuple[str, GenerationRequest]] = []
+    real_generate = InferenceSession.generate
+
+    def tracking(self, text, request):
+        calls.append((text, request))
+        return real_generate(self, text, request)
+
+    monkeypatch.setattr(InferenceSession, "generate", tracking)
+    request = GenerationRequest(max_new_tokens=1)
+    result = infer(
+        InferenceConfig(
+            checkpoint=tiny_pretraining_run,
+            prompt="alpha",
+            request=request,
+        )
+    )
+    assert len(calls) == 1
+    assert calls[0] == ("alpha", request)
+    assert result.token_ids
+    assert result.model.run_identity is not None
+
+
+def test_generate_delegates_to_the_same_batch_engine(
+    tiny_session: InferenceSession,
+) -> None:
+    request = GenerationRequest(
+        max_new_tokens=2,
+        config=GenerationConfig(temperature=0.8, top_p=0.9, seed=41),
+    )
+    single = tiny_session.generate("alpha", request)
+    batched = tiny_session.generate_batch([("alpha", request)])[0]
+    assert single.token_ids == batched.token_ids
+    assert single.seed == batched.seed == 41
+
+
+def test_batch_cardinality_reuses_fixed_compiled_bucket(
+    tiny_session: InferenceSession, compile_spy: _CompileSpy
+) -> None:
+    tiny_session.generate_batch(seed_requests(3))
+    compiled_after_three = set(compile_spy.keys)
+    tiny_session.generate_batch(seed_requests(4))
+    assert set(compile_spy.keys) == compiled_after_three
+    assert len(compiled_after_three) == 1
+    assert next(iter(compiled_after_three)).batch_size_bucket == 4
+
+
+def test_sampling_vmaps_scalar_keys_and_ignores_synthetic_slots(
+    tiny_session: InferenceSession,
+) -> None:
+    bucket = tiny_session._bucketize(seed_requests(3))[0]
+    assert bucket.keys.shape == (4, 2)
+    assert bucket.request_mask.tolist() == [True, True, True, False]
+    selected, next_keys = vmapped_select_one_token(
+        fixed_bucket_logits(batch_size=4),
+        bucket.keys,
+        bucket.request_mask,
+        bucket.kernel_key,
+    )
+    mx.eval(selected, next_keys)
+    assert selected.shape == (4,)
+    assert next_keys.shape == (4, 2)
+    assert source_contains(inference_module, "mx.vmap(select_one_token")
+    assert source_has_none_of(
+        inference_module, ["mx.random.categorical(logits, key=keys)"]
+    )
