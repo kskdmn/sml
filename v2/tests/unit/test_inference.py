@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import inspect
 import json
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 
 import mlx.core as mx
 import pytest
 import zstandard as zstd
 from sml import inference
+from sml.artifacts import checkpoint
 from sml.artifacts.checkpoint import VerifiedCheckpointContents
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
@@ -17,12 +20,13 @@ from sml.data.pretraining import (
 from sml.data.tokenizer import TokenizerTrainingConfig, train_tokenizer_bundle
 from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.inference import (
+    GenerationKernelKey,
     GenerationRequest,
     InferenceRuntimeConfig,
     InferenceSession,
     resolve_model_artifact,
 )
-from sml.model.config import ModelConfig
+from sml.model.config import GenerationConfig, ModelConfig
 from sml.training.common import (
     CheckpointPolicy,
     LoaderConfig,
@@ -265,3 +269,132 @@ def test_session_generate_returns_tokens_and_releases_lease(
     assert len(result.token_ids) == 1
     assert result.model == tiny_session.model_identity
     assert tiny_session.buffer_pool.active_leases == 0
+
+
+def test_session_compile_cache_reuses_shape_and_policy_key(
+    tiny_session: InferenceSession,
+) -> None:
+    prompt = "alpha"
+    prompt_ids = tiny_session._encode_prompt(prompt)
+    small = GenerationRequest(max_new_tokens=1)
+    large = GenerationRequest(max_new_tokens=8)
+    sampled = GenerationRequest(
+        max_new_tokens=1,
+        config=GenerationConfig(temperature=0.8, seed=3),
+    )
+    small_bucket = tiny_session._select_length_bucket(len(prompt_ids) + 1)
+    large_bucket = tiny_session._select_length_bucket(len(prompt_ids) + 8)
+    assert small_bucket != large_bucket
+
+    tiny_session.generate(prompt, small)
+    tiny_session.generate(prompt, small)
+    assert len(tiny_session._compiled) == 1
+    first_key = next(iter(tiny_session._compiled))
+    assert first_key == (
+        small_bucket,
+        1,
+        GenerationKernelKey(
+            temperature=0.0,
+            top_p=1.0,
+            repetition_penalty=1.0,
+            no_repeat_ngram_size=0,
+        ),
+    )
+
+    tiny_session.generate(prompt, large)
+    tiny_session.generate(prompt, sampled)
+    assert len(tiny_session._compiled) == 3
+    assert (
+        large_bucket,
+        1,
+        GenerationKernelKey(
+            temperature=0.0,
+            top_p=1.0,
+            repetition_penalty=1.0,
+            no_repeat_ngram_size=0,
+        ),
+    ) in tiny_session._compiled
+    assert (
+        small_bucket,
+        1,
+        GenerationKernelKey(
+            temperature=0.8,
+            top_p=1.0,
+            repetition_penalty=1.0,
+            no_repeat_ngram_size=0,
+        ),
+    ) in tiny_session._compiled
+
+
+def test_decode_chunk_does_not_call_item_and_returns_continuation(
+    tiny_pretraining_run: Path,
+) -> None:
+    source = inspect.getsource(InferenceSession._decode_chunk)
+    assert ".item(" not in source
+    session = InferenceSession.from_checkpoint(
+        tiny_pretraining_run,
+        runtime=InferenceRuntimeConfig(decode_chunk_size=2),
+    )
+    result = session.generate("alpha", GenerationRequest(max_new_tokens=5))
+    assert result.token_ids
+    assert len(result.token_ids) <= 5
+
+
+def test_session_reuses_pooled_token_storage_for_same_bucket(
+    tiny_session: InferenceSession,
+) -> None:
+    leased: list[object] = []
+    released: list[object] = []
+    pool = tiny_session.buffer_pool
+    real_lease = pool.lease
+    real_release = pool.release
+
+    def wrapped_lease(**kwargs):
+        lease = real_lease(**kwargs)
+        leased.append(lease.token_storage)
+        return lease
+
+    def wrapped_release(lease):
+        released.append(lease.token_storage)
+        return real_release(lease)
+
+    pool.lease = wrapped_lease
+    pool.release = wrapped_release
+    request = GenerationRequest(max_new_tokens=1)
+    tiny_session.generate("alpha", request)
+    tiny_session.generate("alpha", request)
+    assert pool.active_leases == 0
+    assert len(leased) == 2
+    assert len(released) == 2
+    assert leased[1] is released[0]
+
+
+def test_load_owned_model_arrays_does_not_nest_run_access_lock(
+    tiny_pretraining_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    depth = 0
+    max_depth = 0
+    real_lock = checkpoint._protected_lock
+
+    @contextmanager
+    def tracking(protected, *, category, exclusive, wait=False):
+        nonlocal depth, max_depth
+        if category == "run-access":
+            depth += 1
+            max_depth = max(max_depth, depth)
+        try:
+            with real_lock(
+                protected,
+                category=category,
+                exclusive=exclusive,
+                wait=wait,
+            ):
+                yield
+        finally:
+            if category == "run-access":
+                depth -= 1
+
+    monkeypatch.setattr(checkpoint, "_protected_lock", tracking)
+    inference.load_owned_model_arrays(tiny_pretraining_run, full_verify=False)
+    assert max_depth == 1

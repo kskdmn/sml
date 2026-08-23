@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -2320,6 +2320,7 @@ def open_checkpoint_reader(
     expected_checkpoint_identity: str | None = None,
     verification: VerificationLevel = VerificationLevel.FULL,
     load_array_groups: frozenset[str] | None = None,
+    hold_lock: bool = True,
     fs: FilesystemOps = OS_FILESYSTEM,
 ) -> Iterator[CheckpointReader]:
     """Open a verified checkpoint without a pathname reopen after proof."""
@@ -2337,15 +2338,22 @@ def open_checkpoint_reader(
         or not all(isinstance(name, str) for name in load_array_groups)
     ):
         raise TypeError("load_array_groups must be a frozenset of strings or None")
+    if not isinstance(hold_lock, bool):
+        raise TypeError("hold_lock must be a bool")
     if not isinstance(fs, FilesystemOps):
         raise TypeError("fs must implement FilesystemOps")
 
-    with _protected_lock(
-        run,
-        category="run-access",
-        exclusive=False,
-        wait=True,
-    ):
+    lock = (
+        _protected_lock(
+            run,
+            category="run-access",
+            exclusive=False,
+            wait=True,
+        )
+        if hold_lock
+        else nullcontext()
+    )
+    with lock:
         run_descriptor = _open_directory(
             run,
             fs,

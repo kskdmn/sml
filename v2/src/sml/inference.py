@@ -103,6 +103,14 @@ _DEFAULT_RUNTIME = InferenceRuntimeConfig()
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationKernelKey:
+    temperature: float
+    top_p: float
+    repetition_penalty: float
+    no_repeat_ngram_size: int
+
+
+@dataclass(frozen=True, slots=True)
 class ResolvedModel:
     artifact_kind: str
     run_identity: str | None
@@ -157,24 +165,27 @@ class _Lease:
         pool: BufferPool,
         token_storage: mx.array,
         cache_state: object,
+        pool_key: tuple[int, ...],
     ) -> None:
         self.token_storage = token_storage
         self.cache_state = cache_state
         self._pool = pool
+        self._pool_key = pool_key
         self._released = False
 
     def discard(self) -> None:
         if self._released:
             return
+        self._pool._return(self)
+        self._released = True
         self.token_storage = None
         self.cache_state = None
-        self._released = True
-        self._pool._release_one()
 
 
 class BufferPool:
     def __init__(self) -> None:
         self._active = 0
+        self._free: dict[tuple[int, ...], list[tuple[mx.array, object]]] = {}
 
     @property
     def active_leases(self) -> int:
@@ -187,17 +198,41 @@ class BufferPool:
         capacity: int,
         config: ModelConfig,
     ) -> _Lease:
+        key = (
+            batch_size,
+            capacity,
+            config.num_layers,
+            config.num_kv_heads,
+            config.head_dim,
+        )
         self._active += 1
-        token_storage = mx.zeros((batch_size, capacity), dtype=mx.int32)
-        cache_state = allocate_kv_state(config, batch_size, capacity, mx.bfloat16)
-        mx.eval(token_storage, cache_state)
-        return _Lease(self, token_storage, cache_state)
+        available = self._free.get(key)
+        if available:
+            token_storage, cache_state = available.pop()
+        else:
+            token_storage = mx.zeros((batch_size, capacity), dtype=mx.int32)
+            cache_state = allocate_kv_state(config, batch_size, capacity, mx.bfloat16)
+            mx.eval(token_storage, cache_state)
+        return _Lease(self, token_storage, cache_state, key)
 
     def release(self, lease: _Lease) -> None:
         lease.discard()
 
-    def _release_one(self) -> None:
+    def _reset_cache(self, cache_state: object) -> object:
+        keys, values, lengths = cache_state
+        reset = (
+            tuple(mx.zeros_like(layer) for layer in keys),
+            tuple(mx.zeros_like(layer) for layer in values),
+            mx.zeros_like(lengths),
+        )
+        mx.eval(reset)
+        return reset
+
+    def _return(self, lease: _Lease) -> None:
         self._active = max(0, self._active - 1)
+        self._free.setdefault(lease._pool_key, []).append(
+            (lease.token_storage, self._reset_cache(lease.cache_state))
+        )
 
 
 def _length_buckets(effective_context_length: int) -> tuple[int, ...]:
@@ -245,6 +280,7 @@ def load_owned_model_arrays(
             expected_checkpoint_identity=recovered.checkpoint.identity,
             verification=verification,
             load_array_groups=load_groups,
+            hold_lock=False,
         ) as reader:
             contents = reader.read_contents()
             model_group = contents.array_groups[_MODEL_GROUP]
@@ -351,7 +387,7 @@ class InferenceSession:
                 capacity=capacity,
                 config=self._resolved.model_config,
             )
-            generated = self._decode_chunk(prompt_ids, request, lease)
+            generated = self._decode_chunk(prompt_ids, request, lease, capacity)
             token_ids = tuple(int(token) for token in generated)
             if request.include_prompt:
                 token_ids = prompt_ids + token_ids
@@ -386,8 +422,13 @@ class InferenceSession:
             "prompt overflow: required capacity exceeds effective context length"
         )
 
-    def _compiled_forward(self):
-        key = ("forward",)
+    def _compiled_forward(
+        self,
+        length_bucket: int,
+        batch_size_bucket: int,
+        kernel_key: GenerationKernelKey,
+    ):
+        key = (length_bucket, batch_size_bucket, kernel_key)
         compiled = self._compiled.get(key)
         if compiled is None:
             model = self._model
@@ -414,75 +455,94 @@ class InferenceSession:
             self._compiled[key] = compiled
         return compiled
 
-    def _decode_chunk(self, prompt_ids, request: GenerationRequest, lease: _Lease):
-        forward = self._compiled_forward()
+    def _decode_chunk(
+        self,
+        prompt_ids,
+        request: GenerationRequest,
+        lease: _Lease,
+        length_bucket: int,
+    ):
+        config = request.config
+        kernel_key = GenerationKernelKey(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            repetition_penalty=config.repetition_penalty,
+            no_repeat_ngram_size=config.no_repeat_ngram_size,
+        )
+        forward = self._compiled_forward(length_bucket, 1, kernel_key)
         parameters = self._parameters
-        prompt = list(prompt_ids)
-        prompt_array = mx.array([prompt], dtype=mx.int32)
-        prompt_mask = mx.ones((1, len(prompt)), dtype=mx.bool_)
+        prompt_len = len(prompt_ids)
+        prompt = mx.array(list(prompt_ids), dtype=mx.int32)
+        lease.token_storage[0, :prompt_len] = prompt
+        prompt_mask = mx.ones((1, prompt_len), dtype=mx.bool_)
         logits, cache_state = forward(
             parameters,
-            prompt_array,
+            lease.token_storage[:, :prompt_len],
             prompt_mask,
             None,
             lease.cache_state,
         )
-        mx.eval(logits, cache_state)
         lease.cache_state = cache_state
         generated: list[int] = []
         eos_id = self._resolved.model_config.eos_token_id
-        key = mx.random.key(0 if request.config.seed is None else request.config.seed)
-        next_logits = logits[0, len(prompt) - 1]
+        rng = mx.random.key(0 if config.seed is None else config.seed)
+        next_logits = logits[0, prompt_len - 1]
         chunk_size = self._runtime.decode_chunk_size
-        for produced in range(request.max_new_tokens):
-            history = prompt + generated
-            padded = history + [0] * (lease.token_storage.shape[1] - len(history))
-            token_row = mx.array([padded], dtype=mx.int32)
-            lengths = mx.array([len(history)], dtype=mx.int32)
-            scored = next_logits.astype(mx.float32)[None, :]
-            scored = apply_repetition_penalty(
-                scored,
-                token_row,
-                lengths,
-                request.config.repetition_penalty,
-            )
-            scored = apply_no_repeat_ngram(
-                scored,
-                token_row,
-                lengths,
-                request.config.no_repeat_ngram_size,
-            )
-            token_id, key = select_next_token_arrays(
-                scored[0],
-                key,
-                temperature=request.config.temperature,
-                top_p=request.config.top_p,
-            )
-            next_id = int(token_id.item())
-            generated.append(next_id)
-            if next_id == eos_id:
-                break
-            if produced + 1 == request.max_new_tokens:
-                break
-            step_ids = mx.array([[next_id]], dtype=mx.int32)
-            step_mask = mx.ones((1, 1), dtype=mx.bool_)
-            logits, cache_state = forward(
-                parameters,
-                step_ids,
-                step_mask,
-                None,
-                cache_state,
-            )
-            lease.cache_state = cache_state
-            next_logits = logits[0, 0]
-            if (produced + 1) % chunk_size == 0:
-                mx.eval(logits, cache_state, key)
-        mx.eval(cache_state)
+        remaining = request.max_new_tokens
+        logical = prompt_len
+        while remaining > 0:
+            steps = min(remaining, chunk_size)
+            chunk_tokens = []
+            for step in range(steps):
+                lengths = mx.array([logical], dtype=mx.int32)
+                scored = next_logits.astype(mx.float32)[None, :]
+                scored = apply_repetition_penalty(
+                    scored,
+                    lease.token_storage,
+                    lengths,
+                    config.repetition_penalty,
+                )
+                scored = apply_no_repeat_ngram(
+                    scored,
+                    lease.token_storage,
+                    lengths,
+                    config.no_repeat_ngram_size,
+                )
+                token_id, rng = select_next_token_arrays(
+                    scored[0],
+                    rng,
+                    temperature=config.temperature,
+                    top_p=config.top_p,
+                )
+                lease.token_storage[0, logical] = token_id
+                chunk_tokens.append(token_id)
+                logical += 1
+                if step + 1 < steps or remaining > steps:
+                    step_ids = mx.reshape(token_id, (1, 1))
+                    step_mask = mx.ones((1, 1), dtype=mx.bool_)
+                    logits, cache_state = forward(
+                        parameters,
+                        step_ids,
+                        step_mask,
+                        None,
+                        cache_state,
+                    )
+                    lease.cache_state = cache_state
+                    next_logits = logits[0, 0]
+            stacked = mx.stack(chunk_tokens)
+            mx.eval(stacked, cache_state, rng, lease.token_storage)
+            for token in stacked.tolist():
+                host_token = int(token)
+                generated.append(host_token)
+                if host_token == eos_id:
+                    return tuple(generated)
+            remaining -= steps
         return tuple(generated)
 
 
 __all__ = (
     "BufferPool",
+    "GenerationKernelKey",
     "GenerationRequest",
     "GenerationResult",
     "InferenceRuntimeConfig",
