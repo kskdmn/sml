@@ -112,7 +112,7 @@ def tokenizer_manifest() -> TokenizerManifest:
     )
 
 
-def tiny_model_config() -> ModelConfig:
+def tiny_model_config(*, hidden_dropout: float = 0.0) -> ModelConfig:
     return ModelConfig(
         vocab_size=64,
         hidden_size=16,
@@ -122,7 +122,7 @@ def tiny_model_config() -> ModelConfig:
         intermediate_size=32,
         original_context_length=32,
         rope_scaling_factor=1.0,
-        hidden_dropout=0.0,
+        hidden_dropout=hidden_dropout,
     )
 
 
@@ -207,6 +207,50 @@ def assert_builtin_array_tree(tree: object) -> None:
 
 def clone_tree(tree: dict) -> dict:
     return tree_map(lambda value: mx.array(value), tree)
+
+
+def _example_mask_host(batch: SwagBatch) -> np.ndarray:
+    return np.array(batch.example_mask, dtype=bool)
+
+
+def _select_examples(batch: SwagBatch, mask: np.ndarray) -> SwagBatch:
+    return SwagBatch(
+        mx.array(np.array(batch.input_ids)[mask]),
+        mx.array(np.array(batch.score_mask)[mask]),
+        mx.array(np.array(batch.labels)[mask]),
+        mx.array(np.array(batch.example_mask)[mask]),
+        mx.array(np.array(batch.valid_token_mask)[mask]),
+        batch.cursor_after,
+    )
+
+
+def _first_padded_batch(runtime: TinySwagRuntime) -> SwagBatch:
+    loader = replace(
+        runtime.config.loader,
+        microbatch_size=4,
+        prefetch_depth=1,
+    )
+    start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
+    with SwagBatchStream(runtime.bundle, loader, cursor=start) as stream:
+        for envelope in stream:
+            batch = SwagBatch.from_envelope(envelope)
+            if not bool(np.array(batch.example_mask).all()):
+                return batch
+    raise AssertionError("expected a padded synthetic tail batch")
+
+
+def _ranking_trainer(runtime: TinySwagRuntime, batch: SwagBatch):
+    kernels = runtime.kernels(compiled=False)
+    adapters = clone_tree(runtime.initial_adapters)
+    trainer = swag_module.initial_swag_trainer_state(adapters, key=mx.random.key(11))
+    trainer = kernels.ranking_microstep(
+        adapters,
+        runtime.frozen_base,
+        trainer,
+        batch,
+    )
+    mx.eval(trainer.to_tree())
+    return trainer
 
 
 def split_adapter_parameters(parameters: object) -> tuple[object, object]:
@@ -309,8 +353,11 @@ def five_swag_rows() -> tuple[dict[str, object], ...]:
     )
 
 
-def tiny_language_model() -> SMLLanguageModel:
-    model = SMLLanguageModel(tiny_model_config(), key=mx.random.key(3))
+def tiny_language_model(*, hidden_dropout: float = 0.0) -> SMLLanguageModel:
+    model = SMLLanguageModel(
+        tiny_model_config(hidden_dropout=hidden_dropout),
+        key=mx.random.key(3),
+    )
     mx.eval(model.parameters())
     return apply_lora(
         model,
@@ -577,18 +624,96 @@ def test_swag_value_and_grad_targets_adapters_only():
     )
 
 
-def test_per_slot_ranking_losses_are_finite_before_masking():
-    scores = mx.array([[0.0, -1.0, 0.5, 2.0], [1.0, 1.0, 1.0, 1.0]], dtype=mx.float32)
-    labels = mx.array([3, 0], dtype=mx.int32)
-    example_mask = mx.array([True, False])
-    per_slot = mx.logsumexp(scores, axis=-1) - mx.take_along_axis(
-        scores, labels[:, None], axis=-1
-    ).squeeze(-1)
-    mx.eval(per_slot)
-    assert bool(mx.isfinite(per_slot).all().item())
-    masked = per_slot * example_mask.astype(mx.float32)
-    assert float(np.array(masked[1])) == 0.0
-    assert float(np.array(masked[0])) == float(np.array(per_slot[0]))
+def test_swag_kernel_wrappers_do_not_eval_before_rebuilding_host_state():
+    assert "mx.eval(" not in inspect.getsource(
+        swag_module.SwagKernels.ranking_microstep
+    )
+    assert "mx.eval(" not in inspect.getsource(swag_module.SwagKernels.optimizer_step)
+
+
+def test_compiled_swag_optimizer_uses_private_fp32_update_helper():
+    source = inspect.getsource(swag_module)
+    assert "_adamw_fp32_update_tree" in source
+    assert "adamw_fp32_update_tree" not in source.replace("_adamw_fp32_update_tree", "")
+    assert "adamw_mixed_precision_update(" not in source
+    assert "AdamState" not in inspect.getsource(swag_module.build_swag_kernels)
+
+
+def test_direct_swag_envelope_validates_numpy_arrays_and_stores_readonly_views():
+    batch_size, candidate_count, length = 2, 4, 8
+    input_ids = np.arange(
+        batch_size * candidate_count * length, dtype=np.int32
+    ).reshape(batch_size, candidate_count, length)
+    score_mask = np.ones((batch_size, candidate_count, length), dtype=bool)
+    labels = np.arange(batch_size, dtype=np.int32)
+    example_mask = np.array([True, False])
+    valid_token_mask = np.ones((batch_size, candidate_count, length), dtype=bool)
+    cursor = SwagCursor(epoch=0, bucket_order_position=0, row_offset=1)
+    envelope = SwagBatchEnvelope(
+        input_ids,
+        score_mask,
+        labels,
+        example_mask,
+        valid_token_mask,
+        cursor,
+        source_epoch=0,
+    )
+    for array in (
+        envelope.input_ids,
+        envelope.score_mask,
+        envelope.labels,
+        envelope.example_mask,
+        envelope.valid_token_mask,
+    ):
+        assert not array.flags.writeable
+        with pytest.raises(ValueError, match="read-only"):
+            array[(0,) * array.ndim] = 1
+    with pytest.raises(TypeError, match="input_ids"):
+        SwagBatchEnvelope(
+            input_ids.tolist(),
+            score_mask,
+            labels,
+            example_mask,
+            valid_token_mask,
+            cursor,
+            source_epoch=0,
+        )
+    with pytest.raises(ValueError, match="score_mask"):
+        SwagBatchEnvelope(
+            input_ids,
+            score_mask.astype(np.int32),
+            labels,
+            example_mask,
+            valid_token_mask,
+            cursor,
+            source_epoch=0,
+        )
+
+
+def test_per_slot_ranking_losses_are_finite_before_masking(tiny_swag_runtime):
+    padded = _first_padded_batch(tiny_swag_runtime)
+    real_mask = _example_mask_host(padded)
+    assert real_mask.any()
+    assert (~real_mask).any()
+    unpadded = _select_examples(padded, real_mask)
+    padded_trainer = _ranking_trainer(tiny_swag_runtime, padded)
+    reference_trainer = _ranking_trainer(tiny_swag_runtime, unpadded)
+    assert bool(mx.isfinite(padded_trainer.loss_numerator).item())
+    assert int(padded_trainer.valid_count) == int(real_mask.sum())
+    assert int(padded_trainer.valid_count) == int(reference_trainer.valid_count)
+    assert int(padded_trainer.correct_count) == int(reference_trainer.correct_count)
+    assert_close(
+        padded_trainer.loss_numerator,
+        reference_trainer.loss_numerator,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert_tree_close(
+        padded_trainer.accumulators,
+        reference_trainer.accumulators,
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_synthetic_slots_have_no_loss_accuracy_gradient_progress_or_cursor_contribution(
@@ -606,7 +731,8 @@ def test_synthetic_slots_have_no_loss_accuracy_gradient_progress_or_cursor_contr
     tail = next(
         batch for batch in batches if not bool(np.array(batch.example_mask).all())
     )
-    pad_slots = ~np.array(tail.example_mask)
+    pad_slots = ~_example_mask_host(tail)
+    real_slots = _example_mask_host(tail)
     assert pad_slots.any()
     assert bool(np.array(tail.valid_token_mask)[pad_slots].any())
     assert bool(np.array(tail.score_mask)[pad_slots].any())
@@ -614,6 +740,31 @@ def test_synthetic_slots_have_no_loss_accuracy_gradient_progress_or_cursor_contr
     assert real_seen == 5
     assert batches[-1].cursor_after == SwagCursor(
         epoch=1, bucket_order_position=0, row_offset=0
+    )
+
+    unpadded = _select_examples(tail, real_slots)
+    synthetic = _select_examples(tail, pad_slots)
+    padded_trainer = _ranking_trainer(tiny_swag_runtime, tail)
+    reference_trainer = _ranking_trainer(tiny_swag_runtime, unpadded)
+    synthetic_trainer = _ranking_trainer(tiny_swag_runtime, synthetic)
+    assert int(synthetic_trainer.valid_count) == 0
+    assert int(synthetic_trainer.correct_count) == 0
+    assert float(np.array(synthetic_trainer.loss_numerator)) == 0.0
+    for _name, leaf in tree_flatten(synthetic_trainer.accumulators):
+        assert bool(mx.allclose(leaf, mx.zeros_like(leaf)).item()), _name
+    assert int(padded_trainer.valid_count) == int(reference_trainer.valid_count)
+    assert int(padded_trainer.correct_count) == int(reference_trainer.correct_count)
+    assert_close(
+        padded_trainer.loss_numerator,
+        reference_trainer.loss_numerator,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert_tree_close(
+        padded_trainer.accumulators,
+        reference_trainer.accumulators,
+        atol=1e-5,
+        rtol=1e-5,
     )
 
 
@@ -682,20 +833,64 @@ def test_epoch_boundary_commits_with_update(tiny_swag_runtime):
 def test_second_compiled_step_sees_returned_adapter_optimizer_and_key_state(
     tiny_swag_runtime,
 ):
-    compiled = tiny_swag_runtime.run_two_updates(compiled=True)
-    eager = tiny_swag_runtime.run_two_updates(compiled=False)
-    mx.eval(
-        compiled.adapters,
-        compiled.optimizer.to_tree(),
-        eager.adapters,
-        eager.optimizer.to_tree(),
+    model = tiny_language_model(hidden_dropout=0.1)
+    adapters, frozen_base = split_adapter_parameters(model.parameters())
+    mx.eval(adapters, frozen_base)
+    runtime = TinySwagRuntime(
+        bundle=tiny_swag_runtime.bundle,
+        model=model,
+        frozen_base=frozen_base,
+        initial_adapters=clone_tree(adapters),
+        weight_decay_tree=build_weight_decay_tree(adapters, WeightDecayPolicy()),
+        config=tiny_swag_runtime.config,
     )
-    assert int(np.array(compiled.optimizer.step)) == 2
-    assert int(np.array(eager.optimizer.step)) == 2
-    assert_tree_close(compiled.adapters, eager.adapters, atol=1e-5, rtol=1e-5)
+
+    def run_two_steps(*, compiled: bool):
+        kernels = runtime.kernels(compiled=compiled)
+        adapters = clone_tree(runtime.initial_adapters)
+        optimizer = initialize_adam_state(adapters)
+        key0 = mx.random.key(11)
+        trainer = swag_module.initial_swag_trainer_state(adapters, key=key0)
+        loader = replace(
+            runtime.config.loader,
+            microbatch_size=1,
+            prefetch_depth=2,
+            gradient_accumulation_steps=1,
+        )
+        keys = [key0]
+        start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
+        with SwagBatchStream(runtime.bundle, loader, cursor=start) as stream:
+            iterator = iter(stream)
+            for _step in range(2):
+                batch = SwagBatch.from_envelope(next(iterator))
+                trainer = kernels.ranking_microstep(
+                    adapters,
+                    runtime.frozen_base,
+                    trainer,
+                    batch,
+                )
+                keys.append(trainer.next_key)
+                adapters, optimizer, trainer = kernels.optimizer_step(
+                    adapters,
+                    optimizer,
+                    trainer,
+                )
+                stream.commit(batch.cursor_after)
+        mx.eval(adapters, optimizer.to_tree(), *keys)
+        return adapters, optimizer, keys
+
+    compiled_adapters, compiled_optimizer, compiled_keys = run_two_steps(compiled=True)
+    eager_adapters, eager_optimizer, eager_keys = run_two_steps(compiled=False)
+    assert int(np.array(compiled_optimizer.step)) == 2
+    assert int(np.array(eager_optimizer.step)) == 2
+    assert not bool(mx.array_equal(compiled_keys[1], compiled_keys[0]).item())
+    assert not bool(mx.array_equal(compiled_keys[2], compiled_keys[1]).item())
+    assert bool(mx.array_equal(compiled_keys[1], eager_keys[1]).item())
+    assert bool(mx.array_equal(compiled_keys[2], eager_keys[2]).item())
+    assert_tree_close(compiled_adapters, eager_adapters, atol=1e-5, rtol=1e-5)
     assert_tree_close(
-        compiled.optimizer.first_moments,
-        eager.optimizer.first_moments,
+        compiled_optimizer.first_moments,
+        eager_optimizer.first_moments,
         atol=1e-5,
         rtol=1e-5,
     )

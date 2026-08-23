@@ -13,8 +13,8 @@ from sml.training.common import (
     AdamState,
     LoaderConfig,
     OptimizerConfig,
+    _adamw_fp32_update_tree,
     accumulate_fp32,
-    adamw_fp32_update_tree,
     normalize_and_clip,
 )
 
@@ -175,7 +175,6 @@ class SwagKernels:
             optimizer.to_tree(),
             trainer.to_tree(),
         )
-        mx.eval(next_adapters, next_adam, next_trainer)
         return (
             next_adapters,
             AdamState.from_compiled_tree(next_adam),
@@ -273,7 +272,7 @@ def build_swag_kernels(
             valid_count,
             gradient_clip_norm=kernel_config.gradient_clip_norm,
         )
-        next_adapters, next_adam = adamw_fp32_update_tree(
+        next_adapters, next_adam = _adamw_fp32_update_tree(
             adapters,
             gradients,
             adam_tree,

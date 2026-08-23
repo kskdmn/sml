@@ -867,3 +867,13 @@ def test_fp32_adam_preserves_adapter_dtype_and_formula():
     assert masters["weight"].dtype == mx.float32
     assert working["weight"].dtype == mx.bfloat16
     assert mixed_source is not None
+
+
+def test_fp32_adam_public_surface_is_only_host_wrapper():
+    assert "adamw_fp32_update" in common_module.__all__
+    assert "adamw_fp32_update_tree" not in common_module.__all__
+    assert not hasattr(common_module, "adamw_fp32_update_tree")
+    source = inspect.getsource(common_module.adamw_fp32_update)
+    assert "_require_dtype" in source
+    assert "AdamState" in source
+    assert "adamw_mixed_precision_update(" not in source

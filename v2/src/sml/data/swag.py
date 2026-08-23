@@ -1135,6 +1135,27 @@ def _owned_readonly(array: np.ndarray) -> np.ndarray:
     return owned
 
 
+def _readonly_numpy_array(
+    array: object,
+    name: str,
+    *,
+    ndim: int,
+    dtype: np.dtype,
+    shape: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    if not isinstance(array, np.ndarray):
+        raise TypeError(f"{name} must be a NumPy array")
+    if array.ndim != ndim:
+        raise ValueError(f"{name} must be a {ndim}-dimensional array")
+    if array.dtype != dtype:
+        raise ValueError(f"{name} must have dtype {dtype}")
+    if shape is not None and tuple(array.shape) != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    readonly = array.view()
+    readonly.setflags(write=False)
+    return readonly
+
+
 @dataclass(frozen=True, slots=True)
 class SwagCursor:
     """Canonical location of the next real SWAG example, never a padded slot."""
@@ -1270,11 +1291,28 @@ class SwagBatchEnvelope:
         if not isinstance(cursor_after, SwagCursor):
             raise TypeError("cursor_after must be a SwagCursor")
         _require_plain_int(source_epoch, "source_epoch")
+        input_ids = _readonly_numpy_array(input_ids, "input_ids", ndim=3, dtype=_INT32)
+        if input_ids.shape[1] != 4:
+            raise ValueError("input_ids must have 4 candidates")
+        batch_shape = tuple(int(dimension) for dimension in input_ids.shape)
+        label_shape = (batch_shape[0],)
         self._input_ids = input_ids
-        self._score_mask = score_mask
-        self._labels = labels
-        self._example_mask = example_mask
-        self._valid_token_mask = valid_token_mask
+        self._score_mask = _readonly_numpy_array(
+            score_mask, "score_mask", ndim=3, dtype=_BOOL, shape=batch_shape
+        )
+        self._labels = _readonly_numpy_array(
+            labels, "labels", ndim=1, dtype=_INT32, shape=label_shape
+        )
+        self._example_mask = _readonly_numpy_array(
+            example_mask, "example_mask", ndim=1, dtype=_BOOL, shape=label_shape
+        )
+        self._valid_token_mask = _readonly_numpy_array(
+            valid_token_mask,
+            "valid_token_mask",
+            ndim=3,
+            dtype=_BOOL,
+            shape=batch_shape,
+        )
         self._cursor_after = cursor_after
         self._source_epoch = source_epoch
         self._release_callback: Callable[[], None] | None = None

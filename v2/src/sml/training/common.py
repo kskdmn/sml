@@ -1030,7 +1030,7 @@ def _validate_adamw_trees(
     return step, first_state, second_state, can_increment
 
 
-def adamw_fp32_update_tree(
+def _adamw_fp32_update_tree(
     parameters: dict,
     gradients: dict,
     adam_tree: tuple[mx.array, dict, dict],
@@ -1070,7 +1070,7 @@ def adamw_fp32_update(
 ) -> tuple[dict, AdamState]:
     if not isinstance(state, AdamState):
         raise SMLConfigurationError("state must be an AdamState")
-    updated, next_tree = adamw_fp32_update_tree(
+    updated, next_tree = _adamw_fp32_update_tree(
         parameters,
         gradients,
         state.to_tree(),
@@ -1115,7 +1115,6 @@ __all__ = (
     "WeightDecayPolicy",
     "accumulate_fp32",
     "adamw_fp32_update",
-    "adamw_fp32_update_tree",
     "adamw_mixed_precision_update",
     "adamw_mixed_precision_update_tree",
     "build_weight_decay_tree",
