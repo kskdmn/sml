@@ -1954,49 +1954,179 @@ def _verify_optimizer_and_trainer_groups(
         )
 
 
+def _array_specs_by_name(reference: ArrayPayloadRef) -> dict[str, object]:
+    return {spec.name: spec for spec in reference.arrays}
+
+
+def _require_spec_contract(
+    spec: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: str,
+    context: str,
+) -> None:
+    if spec.dtype != dtype or spec.shape != shape:
+        raise SMLArtifactError(f"checkpoint {context} has invalid shape or dtype")
+
+
+def _validate_pretraining_parameter_specs(
+    manifest: PretrainingCheckpointManifest,
+) -> None:
+    working = _array_specs_by_name(manifest.model)
+    masters = _array_specs_by_name(manifest.master)
+    if set(working) != set(masters):
+        raise SMLArtifactError("checkpoint model and master keys do not match")
+    for name, master in masters.items():
+        if master.dtype != "float32":
+            raise SMLArtifactError("checkpoint master parameters must be float32")
+        model = working[name]
+        if model.dtype != "bfloat16" or model.shape != master.shape:
+            raise SMLArtifactError(
+                "checkpoint working parameters must be BF16 master-shaped arrays"
+            )
+
+
+def _validate_optimizer_and_trainer_specs(
+    trainable_names: set[str],
+    optimizer: ArrayPayloadRef,
+    trainer: ArrayPayloadRef,
+    *,
+    master_specs: Mapping[str, object],
+) -> None:
+    expected_optimizer = {
+        "step",
+        *(f"first_moments.{name}" for name in trainable_names),
+        *(f"second_moments.{name}" for name in trainable_names),
+    }
+    expected_trainer = {
+        "accumulation_count",
+        "next_key",
+        "loss_numerator",
+        *(f"accumulators.{name}" for name in trainable_names),
+    }
+    optimizer_specs = _array_specs_by_name(optimizer)
+    trainer_specs = _array_specs_by_name(trainer)
+    if set(optimizer_specs) != expected_optimizer:
+        raise SMLArtifactError("checkpoint optimizer keys do not match trainable state")
+    if set(trainer_specs) != expected_trainer:
+        raise SMLArtifactError("checkpoint trainer keys do not match trainable state")
+    _require_spec_contract(
+        optimizer_specs["step"],
+        shape=(),
+        dtype="int32",
+        context="optimizer step",
+    )
+    _require_spec_contract(
+        trainer_specs["accumulation_count"],
+        shape=(),
+        dtype="int32",
+        context="trainer accumulation count",
+    )
+    _require_spec_contract(
+        trainer_specs["next_key"],
+        shape=(2,),
+        dtype="uint32",
+        context="trainer PRNG key",
+    )
+    _require_spec_contract(
+        trainer_specs["loss_numerator"],
+        shape=(),
+        dtype="float32",
+        context="trainer loss numerator",
+    )
+    for name in trainable_names:
+        master = master_specs[name]
+        if master.dtype != "float32":
+            raise SMLArtifactError("checkpoint trainable state must be float32")
+        shape = master.shape
+        for prefix, specs, label in (
+            ("first_moments.", optimizer_specs, "optimizer"),
+            ("second_moments.", optimizer_specs, "optimizer"),
+            ("accumulators.", trainer_specs, "trainer"),
+        ):
+            _require_spec_contract(
+                specs[f"{prefix}{name}"],
+                shape=shape,
+                dtype="float32",
+                context=f"{label} state for {name}",
+            )
+
+
 def _verify_checkpoint_semantics(
     descriptor: int,
     manifest: CheckpointManifest,
     verification: VerificationLevel,
+    *,
+    load_array_groups: frozenset[str] | None = None,
 ) -> VerifiedCheckpointContents:
     mx = _mlx_core()
     local_apfs = _descriptor_is_local_apfs(descriptor)
     full = verification is VerificationLevel.FULL
+    references = checkpoint_array_payloads(manifest)
+    available = {reference.payload.logical_path for reference in references}
+    if load_array_groups is None:
+        selected = available
+    else:
+        unknown = load_array_groups - available
+        if unknown:
+            raise SMLArtifactError(
+                "unknown checkpoint array groups requested: "
+                + ", ".join(sorted(unknown))
+            )
+        selected = set(load_array_groups)
     with ArtifactRoot(os.dup(descriptor), local_apfs=local_apfs) as root:
         scalar = _read_checkpoint_scalar_payload(root, manifest, full=full)
         groups = {
             reference.payload.logical_path: _load_checkpoint_array_payload(
                 root, reference, full=full
             )
-            for reference in checkpoint_array_payloads(manifest)
+            for reference in references
+            if reference.payload.logical_path in selected
         }
 
     if isinstance(manifest, PretrainingCheckpointManifest):
-        working = groups["model.safetensors"]
-        masters = groups["master.safetensors"]
-        if set(working) != set(masters):
-            raise SMLArtifactError("checkpoint model and master keys do not match")
-        for name, master in masters.items():
-            model = working[name]
-            if _checkpoint_dtype_name(master) != "float32":
-                raise SMLArtifactError("checkpoint master parameters must be float32")
-            if _checkpoint_dtype_name(model) != "bfloat16" or tuple(
-                model.shape
-            ) != tuple(master.shape):
+        _validate_pretraining_parameter_specs(manifest)
+        if "model.safetensors" in groups and "master.safetensors" in groups:
+            working = groups["model.safetensors"]
+            masters = groups["master.safetensors"]
+            if set(working) != set(masters):
+                raise SMLArtifactError("checkpoint model and master keys do not match")
+            for name, master in masters.items():
+                model = working[name]
+                if _checkpoint_dtype_name(master) != "float32":
+                    raise SMLArtifactError(
+                        "checkpoint master parameters must be float32"
+                    )
+                if _checkpoint_dtype_name(model) != "bfloat16" or tuple(
+                    model.shape
+                ) != tuple(master.shape):
+                    raise SMLArtifactError(
+                        "checkpoint working parameters must be BF16 master-shaped arrays"
+                    )
+                if full and not bool(mx.array_equal(model, master.astype(mx.bfloat16))):
+                    raise SMLArtifactError(
+                        "checkpoint working parameter is not the exact BF16 cast of "
+                        f"master: {name}"
+                    )
+        if "optimizer.safetensors" in groups and "trainer.safetensors" in groups:
+            if "master.safetensors" not in groups:
                 raise SMLArtifactError(
-                    "checkpoint working parameters must be BF16 master-shaped arrays"
+                    "optimizer verification requires loaded master arrays"
                 )
-            if full and not bool(mx.array_equal(model, master.astype(mx.bfloat16))):
-                raise SMLArtifactError(
-                    "checkpoint working parameter is not the exact BF16 cast of master: "
-                    f"{name}"
-                )
-        _verify_optimizer_and_trainer_groups(
-            masters,
-            groups["optimizer.safetensors"],
-            groups["trainer.safetensors"],
-            step=manifest.step,
-        )
+            _verify_optimizer_and_trainer_groups(
+                groups["master.safetensors"],
+                groups["optimizer.safetensors"],
+                groups["trainer.safetensors"],
+                step=manifest.step,
+            )
+        else:
+            master_specs = _array_specs_by_name(manifest.master)
+            _validate_optimizer_and_trainer_specs(
+                set(master_specs),
+                manifest.optimizer,
+                manifest.trainer,
+                master_specs=master_specs,
+            )
     else:
         adapters = groups["adapters.safetensors"]
         _verify_optimizer_and_trainer_groups(
@@ -2104,6 +2234,7 @@ def _open_verified_step_from_descriptor(
     step: int,
     verification: VerificationLevel,
     fs: FilesystemOps,
+    load_array_groups: frozenset[str] | None = None,
 ) -> _OwnedStep:
     name = _step_name(step)
     descriptor = -1
@@ -2134,9 +2265,17 @@ def _open_verified_step_from_descriptor(
             manifest_present=True,
             full=verification is VerificationLevel.FULL,
         )
+        materialize = (
+            verification is VerificationLevel.FULL or load_array_groups is not None
+        )
         contents = (
-            _verify_checkpoint_semantics(descriptor, manifest, verification)
-            if verification is VerificationLevel.FULL
+            _verify_checkpoint_semantics(
+                descriptor,
+                manifest,
+                verification,
+                load_array_groups=load_array_groups,
+            )
+            if materialize
             else None
         )
         _require_named_directory_inode(
@@ -2179,9 +2318,11 @@ def open_checkpoint_reader(
     *,
     step: int,
     expected_checkpoint_identity: str | None = None,
+    verification: VerificationLevel = VerificationLevel.FULL,
+    load_array_groups: frozenset[str] | None = None,
     fs: FilesystemOps = OS_FILESYSTEM,
 ) -> Iterator[CheckpointReader]:
-    """Open a FULL-verified checkpoint without a pathname reopen after proof."""
+    """Open a verified checkpoint without a pathname reopen after proof."""
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
     requested_step = _require_step(step)
@@ -2189,6 +2330,13 @@ def open_checkpoint_reader(
         expected_checkpoint_identity, str
     ):
         raise TypeError("expected_checkpoint_identity must be a string or None")
+    if not isinstance(verification, VerificationLevel):
+        raise TypeError("verification must be a VerificationLevel")
+    if load_array_groups is not None and (
+        not isinstance(load_array_groups, frozenset)
+        or not all(isinstance(name, str) for name in load_array_groups)
+    ):
+        raise TypeError("load_array_groups must be a frozenset of strings or None")
     if not isinstance(fs, FilesystemOps):
         raise TypeError("fs must implement FilesystemOps")
 
@@ -2210,7 +2358,7 @@ def open_checkpoint_reader(
             run_manifest = _read_manifest_from_descriptor(
                 run_descriptor,
                 RUN_MANIFEST_TYPES,
-                VerificationLevel.FULL,
+                verification,
                 context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
             )
             checkpoints_descriptor = _open_checkpoints_directory(
@@ -2224,8 +2372,9 @@ def open_checkpoint_reader(
                 run_manifest,
                 checkpoints_descriptor,
                 step=requested_step,
-                verification=VerificationLevel.FULL,
+                verification=verification,
                 fs=fs,
+                load_array_groups=load_array_groups,
             )
             if (
                 expected_checkpoint_identity is not None
