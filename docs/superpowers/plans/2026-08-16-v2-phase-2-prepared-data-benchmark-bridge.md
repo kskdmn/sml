@@ -2,7 +2,8 @@
 
 **Status update (2026-08-22):** Task 1 is complete. Task 2 is superseded as a
 required task: the screen is optional diagnostic work and no Phase 2 benchmark
-result or acceptance commit is needed to continue the refactor.
+result or acceptance commit is needed to continue the refactor. The unchecked
+Task 1 boxes preserve its historical TDD procedure.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

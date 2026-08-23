@@ -1,6 +1,8 @@
 # V2 Post-Exit Memory Recovery Design
 
-**Status:** Approved design; written specification pending user review
+**Status (2026-08-23):** Implemented and reviewed, including the deterministic-
+termination amendment. This is an optional benchmark-evidence protocol, not
+remaining refactor work.
 
 **Date:** 2026-08-09
 

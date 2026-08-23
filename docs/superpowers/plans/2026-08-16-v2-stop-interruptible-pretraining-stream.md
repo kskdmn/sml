@@ -2,7 +2,8 @@
 
 **Status update (2026-08-22):** Task 1 is complete and functionally accepted.
 Task 2 is superseded as required work; its commands are retained only as an
-optional reproducible performance diagnostic.
+optional reproducible performance diagnostic. The unchecked Task 1 boxes
+preserve its historical TDD procedure.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

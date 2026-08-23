@@ -1,6 +1,8 @@
 # V2 Baseline Thermal Recovery and Resume Design
 
-**Status:** Approved
+**Status (2026-08-23):** Implemented and later extended by the shorter and
+post-exit recovery protocols. Baseline capture is now optional diagnostic work;
+no required refactor task remains in this document.
 
 **Date:** 2026-08-05
 

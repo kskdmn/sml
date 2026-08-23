@@ -1,5 +1,9 @@
 # V2 Baseline Thermal Recovery and Resume Implementation Plan
 
+**Execution status (2026-08-23):** Implemented and later extended by the
+shorter and post-exit recovery protocols. The unchecked boxes below are the
+historical TDD procedure; baseline capture is optional diagnostic work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make the pinned v2 baseline capture record exact macOS thermal observations, preserve accepted and rejected work durably, wait for sustained nominal thermals, and resume only identity-compatible missing trials.

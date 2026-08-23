@@ -1,5 +1,9 @@
 # V2 MLX-Native Training Design
 
+**Status (2026-08-23):** Implemented in the legacy flat v2 tree and superseded
+for future work by
+`2026-07-31-v2-performance-first-refactor-design.md`.
+
 ## Goal
 
 Add a v2 training script that keeps the model-training hot loop fully MLX-native:

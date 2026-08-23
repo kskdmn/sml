@@ -1,6 +1,7 @@
 # V2 Shorter Benchmark Protocol Design
 
-**Status:** Approved design; implementation planned
+**Status (2026-08-23):** Implemented. The protocol remains an optional
+performance diagnostic and is not an active refactor gate.
 
 **Date:** 2026-08-08
 

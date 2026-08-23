@@ -1,5 +1,9 @@
 # V2 MLX-Native Training Implementation Plan
 
+**Execution status (2026-08-23):** Implemented in the legacy flat v2 tree and
+superseded by the package refactor. The unchecked boxes below are historical,
+not remaining tasks.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a v2 MLX-native training script whose hot loop uses MLX arrays, gradients, optimizer updates, and checkpoints.

@@ -1,5 +1,9 @@
 # V2 Post-Exit Memory Recovery Implementation Plan
 
+**Execution status (2026-08-23):** Implemented and reviewed through the whole-
+review termination fixes. The unchecked boxes below are the historical TDD
+procedure; no required refactor task remains.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Accept a v2 benchmark trial only after an immediate post-exit warning is followed by 30 continuous seconds of identity-bound normal memory evidence inside a fixed five-minute recovery window.

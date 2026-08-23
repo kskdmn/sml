@@ -2,6 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Execution status (2026-08-23):** Tasks 4.1-4.4, 5.1-5.5, and 6.1-6.4
+have not started. Task 4.1 is blocked until Part 1 implements and reviews the
+approved recorded-source quality validator and makes
+`VerifiedCheckpointContents` deeply immutable. The checkboxes below are the
+live remaining-task procedure.
+
 **Goal:** Complete persistent inference/evaluation, cached SWAG LoRA fine-tuning/export, the unified CLI, and the clean removal of every replaced flat v2 path while meeting the final correctness and runnable-workflow gates.
 
 **Architecture:** This part consumes the model, artifact, prepared-data, and pretraining-run contracts completed in Part 1. It adds persistent non-reentrant inference sessions and batched evaluation, then self-contained LoRA runs backed by immutable encoded SWAG data, and finally exposes all workflows through one typed CLI before deleting migration scaffolding and legacy modules.
@@ -16,7 +22,7 @@ relevant end-to-end/CLI smoke workflows. Baseline comparisons, statistical
 thresholds, thermal launch gates, and performance evidence files are optional
 diagnostics and cannot block a phase.
 
-- Complete `docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md` through its Phase 3 gate first.
+- Complete `docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md` through its Phase 3 gate first, including recorded-source quality validation and deeply immutable checkpoint-reader contents.
 - The approved source of truth is `docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md`.
 - This is a clean break: provide no readers, aliases, conversions, warnings, or fallback interpretations for existing v2 imports, CLI flags, tokenizer inputs, prepared datasets, manifests, checkpoints, metadata, or resume state.
 - Preserve Transformer, YaRN/RoPE, GQA, RMSNorm, SwiGLU, causal-loss, KV-cache, greedy/configured sampling, and SentencePiece BPE mathematics.
@@ -72,9 +78,9 @@ Test snippets omit routine imports only. Reuse the Part 1 fixtures for MLX avail
 
 **Interfaces:**
 - Frozen `ResolvedModel` records artifact kind, run identity, resolved step, checkpoint identity, run-step identity, verification level, model config, a fully loaded `LoadedTokenizer`, and owned BF16 inference-weight arrays. For a pretraining checkpoint, resolution validates the complete checkpoint schema including FP32 master metadata but loads only `model.safetensors` into the inference session; `full_verify=True` additionally rehashes both parameter payloads and proves the BF16 model tree is the exact cast of the FP32 master tree before returning owned inference weights. Its `tokenizer_identity` property delegates to the loaded tokenizer manifest, so inference and SWAG preparation use the same verified processor rather than reopening or accepting a second tokenizer path.
-- `resolve_model_artifact(path, *, step: int | None, full_verify: bool) -> ResolvedModel` supports a pretraining run or exact pretraining step in this task; Phase 5 extends it for LoRA runs and exports.
+- `resolve_model_artifact(path, *, full_verify: bool) -> ResolvedModel` supports a pretraining run in this task; Phase 5 extends it for latest-only LoRA runs and self-contained exports. Direct `step-*` paths and historical step selectors are rejected.
 - Frozen `InferenceRuntimeConfig(batch_size_buckets=(1, 2, 4, 8, 16), decode_chunk_size=8)` validates strictly increasing positive batch buckets. Length buckets are powers of two capped by and including the loaded model's authoritative effective context length; a request's bucket is selected from its required capacity `prompt_token_count + max_new_tokens`, not prompt length alone.
-- `InferenceSession.from_checkpoint(path, *, step=None, full_verify=False, runtime=InferenceRuntimeConfig()) -> InferenceSession` loads tokenizer/model once and caches compiled functions by complete stable shape/policy key.
+- `InferenceSession.from_checkpoint(path, *, full_verify=False, runtime=InferenceRuntimeConfig()) -> InferenceSession` loads the run's recovered latest tokenizer/model once and caches compiled functions by complete stable shape/policy key.
 - The session owns immutable model state and a buffer pool but no request token/KV/logical-length/finished/key state between calls.
 - A nonblocking call guard rejects overlapping `generate`, `generate_batch`, or evaluation scoring before leasing mutable buffers.
 - A base-pretraining `ResolvedModel.model_config.rope_scaling_factor` must be exactly `1.0`, matching its run manifest. Resolution never substitutes a larger inference factor. LoRA/export resolution added in Phase 5 likewise preserves its source run's authoritative value.
@@ -115,19 +121,41 @@ def test_overlapping_call_fails_before_state_mutation(tiny_session):
     assert tiny_session.buffer_pool.active_leases == 0
 ```
 
-Also test read-only stale-latest recovery without persistence, exact-step independence from latest/malformed newer steps, shared access lock held through owned-array evaluation, manifest-trusted versus full metadata, full verification rejecting a master/working cast mismatch, inference loading no training-only master or optimizer arrays into session ownership, prompt overflow, and empty text without usable BOS.
+Also test read-only stale-latest recovery without persistence, direct
+`step-*` path and historical-selector rejection, shared access lock held through
+owned-array evaluation, immutable scalar and nested array-group mappings from
+`VerifiedCheckpointContents`, manifest-trusted versus full metadata, full
+verification rejecting a master/working cast mismatch, inference loading no
+training-only master or optimizer arrays into session ownership, prompt
+overflow, and empty text without usable BOS.
 
 - [ ] **Step 2: Run session tests and verify RED**
 
 ```bash
-uv run pytest v2/tests/unit/test_inference.py v2/tests/integration/test_inference_workflow.py -k "resolve or session or guard or failed or exact_step" -v
+uv run pytest v2/tests/unit/test_inference.py v2/tests/integration/test_inference_workflow.py -k "resolve or session or guard or failed or latest" -v
 ```
 
 Expected: FAIL because persistent inference APIs do not exist.
 
 - [ ] **Step 3: Implement model resolution, owned loading, and buffer leasing**
 
-Resolve artifacts once, hold the shared access lock until required safetensors are validated and the BF16 working arrays have been evaluated into owned MLX storage, then release it. `full_verify=False` must still validate the complete checkpoint schema/path/array metadata and report `manifest-trusted`; `full_verify=True` rehashes both `master.safetensors` and `model.safetensors` and checks the exact FP32-master-to-BF16-working cast relationship before discarding the temporary master load. Construct the tokenizer/model from copied run state only and preserve its authoritative `rope_scaling_factor=1.0`. Do not retain master, optimizer, or trainer arrays in `InferenceSession`. Implement the call guard with `threading.Lock.acquire(blocking=False)` and a `finally` block that clears/discards leased request storage before releasing the guard. Session-owned cache wrappers pass only their `KVArrayState` tuple into compiled functions and install returned state after evaluation; no `KVCache` object crosses compilation.
+Resolve artifacts once, hold the shared access lock until required safetensors
+are validated and the BF16 working arrays have been evaluated into owned MLX
+storage, then release it. Before the model resolver consumes the Part 1 reader,
+copy/freeze its scalar mapping and outer/inner array-group mappings so assignment
+or alias mutation fails. `full_verify=False` must still validate the complete
+checkpoint schema/path/array metadata and report `manifest-trusted`;
+`full_verify=True` rehashes both `master.safetensors` and
+`model.safetensors` and checks the exact FP32-master-to-BF16-working cast
+relationship before discarding the temporary master load. Construct the
+tokenizer/model from copied run state only and preserve its authoritative
+`rope_scaling_factor=1.0`. Do not retain master, optimizer, or trainer arrays in
+`InferenceSession`. Implement the call guard with
+`threading.Lock.acquire(blocking=False)` and a `finally` block that
+clears/discards leased request storage before releasing the guard.
+Session-owned cache wrappers pass only their `KVArrayState` tuple into compiled
+functions and install returned state after evaluation; no `KVCache` object
+crosses compilation.
 
 Use these result types:
 
@@ -154,10 +182,12 @@ class GenerationResult:
 - [ ] **Step 4: Verify artifact-resolution and session-lifecycle tests**
 
 ```bash
-uv run pytest v2/tests/unit/test_inference.py v2/tests/integration/test_inference_workflow.py -k "resolve or session or guard or failed or exact_step" -v
+uv run pytest v2/tests/unit/test_inference.py v2/tests/integration/test_inference_workflow.py -k "resolve or session or guard or failed or latest" -v
 ```
 
-Expected: all focused tests pass; sequential calls begin with empty token/KV state and exact-step resolution never reads or repairs `latest.json`.
+Expected: all focused tests pass; sequential calls begin with empty token/KV
+state, read-only latest recovery never persists repairs, direct step paths and
+historical selectors fail, and verified checkpoint mappings cannot be mutated.
 
 - [ ] **Step 5: Commit persistent session foundation**
 
@@ -176,7 +206,7 @@ git commit -m "feat(v2): load persistent inference sessions"
 
 **Interfaces:**
 - Frozen `GenerationRequest(max_new_tokens: int, config: GenerationConfig = GenerationConfig(), include_prompt: bool = False)` rejects negative token counts; the CLI DTO defaults omitted `--max-new-tokens` to `128` before constructing it, while library callers choose the limit explicitly. `max_new_tokens` counts only generated continuation tokens. `GenerationResult.token_ids` and `.text` contain only that continuation unless `include_prompt=True`, in which case both contain prompt plus continuation.
-- Frozen `InferenceConfig(checkpoint: Path, prompt: str, request: GenerationRequest, step: int | None = None, full_verify: bool = False, runtime: InferenceRuntimeConfig = InferenceRuntimeConfig())` is the typed one-shot CLI domain configuration. `infer(config: InferenceConfig) -> GenerationResult` constructs one session and delegates exactly once to `generate`; persistent library callers construct `InferenceSession` directly.
+- Frozen `InferenceConfig(checkpoint: Path, prompt: str, request: GenerationRequest, full_verify: bool = False, runtime: InferenceRuntimeConfig = InferenceRuntimeConfig())` is the typed one-shot CLI domain configuration. `infer(config: InferenceConfig) -> GenerationResult` constructs one latest-only session and delegates exactly once to `generate`; persistent library callers construct `InferenceSession` directly.
 - `InferenceSession.generate(text, request) -> GenerationResult` delegates to the same batch engine as one request.
 - `InferenceSession.generate_batch(items: Sequence[tuple[str, GenerationRequest]]) -> tuple[GenerationResult, ...]` restores caller order.
 - An empty batch returns `()` before taking the call guard. For an omitted seed, the host allocator calls `secrets.randbits(32)` once per real request in caller order; tests monkeypatch that allocator, and the concrete value is returned in `GenerationResult` for replay.
@@ -291,7 +321,7 @@ git commit -m "perf(v2): batch compiled prefill and decode"
 - `LoglikelihoodRequest(context: str, continuation: str)` and `LoglikelihoodResult(log_likelihood: float, greedy_match: bool)`.
 - `score_loglikelihood_batch(session, requests, *, padding) -> tuple[LoglikelihoodResult, ...]` reuses the session's length and batch-size buckets, pads with masked finite synthetic rows, and synchronizes once per fixed-shape batch.
 - `SMLEvalLM` implements only `loglikelihood` and `generate_until`; unsupported request methods raise `SMLRuntimeError`.
-- Frozen `EvaluationConfig(checkpoint: Path, tasks: tuple[Literal["hellaswag", "winogrande"], ...], output: Path, step: int | None = None, full_verify: bool = False, padding: Literal["left", "right"] = "right", runtime: InferenceRuntimeConfig = InferenceRuntimeConfig(), limit: int | None = None)` requires at least one task and a positive optional limit.
+- Frozen `EvaluationConfig(checkpoint: Path, tasks: tuple[Literal["hellaswag", "winogrande"], ...], output: Path, full_verify: bool = False, padding: Literal["left", "right"] = "right", runtime: InferenceRuntimeConfig = InferenceRuntimeConfig(), limit: int | None = None)` requires at least one task and a positive optional limit.
 - Frozen `EvaluationResult(output: Path, model: ModelIdentity, tasks: tuple[str, ...], provider_versions: tuple[tuple[str, str], ...])` is returned by `evaluate(config)`, which supports repeated tasks from exactly `hellaswag` and `winogrande` and persists the complete result atomically at the required output path. Provider-version pairs are sorted by name before construction.
 
 - [ ] **Step 1: Write serial/batched score and adapter contract tests**
@@ -355,7 +385,7 @@ git commit -m "perf(v2): batch evaluation requests"
 
 **Interfaces:**
 - Consumes the functionally verified Phase 3 package and artifact contracts.
-- Proves persistent inference, exact-step resolution, batched evaluation, and
+- Proves persistent latest-only inference, batched evaluation, and
   read-only/full verification behavior through production workflows.
 
 - [ ] **Step 1: Run full correctness/format verification**
@@ -373,8 +403,9 @@ git status --short
 uv run pytest v2/tests/integration/test_inference_workflow.py v2/tests/integration/test_evaluation_workflow.py -v
 ```
 
-Expected: persistent-session generation, unequal-length batching, exact-step
-artifact resolution, evaluation scoring, and both verification levels pass.
+Expected: persistent-session generation, unequal-length batching, latest-only
+artifact resolution, direct step-path rejection, evaluation scoring, and both
+verification levels pass.
 
 - [ ] **Step 3: Run CLI smoke coverage available at this phase**
 
@@ -775,7 +806,6 @@ class SwagTrainingConfig:
     base_checkpoint: Path
     data: Path
     output_run: Path
-    base_step: int | None = None
     lora: LoRAConfig = field(default_factory=LoRAConfig)
     optimizer: OptimizerConfig = field(default_factory=default_swag_optimizer_config)
     loader: LoaderConfig = field(default_factory=LoaderConfig)
@@ -795,8 +825,8 @@ class SwagTrainingConfig:
 - `finetune(config: SwagTrainingConfig) -> SwagTrainingResult` creates a new LoRA run only.
 - `resume_finetune(run, *, data, overrides) -> SwagTrainingResult` accepts only termination/observability overrides and identity-matching relocated data.
 - Run root copies tokenizer and selected base weights once; periodic steps store adapters/optimizer/trainer/scalar state only.
-- `export_merged(checkpoint, output, *, step=None) -> ExportResult` publishes a portable immutable export without mutating live state.
-- Extend `resolve_model_artifact` for LoRA run/latest/exact and merged export.
+- `export_merged(checkpoint, output) -> ExportResult` publishes a portable immutable export from the run's recovered latest checkpoint without mutating live state.
+- Extend `resolve_model_artifact` for latest-only LoRA runs and merged exports; direct checkpoint-step directories and historical selectors remain invalid.
 
 - [ ] **Step 1: Write step-zero, resume, source-removal, export, and resolution tests**
 
@@ -830,7 +860,12 @@ def test_lora_checkpoint_omits_frozen_base(tiny_lora_run):
     assert_base_snapshot_array_dtypes(tiny_lora_run / "base", model=mx.bfloat16)
 ```
 
-Also compare uninterrupted/interrupted adapter/optimizer/cursor/step/PRNG state, reject every data/base/tokenizer/precision mismatch before allocation, ensure limit-satisfied resume returns before iterator/kernel construction, prove exact-step export ignores malformed unrelated newer steps/latest, and reject any LoRA run, checkpoint, or export whose model configuration changes the copied base's `rope_scaling_factor=1.0`.
+Also compare uninterrupted/interrupted adapter/optimizer/cursor/step/PRNG state,
+reject every data/base/tokenizer/precision mismatch before allocation, ensure
+limit-satisfied resume returns before iterator/kernel construction, prove
+latest-only export uses recovered latest state and rejects direct step paths,
+and reject any LoRA run, checkpoint, or export whose model configuration changes
+the copied base's `rope_scaling_factor=1.0`.
 
 - [ ] **Step 2: Run LoRA workflow tests and verify RED**
 
@@ -842,7 +877,31 @@ Expected: FAIL because LoRA run orchestration/export/resolution is incomplete.
 
 - [ ] **Step 3: Implement copied-base run creation, strict resume, and atomic export**
 
-Fully verify the selected base step/tokenizer/SWAG bundle before allocation, including both pretraining parameter payloads and the exact FP32-master-to-BF16-working cast relationship. Require the copied base model configuration to record `rope_scaling_factor=1.0`; copy that complete configuration unchanged into the LoRA run, every adapter checkpoint, and the merged export. Construct `SwagKernelConfig` only from the validated composed `SwagTrainingConfig`; do not flatten shared loader/optimizer/checkpoint fields into a second configuration source. Under the writer lock, copy only the selected checkpoint's exact BF16 `model.safetensors` bytes into the frozen base snapshot, not `master.safetensors` or base optimizer/trainer state; create `base/manifest.json` with complete source model/precision configuration, tokenizer identity, copied-working-weight ref, and diagnostic source run/step identity. Copy tokenizer and atomically publish adapter step zero, immutable run manifest, and latest. The LoRA run manifest records copied-base and authoritative encoded-SWAG identities plus only a diagnostic data locator. Resume strictly loads FP32 adapter/moment/accumulator state, calls the FP32 SWAG optimizer path, restores the explicit PRNG key, and rejects any BF16 adapter or optimizer leaf or changed RoPE factor before constructing kernels. Export resolves an exact state, computes `merged_model_weights`, saves BF16 plain names without base masters, copies tokenizer, and builds `ExportManifest` with the unchanged complete model/precision configuration, tokenizer/payload identities, and diagnostic source run/step identity before immutable publication. Long-context fine-tuning with a factor above `1.0` will use a future, separately specified workflow and distinct artifact identity; it is not an export-time or inference-time override.
+Fully verify the recovered latest base checkpoint, tokenizer, and SWAG bundle
+before allocation, including both pretraining parameter payloads and the exact
+FP32-master-to-BF16-working cast relationship. Require the copied base model
+configuration to record `rope_scaling_factor=1.0`; copy that complete
+configuration unchanged into the LoRA run, every adapter checkpoint, and the
+merged export. Construct `SwagKernelConfig` only from the validated composed
+`SwagTrainingConfig`; do not flatten shared loader/optimizer/checkpoint fields
+into a second configuration source. Under the writer lock, copy only the
+recovered latest checkpoint's exact BF16 `model.safetensors` bytes into the
+frozen base snapshot, not `master.safetensors` or base optimizer/trainer state;
+create `base/manifest.json` with complete source model/precision configuration,
+tokenizer identity, copied-working-weight ref, and diagnostic source run/step
+identity. Copy tokenizer and atomically publish adapter step zero, immutable run
+manifest, and latest. The LoRA run manifest records copied-base and authoritative
+encoded-SWAG identities plus only a diagnostic data locator. Resume strictly
+loads FP32 adapter/moment/accumulator state, calls the FP32 SWAG optimizer path,
+restores the explicit PRNG key, and rejects any BF16 adapter or optimizer leaf
+or changed RoPE factor before constructing kernels. Export resolves recovered
+latest state, computes `merged_model_weights`, saves BF16 plain names without
+base masters, copies tokenizer, and builds `ExportManifest` with the unchanged
+complete model/precision configuration, tokenizer/payload identities, and
+diagnostic source run/step identity before immutable publication. Long-context
+fine-tuning with a factor above `1.0` will use a future, separately specified
+workflow and distinct artifact identity; it is not an export-time or
+inference-time override.
 
 - [ ] **Step 4: Verify end-to-end LoRA portability/resume/export**
 
@@ -879,7 +938,7 @@ git commit -m "feat(v2): persist portable lora runs and exports"
 
 ```python
 def test_encoded_swag_to_exported_evaluation(tiny_base_run, fake_swag_provider, fake_lm_eval, tmp_path):
-    data = prepare_swag_bundle(tiny_swag_preparation_config(fake_swag_provider), resolve_model_artifact(tiny_base_run, step=None, full_verify=True), tmp_path / "swag")
+    data = prepare_swag_bundle(tiny_swag_preparation_config(fake_swag_provider), resolve_model_artifact(tiny_base_run, full_verify=True), tmp_path / "swag")
     tuned = finetune(tiny_swag_training_config(tiny_base_run, data, tmp_path / "run", maximum_steps=1))
     resumed = resume_finetune(tuned.run, data=data.path, overrides=ResumeOverrides(maximum_steps=2))
     exported = export_merged(resumed.run, tmp_path / "export")
@@ -938,7 +997,22 @@ Expected: FAIL because the controlled SWAG quality harness does not exist.
 
 - [ ] **Step 5: Implement the fixed 256-step candidate/oracle harness**
 
-Build fixed source-train and disjoint validation examples from checked-in encoded arrays. Fully verify the source pretraining checkpoint and record both its FP32-master identity and selected BF16-working identity before copying only the frozen BF16 base into each quality run. Initialize identical FP32 adapters, then run the compiled candidate and eager FP32-adapter oracle for exactly 256 optimizer steps using the same ordered real examples, synthetic-tail masks, mean continuation-token score including EOS, AdamW formula, schedule, and keys. Record raw train/validation loss, validation accuracy, finite-state flags, real-example counts, base byte identity, adapter state identity, and workload identity. Reject missing/extra records, changed base bytes, mismatched real-example counts, or any nonfinite value before applying the 1-percent loss and one-percentage-point accuracy decisions. The harness identity hashes the ordered bytes of `swag_quality.py` and `test_swag_quality.py`.
+Build fixed source-train and disjoint validation examples from checked-in
+encoded arrays. Fully verify the source pretraining checkpoint and record both
+its FP32-master identity and selected BF16-working identity before copying only
+the frozen BF16 base into each quality run. Initialize identical FP32 adapters,
+then run the compiled candidate and eager FP32-adapter oracle for exactly 256
+optimizer steps using the same ordered real examples, synthetic-tail masks,
+mean continuation-token score including EOS, AdamW formula, schedule, and keys.
+Record raw train/validation loss, validation accuracy, finite-state flags,
+real-example counts, base byte identity, adapter state identity, and workload
+identity. Reject missing/extra records, changed base bytes, mismatched
+real-example counts, or any nonfinite value before applying the 1-percent loss
+and one-percentage-point accuracy decisions. The harness identity hashes the
+ordered bytes of `swag_quality.py` and `test_swag_quality.py`. As with
+pretraining quality, the manifest records an authoritative source commit and
+execution dependency boundary; standalone validation reconstructs those
+recorded bytes rather than deriving an expected workload from a later checkout.
 
 - [ ] **Step 6: Verify and commit the SWAG quality harness before evidence**
 
@@ -993,7 +1067,7 @@ evidence commit is required.
 - Commands are exactly `tokenize`, `prepare pretraining`, `prepare swag`, `train`, `infer`, `evaluate`, `finetune`, `export`, and `verify`.
 - Every command accepts optional `--config PATH`; precedence is frozen dataclass defaults, TOML values, then explicit CLI values.
 - The only accepted TOML root tables are exactly `[tokenize]`, `[prepare.pretraining]`, `[prepare.swag]`, `[train]`, `[infer]`, `[evaluate]`, `[finetune]`, `[export]`, and `[verify]`. A file passed to one command must contain exactly that command table and its documented nested policy tables; sibling command tables and unknown keys fail.
-- CLI functions parse to frozen command-specific DTOs, construct the owner module's domain dataclasses, import the owner workflow functions only after validation, print typed results, and map focused domain exceptions to stable nonzero exit codes. A DTO may contain CLI-only selection fields such as `resume`, `step`, `full`, or `output`, but domain dataclasses contain only the fields defined by their owner tasks.
+- CLI functions parse to frozen command-specific DTOs, construct the owner module's domain dataclasses, import the owner workflow functions only after validation, print typed results, and map focused domain exceptions to stable nonzero exit codes. A DTO may contain CLI-only fields such as `resume`, `full`, or `output`, but neither CLI nor domain APIs accept historical step selection, and domain dataclasses contain only the fields defined by their owner tasks.
 - `argparse.Namespace` never enters a domain API.
 - Resume accepts only maximum steps/epochs, logging interval, checkpoint interval, and an optional identity-matching `--data` location; checkpoint storage is always pruned to latest-only.
 - The overlay mapper uses the exact domain paths below; it never relies on same-named flat attributes:
@@ -1009,8 +1083,8 @@ evidence commit is required.
 | `prepare.swag.revision` / `--revision` | `source.revision` |
 
 - All remaining structured settings use recursively validated nested tables that match their domain field names, such as `[train.model]`, `[train.optimizer.weight_decay]`, `[train.precision]`, `[prepare.swag.source]`, `[finetune.lora]`, and `[finetune.lora.initializer]`. Fields listed in the flat mapping table are accepted only in their flat form and are rejected if repeated in a nested policy table, so one invocation can never supply two TOML sources for the same domain path. `rope_scaling_factor` in `[train.model]` must be `1.0`; the CLI provides no inference/export override and the current `[finetune]` command preserves the base value.
-- Command DTO defaults not owned by a domain dataclass are exact: `infer.max_new_tokens=128`; `infer` and `evaluate` use `step=None` and `full_verify=False`; `prepare swag` and `export` use `step=None` but their owner workflows always perform full correctness-sensitive verification; and evaluation requires an explicit output path rather than writing into a model artifact or implicit project directory.
-- Dispatch is exact: `tokenize` calls `train_tokenizer_bundle(config, output)`; `prepare pretraining` calls `prepare_pretraining_bundle(config, output)`; `prepare swag` calls `resolve_model_artifact(checkpoint, step=step, full_verify=True)` and then `prepare_swag_bundle(config, base, output)`; fresh/resumed `train` call `train(config)` / `resume(run, data=data, overrides=overrides)`; `infer` calls `infer(InferenceConfig(...))`; `evaluate` calls `evaluate(EvaluationConfig(...))`; fresh/resumed `finetune` call `finetune(config)` / `resume_finetune(run, data=data, overrides=overrides)`; `export` calls `export_merged(checkpoint, output, step=step)` and that workflow fully verifies its source; and `verify` calls `verify_artifact(path, full=full)`. `prepare swag` is allowed to import and call both resolution and preparation functions from their owner modules; “lazy” means unrelated workflows and optional providers stay unimported.
+- Command DTO defaults not owned by a domain dataclass are exact: `infer.max_new_tokens=128`; `infer` and `evaluate` use `full_verify=False`; `prepare swag` and `export` always perform full correctness-sensitive verification of recovered latest state; and evaluation requires an explicit output path rather than writing into a model artifact or implicit project directory.
+- Dispatch is exact: `tokenize` calls `train_tokenizer_bundle(config, output)`; `prepare pretraining` calls `prepare_pretraining_bundle(config, output)`; `prepare swag` calls `resolve_model_artifact(checkpoint, full_verify=True)` and then `prepare_swag_bundle(config, base, output)`; fresh/resumed `train` call `train(config)` / `resume(run, data=data, overrides=overrides)`; `infer` calls `infer(InferenceConfig(...))`; `evaluate` calls `evaluate(EvaluationConfig(...))`; fresh/resumed `finetune` call `finetune(config)` / `resume_finetune(run, data=data, overrides=overrides)`; `export` calls `export_merged(checkpoint, output)` and that workflow fully verifies its source; and `verify` calls `verify_artifact(path, full=full)`. `prepare swag` is allowed to import and call both resolution and preparation functions from their owner modules; “lazy” means unrelated workflows and optional providers stay unimported.
 
 - [ ] **Step 1: Write parser/config/error tests for every command**
 
@@ -1062,7 +1136,13 @@ def test_each_subcommand_lazy_dispatches_typed_config(argv, workflow, cli_spies)
 
 `cli_spies` replaces every owner workflow plus `resolve_model_artifact` with typed-result fakes, so this unit test covers dispatch without touching the named placeholder paths; subprocess integration in Task 6.2 uses real local artifacts.
 
-Also test repeated supported evaluation tasks, wrong command/root tables (including `[prepare]` instead of `[prepare.pretraining]`), unknown nested TOML keys, invalid task, unexpected exceptions retaining traceback, concise domain errors, `--step` exact resolution, `--full`, fresh-run collision, resume semantic override rejection, absent resume data locator, nested DTO-to-domain mappings, and rejection of any base-pretraining `rope_scaling_factor` other than `1.0`.
+Also test repeated supported evaluation tasks, wrong command/root tables
+(including `[prepare]` instead of `[prepare.pretraining]`), unknown nested TOML
+keys, invalid task, unexpected exceptions retaining traceback, concise domain
+errors, rejection of `--step` and direct `step-*` paths, `--full`, fresh-run
+collision, resume semantic override rejection, absent resume data locator,
+nested DTO-to-domain mappings, and rejection of any base-pretraining
+`rope_scaling_factor` other than `1.0`.
 
 - [ ] **Step 2: Run CLI tests and verify RED**
 
@@ -1137,7 +1217,9 @@ def test_all_cli_workflows(cli_workspace):
     cli_workspace.run("verify", "--full", cli_workspace.export)
 ```
 
-Add `train --resume`, `finetune --resume`, exact `--step` inference/export, moved run with relocated data, read-only default versus `--full`, and expected error exit-code tests.
+Add `train --resume`, `finetune --resume`, historical `--step` and direct
+`step-*` path rejection, moved run with relocated data, read-only default versus
+`--full`, and expected error exit-code tests.
 
 - [ ] **Step 2: Run the smoke tests and verify RED or missing wiring**
 
@@ -1233,7 +1315,14 @@ Expected: FAIL while flat modules and the bridge remain.
 
 - [ ] **Step 3: Remove replaced source/tests, narrow exports, and rewrite README**
 
-Delete the listed files only after mapping each lasting behavioral assertion to its new mirrored test. Remove the obsolete repository-level NPZ inspector because replacement prepared data is a strict NPY directory artifact and NPZ compatibility is explicitly excluded. Remove bridge loading and export new names directly from owner modules. Document tokenizer/pretraining/SWAG/run/export layouts, full versus manifest-trusted verification, resume override rules, exact-step selection, and every unified command. Do not document any legacy path or artifact.
+Delete the listed files only after mapping each lasting behavioral assertion to
+its new mirrored test. Remove the obsolete repository-level NPZ inspector
+because replacement prepared data is a strict NPY directory artifact and NPZ
+compatibility is explicitly excluded. Remove bridge loading and export new
+names directly from owner modules. Document tokenizer/pretraining/SWAG/run/
+export layouts, full versus manifest-trusted verification, resume override
+rules, latest-only model selection, rejection of direct step paths, and every
+unified command. Do not document any legacy path or artifact.
 
 - [ ] **Step 4: Verify clean layout, all behavior, formatting, and unchanged lock**
 
@@ -1272,7 +1361,10 @@ uv run python -m v2.benchmarks.quality validate --manifest v2/benchmarks/manifes
 uv run python -m v2.benchmarks.swag_quality validate --manifest v2/benchmarks/manifests/swag-quality-v1.json --raw-input v2/benchmarks/results/swag-quality-v1.jsonl --report v2/benchmarks/results/swag-quality-v1.json
 ```
 
-Expected: the worktree is clean; all correctness/equivalence/integration tests pass outside the sandbox; and both controlled quality reports revalidate against their committed raw evidence and harness identities.
+Expected: the worktree is clean; all correctness/equivalence/integration tests
+pass outside the sandbox; and both controlled quality reports revalidate
+against their committed raw evidence, harness identities, and recorded source
+commits without rebuilding expected workloads from final-tree bytes.
 
 - [ ] **Step 2: Run every unified CLI smoke from the final tree**
 
@@ -1281,7 +1373,8 @@ uv run pytest v2/tests/integration/test_cli_workflows.py -v
 uv run python -m sml --help
 ```
 
-Expected: all commands and fresh/resume/exact-step/full-verification paths pass.
+Expected: all commands and fresh/resume/latest-only/full-verification paths
+pass, and historical selectors/direct step paths fail.
 
 - [ ] **Step 3: Run the final end-to-end workflow set**
 
@@ -1316,6 +1409,9 @@ The refactor is complete only when:
 - every new package unit, equivalence, artifact-safety, resume, integration, and CLI test passes;
 - pretraining checkpoints retain authoritative FP32 masters plus exact BF16 working casts, while inference, LoRA base snapshots, and merged exports own only the BF16 model state they require;
 - the committed pretraining and SWAG controlled quality reports pass their finite-state, master-update, validation-loss, validation-accuracy, and real-work identity gates;
+- each controlled-quality validator verifies its manifest's recorded source
+  boundary; unrelated later source edits and the completed migration-bridge
+  deletion do not invalidate earlier accepted evidence;
 - inference/evaluation pin resolved model identity and correctly report `manifest-trusted` or `full`;
 - encoded SWAG data is immutable/reusable offline, LoRA resume is exact, the copied-base run survives source-run deletion, and export is a portable BF16 plain-weight artifact;
 - the current inference, evaluation, SWAG LoRA, resume, and export paths preserve the base run's authoritative `rope_scaling_factor=1.0`; a future factor-above-`1.0` long-context fine-tuning creates a distinct run and is outside this plan;

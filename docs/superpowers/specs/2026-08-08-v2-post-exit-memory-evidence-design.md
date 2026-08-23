@@ -1,6 +1,7 @@
 # V2 Post-Exit Memory Evidence Design
 
-**Status:** Approved design; written specification pending user review
+**Status (2026-08-23):** Implemented and reviewed. This is an optional
+benchmark-evidence protocol, not remaining refactor work.
 
 **Date:** 2026-08-08
 

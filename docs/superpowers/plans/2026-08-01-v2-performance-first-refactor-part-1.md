@@ -2,6 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Execution status (2026-08-23):** Tasks 0.1 and 1.1-3.6 are implemented,
+reviewed at their task boundaries, and have passed the repeated functional
+gate. The unchecked boxes below preserve the original TDD procedure; they are
+not live task status. Part 1 remains open only until the approved recorded-
+source quality validator is implemented and reviewed and
+`VerifiedCheckpointContents` is made deeply immutable before Task 4.1.
+
 **Goal:** Replace the v2 model/data/artifact foundation with the `sml` package and deliver exact, resumable BF16-compute pretraining with authoritative FP32 master parameters and FP32 optimizer state. The existing benchmark harness may be used for diagnostics, but baseline comparison is not required.
 
 **Architecture:** This first part creates the package and temporary migration bridge, captures legacy equivalence fixtures, implements the model and immutable artifact contracts, then builds prepared-data and pretraining runtimes on those contracts. It ends with a portable pretraining run/checkpoint that Part 2 consumes for inference, evaluation, SWAG fine-tuning, and final cutover.
@@ -50,7 +57,10 @@ The approved design calls for six ordered, independently reviewable implementati
 5. [LoRA and SWAG](2026-08-01-v2-performance-first-refactor-part-2.md#phase-5-lora-and-swag)
 6. [Unified CLI and final cutover](2026-08-01-v2-performance-first-refactor-part-2.md#phase-6-unified-cli-and-final-cutover)
 
-Part 2 must not begin until Part 1's Phase 3 gate passes and a valid tiny pretraining run can be opened through the new artifact API.
+Part 2 must not begin until Part 1's Phase 3 gate passes, a valid tiny
+pretraining run can be opened through the new artifact API, the committed
+quality evidence validates against its recorded source boundary, and checkpoint
+reader contents are deeply immutable for the Task 4.1 consumer.
 
 ## File Structure for Part 1
 
@@ -814,11 +824,14 @@ absence or result does not block Phase 2.
 **Interfaces:**
 - `canonical_json_bytes(value: object) -> bytes` implements only `sml-json-v1`.
 - `file_identity(file: BinaryIO) -> str`, `structured_identity(domain_tag: str, value: object) -> str`, and `row_content_identity(rows: Iterable[np.ndarray], row_count: int, row_width: int) -> str`.
-- Strict frozen manifests: `TokenizerManifest`, `PretrainingDataManifest`, `CheckpointManifest`, `RunManifest`, `LatestIndex`, `BaseSnapshotManifest`, `SwagDataManifest`, and `ExportManifest`.
+- Strict frozen manifests: `TokenizerManifest`, `PretrainingDataManifest`,
+  distinct `PretrainingCheckpointManifest` and `LoRACheckpointManifest`,
+  distinct `PretrainingRunManifest` and `LoRARunManifest`, `LatestIndex`,
+  `BaseSnapshotManifest`, `SwagDataManifest`, and `ExportManifest`.
 - `read_manifest(root: Path, manifest_type: type[M], verification: VerificationLevel) -> Verified[M]` rejects unknown/missing fields and always recomputes the structured identity.
 - `VerificationLevel` values are exactly `manifest-trusted` and `full`.
 
-Use one shared payload vocabulary: `PayloadRef(logical_path, identity, byte_size)`, `ArraySpec(name, shape, dtype)`, and `ArrayPayloadRef(payload, arrays)`. `TokenizerManifest` fields are exactly `kind`, `version`, `identity`, `algorithm`, `training`, `vocab_size`, `bos_token_id`, `eos_token_id`, `pad_token_id`, `unk_token_id`, `model: PayloadRef`, `vocab: PayloadRef`, and `diagnostic_source_locator: str | None`; only the last field is excluded from identity. `PretrainingDataManifest` contains sequence/row width/dtype, shard row counts and ordered refs, preparation seed/order policy, tokenizer identity/copied tokenizer refs, source summary/diagnostic locator, and row-content identity. `RunManifest` contains run kind, immutable model/precision/optimizer/loader/checkpoint configuration, tokenizer/base/data identities, and diagnostic data/source locators. A pretraining `RunManifest.model` must record `rope_scaling_factor=1.0`. `CheckpointManifest` contains owning-run identity, checkpoint kind/step, scalar-state ref, and exact array payload specs. `LatestIndex` contains owning-run identity, step, and checkpoint identity. `BaseSnapshotManifest`, `SwagDataManifest`, and `ExportManifest` contain the complete fields stated by their owner tasks in Part 2; define their schema versions here so later tasks cannot invent alternate encodings.
+Use one shared payload vocabulary: `PayloadRef(logical_path, identity, byte_size)`, `ArraySpec(name, shape, dtype)`, and `ArrayPayloadRef(payload, arrays)`. `TokenizerManifest` fields are exactly `kind`, `version`, `identity`, `algorithm`, `training`, `vocab_size`, `bos_token_id`, `eos_token_id`, `pad_token_id`, `unk_token_id`, `model: PayloadRef`, `vocab: PayloadRef`, and `diagnostic_source_locator: str | None`; only the last field is excluded from identity. `PretrainingDataManifest` contains sequence/row width/dtype, shard row counts and ordered refs, preparation seed/order policy, tokenizer identity/copied tokenizer refs, source summary/diagnostic locator, and row-content identity. The distinct pretraining and LoRA run manifests each contain only their kind's immutable model/precision/optimizer/loader/checkpoint configuration and tokenizer/base/data identities. A pretraining run's model must record `rope_scaling_factor=1.0`. The distinct checkpoint manifests each bind the owning-run identity, checkpoint step, scalar-state ref, and that kind's exact fixed array payload groups; strict readers reject fields or groups from the other kind. `RunManifest` and `CheckpointManifest` may be union aliases only, never generic optional-field schemas. `LatestIndex` contains owning-run identity, step, and checkpoint identity. `BaseSnapshotManifest`, `SwagDataManifest`, and `ExportManifest` contain the complete fields stated by their owner tasks in Part 2; define their schema versions here so later tasks cannot invent alternate encodings.
 
 - [ ] **Step 1: Write canonical-vector and strict-schema tests**
 
@@ -925,7 +938,15 @@ def test_open_payload_rejects_symlink_swap_and_hard_link_alias(
         verify_artifact(external_hard_link.bundle, full=True)
 ```
 
-Name the remaining cases exactly `test_unicode_normalized_paths_collide`, `test_casefolded_paths_collide`, `test_two_logical_paths_cannot_share_inode`, `test_non_apfs_writer_is_rejected`, and `test_non_apfs_read_only_open_reports_no_writer_guarantee`. The Unicode case uses an NFKC-equivalent full-width/ASCII component pair; each test creates the named filesystem condition before calling the public API and asserts the focused `SMLArtifactError` category.
+Name the remaining cases exactly `test_exact_duplicate_logical_paths_collide`,
+`test_unicode_normalized_paths_collide`, `test_casefolded_paths_collide`,
+`test_two_logical_paths_cannot_share_inode`,
+`test_non_apfs_writer_is_rejected`, and
+`test_non_apfs_read_only_open_reports_no_writer_guarantee`. Cover exact
+duplicate prepared-shard and checkpoint-group paths separately from normalized
+spelling collisions. The Unicode case uses an NFKC-equivalent full-width/ASCII
+component pair; each test creates the named filesystem condition before calling
+the public API and asserts the focused `SMLArtifactError` category.
 
 - [ ] **Step 2: Run traversal tests and verify RED**
 
@@ -1023,9 +1044,17 @@ git commit -m "feat(v2): publish immutable artifact bundles"
 - Modify: `v2/tests/integration/test_artifact_integrity.py`
 
 **Interfaces:**
-- `publish_checkpoint`, `resolve_latest_step`, `resolve_exact_step`, `recover_latest_index`, and `apply_retention` implement the design's step-commit and recovery algorithms using `FilesystemOps`.
+- `publish_checkpoint`, `resolve_latest_step`, `resolve_exact_step`,
+  `recover_latest_index`, and parameterless `prune_to_latest` implement the
+  design's step-commit, recovery, and mandatory latest-only algorithms using
+  `FilesystemOps`. There is no public configurable-retention operation.
 - Checkpoint fault stages are exactly `arrays-written`, `scalar-state-written`, `checkpoint-manifest-written`, `step-directory-fsynced`, `step-directory-renamed`, `step-parent-fsynced`, `latest-temporary-fsynced`, `latest-replaced`, and `latest-parent-fsynced`.
 - Retention obtains the exclusive access lock, resolves latest, proves the retained step with current full verification, then deletes only eligible non-latest steps by descriptor.
+- `open_checkpoint_reader(...) -> CheckpointReader` owns the shared access lock
+  and verified run/checkpoint descriptors until the consumer has eagerly loaded
+  and evaluated the exact scalar and array bytes it will use. Its
+  `VerifiedCheckpointContents` result contains an immutable scalar mapping and
+  immutable outer/inner array-group mappings.
 - Resolution returns:
 
 ```python
@@ -1075,7 +1104,15 @@ Expected: FAIL because checkpoint state machines are absent.
 
 - [ ] **Step 3: Implement commit-point recovery and retention**
 
-Write arrays and scalar state, write `checkpoint.json` last, fsync, rename the step directory as the commit point, then publish `latest.json` through fsync plus atomic replace. Latest resolution validates the pointed step and required newer scan range; exact resolution opens only `run.json` plus the requested step. Writable recovery persists a repaired index, read-only recovery records it in memory, and neither path silently skips malformed candidates it is required to examine. Retention begins only after successful latest recovery and a current retained-step proof.
+Write arrays and scalar state, write `checkpoint.json` last, fsync, rename the
+step directory as the commit point, then publish `latest.json` through fsync
+plus atomic replace. Latest resolution validates the pointed step and required
+newer scan range; exact resolution opens only `run.json` plus the requested
+step. Writable recovery persists a repaired index, read-only recovery records
+it in memory, and neither path silently skips malformed candidates it is
+required to examine. The owned checkpoint reader consumes descriptor-bound
+verified bytes without a pathname reopen. Latest-only pruning begins only after
+successful latest recovery and a current retained-step proof.
 
 - [ ] **Step 4: Verify checkpoint safety independently and with all artifact tests**
 
@@ -1393,7 +1430,6 @@ class LoaderConfig:
 @dataclass(frozen=True, slots=True)
 class CheckpointPolicy:
     interval: int = 1_000
-    keep_last: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1423,14 +1459,29 @@ class PretrainingConfig:
     compile: bool = True
 ```
 
-- `PretrainingConfig.__post_init__` rejects `model.rope_scaling_factor != 1.0`; the value is saved unchanged in `RunManifest` and every checkpoint. It also rejects the absence of both termination limits, invalid finite numeric values, nonpositive sizes/intervals, and any step/epoch value that cannot be represented by the int32 device counters. When both limits are present, training stops at the first one reached. The learning-rate schedule clamps after `schedule_steps`, so a larger finite `maximum_steps` is valid.
+- `PretrainingConfig.__post_init__` rejects
+  `model.rope_scaling_factor != 1.0`; the value is saved unchanged in
+  `PretrainingRunManifest` and every `PretrainingCheckpointManifest`. It also
+  rejects the absence of both termination limits, invalid finite numeric
+  values, nonpositive sizes/intervals, and any step/epoch value that cannot be
+  represented by the int32 device counters. When both limits are present,
+  training stops at the first one reached. The learning-rate schedule clamps
+  after `schedule_steps`, so a larger finite `maximum_steps` is valid.
 - If `OptimizerConfig.warmup_steps is None`, `resolved_warmup_steps(config)` is exactly `int(0.01 * (10_000 if schedule_steps is None else schedule_steps))`. If `schedule_steps is None` and `maximum_steps` is finite, fresh orchestration replaces it with `maximum_steps` before identity calculation; resume never re-derives saved configuration.
 - `learning_rate_at(step: mx.array, config: OptimizerConfig) -> mx.array` implements warmup `(step + 1) / max(1, warmup_steps)`, then either holds the base learning rate when `schedule_steps is None` or applies cosine decay over `schedule_steps - warmup_steps` clamped to `minimum_learning_rate_ratio`; it performs no `int(step)` or host synchronization.
 - `AdamState.step` is an int32 scalar counting already-completed optimizer updates. An update uses `learning_rate_at(state.step, config)` and returns `step + 1`; checkpoint step and Adam step must match at every canonical optimizer boundary. Validate `0 <= warmup_steps < schedule_steps` when a finite schedule is present.
 - `initialize_base_parameter_state(working_parameters: dict) -> BaseParameterState` requires a complete BF16 working tree, creates its authoritative FP32 master tree by explicit cast, and proves that every working leaf is the exact BF16 cast of the corresponding master leaf.
 - `initialize_adam_state(master_parameters: dict) -> AdamState` creates zero FP32 first/second moments matching the complete master tree and an int32 zero step.
 - `build_weight_decay_tree(named_parameters, policy)`, `accumulate_fp32`, `normalize_and_clip`, and `adamw_mixed_precision_update(master_parameters, gradients, state, config, weight_decay_tree) -> tuple[dict, dict, AdamState]` use the exact saved policy. The update returns the updated FP32 master tree, its explicitly derived BF16 working tree, and FP32/int32 Adam state. Tied embeddings classify only as `embed_tokens`; `lm_head` applies only to an untied head; Part 2 classifies adapter leaves as `lora_a`/`lora_b` rather than `other`.
-- `BaseParameterState(master_parameters: dict, working_parameters: dict)`, `AdamState(step: mx.array, first_moments: dict, second_moments: dict)`, and `TrainerState(accumulators, accumulation_count, next_key)` are frozen host wrappers. Their `to_tree()` methods return built-in dict/tuple array trees and `from_tree()` validates exact keys/shapes plus FP32-master, BF16-working, FP32-moment/accumulator, and int32-counter dtypes. Only those trees cross `mx.compile`.
+- `BaseParameterState(master_parameters: dict, working_parameters: dict)`,
+  `AdamState(step: mx.array, first_moments: dict, second_moments: dict)`, and
+  `TrainerState(accumulators, accumulation_count, next_key, loss_numerator)`
+  are frozen host wrappers. The trainer's fourth field is an FP32 scalar
+  additive loss numerator so compiled accumulation remains accurate without
+  per-microstep synchronization. Their `to_tree()` methods return built-in
+  dict/tuple array trees and `from_tree()` validates exact keys/shapes plus
+  FP32-master, BF16-working, FP32-moment/accumulator/loss, int32-counter, and
+  PRNG-key dtypes. Only those trees cross `mx.compile`.
 
 - [ ] **Step 1: Write formula, dtype, overflow, and two-step state tests**
 
@@ -1632,7 +1683,6 @@ class ResumeOverrides:
     maximum_epochs: int | None = None
     log_interval: int | None = None
     checkpoint_interval: int | None = None
-    retention: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1643,7 +1693,10 @@ class TrainingResult:
     rows: int
 ```
 
-- `None` means “keep the saved value”; resume cannot change model/optimizer/precision/loader semantics. A positive `retention` replaces the saved `keep_last`; the current plan intentionally exposes no resume operation that changes finite retention back to unlimited.
+- `None` means “keep the saved invocation value”; resume cannot change
+  model/optimizer/precision/loader semantics. Checkpoint retention is not an
+  override: every successful checkpoint operation prunes to the latest
+  checkpoint only.
 - `PretrainingConfig` contains no runtime object, fault injector, callback, or test-only dependency. Tests replace the owner-level `build_pretraining_kernels` symbol with a test-owned wrapper when they need a controlled failure.
 - Fresh training requires `config.model.rope_scaling_factor == 1.0`; `run.json`, step zero, every resumed step, and model-only inference from the base run all expose that same authoritative value. Resume rejects any checkpoint/run metadata that claims another value before model allocation.
 - Every checkpoint has `model.safetensors`, `master.safetensors`, `optimizer.safetensors`, `trainer.safetensors`, `state.json`, and `checkpoint.json`; `model.safetensors` is the BF16 working tree, `master.safetensors` is the authoritative FP32 tree, and full verification proves exact leaf/key/shape correspondence plus `model_leaf == cast_bf16(master_leaf)`. Step zero is published atomically with `run.json`, tokenizer copy, and `latest.json`.
@@ -1706,7 +1759,20 @@ def test_resume_accepts_relocated_identical_bundle_and_rejects_resharded_bundle(
         resume(tiny_completed_run, data=resharded_same_rows, overrides=ResumeOverrides(maximum_steps=2))
 ```
 
-Also cover full queue cursor safety, shard/cross-shard/tail/epoch cursor normalization, completed-limit early return before iterators/compilation, existing run rejection, writer conflict, checkpoint dtype/key corruption, missing/additional master or working leaves, wrong master/working dtypes, a BF16 working leaf that is not the exact cast of its FP32 master, latest recovery, moved run model-only portability, retention waiting for a reader, checkpoint intervals counting completed optimizer steps, no progress-only duplicate step at dropped tail, and rejection of a non-`1.0` pretraining model config before allocation. Mutate one payload byte without changing its manifest in fresh train, resume, writable recovery, and retention cases; each must fail before model/optimizer allocation or deletion.
+Also cover full queue cursor safety, shard/cross-shard/tail/epoch cursor
+normalization, completed-limit early return before iterators/compilation,
+existing run rejection, writer conflict, checkpoint dtype/key corruption,
+missing/additional master or working leaves, wrong master/working dtypes, a BF16
+working leaf that is not the exact cast of its FP32 master, latest recovery,
+moved run model-only portability, latest-only pruning waiting for a reader,
+checkpoint intervals counting completed optimizer steps, no progress-only
+duplicate step at dropped tail, and rejection of a non-`1.0` pretraining model
+config before allocation. Use a fully identity-consistent but semantically
+invalid prepared bundle to prove complete NPY metadata, token ranges, canonical
+cursor, and full-batch availability are checked before checkpoint restoration,
+pruning, or a completed-limit return. Mutate one payload byte without changing
+its manifest in fresh train, resume, writable recovery, and pruning cases; each
+must fail before model/optimizer allocation or deletion.
 
 - [ ] **Step 2: Run workflow tests and verify RED**
 
@@ -1718,7 +1784,26 @@ Expected: FAIL because run orchestration and checkpoint serialization are incomp
 
 - [ ] **Step 3: Implement pre-GPU validation and direct orchestration**
 
-Hold the nonblocking writer lock for the workflow lifetime. Before model/optimizer allocation, fully verify prepared data and every restored checkpoint payload, validate token ranges/metadata/batch availability, enforce saved semantic config, require the authoritative base-pretraining `ModelConfig.rope_scaling_factor` to equal `1.0`, and prove exact FP32-master/BF16-working key, shape, dtype, and cast relationships. Construct the training model from that unchanged configuration; do not substitute a larger inference-only value. For a fresh run, initialize and evaluate the BF16 working tree once, derive the authoritative FP32 masters from that exact tree, initialize FP32 moments, and publish both trees in step zero. Persist model, precision, optimizer, loader, checkpoint, tokenizer, and authoritative prepared-data identities in immutable `run.json`; keep the original data location diagnostic. For each accumulation window, retain the last consumed `cursor_after`, call the compiled update, evaluate master/working/Adam/trainer state together, then commit the cursor. Checkpoint only canonical empty accumulation state at optimizer boundaries and always write both `master.safetensors` and its exact BF16 `model.safetensors` derivation. Apply retention only after latest recovery and a full retained-step proof.
+Hold the nonblocking writer lock for the workflow lifetime. Before
+model/optimizer allocation or any pruning, synchronously FULL-verify prepared
+data, parse every NPY header, validate token ranges and full-batch availability,
+and validate every restored scalar/cursor/array through the descriptor-owned
+checkpoint reader. Enforce saved semantic config, require the authoritative
+base-pretraining `ModelConfig.rope_scaling_factor` to equal `1.0`, and prove
+exact FP32-master/BF16-working key, shape, dtype, and cast relationships.
+Construct the training model from that unchanged configuration; do not
+substitute a larger inference-only value. For a fresh run, initialize and
+evaluate the BF16 working tree once, derive the authoritative FP32 masters from
+that exact tree, initialize FP32 moments, and publish both trees in step zero.
+Persist model, precision, optimizer, loader, checkpoint, tokenizer, and
+authoritative prepared-data identities in immutable `run.json`; keep the
+original data location diagnostic. For each accumulation window, retain the
+last consumed `cursor_after`, call the compiled update, evaluate
+master/working/Adam/trainer state together, then commit the cursor. Checkpoint
+only canonical empty accumulation state at optimizer boundaries and always
+write both `master.safetensors` and its exact BF16 `model.safetensors`
+derivation. Prune to latest only after latest recovery and a full retained-step
+proof.
 
 - [ ] **Step 4: Verify uninterrupted/resumed equivalence and portable run behavior**
 
@@ -1741,7 +1826,10 @@ git commit -m "feat(v2): train and resume portable pretraining runs"
 - Create: `v2/tests/integration/test_part1_workflow.py`
 
 **Interfaces:**
-- The integration test trains a tiny tokenizer, prepares int32 shards, trains two optimizer steps, resumes to three, reopens exact step one, and fully verifies the run including its FP32-master/BF16-working relationship.
+- The integration test trains a tiny tokenizer, prepares int32 shards, trains
+  two optimizer steps, resumes to three, FULL-reopens exact latest step three,
+  proves step one is unavailable and only the latest checkpoint remains, and
+  fully verifies the run including its FP32-master/BF16-working relationship.
 
 - [ ] **Step 1: Write the complete Part 1 integration test**
 
@@ -1751,11 +1839,16 @@ def test_part1_tokenizer_to_resumed_pretraining(tiny_raw_corpus, tmp_path):
     data = prepare_pretraining_bundle(tiny_preparation_config(tiny_raw_corpus, tokenizer), tmp_path / "data")
     first = train(tiny_pretraining_config(data, tmp_path / "run", maximum_steps=2))
     resumed = resume(first.run, data=None, overrides=ResumeOverrides(maximum_steps=3))
-    exact = resolve_exact_step(first.run, step=1, verification=VerificationLevel.FULL)
+    exact = resolve_exact_step(first.run, step=3, verification=VerificationLevel.FULL)
     assert resumed.step == 3
-    assert exact.step == 1
+    assert exact.step == 3
     assert exact.run.model.rope_scaling_factor == 1.0
     assert_model_is_exact_bf16_cast_of_master(exact)
+    with pytest.raises(SMLArtifactError, match="does not exist"):
+        resolve_exact_step(first.run, step=1, verification=VerificationLevel.FULL)
+    assert sorted(path.name for path in (first.run / "checkpoints").iterdir()) == [
+        "step-000000003",
+    ]
     assert verify_artifact(first.run, full=True).verification is VerificationLevel.FULL
 ```
 
@@ -1777,13 +1870,24 @@ git add v2/src/sml v2/tests/integration/test_part1_workflow.py
 git commit -m "test(v2): prove tokenizer to pretraining workflow"
 ```
 
-Expected: the complete flow passes from the new committed tree and the reopened exact step proves that its BF16 model is derived from the checkpointed FP32 masters.
+Expected: the complete flow passes from the new committed tree; the exact
+latest step proves that its BF16 model is derived from the checkpointed FP32
+masters, and no historical checkpoint remains selectable.
 
 ### Task 3.5: Version and Run the Controlled Pretraining-Quality Gate
+
+**Execution update (2026-08-23):** The harness and canonical 1,000-step
+candidate/oracle evidence are committed, and the numerical gate passes. The
+remaining work is to make standalone validation consume the manifest's recorded
+source boundary instead of rebuilding an expected workload from current-tree
+bytes. The approved policy does not require rerecording unless that correction
+changes the evidence identity.
 
 **Files:**
 - Create: `v2/benchmarks/quality.py`
 - Create: `v2/tests/unit/test_pretraining_quality.py`
+- Create: `v2/benchmarks/fixtures/pretraining-quality-train-v1.npy`
+- Create: `v2/benchmarks/fixtures/pretraining-quality-validation-v1.npy`
 - Create: `v2/benchmarks/manifests/pretraining-quality-v1.json`
 - Create: `v2/benchmarks/results/pretraining-quality-v1.jsonl`
 - Create: `v2/benchmarks/results/pretraining-quality-v1.json`
@@ -1793,7 +1897,7 @@ Expected: the complete flow passes from the new committed tree and the reopened 
 - `PretrainingQualityCheckpoint` records candidate/oracle train loss, held-out FP32 validation NLL, finite-state status, per-leaf update-to-BF16-ULP statistics, fraction of changed BF16 working values, RMSNorm-master movement, and whether a sub-BF16-ULP update survived in the master tree.
 - `PretrainingQualityReport(candidate_validation_nll: float, oracle_validation_nll: float, candidate_finite: bool, oracle_finite: bool, rms_norm_master_moved: bool, sub_bf16_update_survived: bool, matching_work_identity: bool)` is the strict acceptance summary reconstructed from the raw checkpoint records.
 - `decide_pretraining_quality(report: PretrainingQualityReport) -> Literal["pass", "fail"]` passes only when both runs remain finite, the candidate RMSNorm master moves, at least one individually sub-BF16-ULP update survives in FP32 master state, the candidate/FP32-oracle real-work identities match exactly, and candidate step-1,000 validation NLL is at most `1.01 * oracle_validation_nll`.
-- `python -m v2.benchmarks.quality record` runs the candidate FP32-master/BF16-compute runtime and an FP32-master/FP32-compute oracle from the same initial BF16 tree for exactly 1,000 optimizer steps; `validate` recomputes identities and the acceptance decision from raw evidence.
+- `python -m v2.benchmarks.quality record` runs the candidate FP32-master/BF16-compute runtime and an FP32-master/FP32-compute oracle from the same initial BF16 tree for exactly 1,000 optimizer steps. `validate` treats the committed manifest workload and source commit as authoritative, reconstructs the recorded harness, production-dependency, and fixture bytes from that commit, and recomputes identities and the acceptance decision from raw evidence without first deriving an expected workload from current-tree bytes.
 
 - [ ] **Step 1: Write deterministic quality-decision tests**
 
@@ -1827,13 +1931,27 @@ Expected: FAIL because the controlled quality harness and decision function do n
 
 - [ ] **Step 3: Implement deterministic candidate/oracle execution and strict validation**
 
-Build the source-disjoint row fixtures from fixed checked-in token rows, evaluate the shared initial BF16 parameter tree before hashing or casting, and feed both runs the same ordered batches, corrected tied-embedding graph, AdamW formula, schedule, clipping, decay tree, and PRNG sequence. The candidate keeps authoritative FP32 masters, derives BF16 working parameters after every update, and performs model compute in BF16; the oracle keeps authoritative FP32 parameters and performs model compute in FP32. Synchronize only at the pinned reporting steps. Write one raw JSON object per run/checkpoint, then validate exact workload/row/batch/request identities, finite values, expected record cardinality, FP32-master evidence, and the 1-percent validation-NLL rule. The harness content identity hashes the ordered bytes of `quality.py` and `test_pretraining_quality.py`.
+Build the source-disjoint row fixtures from fixed checked-in token rows,
+evaluate the shared initial BF16 parameter tree before hashing or casting, and
+feed both runs the same ordered batches, corrected tied-embedding graph, AdamW
+formula, schedule, clipping, decay tree, and PRNG sequence. The candidate keeps
+authoritative FP32 masters, derives BF16 working parameters after every update,
+and performs model compute in BF16; the oracle keeps authoritative FP32
+parameters and performs model compute in FP32. Synchronize only at the pinned
+reporting steps. Write one raw JSON object per run/checkpoint, then validate
+exact workload/row/batch/request identities, finite values, expected record
+cardinality, FP32-master evidence, and the 1-percent validation-NLL rule. The
+harness content identity hashes the ordered bytes of `quality.py` and
+`test_pretraining_quality.py`; separate manifest fields bind the recorded source
+commit and exact production dependency closure. Standalone validation verifies
+those recorded commit bytes. It must remain valid after unrelated source edits,
+the Task 4.1 checkpoint-reader edit, and Phase 6 migration-bridge deletion.
 
 - [ ] **Step 4: Verify and commit the quality harness before producing evidence**
 
 ```bash
 uv run pytest v2/tests/unit/test_pretraining_quality.py -v
-git add v2/benchmarks/quality.py v2/tests/unit/test_pretraining_quality.py
+git add v2/benchmarks/quality.py v2/tests/unit/test_pretraining_quality.py v2/benchmarks/fixtures/pretraining-quality-train-v1.npy v2/benchmarks/fixtures/pretraining-quality-validation-v1.npy
 git commit -m "test(v2): version pretraining quality harness"
 ```
 
@@ -1847,6 +1965,11 @@ uv run python -m v2.benchmarks.quality validate --manifest v2/benchmarks/manifes
 ```
 
 Expected: PASS with complete records for steps 0, 10, 100, and 1,000; no nonfinite state; nonzero RMSNorm-master movement; at least one surviving sub-BF16-ULP master update; and candidate validation NLL no more than 1 percent above the FP32-compute oracle.
+
+The committed evidence at `0538b3a` already satisfies the numerical conditions.
+After the recorded-source validator correction, rerun this 1,000-step command
+only if the evidence identity changes; otherwise revalidate the existing
+manifest/raw/report set and preserve it byte-for-byte.
 
 - [ ] **Step 6: Commit controlled quality evidence**
 
@@ -1890,5 +2013,10 @@ Part 1 is complete only when:
 - the committed 1,000-step quality report proves finite state, RMSNorm-master movement, survival of sub-BF16-ULP master updates, and candidate validation NLL no more than 1 percent above the FP32-compute oracle;
 - base pretraining and every base checkpoint authoritatively record `rope_scaling_factor=1.0`; training a factor above `1.0` belongs to a later distinct long-context fine-tuning workflow, not this pretraining plan;
 - the Phase 3 functional gate and all controlled quality checks pass; performance reports are optional diagnostics;
+- standalone controlled-quality validation verifies the evidence's recorded
+  source commit and does not invalidate it because of unrelated later-tree
+  edits or migration-bridge deletion;
+- `VerifiedCheckpointContents` exposes immutable scalar and nested array-group
+  mappings before the Part 2 model resolver consumes that reader boundary;
 - `uv.lock` remains byte-identical;
 - Part 2 starts from a committed, functionally verified Phase 3 tree, not from an uncommitted worktree.

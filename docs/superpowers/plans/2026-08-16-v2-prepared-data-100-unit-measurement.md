@@ -4,8 +4,9 @@
 3 are cancelled as required refactor work; their commands are retained only as
 an optional reproducible benchmark procedure. No fresh 45-trial baseline,
 before/after comparison, thermal gate, benchmark artifact, or performance
-review is required to continue to Phase 3. Task 4 is reduced to functional
-verification and handoff maintenance.
+review is required to continue to Phase 3. Task 4's functional verification and
+handoff maintenance are complete. The unchecked Task 1 and Task 4 boxes preserve
+their historical procedures.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

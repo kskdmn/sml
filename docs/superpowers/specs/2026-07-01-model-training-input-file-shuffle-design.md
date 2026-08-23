@@ -1,5 +1,8 @@
 # Model Training Input File Shuffle Design
 
+**Status (2026-08-23):** Implemented in v1. This is a historical design with
+no remaining v2-refactor work.
+
 ## Context
 
 Model training currently discovers input shards in `v1/src/train_sml.py` by

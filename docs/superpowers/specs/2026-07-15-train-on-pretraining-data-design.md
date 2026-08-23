@@ -1,5 +1,9 @@
 # Train on Prepared Pretraining Data Design
 
+**Status (2026-08-23):** The legacy NPZ prepared-data flow was implemented.
+The active refactor's strict immutable int32 NPY bundle design supersedes this
+document; no task remains here.
+
 ## Goal
 
 Make `v2/src/train_sml.py` consume offline-prepared pretraining shards

@@ -1,5 +1,8 @@
 # Model Training Input File Shuffle Implementation Plan
 
+**Execution status (2026-08-23):** Implemented in v1. The unchecked boxes
+below are the original TDD procedure, not remaining work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Shuffle model-training input files deterministically while leaving tokenizer input ordering unchanged.

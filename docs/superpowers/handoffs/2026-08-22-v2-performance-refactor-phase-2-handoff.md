@@ -1,4 +1,4 @@
-# V2 Refactor Handoff During Part 1 Final Remediation
+# V2 Refactor Handoff: Part 1 Remediation and Part 2 Pending
 
 **Recorded:** 2026-08-22 (Asia/Shanghai)
 
@@ -41,6 +41,8 @@ they verify correctness rather than speed.
 ## Current Repository Snapshot
 
 - Branch: main, tracking origin/main.
+- Documentation-audit base before this consistency update:
+  ddad9a8 (docs(v2): record residual Part 1 provenance blocker).
 - Latest Part 1 repair/evidence HEAD before this documentation handoff:
   0538b3a (bench(v2): regenerate portable quality evidence).
 - The first tracked handoff was committed as 24b3ba4.
@@ -61,7 +63,7 @@ they verify correctness rather than speed.
   and the tracked worktree was clean.
 - The subsequent broad Part 1 architecture review over `aa6bb43..79a46d4`
   found 0 Critical, 5 Important, and 1 Minor issue. Part 2 Task 4.1 is paused
-  pending the residual provenance decision below.
+  pending implementation and review of the approved provenance policy below.
 - The consolidated repair was committed at 54f1749 and regenerated evidence
   at 0538b3a. Fresh Ruff passed, 92 files were already formatted, all 1,062
   v2 tests passed, standalone/current-relocated quality validation passed, and
@@ -84,21 +86,32 @@ they verify correctness rather than speed.
   conflicts with the authoritative latest-only design. The integration instead
   FULL-reopens exact latest step 3, proves step 1 is unavailable, and proves
   only the canonical latest checkpoint remains.
+- Quality-provenance ruling (approved 2026-08-23): committed controlled-quality
+  evidence is immutable evidence for its recorded source commit. Validation
+  must reconstruct and verify that recorded source boundary instead of
+  rebuilding an expected workload from unrelated current-worktree bytes.
+  Evidence is rerecorded only after a change to the controlled numerical
+  execution contract, harness/workload, fixtures, telemetry, or decision rule.
+- Documentation consistency audit (2026-08-23): all 25 tracked spec/plan files
+  have explicit current status and appear in this handoff; active relative plan
+  links resolve and Markdown code fences are balanced. Fresh verification on
+  the resulting documentation tree passed Ruff check, Ruff format check (92
+  files already formatted), and all 1,062 v2 tests in 65.04 seconds.
 
 ## Related Specifications and Plans
 
 | File | Role | Done | Remaining under current policy |
 | --- | --- | --- | --- |
-| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Part 1 foundation, model, artifacts, tokenizer, prepared data, pretraining, integration, and controlled quality are functionally implemented | Close the final architecture-review findings, then Phases 4-6; performance section is optional diagnostic guidance |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | All Phase 1-3 task bodies and the functional gate ran successfully | Final remediation, evidence regeneration, re-review, and repeated gate |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning only | All Tasks 4.1-4.4, 5.1-5.5, and 6.1-6.4 |
+| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Part 1 foundation, model, artifacts, tokenizer, prepared data, pretraining, integration, and numerical quality run are functionally implemented | Implement the approved source-bound quality-evidence validator and checkpoint-content immutability fix, then Phases 4-6; performance remains optional |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | All task bodies, the controlled run, and the repeated functional gate ran successfully | Correct quality validation to use the recorded source boundary, pass scoped review, and freeze checkpoint-content mappings |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning is complete; implementation has not started | All Tasks 4.1-4.4, 5.1-5.5, and 6.1-6.4 after Part 1 remediation |
 | docs/superpowers/specs/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge-design.md | Real prepared-data benchmark owner design | Production goal implemented at ffb29f97b7770d06a95df41c2b612c07a9fa6c1b | Nothing required; screen is optional |
 | docs/superpowers/plans/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge.md | Bridge implementation plan | Task 1 complete at ffb29f9 | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-stop-interruptible-pretraining-stream-design.md | Full-queue shutdown correctness design | Implemented and reviewed at 8e2291f1c87244fa8acd33d375c9e49961bb70fa | Nothing required; timing rerun is optional |
 | docs/superpowers/plans/2026-08-16-v2-stop-interruptible-pretraining-stream.md | Shutdown fix plan | Task 1 complete at 8e2291f | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-prepared-data-100-unit-measurement-design.md | Versioned 20/100 benchmark protocol | Harness design implemented | Baseline capture/comparison only if explicitly desired |
-| docs/superpowers/plans/2026-08-16-v2-prepared-data-100-unit-measurement.md | Versioned protocol implementation plan | Task 1 complete and reviewed at 8c3b1be | Tasks 2 and 3 cancelled as required work; Task 4 is functional handoff maintenance |
-| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through the Part 1 final-review findings | Keep current as remediation and later tasks complete |
+| docs/superpowers/plans/2026-08-16-v2-prepared-data-100-unit-measurement.md | Versioned protocol implementation plan | Required Tasks 1 and 4 complete; Task 1 reviewed at 8c3b1be | Tasks 2 and 3 remain optional diagnostic procedures only |
+| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through the approved quality-provenance ruling | Keep current as remediation and later tasks complete |
 
 ## Supporting Benchmark Documents
 
@@ -112,6 +125,17 @@ details remain unchanged:
 | docs/superpowers/specs/2026-08-08-v2-shorter-benchmark-protocol-design.md | docs/superpowers/plans/2026-08-08-v2-shorter-benchmark-protocol.md | Shorter canonical measurement protocol |
 | docs/superpowers/specs/2026-08-08-v2-post-exit-memory-evidence-design.md | docs/superpowers/plans/2026-08-08-v2-post-exit-memory-evidence.md | Child/parent/post-exit evidence |
 | docs/superpowers/specs/2026-08-09-v2-post-exit-memory-recovery-design.md | docs/superpowers/plans/2026-08-09-v2-post-exit-memory-recovery.md | Post-exit recovery and cooldown evidence |
+
+## Historical Precursor Documents
+
+These implemented documents describe v1 work or the legacy flat v2 system.
+They are historical records, not remaining work for the package refactor:
+
+| Spec | Plan(s) | Status |
+| --- | --- | --- |
+| docs/superpowers/specs/2026-07-01-model-training-input-file-shuffle-design.md | docs/superpowers/plans/2026-07-01-model-training-input-file-shuffle.md | Implemented in v1; no remaining refactor task |
+| docs/superpowers/specs/2026-07-05-v2-mlx-native-training-design.md | docs/superpowers/plans/2026-07-05-v2-mlx-model.md; docs/superpowers/plans/2026-07-05-v2-mlx-native-training.md; docs/superpowers/plans/2026-07-11-v2-mlx-only.md | Implemented in the legacy flat v2 tree and superseded by the umbrella package refactor |
+| docs/superpowers/specs/2026-07-15-train-on-pretraining-data-design.md | docs/superpowers/plans/2026-07-15-train-on-pretraining-data.md | Implemented legacy NPZ prepared-data flow; superseded by the strict NPY bundle design |
 
 ## Completed Refactor Tasks
 
@@ -229,12 +253,13 @@ will reject this evidence. The closure also omits executed legacy
 but the artifact is rejected as the promised portable Part 2/final acceptance
 proof.
 
-This residual needs an explicit provenance policy before another fix attempt.
-The recommended policy is to treat quality evidence as immutable historical
-evidence bound to its recorded source commit, and make validation reconstruct
-and verify that recorded source boundary rather than compare with unrelated
-current-worktree bytes. The alternative is to amend Part 2 to regenerate the
-95-minute controlled run at every relevant source boundary.
+The user approved the source-bound provenance policy on 2026-08-23. Treat the
+quality evidence as immutable historical evidence bound to its recorded source
+commit. Validation must reconstruct and verify that recorded source boundary
+rather than compare with unrelated current-worktree bytes. Do not regenerate
+the approximately 95-minute controlled run unless implementing the policy
+changes the recorded evidence identity or a later change alters the controlled
+numerical execution contract.
 
 The scoped re-review's new Minor is that `VerifiedCheckpointContents` is only
 shallowly frozen because it exposes mutable outer/inner dictionaries. Current
@@ -267,9 +292,9 @@ new empty external journal and follow the optional prepared-data-100 protocol.
 | 3.2: compiled pretraining microstep and optimizer step | Complete and reviewed | 37 focused tests and all 984 v2 tests passed on 5eb977a; Ruff clean; unchanged uv.lock |
 | 3.3: pretraining create/checkpoint/exact resume/latest-only retention | Complete and reviewed | 194 focused tests and all 1,022 v2 tests passed on 4a47221; Ruff clean; unchanged uv.lock |
 | 3.4: complete Part 1 integration | Complete and reviewed | 133 focused tests and all 1,024 v2 tests passed on 2b4e9d2; Ruff clean; unchanged uv.lock |
-| 3.5: controlled pretraining-quality gate | Numerically passed; portable acceptance semantics blocked | Regenerated evidence at 0538b3a passes current/relocated validation, but scoped review rejects its guaranteed stability through Tasks 4.1 and 6.4 |
+| 3.5: controlled pretraining-quality gate | Numerically passed; validator remediation remains | Regenerated evidence at 0538b3a passes current/relocated validation; implement the approved recorded-source validation rule so it remains valid through Tasks 4.1 and 6.3 |
 | 3.6: Phase 3 correctness and workflow gate | Repeated after repair | Ruff clean; all 1,062 v2 tests passed; current standalone quality validation passed; unchanged uv.lock |
-| Part 1 completion | Blocked by one residual Important | Decide and implement stable quality provenance, regenerate only if the chosen contract requires it, pass scoped review, and freeze checkpoint-content mappings before Task 4.1 exposes them |
+| Part 1 completion | Blocked by one residual Important | Implement the approved stable quality-provenance contract, regenerate only if that changes evidence identity, pass scoped review, and freeze checkpoint-content mappings before Task 4.1 exposes them |
 
 ## Remaining Part 2 Tasks
 
@@ -303,12 +328,12 @@ The absent files are not blockers and should not be fabricated.
    Task 4.1 consumer contract.
 2. Confirm the latest main commit and inspect git status. Preserve unrelated
    user changes if any exist.
-3. Resolve the residual quality-provenance policy described above. Do not start
-   Task 4.1 until a reviewed contract can survive its required checkpoint-file
-   edit and the Phase 6 bridge deletion.
+3. Implement the approved recorded-source quality-provenance policy described
+   above. Do not start Task 4.1 until the reviewed validator survives its
+   required checkpoint-file edit and the Phase 6 bridge deletion.
 4. Use a strict test-first repair for the selected provenance contract and the
    shallow checkpoint-content mapping Minor. Run MLX pytest outside the
-   sandbox; rerun canonical quality only if the selected policy changes the
+   sandbox; rerun canonical quality only if the approved policy changes the
    recorded evidence identity.
 5. Follow the updated functional gate at the end of each phase. Do not pause
    for baseline capture or performance comparison.
@@ -327,10 +352,17 @@ The absent files are not blockers and should not be fabricated.
 - Work may continue on the user-authorized main checkout.
 - Do not push unless the user explicitly requests it.
 
-## Ignored Historical Records
+## Ignored Review and Historical Records
 
-The ignored workspace
+The active Part 1 final-review evidence is preserved in
+.superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-1/, especially
+`part1-final-review.md`, `part1-final-fix-report.md`,
+`part1-final-re-review.md`, and `progress.md`. Keep that workspace until Part 1
+remediation closes; it is supporting evidence, while this tracked handoff is
+the authoritative status.
+
+The historical benchmark workspace
 .superpowers/sdd/2026-08-16-v2-prepared-data-100-unit-measurement/
 contains Task 1 reports, rejected benchmark diagnostics, review packages, and
 the old execution ledger. Those files are useful history but are not required
-takeover state. This tracked handoff is authoritative.
+takeover state.

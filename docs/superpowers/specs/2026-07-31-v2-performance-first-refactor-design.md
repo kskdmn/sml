@@ -5,6 +5,12 @@
 Approved umbrella design for a clean replacement of the entire `v2` tree.
 This specification supersedes the former checkpoint/SWAG-only design and plan.
 
+**Execution update (2026-08-23):** Phases 1-3 are functionally implemented
+and their current Ruff, full-test, integration, and numerical quality gates
+pass. Part 1 remains open only for the controlled-quality provenance correction
+and the shallow checkpoint-content immutability fix described in the tracked
+handoff. Phases 4-6 have not started.
+
 **Acceptance-policy update (2026-08-22):** Functional correctness is the
 required refactor gate. Ruff, the full v2 test suite, controlled mathematical
 and training-quality checks, and relevant end-to-end/CLI smoke workflows must
@@ -1348,6 +1354,25 @@ master movement, survival of at least one update that was individually below a
 BF16 ULP, and candidate step-1,000 validation NLL no more than 1 percent above
 the FP32-compute oracle. The candidate and oracle reports, exact workload
 identity, and raw checkpoint metrics are committed before Part 1 is accepted.
+
+Committed controlled-quality evidence is immutable evidence for the exact
+source boundary recorded in its manifest; it is not a rolling certificate over
+every later checkout. Validation treats the committed manifest workload and
+source commit as authoritative, reconstructs the recorded harness, production
+dependency, and fixture bytes from that commit, and then recomputes identities,
+record cardinality, telemetry, report values, and the acceptance decision from
+the committed raw evidence. It must not first rebuild an expected workload from
+unrelated current-worktree bytes.
+
+Later changes that do not alter the controlled numerical execution contract do
+not invalidate accepted evidence. In particular, adding inference/evaluation
+consumers, changing checkpoint-reader ownership without changing the training
+calculation, or deleting the temporary flat migration bridge does not require a
+rerun. A new recording is required when a change alters model or optimizer
+mathematics, precision behavior, ordered training/evaluation work, fixtures,
+quality telemetry or decision semantics, or another source component that
+actually changes the controlled execution result. The same source-boundary and
+rerun rules apply to the later SWAG quality evidence.
 
 The SWAG quality workload fine-tunes the same frozen BF16 base and FP32 adapters
 for 256 optimizer steps on fixed source-train rows, then evaluates a disjoint

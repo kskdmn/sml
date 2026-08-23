@@ -1,5 +1,8 @@
 # V2 Post-Exit Memory Evidence Implementation Plan
 
+**Execution status (2026-08-23):** Implemented and reviewed. The unchecked
+boxes below are the historical TDD procedure; no required refactor task remains.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make immediate parent post-exit memory pressure the authoritative v2 trial gate while retaining identity-bound child-start and child-end diagnostics, strict fail-closed validation, and crash-resumable baseline evidence.

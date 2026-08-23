@@ -1,5 +1,9 @@
 # V2 Shorter Benchmark Protocol Implementation Plan
 
+**Execution status (2026-08-23):** Implemented. The unchecked boxes below are
+the historical TDD procedure; running a new baseline is optional and requires a
+separate explicit request.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Shorten the immutable v2 benchmark protocol to five warmups and 20 default measured units, with one measured peak-memory optimizer step, while preserving the full 1,024-token workload and every existing acceptance gate.
