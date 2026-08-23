@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import os
 import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,7 +29,6 @@ import v2.benchmarks.quality as quality_module
 from v2.benchmarks.quality import (
     CANONICAL_STEPS,
     CHECKPOINT_STEPS,
-    PRODUCTION_DEPENDENCY_COMPONENTS,
     ParameterLeafSpec,
     ParameterUpdateStatistics,
     PretrainingQualityCheckpoint,
@@ -37,6 +37,7 @@ from v2.benchmarks.quality import (
     build_pretraining_quality_workload,
     decide_pretraining_quality,
     harness_content_identity,
+    production_dependency_components,
     production_dependency_content_identity,
     real_work_identity,
     validate_pretraining_quality_records,
@@ -154,45 +155,138 @@ def test_harness_identity_hashes_only_the_two_reviewed_files_in_order():
     assert harness_content_identity(ROOT) == f"sha256:{expected.hexdigest()}"
 
 
-def test_workload_separately_binds_the_bounded_production_dependency_closure(
+def test_workload_separately_binds_the_complete_sml_production_source_tree(
     canonical_workload,
     tmp_path,
 ):
-    expected_components = (
-        "v2/src/sml/errors.py",
-        "v2/src/sml/model/config.py",
-        "v2/src/sml/model/cache.py",
-        "v2/src/sml/model/rope.py",
-        "v2/src/sml/model/layers.py",
-        "v2/src/sml/model/language_model.py",
-        "v2/src/sml/training/common.py",
-        "v2/src/sml/training/pretrain.py",
-        "v2/benchmarks/schema.py",
-        "v2/benchmarks/workload.py",
-    )
-    assert tuple(path.as_posix() for path in PRODUCTION_DEPENDENCY_COMPONENTS) == (
-        expected_components
+    expected_components = tuple(
+        path.as_posix()
+        for path in sorted(
+            {
+                Path("v2/src/sml.py"),
+                Path("v2/benchmarks/schema.py"),
+                Path("v2/benchmarks/workload.py"),
+                *(
+                    path.relative_to(ROOT)
+                    for path in (ROOT / "v2/src/sml").rglob("*.py")
+                ),
+            },
+            key=lambda path: path.as_posix(),
+        )
     )
     assert canonical_workload.production_dependency_components == expected_components
+    assert (
+        tuple(path.as_posix() for path in production_dependency_components(ROOT))
+        == expected_components
+    )
     assert canonical_workload.production_dependency_identity == (
         production_dependency_content_identity(ROOT)
     )
 
     for relative in (
         *quality_module.HARNESS_COMPONENTS,
-        *PRODUCTION_DEPENDENCY_COMPONENTS,
+        *(Path(path) for path in expected_components),
     ):
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / relative, destination)
     original_harness = harness_content_identity(tmp_path)
-    dependency = tmp_path / PRODUCTION_DEPENDENCY_COMPONENTS[4]
+    dependency = tmp_path / "v2/src/sml/artifacts/manifest.py"
     dependency.write_bytes(dependency.read_bytes() + b"\n# provenance mutation\n")
 
     assert harness_content_identity(tmp_path) == original_harness
     assert production_dependency_content_identity(tmp_path) != (
         canonical_workload.production_dependency_identity
     )
+
+
+@pytest.mark.parametrize(
+    "source_mutation",
+    ["content", "executable_mode"],
+)
+def test_re_signed_descendant_cannot_reuse_evidence_after_artifact_source_change(
+    canonical_workload,
+    tmp_path,
+    source_mutation,
+):
+    changed_source = Path("v2/src/sml/artifacts/manifest.py")
+    fixtures = (
+        Path(canonical_workload.training_fixture.logical_path),
+        Path(canonical_workload.validation_fixture.logical_path),
+    )
+    copied = {
+        *quality_module.HARNESS_COMPONENTS,
+        *(Path(path) for path in canonical_workload.production_dependency_components),
+        *fixtures,
+        changed_source,
+    }
+    for relative in copied:
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, destination)
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "--quiet")
+    git("config", "user.name", "Quality Provenance Test")
+    git("config", "user.email", "quality-provenance@example.invalid")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "quality source")
+    changed_path = tmp_path / changed_source
+    if source_mutation == "content":
+        changed_path.write_bytes(
+            changed_path.read_bytes() + b"\n# descendant mutation\n"
+        )
+    else:
+        changed_path.chmod(changed_path.stat().st_mode | 0o111)
+    git("add", changed_source.as_posix())
+    git("commit", "--quiet", "-m", "change executed artifact source")
+    descendant = git("rev-parse", "HEAD")
+
+    destinations = quality_module._canonical_evidence_destinations(
+        tmp_path,
+        tmp_path / quality_module.CANONICAL_MANIFEST_PATH,
+        tmp_path / quality_module.CANONICAL_RAW_PATH,
+        tmp_path / quality_module.CANONICAL_REPORT_PATH,
+    )
+    command = quality_module._recording_command_document(tmp_path, destinations)
+    session_identity = quality_module._recording_session_identity(
+        descendant, canonical_workload.identity, command
+    )
+    re_signed = quality_module._manifest_document(
+        workload=canonical_workload,
+        source_commit=descendant,
+        recording_command=command,
+        phase_times={
+            "setup": 1.0,
+            "candidate": 2.0,
+            "oracle": 3.0,
+            "validation_serialization": 1.0,
+        },
+        peak_memory=1,
+        raw_identity="sha256:" + "1" * 64,
+        raw_file_identity="sha256:" + "2" * 64,
+        raw_bytes=100,
+        report_identity="sha256:" + "3" * 64,
+        report_file_identity="sha256:" + "4" * 64,
+        report_bytes=100,
+        recording_session_identity=session_identity,
+    )
+
+    with pytest.raises(ValueError, match="production source tree"):
+        quality_module._validate_manifest(
+            re_signed,
+            canonical_workload,
+            tmp_path,
+            command,
+        )
 
 
 def test_workload_rejects_a_validation_row_copied_from_training(tmp_path):

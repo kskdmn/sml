@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -56,15 +56,9 @@ HARNESS_COMPONENTS = (
     Path("v2/benchmarks/quality.py"),
     Path("v2/tests/unit/test_pretraining_quality.py"),
 )
-PRODUCTION_DEPENDENCY_COMPONENTS = (
-    Path("v2/src/sml/errors.py"),
-    Path("v2/src/sml/model/config.py"),
-    Path("v2/src/sml/model/cache.py"),
-    Path("v2/src/sml/model/rope.py"),
-    Path("v2/src/sml/model/layers.py"),
-    Path("v2/src/sml/model/language_model.py"),
-    Path("v2/src/sml/training/common.py"),
-    Path("v2/src/sml/training/pretrain.py"),
+PRODUCTION_SOURCE_TREE = Path("v2/src/sml")
+PRODUCTION_DEPENDENCY_FIXED_COMPONENTS = (
+    Path("v2/src/sml.py"),
     Path("v2/benchmarks/schema.py"),
     Path("v2/benchmarks/workload.py"),
 )
@@ -172,16 +166,59 @@ def harness_content_identity(root: Path) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
+def production_dependency_components(root: Path) -> tuple[Path, ...]:
+    if not isinstance(root, Path):
+        raise TypeError("root must be a Path")
+    source_tree = root / PRODUCTION_SOURCE_TREE
+    if source_tree.is_symlink() or not source_tree.is_dir():
+        raise FileNotFoundError(
+            f"missing quality production source tree: {source_tree}"
+        )
+    components = set(PRODUCTION_DEPENDENCY_FIXED_COMPONENTS)
+    for path in source_tree.rglob("*.py"):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(
+                f"quality production source must be a regular file: {path}"
+            )
+        components.add(path.relative_to(root))
+    return tuple(sorted(components, key=lambda path: path.as_posix()))
+
+
+def _production_dependency_identity(
+    components: Sequence[Path],
+    read_component: Callable[[Path], bytes],
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"sml-pretraining-quality-production-source-tree-v1\0")
+    for relative_path in components:
+        encoded_path = relative_path.as_posix().encode("utf-8")
+        payload = read_component(relative_path)
+        if not isinstance(payload, bytes):
+            raise TypeError("production dependency reader must return bytes")
+        digest.update(len(encoded_path).to_bytes(8, "little"))
+        digest.update(encoded_path)
+        digest.update(len(payload).to_bytes(8, "little"))
+        digest.update(payload)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _current_production_dependency_identity(
+    root: Path, components: Sequence[Path]
+) -> str:
+    def read_component(relative_path: Path) -> bytes:
+        path = root / relative_path
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(f"missing quality production dependency: {path}")
+        return path.read_bytes()
+
+    return _production_dependency_identity(components, read_component)
+
+
 def production_dependency_content_identity(root: Path) -> str:
     if not isinstance(root, Path):
         raise TypeError("root must be a Path")
-    digest = hashlib.sha256()
-    for relative_path in PRODUCTION_DEPENDENCY_COMPONENTS:
-        path = root / relative_path
-        if not path.is_file():
-            raise FileNotFoundError(f"missing quality production dependency: {path}")
-        digest.update(path.read_bytes())
-    return f"sha256:{digest.hexdigest()}"
+    components = production_dependency_components(root)
+    return _current_production_dependency_identity(root, components)
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,10 +511,25 @@ class PretrainingQualityWorkload:
             )
         if components != tuple(path.as_posix() for path in HARNESS_COMPONENTS):
             raise ValueError("quality harness component order changed")
-        if production_components != tuple(
-            path.as_posix() for path in PRODUCTION_DEPENDENCY_COMPONENTS
+        production_paths = tuple(Path(value) for value in production_components)
+        if (
+            production_components != tuple(sorted(set(production_components)))
+            or any(
+                path.is_absolute() or path.as_posix() != value or ".." in path.parts
+                for path, value in zip(
+                    production_paths, production_components, strict=True
+                )
+            )
+            or not set(PRODUCTION_DEPENDENCY_FIXED_COMPONENTS).issubset(
+                production_paths
+            )
         ):
             raise ValueError("quality production dependency order changed")
+        for path in production_paths:
+            if path in PRODUCTION_DEPENDENCY_FIXED_COMPONENTS:
+                continue
+            if path.suffix != ".py" or not path.is_relative_to(PRODUCTION_SOURCE_TREE):
+                raise ValueError("quality production source tree is incomplete")
         workload = cls(
             kind="pretraining-quality-workload",
             version=1,
@@ -1044,6 +1096,7 @@ def build_pretraining_quality_workload(root: Path) -> PretrainingQualityWorkload
             "pad_token_id": model_config.pad_token_id,
         },
     )
+    production_components = production_dependency_components(root)
     workload = PretrainingQualityWorkload(
         kind="pretraining-quality-workload",
         version=1,
@@ -1083,9 +1136,11 @@ def build_pretraining_quality_workload(root: Path) -> PretrainingQualityWorkload
         harness_components=tuple(path.as_posix() for path in HARNESS_COMPONENTS),
         harness_identity=harness_content_identity(root),
         production_dependency_components=tuple(
-            path.as_posix() for path in PRODUCTION_DEPENDENCY_COMPONENTS
+            path.as_posix() for path in production_components
         ),
-        production_dependency_identity=production_dependency_content_identity(root),
+        production_dependency_identity=_current_production_dependency_identity(
+            root, production_components
+        ),
     )
     return replace(workload, identity=workload.recompute_identity())
 
@@ -3276,6 +3331,38 @@ def _git_bytes(root: Path, *arguments: str) -> bytes:
     ).stdout
 
 
+def _git_production_dependency_components(root: Path, commit: str) -> tuple[Path, ...]:
+    scopes = (
+        PRODUCTION_SOURCE_TREE,
+        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
+    )
+    entries = _git_bytes(
+        root,
+        "ls-tree",
+        "-r",
+        "-z",
+        commit,
+        "--",
+        *(path.as_posix() for path in scopes),
+    ).split(b"\0")
+    components: set[Path] = set()
+    for entry in entries:
+        if not entry:
+            continue
+        metadata, encoded_path = entry.split(b"\t", 1)
+        mode, object_type, _object_identity = metadata.split(b" ", 2)
+        path = Path(encoded_path.decode("utf-8"))
+        is_source = path.suffix == ".py" and path.is_relative_to(PRODUCTION_SOURCE_TREE)
+        if not is_source and path not in PRODUCTION_DEPENDENCY_FIXED_COMPONENTS:
+            continue
+        if object_type != b"blob" or mode != b"100644":
+            raise ValueError("recorded production source tree contains a non-file")
+        components.add(path)
+    if not set(PRODUCTION_DEPENDENCY_FIXED_COMPONENTS).issubset(components):
+        raise ValueError("recorded production source tree is incomplete")
+    return tuple(sorted(components, key=lambda path: path.as_posix()))
+
+
 def _validate_harness_commit(
     root: Path,
     commit: str,
@@ -3299,17 +3386,20 @@ def _validate_harness_commit(
             digest.update(_git_bytes(root, "show", f"{commit}:{component.as_posix()}"))
         if f"sha256:{digest.hexdigest()}" != workload.harness_identity:
             raise ValueError("recorded harness commit does not contain harness bytes")
-        production_digest = hashlib.sha256()
-        for component in PRODUCTION_DEPENDENCY_COMPONENTS:
-            production_digest.update(
-                _git_bytes(root, "show", f"{commit}:{component.as_posix()}")
-            )
-        if (
-            f"sha256:{production_digest.hexdigest()}"
-            != workload.production_dependency_identity
+        production_components = _git_production_dependency_components(root, commit)
+        if tuple(path.as_posix() for path in production_components) != (
+            workload.production_dependency_components
         ):
+            raise ValueError("recorded production source tree component set changed")
+        production_identity = _production_dependency_identity(
+            production_components,
+            lambda component: _git_bytes(
+                root, "show", f"{commit}:{component.as_posix()}"
+            ),
+        )
+        if production_identity != workload.production_dependency_identity:
             raise ValueError(
-                "recorded harness commit does not contain production dependency bytes"
+                "recorded harness commit does not contain production source tree bytes"
             )
         for fixture in (workload.training_fixture, workload.validation_fixture):
             payload = _git_bytes(root, "show", f"{commit}:{fixture.logical_path}")
@@ -3435,7 +3525,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = (
     "CANONICAL_STEPS",
     "CHECKPOINT_STEPS",
-    "PRODUCTION_DEPENDENCY_COMPONENTS",
     "ParameterLeafSpec",
     "ParameterUpdateStatistics",
     "PretrainingQualityCheckpoint",
@@ -3444,6 +3533,7 @@ __all__ = (
     "build_pretraining_quality_workload",
     "decide_pretraining_quality",
     "harness_content_identity",
+    "production_dependency_components",
     "production_dependency_content_identity",
     "real_work_identity",
     "validate_pretraining_quality_records",
