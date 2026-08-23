@@ -43,6 +43,7 @@ from sml.artifacts.manifest import (
     TokenizerManifest,
     VerificationLevel,
     _descriptor_is_local_apfs,
+    _freeze_normalized,
     _json_object_no_duplicates,
     _manifest_type_for_raw,
     _parse_manifest,
@@ -1668,6 +1669,23 @@ def _read_manifest_from_descriptor[M](
 class VerifiedCheckpointContents:
     scalar_state: Mapping[str, object]
     array_groups: Mapping[str, Mapping[str, mx.array]]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scalar_state, Mapping):
+            raise TypeError("scalar_state must be a mapping")
+        if not isinstance(self.array_groups, Mapping):
+            raise TypeError("array_groups must be a mapping")
+        frozen_groups: dict[str, object] = {}
+        for path, group in self.array_groups.items():
+            if not isinstance(path, str) or not isinstance(group, Mapping):
+                raise TypeError("array_groups must map payload paths to array mappings")
+            frozen_groups[path] = dict(group)
+        object.__setattr__(
+            self,
+            "scalar_state",
+            _freeze_normalized(dict(self.scalar_state)),
+        )
+        object.__setattr__(self, "array_groups", _freeze_normalized(frozen_groups))
 
 
 def _mlx_core() -> ModuleType:

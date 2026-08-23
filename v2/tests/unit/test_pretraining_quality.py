@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
 import shutil
 import subprocess
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,6 +46,27 @@ from v2.benchmarks.quality import (
 )
 
 ROOT = Path(__file__).parents[3]
+
+
+def _canonical_validate_args() -> SimpleNamespace:
+    return SimpleNamespace(
+        manifest=ROOT / quality_module.CANONICAL_MANIFEST_PATH,
+        raw_input=ROOT / quality_module.CANONICAL_RAW_PATH,
+        report=ROOT / quality_module.CANONICAL_REPORT_PATH,
+    )
+
+
+@contextmanager
+def _temporary_current_tree_bytes(path: Path, payload: bytes | None):
+    original = path.read_bytes()
+    try:
+        if payload is None:
+            path.unlink()
+        else:
+            path.write_bytes(payload)
+        yield
+    finally:
+        path.write_bytes(original)
 
 
 def test_quality_gate_requires_fp32_master_evidence_and_oracle_bound():
@@ -343,6 +366,148 @@ def test_re_signed_descendant_cannot_reuse_evidence_after_artifact_source_change
             tmp_path,
             command,
         )
+
+
+def _signed_quality_manifest(tmp_path, canonical_workload, source_commit):
+    destinations = quality_module._canonical_evidence_destinations(
+        tmp_path,
+        tmp_path / quality_module.CANONICAL_MANIFEST_PATH,
+        tmp_path / quality_module.CANONICAL_RAW_PATH,
+        tmp_path / quality_module.CANONICAL_REPORT_PATH,
+    )
+    command = quality_module._recording_command_document(tmp_path, destinations)
+    session_identity = quality_module._recording_session_identity(
+        source_commit, canonical_workload.identity, command
+    )
+    return (
+        quality_module._manifest_document(
+            workload=canonical_workload,
+            source_commit=source_commit,
+            recording_command=command,
+            phase_times={
+                "setup": 1.0,
+                "candidate": 2.0,
+                "oracle": 3.0,
+                "validation_serialization": 1.0,
+            },
+            peak_memory=1,
+            raw_identity="sha256:" + "1" * 64,
+            raw_file_identity="sha256:" + "2" * 64,
+            raw_bytes=100,
+            report_identity="sha256:" + "3" * 64,
+            report_file_identity="sha256:" + "4" * 64,
+            report_bytes=100,
+            recording_session_identity=session_identity,
+        ),
+        command,
+    )
+
+
+@pytest.mark.parametrize(
+    ("mismatch", "match"),
+    [
+        ("harness", "harness"),
+        ("fixture", "fixture"),
+        ("embedded_identity", "identity"),
+    ],
+)
+def test_validate_rejects_recorded_source_bytes_that_do_not_match_the_manifest(
+    canonical_workload,
+    tmp_path,
+    mismatch,
+    match,
+):
+    fixtures = (
+        Path(canonical_workload.training_fixture.logical_path),
+        Path(canonical_workload.validation_fixture.logical_path),
+    )
+    copied = {
+        *quality_module.HARNESS_COMPONENTS,
+        *(Path(path) for path in canonical_workload.production_dependency_components),
+        *fixtures,
+    }
+    for relative in copied:
+        destination = tmp_path / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, destination)
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "--quiet")
+    git("config", "user.name", "Quality Provenance Test")
+    git("config", "user.email", "quality-provenance@example.invalid")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "quality source")
+    recorded = git("rev-parse", "HEAD")
+    workload = canonical_workload
+    if mismatch == "harness":
+        harness = tmp_path / quality_module.HARNESS_COMPONENTS[0]
+        harness.write_bytes(harness.read_bytes() + b"\n# harness mutation\n")
+        git("add", quality_module.HARNESS_COMPONENTS[0].as_posix())
+        git("commit", "--quiet", "-m", "change recorded harness bytes")
+        recorded = git("rev-parse", "HEAD")
+    elif mismatch == "fixture":
+        fixture = tmp_path / fixtures[0]
+        fixture.write_bytes(fixture.read_bytes() + b"\x00")
+        git("add", fixtures[0].as_posix())
+        git("commit", "--quiet", "-m", "change recorded fixture bytes")
+        recorded = git("rev-parse", "HEAD")
+    else:
+        workload = replace(canonical_workload, identity="sha256:" + "f" * 64)
+
+    re_signed, command = _signed_quality_manifest(tmp_path, workload, recorded)
+
+    with pytest.raises(ValueError, match=match):
+        quality_module._validate_manifest(
+            re_signed,
+            workload,
+            tmp_path,
+            command,
+        )
+
+
+def test_canonical_evidence_validates_after_unrelated_checkpoint_source_edit():
+    path = ROOT / "v2/src/sml/artifacts/checkpoint.py"
+    recorded = json.loads((ROOT / quality_module.CANONICAL_MANIFEST_PATH).read_bytes())[
+        "production_dependency_identity"
+    ]
+    with _temporary_current_tree_bytes(
+        path,
+        path.read_bytes() + b"\n# unrelated current-tree checkpoint edit\n",
+    ):
+        assert production_dependency_content_identity(ROOT) != recorded
+        captured = []
+
+        def forbid(_root):
+            captured.append(True)
+            raise AssertionError("validate must not rebuild the current-tree workload")
+
+        original = quality_module.build_pretraining_quality_workload
+        quality_module.build_pretraining_quality_workload = forbid
+        try:
+            assert quality_module._validate(_canonical_validate_args()) == 0
+        finally:
+            quality_module.build_pretraining_quality_workload = original
+        assert captured == []
+
+
+def test_canonical_evidence_validates_without_the_temporary_flat_bridge():
+    path = ROOT / "v2/src/sml.py"
+    with _temporary_current_tree_bytes(path, None):
+        with pytest.raises(FileNotFoundError, match="sml.py"):
+            production_dependency_components(ROOT)
+        assert quality_module._validate(_canonical_validate_args()) == 0
+
+
+def test_canonical_standalone_validator_accepts_the_unchanged_evidence_set():
+    assert quality_module._validate(_canonical_validate_args()) == 0
 
 
 def test_workload_rejects_a_validation_row_copied_from_training(tmp_path):
@@ -1179,7 +1344,7 @@ def test_record_resumes_after_all_artifact_links_before_completed_fast_path(
     )
     validated_after_cleanup = []
 
-    def validate_after_cleanup(_root, _workload, _destinations):
+    def validate_after_cleanup(_root, _destinations, **_kwargs):
         validated_after_cleanup.append(not recovery.exists())
         return "pass"
 

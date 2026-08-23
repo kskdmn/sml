@@ -5,7 +5,10 @@ from pathlib import Path
 
 import mlx.core as mx
 import pytest
-from sml.artifacts.checkpoint import resolve_exact_step
+from sml.artifacts.checkpoint import (
+    VerifiedCheckpointContents,
+    resolve_exact_step,
+)
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
@@ -154,3 +157,38 @@ def test_full_resolution_rejects_false_safetensors_metadata(tmp_path: Path) -> N
 
     with pytest.raises(SMLArtifactError, match="exact BF16 cast"):
         verify_artifact(run, full=True)
+
+
+def test_verified_checkpoint_contents_mappings_are_deeply_immutable() -> None:
+    scalar = {
+        "kind": "pretraining-state",
+        "cursor": {"epoch": 0, "shard_order_position": 0, "row_offset": 0},
+    }
+    inner = {"weight": mx.array([1.0], dtype=mx.float32)}
+    groups = {"model.safetensors": inner}
+    contents = VerifiedCheckpointContents(scalar, groups)
+
+    with pytest.raises(TypeError):
+        contents.scalar_state["kind"] = "mutated"
+    with pytest.raises(TypeError):
+        contents.scalar_state["cursor"]["epoch"] = 1
+    with pytest.raises(TypeError):
+        contents.array_groups["trainer.safetensors"] = {}
+    with pytest.raises(TypeError):
+        contents.array_groups["model.safetensors"]["weight"] = mx.array(
+            [2.0], dtype=mx.float32
+        )
+
+    scalar["injected"] = True
+    scalar["cursor"]["epoch"] = 9
+    inner["other"] = mx.array([0.0], dtype=mx.float32)
+    groups["injected"] = {}
+
+    assert "injected" not in contents.scalar_state
+    assert contents.scalar_state["cursor"]["epoch"] == 0
+    assert "other" not in contents.array_groups["model.safetensors"]
+    assert "injected" not in contents.array_groups
+    copied_scalar = dict(contents.scalar_state)
+    copied_groups = {path: dict(group) for path, group in contents.array_groups.items()}
+    assert copied_scalar["kind"] == "pretraining-state"
+    assert copied_groups["model.safetensors"]["weight"].shape == (1,)

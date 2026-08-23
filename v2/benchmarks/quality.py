@@ -3179,11 +3179,15 @@ def _record(args: argparse.Namespace) -> int:
         )
         if publication.staged:
             _publish_staged_evidence(publication)
-            decision = _validate_evidence_files(root, workload, destinations)
+            decision = _validate_evidence_files(
+                root, destinations, recorded_workload=workload
+            )
             print(decision)
             return 0 if decision == "pass" else 1
     elif all_destinations:
-        decision = _validate_evidence_files(root, workload, destinations)
+        decision = _validate_evidence_files(
+            root, destinations, recorded_workload=workload
+        )
         print(decision)
         return 0 if decision == "pass" else 1
     elif any_destination:
@@ -3263,7 +3267,9 @@ def _record(args: argparse.Namespace) -> int:
     if measured_temporary_bytes != manifest["temporary_disk_high_water_bytes"]:
         raise RuntimeError("quality temporary-disk high-water measurement changed")
     _publish_staged_evidence(publication)
-    validated_decision = _validate_evidence_files(root, workload, destinations)
+    validated_decision = _validate_evidence_files(
+        root, destinations, recorded_workload=workload
+    )
     decision = decide_pretraining_quality(report)
     if decision != validated_decision:
         raise RuntimeError("published quality decision changed during validation")
@@ -3608,16 +3614,26 @@ def _read_raw(path: Path) -> tuple[PretrainingQualityCheckpoint, ...]:
 
 def _validate_evidence_files(
     root: Path,
-    workload: PretrainingQualityWorkload,
     destinations: _EvidenceDestinations,
+    *,
+    recorded_workload: PretrainingQualityWorkload | None = None,
 ) -> Literal["pass", "fail"]:
     for _name, path in destinations.ordered():
         if path.is_symlink() or not path.is_file():
             raise ValueError("quality evidence paths must be regular files")
     expected_command = _recording_command_document(root, destinations)
     manifest_payload = destinations.manifest.read_bytes()
+    raw_manifest = _decode_json_object(
+        manifest_payload, label=str(destinations.manifest)
+    )
+    workload_raw = raw_manifest.get("workload")
+    if not isinstance(workload_raw, dict):
+        raise ValueError("pretraining quality manifest workload must be an object")
+    workload = PretrainingQualityWorkload.from_dict(workload_raw)
+    if recorded_workload is not None and recorded_workload != workload:
+        raise ValueError("pretraining quality manifest workload changed")
     manifest = _validate_manifest(
-        _decode_json_object(manifest_payload, label=str(destinations.manifest)),
+        raw_manifest,
         workload,
         root,
         expected_command,
@@ -3669,8 +3685,7 @@ def _validate(args: argparse.Namespace) -> int:
         Path(args.raw_input),
         Path(args.report),
     )
-    workload = build_pretraining_quality_workload(root)
-    decision = _validate_evidence_files(root, workload, destinations)
+    decision = _validate_evidence_files(root, destinations)
     print(decision)
     return 0 if decision == "pass" else 1
 
