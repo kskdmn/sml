@@ -3,12 +3,14 @@ from __future__ import annotations
 import inspect
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
 import pytest
 import sml.training.pretrain as pretrain_module
 from mlx.utils import tree_flatten, tree_map
+from sml.errors import SMLArtifactError
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel, causal_lm_loss
 from sml.training.common import (
@@ -119,6 +121,22 @@ def build_tiny_runtime(tmp_path: Path, *, dropout: float = 0.0) -> TinyRuntime:
         weight_decay_tree=weight_decay_tree,
         rows=np.arange(10, dtype=np.int32).reshape(2, 5) % model_config.vocab_size,
     )
+
+
+def test_retention_handoff_requires_run_and_checkpoint_identity():
+    published = SimpleNamespace(
+        step=7,
+        run=SimpleNamespace(identity="run-a"),
+        checkpoint=SimpleNamespace(identity="checkpoint-a"),
+    )
+    substituted = SimpleNamespace(
+        step=7,
+        run=SimpleNamespace(identity="run-b"),
+        checkpoint=SimpleNamespace(identity="checkpoint-b"),
+    )
+
+    with pytest.raises(SMLArtifactError, match="identity"):
+        pretrain_module._require_retained_publication(published, substituted)
 
 
 @pytest.fixture

@@ -170,6 +170,33 @@ def test_pretraining_cursor_is_canonical_and_rejects_non_plain_integers():
         PretrainingCursor(0, 0, -1)
 
 
+def test_cursor_canonicalization_uses_seeded_shard_geometry():
+    canonicalize = pretraining_module.canonicalize_pretraining_cursor
+
+    assert canonicalize(
+        PretrainingCursor(0, 0, 3),
+        shard_row_counts=(2, 3),
+        seed=13,
+    ) == PretrainingCursor(0, 1, 0)
+    assert canonicalize(
+        PretrainingCursor(0, 1, 2),
+        shard_row_counts=(2, 3),
+        seed=13,
+    ) == PretrainingCursor(1, 0, 0)
+    with pytest.raises(pretraining_module.SMLDataError, match="shard order"):
+        canonicalize(
+            PretrainingCursor(0, 3, 0),
+            shard_row_counts=(2, 3),
+            seed=13,
+        )
+    with pytest.raises(pretraining_module.SMLDataError, match="beyond its shard"):
+        canonicalize(
+            PretrainingCursor(0, 0, 4),
+            shard_row_counts=(2, 3),
+            seed=13,
+        )
+
+
 def test_batch_envelope_exposes_read_only_rows_and_releases_idempotently():
     rows = np.arange(12, dtype="<i4").reshape(3, 4)
     cursor = PretrainingCursor(0, 1, 1)

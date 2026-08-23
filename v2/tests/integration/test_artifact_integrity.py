@@ -13,7 +13,9 @@ from sml.artifacts.checkpoint import (
     FilesystemOps,
     publish_checkpoint,
     publish_immutable_bundle,
+    publish_run,
     resolve_exact_step,
+    resolve_latest_step,
     run_writer_lock,
 )
 from sml.artifacts.manifest import (
@@ -193,6 +195,12 @@ class RecordingFilesystemOps:
         self._inner.flock(descriptor, operation)
 
 
+def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
+    with path.open("rb") as payload:
+        identity = file_identity(payload)
+    return PayloadRef(logical_path, identity, path.stat().st_size)
+
+
 def _tokenizer_manifest_with_payloads(root, *, payload_directory: str | None = None):
     payload_root = root
     logical_prefix = ""
@@ -247,6 +255,56 @@ def _immutable_bundle_builder(private_path: Path) -> TokenizerManifest:
     )
 
 
+def _complete_run_builder(private_path: Path) -> RunManifest:
+    tokenizer_path = private_path / "tokenizer"
+    tokenizer_path.mkdir()
+    tokenizer = _published_tokenizer_manifest(tokenizer_path)
+    run = RunManifest(
+        kind="run",
+        version=1,
+        identity="sha256:" + "0" * 64,
+        run_kind="pretraining",
+        model={"rope_scaling_factor": 1.0},
+        precision={"working": "bfloat16"},
+        optimizer={"name": "adamw"},
+        loader={"batch_size": 1},
+        checkpoint={"interval": 1},
+        tokenizer_identity=tokenizer.identity,
+        base_identity=None,
+        data_identity="sha256:" + "2" * 64,
+        diagnostic_data_locator="/portable/data",
+        diagnostic_source_locator=None,
+    )
+    run = replace(run, identity=run.recompute_identity())
+    (private_path / "run.json").write_bytes(canonical_json_bytes(run))
+    (private_path / "checkpoints").mkdir()
+
+    def build_step(private_step: Path) -> CheckpointManifest:
+        arrays_path = private_step / "arrays.safetensors"
+        state_path = private_step / "state.json"
+        arrays_path.write_bytes(b"step-zero-arrays")
+        state_path.write_bytes(b'{"step":0}')
+        checkpoint = CheckpointManifest(
+            kind="checkpoint",
+            version=1,
+            identity="sha256:" + "0" * 64,
+            owning_run_identity=run.identity,
+            checkpoint_kind="pretraining",
+            step=0,
+            scalar_state=_payload_ref(state_path, "state.json"),
+            arrays=(
+                ArrayPayloadRef(
+                    _payload_ref(arrays_path, "arrays.safetensors"),
+                    (ArraySpec("model.weight", (1,), "float32"),),
+                ),
+            ),
+        )
+        return replace(checkpoint, identity=checkpoint.recompute_identity())
+
+    publish_checkpoint(private_path, build_step)
+    return run
+
+
 @pytest.mark.parametrize("stage", IMMUTABLE_PUBLICATION_STAGES)
 def test_interrupted_bundle_never_exposes_partial_target(stage, tmp_path):
     """Every completed durability boundary must leave absence or a full bundle."""
@@ -268,6 +326,51 @@ def test_interrupted_bundle_never_exposes_partial_target(stage, tmp_path):
         child.name.startswith(".sml-tmp-") and child.is_dir()
         for child in tmp_path.iterdir()
     )
+
+
+@pytest.mark.parametrize(
+    "stage",
+    (
+        "manifest-written",
+        "payloads-written",
+        "directory-renamed",
+        "parent-directory-fsynced",
+    ),
+)
+def test_interrupted_run_publication_is_absent_or_full_step_zero(stage, tmp_path):
+    target = tmp_path / "run"
+    fs = RecordingFilesystemOps.raise_after(stage, target=target)
+
+    with run_writer_lock(target), pytest.raises(InjectedFailure, match=stage):
+        publish_run(target, _complete_run_builder, fs=fs)
+
+    if target.exists():
+        resolved = resolve_latest_step(
+            target,
+            writable=False,
+            verification=VerificationLevel.FULL,
+        )
+        assert resolved.step == 0
+        assert resolved.verification is VerificationLevel.FULL
+    assert not any(
+        child.name.startswith(".sml-tmp-") and child.is_dir()
+        for child in tmp_path.iterdir()
+    )
+
+
+def test_existing_run_target_is_rejected_before_owned_stale_cleanup(tmp_path):
+    target = tmp_path / "run"
+    target.mkdir()
+    digest = hashlib.sha256(target.name.encode("utf-8")).hexdigest()
+    stale = tmp_path / f".sml-tmp-{digest}-{'d' * 32}"
+    stale.mkdir()
+    sentinel = stale / "must-survive.bin"
+    sentinel.write_bytes(b"owned but not yet authorized for deletion")
+
+    with run_writer_lock(target), pytest.raises(SMLArtifactError, match="exists"):
+        publish_run(target, _complete_run_builder)
+
+    assert sentinel.read_bytes() == b"owned but not yet authorized for deletion"
 
 
 def test_cleanup_accepts_only_exact_target_digest_marker(tmp_path):

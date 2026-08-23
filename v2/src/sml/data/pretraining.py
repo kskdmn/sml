@@ -102,6 +102,61 @@ class PretrainingCursor:
         return cls(epoch=0, shard_order_position=0, row_offset=0)
 
 
+def _epoch_shard_order(shard_count: int, *, seed: int, epoch: int) -> tuple[int, ...]:
+    generator = np.random.Generator(
+        np.random.PCG64(np.random.SeedSequence([seed, epoch]))
+    )
+    return tuple(int(index) for index in generator.permutation(shard_count))
+
+
+def canonicalize_pretraining_cursor(
+    cursor: PretrainingCursor,
+    *,
+    shard_row_counts: tuple[int, ...],
+    seed: int,
+    shard_order: tuple[int, ...] | None = None,
+) -> PretrainingCursor:
+    """Return the unique cursor representation for deterministic shard geometry."""
+    if not isinstance(cursor, PretrainingCursor):
+        raise TypeError("cursor must be a PretrainingCursor")
+    if not isinstance(shard_row_counts, tuple) or not shard_row_counts:
+        raise TypeError("shard_row_counts must be a nonempty tuple")
+    for row_count in shard_row_counts:
+        _require_plain_int(row_count, "shard row count", minimum=1)
+    _require_plain_int(seed, "seed")
+
+    epoch = cursor.epoch
+    position = cursor.shard_order_position
+    offset = cursor.row_offset
+    if shard_order is None:
+        order = _epoch_shard_order(len(shard_row_counts), seed=seed, epoch=epoch)
+    else:
+        if (
+            not isinstance(shard_order, tuple)
+            or len(shard_order) != len(shard_row_counts)
+            or set(shard_order) != set(range(len(shard_row_counts)))
+        ):
+            raise ValueError("shard_order must be a complete shard permutation")
+        order = shard_order
+    if position > len(order):
+        raise SMLDataError("pretraining cursor is beyond the epoch shard order")
+    if position == len(order):
+        if offset != 0:
+            raise SMLDataError("pretraining cursor offset is beyond the epoch")
+        return PretrainingCursor(epoch + 1, 0, 0)
+
+    row_count = shard_row_counts[order[position]]
+    if offset > row_count:
+        raise SMLDataError("pretraining cursor offset is beyond its shard")
+    if offset < row_count:
+        return cursor
+
+    position += 1
+    if position == len(order):
+        return PretrainingCursor(epoch + 1, 0, 0)
+    return PretrainingCursor(epoch, position, 0)
+
+
 _EMPTY_ROWS = np.empty((0, 0), dtype=_INT32)
 _EMPTY_ROWS.setflags(write=False)
 
@@ -460,7 +515,12 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
                 raise SMLDataError(
                     "prepared bundle does not contain one full runtime batch"
                 )
-            normalized_cursor = self._normalize_cursor(cursor)
+            normalized_cursor = canonicalize_pretraining_cursor(
+                cursor,
+                shard_row_counts=self._manifest.shard_row_counts,
+                seed=self._seed,
+                shard_order=self._shard_order(cursor.epoch),
+            )
             self._committed_cursor = normalized_cursor
             self._producer_cursor = normalized_cursor
             self._pool = _StagingPool(
@@ -571,11 +631,10 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
     def _shard_order(self, epoch: int) -> tuple[int, ...]:
         if epoch == self._order_cache_epoch:
             return self._order_cache
-        generator = np.random.Generator(
-            np.random.PCG64(np.random.SeedSequence([self._seed, epoch]))
-        )
-        order = tuple(
-            int(index) for index in generator.permutation(len(self._shard_arrays))
+        order = _epoch_shard_order(
+            len(self._manifest.shard_row_counts),
+            seed=self._seed,
+            epoch=epoch,
         )
         suffix_rows = [0] * (len(order) + 1)
         for position in range(len(order) - 1, -1, -1):
@@ -587,29 +646,6 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         self._order_cache = order
         self._order_suffix_rows = tuple(suffix_rows)
         return order
-
-    def _normalize_cursor(self, cursor: PretrainingCursor) -> PretrainingCursor:
-        epoch = cursor.epoch
-        position = cursor.shard_order_position
-        offset = cursor.row_offset
-        order = self._shard_order(epoch)
-        if position > len(order):
-            raise SMLDataError("pretraining cursor is beyond the epoch shard order")
-        if position == len(order):
-            if offset != 0:
-                raise SMLDataError("pretraining cursor offset is beyond the epoch")
-            return PretrainingCursor(epoch + 1, 0, 0)
-
-        row_count = self._manifest.shard_row_counts[order[position]]
-        if offset > row_count:
-            raise SMLDataError("pretraining cursor offset is beyond its shard")
-        if offset < row_count:
-            return cursor
-
-        position += 1
-        if position == len(order):
-            return PretrainingCursor(epoch + 1, 0, 0)
-        return PretrainingCursor(epoch, position, 0)
 
     def _make_envelope(
         self,
@@ -642,7 +678,12 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
     def _next_produced(
         self, cursor: PretrainingCursor
     ) -> tuple[BatchEnvelope | None, PretrainingCursor]:
-        cursor = self._normalize_cursor(cursor)
+        cursor = canonicalize_pretraining_cursor(
+            cursor,
+            shard_row_counts=self._manifest.shard_row_counts,
+            seed=self._seed,
+            shard_order=self._shard_order(cursor.epoch),
+        )
         order = self._shard_order(cursor.epoch)
         remaining = (
             self._order_suffix_rows[cursor.shard_order_position] - cursor.row_offset
@@ -1233,6 +1274,7 @@ __all__ = [
     "PretrainingCursor",
     "PretrainingPreparationConfig",
     "build_benchmark_workload",
+    "canonicalize_pretraining_cursor",
     "pack_token_ranges",
     "prepare_pretraining_bundle",
 ]

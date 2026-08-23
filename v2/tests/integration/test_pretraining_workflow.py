@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -7,6 +9,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
+from mlx.utils import tree_unflatten
 from sml.artifacts.checkpoint import (
     publish_immutable_bundle,
     resolve_latest_step,
@@ -15,6 +18,7 @@ from sml.artifacts.checkpoint import (
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
+    ArtifactRoot,
     CheckpointManifest,
     PayloadRef,
     PretrainingDataManifest,
@@ -27,6 +31,7 @@ from sml.artifacts.manifest import (
 from sml.data.pretraining import PretrainingCursor
 from sml.errors import SMLArtifactError
 from sml.model.config import ModelConfig
+from sml.model.language_model import SMLLanguageModel
 from sml.training import common as training_common
 from sml.training import pretrain
 from sml.training.common import (
@@ -233,6 +238,51 @@ def _rewrite_array_group(
     )
 
 
+def _rewrite_scalar_state(resolved, mutate) -> None:
+    path = resolved.step_directory / "state.json"
+    document = json.loads(path.read_bytes())
+    mutate(document)
+    path.write_bytes(canonical_json_bytes(document))
+    manifest = replace(
+        resolved.checkpoint,
+        scalar_state=_payload_ref(path, "state.json"),
+    )
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (resolved.step_directory / CheckpointManifest.MANIFEST_FILENAME).write_bytes(
+        canonical_json_bytes(manifest)
+    )
+
+
+def _run_with_unpruned_latest(
+    data: Path,
+    run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    real_retention = pretrain.apply_retention
+
+    def interrupt_retention(*_args, **_kwargs):
+        raise InjectedFailure("before retention")
+
+    monkeypatch.setattr(pretrain, "apply_retention", interrupt_retention)
+    with pytest.raises(InjectedFailure, match="before retention"):
+        pretrain.train(
+            replace(
+                _config(data, run, maximum_steps=1),
+                checkpoint=CheckpointPolicy(interval=1),
+            )
+        )
+    monkeypatch.setattr(pretrain, "apply_retention", real_retention)
+    assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
+        "step-000000000",
+        "step-000000001",
+    ]
+    return resolve_latest_step(
+        run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+
+
 def _assert_run_states_equal(left: Path, right: Path) -> None:
     left_groups = _loaded_groups(left)
     right_groups = _loaded_groups(right)
@@ -367,12 +417,46 @@ def test_resume_accepts_relocation_rejects_resharding_and_prunes_to_latest(
     ]
     assert (moved_run / "run.json").read_bytes() == immutable_run_bytes
     prepared_data.rename(tmp_path / "removed-original-data")
-    assert (
-        resolve_latest_step(
-            moved_run, writable=False, verification=VerificationLevel.FULL
-        ).step
-        == 2
+    resolved = resolve_latest_step(
+        moved_run, writable=False, verification=VerificationLevel.FULL
     )
+    assert resolved.step == 2
+    saved_model = ModelConfig(**dict(resolved.run.model))
+    assert saved_model.rope_scaling_factor == 1.0
+    with (
+        ArtifactRoot.open(resolved.step_directory, writable=False) as root,
+        root.open_payload("model.safetensors") as payload,
+    ):
+        saved_parameters = mx.load(payload, format="safetensors")
+    assert {name: tuple(array.shape) for name, array in saved_parameters.items()} == {
+        "embed_tokens.weight": (32, 8),
+        "layers.0.input_norm.weight": (8,),
+        "layers.0.mlp.down_proj.weight": (8, 16),
+        "layers.0.mlp.gate_proj.weight": (16, 8),
+        "layers.0.mlp.up_proj.weight": (16, 8),
+        "layers.0.post_attn_norm.weight": (8,),
+        "layers.0.self_attn.k_proj.weight": (4, 8),
+        "layers.0.self_attn.o_proj.weight": (8, 8),
+        "layers.0.self_attn.q_proj.weight": (8, 8),
+        "layers.0.self_attn.v_proj.weight": (4, 8),
+        "norm.weight": (8,),
+    }
+    assert all(array.dtype == mx.bfloat16 for array in saved_parameters.values())
+    model = SMLLanguageModel(saved_model, key=mx.random.key(0))
+    logits, cache_state, next_key = model.forward_arrays(
+        tree_unflatten(sorted(saved_parameters.items())),
+        mx.array([[4, 5, 6, 7]], dtype=mx.int32),
+        attention_mask=None,
+        positions=None,
+        cache_state=None,
+        training=False,
+        key=None,
+    )
+    mx.eval(logits)
+    assert logits.shape == (1, 4, 32)
+    assert logits.dtype == mx.bfloat16
+    assert cache_state is None
+    assert next_key is None
 
     resharded = _prepared_bundle(
         tmp_path / "resharded",
@@ -432,10 +516,16 @@ def test_corrupt_inputs_fail_before_model_allocation(
 
     monkeypatch.setattr(pretrain, "SMLLanguageModel", record_allocation)
     run = tmp_path / "fresh-corrupt"
+    digest = hashlib.sha256(run.name.encode("utf-8")).hexdigest()
+    stale = tmp_path / f".sml-tmp-{digest}-{'a' * 32}"
+    stale.mkdir()
+    sentinel = stale / "must-survive.bin"
+    sentinel.write_bytes(b"preflight has not authorized deletion")
     with pytest.raises(SMLArtifactError, match="payload identity"):
         pretrain.train(_config(corrupted_data, run, maximum_steps=1))
     assert allocations == 0
     assert not run.exists()
+    assert sentinel.read_bytes() == b"preflight has not authorized deletion"
 
     monkeypatch.undo()
     completed = pretrain.train(
@@ -522,6 +612,38 @@ def test_checkpoint_interval_counts_updates_and_final_state_is_committed(
     ]
 
 
+def test_checkpoint_retention_rejects_same_step_identity_substitution(
+    prepared_data: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    substitute = pretrain.train(
+        replace(
+            _config(prepared_data, tmp_path / "substitute", maximum_steps=1),
+            seed=23,
+        )
+    )
+    substituted = resolve_latest_step(
+        substitute.run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+    assert substituted.step == 1
+
+    monkeypatch.setattr(
+        pretrain,
+        "apply_retention",
+        lambda _run, *, keep_last: substituted,
+    )
+    with pytest.raises(SMLArtifactError, match="identity"):
+        pretrain.train(
+            replace(
+                _config(prepared_data, tmp_path / "target", maximum_steps=1),
+                checkpoint=CheckpointPolicy(interval=1),
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
@@ -573,6 +695,7 @@ def test_structural_checkpoint_corruption_fails_before_allocation_or_retention(
 
     allocations = 0
     retentions = 0
+    streams = 0
 
     def forbidden_allocation(*_args, **_kwargs):
         nonlocal allocations
@@ -584,8 +707,14 @@ def test_structural_checkpoint_corruption_fails_before_allocation_or_retention(
         retentions += 1
         raise AssertionError("retention reached")
 
+    def forbidden_stream(*_args, **_kwargs):
+        nonlocal streams
+        streams += 1
+        raise AssertionError("stream construction reached")
+
     monkeypatch.setattr(pretrain, "SMLLanguageModel", forbidden_allocation)
     monkeypatch.setattr(pretrain, "apply_retention", forbidden_retention)
+    monkeypatch.setattr(pretrain, "PretrainingBatchStream", forbidden_stream)
     with pytest.raises(SMLArtifactError, match="checkpoint|parameter|working|master"):
         pretrain.resume(
             completed.run,
@@ -594,6 +723,129 @@ def test_structural_checkpoint_corruption_fails_before_allocation_or_retention(
         )
     assert allocations == 0
     assert retentions == 0
+    assert streams == 0
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "optimizer-missing-key",
+        "optimizer-additional-key",
+        "optimizer-wrong-dtype",
+        "optimizer-coordinated-shape",
+        "trainer-missing-key",
+        "trainer-additional-key",
+        "trainer-wrong-dtype",
+        "trainer-wrong-shape",
+        "scalar-state-type",
+        "cursor-beyond-order",
+        "cursor-noncanonical-boundary",
+        "prng-wrong-dtype",
+        "prng-wrong-shape",
+    ),
+)
+def test_restored_state_corruption_fails_before_pruning_stream_or_model(
+    mutation: str,
+    prepared_data: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "run"
+    resolved = _run_with_unpruned_latest(prepared_data, run, monkeypatch)
+    masters = mx.load(resolved.step_directory / "master.safetensors")
+    parameter_name = next(
+        name for name, array in masters.items() if len(array.shape) == 2
+    )
+    moment_name = f"first_moments.{parameter_name}"
+    second_name = f"second_moments.{parameter_name}"
+    accumulator_name = f"accumulators.{parameter_name}"
+
+    if mutation.startswith("optimizer-"):
+        optimizer = mx.load(resolved.step_directory / "optimizer.safetensors")
+        if mutation == "optimizer-missing-key":
+            optimizer.pop(moment_name)
+        elif mutation == "optimizer-additional-key":
+            optimizer["first_moments.unexpected.weight"] = optimizer[moment_name]
+        elif mutation == "optimizer-wrong-dtype":
+            optimizer[moment_name] = optimizer[moment_name].astype(mx.bfloat16)
+        else:
+            wrong_shape = (int(np.prod(masters[parameter_name].shape)),)
+            optimizer[moment_name] = mx.zeros(wrong_shape, dtype=mx.float32)
+            optimizer[second_name] = mx.zeros(wrong_shape, dtype=mx.float32)
+        _rewrite_array_group(resolved, "optimizer.safetensors", optimizer)
+    elif mutation.startswith(("trainer-", "prng-")):
+        trainer = mx.load(resolved.step_directory / "trainer.safetensors")
+        if mutation == "trainer-missing-key":
+            trainer.pop(accumulator_name)
+        elif mutation == "trainer-additional-key":
+            trainer["accumulators.unexpected.weight"] = trainer[accumulator_name]
+        elif mutation == "trainer-wrong-dtype":
+            trainer[accumulator_name] = trainer[accumulator_name].astype(mx.bfloat16)
+        elif mutation == "trainer-wrong-shape":
+            wrong_shape = (int(np.prod(masters[parameter_name].shape)),)
+            trainer[accumulator_name] = mx.zeros(wrong_shape, dtype=mx.float32)
+        elif mutation == "prng-wrong-dtype":
+            trainer["next_key"] = trainer["next_key"].astype(mx.int32)
+        else:
+            trainer["next_key"] = mx.zeros((3,), dtype=mx.uint32)
+        _rewrite_array_group(resolved, "trainer.safetensors", trainer)
+    elif mutation == "scalar-state-type":
+        _rewrite_scalar_state(
+            resolved,
+            lambda document: document.__setitem__("rows", "one"),
+        )
+    elif mutation == "cursor-beyond-order":
+        _rewrite_scalar_state(
+            resolved,
+            lambda document: document.__setitem__(
+                "cursor",
+                {"epoch": 0, "shard_order_position": 3, "row_offset": 0},
+            ),
+        )
+    else:
+        _rewrite_scalar_state(
+            resolved,
+            lambda document: document.__setitem__(
+                "cursor",
+                {"epoch": 0, "shard_order_position": 0, "row_offset": 3},
+            ),
+        )
+
+    allocations = 0
+    retentions = 0
+    streams = 0
+
+    def forbidden_allocation(*_args, **_kwargs):
+        nonlocal allocations
+        allocations += 1
+        raise AssertionError("model allocation reached")
+
+    def forbidden_retention(*_args, **_kwargs):
+        nonlocal retentions
+        retentions += 1
+        raise AssertionError("retention reached")
+
+    def forbidden_stream(*_args, **_kwargs):
+        nonlocal streams
+        streams += 1
+        raise AssertionError("stream construction reached")
+
+    monkeypatch.setattr(pretrain, "SMLLanguageModel", forbidden_allocation)
+    monkeypatch.setattr(pretrain, "apply_retention", forbidden_retention)
+    monkeypatch.setattr(pretrain, "PretrainingBatchStream", forbidden_stream)
+    with pytest.raises(SMLArtifactError, match="checkpoint|cursor|optimizer|trainer"):
+        pretrain.resume(
+            run,
+            data=prepared_data,
+            overrides=_overrides(maximum_steps=2),
+        )
+    assert allocations == 0
+    assert retentions == 0
+    assert streams == 0
+    assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
+        "step-000000000",
+        "step-000000001",
+    ]
 
 
 def test_dropped_epoch_tail_does_not_publish_duplicate_progress_checkpoint(

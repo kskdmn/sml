@@ -1447,9 +1447,11 @@ def publish_run(
     created = False
     committed = False
     try:
-        _cleanup_stale_temporaries(fs, parent_descriptor, target_name)
         if _stat_if_present(fs, target_name, parent_descriptor=parent_descriptor):
             raise SMLArtifactError(f"fresh run target already exists: {target}")
+        _cleanup_stale_temporaries(fs, parent_descriptor, target_name)
+        if _stat_if_present(fs, target_name, parent_descriptor=parent_descriptor):
+            raise SMLArtifactError(f"fresh run target appeared concurrently: {target}")
         fs.mkdir(temporary_name, 0o700, dir_fd=parent_descriptor)
         created = True
         temporary_descriptor = fs.open(

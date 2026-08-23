@@ -40,8 +40,9 @@ from sml.data.pretraining import (
     PreparedDataBundle,
     PretrainingBatchStream,
     PretrainingCursor,
+    canonicalize_pretraining_cursor,
 )
-from sml.errors import SMLArtifactError, SMLConfigurationError
+from sml.errors import SMLArtifactError, SMLConfigurationError, SMLDataError
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel, causal_lm_loss
 from sml.training.common import (
@@ -662,6 +663,12 @@ def _restore_checkpoint(resolved: ResolvedStep) -> _RestoredTrainingState:
             *(f"second_moments.{name}" for name in masters),
         }:
             raise SMLArtifactError("optimizer checkpoint keys do not match masters")
+        for name, master in masters.items():
+            for prefix in ("first_moments.", "second_moments."):
+                if optimizer_arrays[f"{prefix}{name}"].shape != master.shape:
+                    raise SMLArtifactError(
+                        "optimizer checkpoint shapes do not match masters"
+                    )
         optimizer = AdamState(
             optimizer_arrays["step"],
             _unflatten_prefixed(optimizer_arrays, "first_moments."),
@@ -675,6 +682,9 @@ def _restore_checkpoint(resolved: ResolvedStep) -> _RestoredTrainingState:
             *(f"accumulators.{name}" for name in masters),
         }:
             raise SMLArtifactError("trainer checkpoint keys do not match masters")
+        for name, master in masters.items():
+            if trainer_arrays[f"accumulators.{name}"].shape != master.shape:
+                raise SMLArtifactError("trainer checkpoint shapes do not match masters")
         trainer = TrainerState(
             _unflatten_prefixed(trainer_arrays, "accumulators."),
             trainer_arrays["accumulation_count"],
@@ -895,9 +905,23 @@ def _publish_training_state(
 ) -> ResolvedStep:
     published = publish_checkpoint(run, _checkpoint_builder(manifest, state))
     retained = apply_retention(run, keep_last=1)
+    _require_retained_publication(published, retained)
     if retained.step != published.step:
         raise SMLArtifactError("retention did not preserve the published latest step")
     return retained
+
+
+def _require_retained_publication(
+    published: ResolvedStep,
+    retained: ResolvedStep,
+) -> None:
+    if (
+        retained.run.identity != published.run.identity
+        or retained.checkpoint.identity != published.checkpoint.identity
+    ):
+        raise SMLArtifactError(
+            "retention did not preserve the published run and checkpoint identity"
+        )
 
 
 def _training_result(run: Path, state: ScalarTrainingState) -> TrainingResult:
@@ -981,28 +1005,31 @@ def train(config: PretrainingConfig) -> TrainingResult:
     config = _resolved_fresh_config(config)
     stream: PretrainingBatchStream | None = None
     runtime: tuple[SMLLanguageModel, _RestoredTrainingState] | None = None
-    manifest: RunManifest | None = None
     with run_writer_lock(config.output_run):
         try:
+            if config.output_run.exists() or config.output_run.is_symlink():
+                raise SMLArtifactError(
+                    f"fresh run target already exists: {config.output_run}"
+                )
+            data = _verified_data(
+                config.data,
+                expected_identity=None,
+                model=config.model,
+                loader=config.loader,
+            )
+            stream = PretrainingBatchStream(
+                data,
+                batch_size=config.loader.microbatch_size,
+                seed=config.loader.epoch_seed,
+                prefetch_depth=config.loader.prefetch_depth,
+                cursor=PretrainingCursor.initial(),
+            )
+            manifest = _run_manifest(config, data)
 
             def build(private_run: Path) -> RunManifest:
-                nonlocal stream, runtime, manifest
-                data = _verified_data(
-                    config.data,
-                    expected_identity=None,
-                    model=config.model,
-                    loader=config.loader,
-                )
-                stream = PretrainingBatchStream(
-                    data,
-                    batch_size=config.loader.microbatch_size,
-                    seed=config.loader.epoch_seed,
-                    prefetch_depth=config.loader.prefetch_depth,
-                    cursor=PretrainingCursor.initial(),
-                )
+                nonlocal runtime
                 _copy_run_tokenizer(config.data, private_run)
                 (private_run / "checkpoints").mkdir()
-                manifest = _run_manifest(config, data)
                 (private_run / "run.json").write_bytes(canonical_json_bytes(manifest))
                 runtime = _initial_state(config)
                 publish_checkpoint(
@@ -1012,7 +1039,7 @@ def train(config: PretrainingConfig) -> TrainingResult:
                 return manifest
 
             published: Published[RunManifest] = publish_run(config.output_run, build)
-            if stream is None or runtime is None or manifest is None:
+            if runtime is None:
                 raise SMLArtifactError("fresh run builder did not return runtime state")
             if published.manifest.identity != manifest.identity:
                 raise SMLArtifactError("published run identity changed during creation")
@@ -1066,6 +1093,20 @@ def resume(
             )
             restored = _restore_checkpoint(resolved)
             scalar = restored.scalar
+            try:
+                canonical_cursor = canonicalize_pretraining_cursor(
+                    scalar.cursor,
+                    shard_row_counts=prepared.manifest.shard_row_counts,
+                    seed=config.loader.epoch_seed,
+                )
+            except SMLDataError as error:
+                raise SMLArtifactError(
+                    "checkpoint cursor is invalid for the prepared data"
+                ) from error
+            if canonical_cursor != scalar.cursor:
+                raise SMLArtifactError(
+                    "checkpoint cursor is not in canonical prepared-data form"
+                )
             retained = apply_retention(run, keep_last=1)
             if retained.checkpoint.identity != resolved.checkpoint.identity:
                 raise SMLArtifactError(
