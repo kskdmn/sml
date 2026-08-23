@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -37,6 +38,7 @@ _SOURCE_REQUEST_FIELDS = (
     "split",
 )
 _ARRAY_NAMES = ("input_ids", "valid_token_mask", "score_mask", "labels")
+_INGEST_CHUNK_SIZE = 1024
 JOIN_POLICY_V1 = "separate-context-ending-v1"
 OVERLENGTH_POLICY_V1 = "drop-complete-row-v1"
 BOS_POLICY_V1 = "context-bos-v1"
@@ -333,6 +335,7 @@ def _preprocessing_projection(config: SwagPreparationConfig) -> dict[str, object
         "eos_policy": config.eos_policy,
         "maximum_length": config.maximum_length,
         "bucket_boundaries": list(config.bucket_boundaries),
+        "maximum_examples": config.maximum_examples,
     }
 
 
@@ -649,6 +652,39 @@ def _group_manifest_buckets(
     return tuple(ordered)
 
 
+def _validate_bucket_arrays(
+    *,
+    input_ids: np.ndarray,
+    valid_token_mask: np.ndarray,
+    score_mask: np.ndarray,
+    vocab_size: int,
+    pad_token_id: int,
+    eos_token_id: int,
+) -> None:
+    if np.any(input_ids < 0) or np.any(input_ids >= vocab_size):
+        raise SMLArtifactError("SWAG token id is outside the tokenizer vocabulary")
+    invalid = ~valid_token_mask
+    if np.any(score_mask & invalid):
+        raise SMLArtifactError("SWAG score mask is true where the valid mask is false")
+    lengths = valid_token_mask.sum(axis=-1, dtype=np.int64)
+    expected_valid = np.arange(input_ids.shape[-1]) < lengths[..., None]
+    if not np.array_equal(valid_token_mask, expected_valid) or np.any(
+        input_ids[invalid] != pad_token_id
+    ):
+        raise SMLArtifactError("SWAG padding is inconsistent with the valid mask")
+    if input_ids.shape[0] and np.any(~score_mask.any(axis=-1)):
+        raise SMLArtifactError("SWAG candidate is missing scored continuation tokens")
+    last_index = np.maximum(lengths - 1, 0)
+    example_count, candidate_count, _ = input_ids.shape
+    example_index = np.arange(example_count)[:, None]
+    candidate_index = np.arange(candidate_count)[None, :]
+    last_tokens = input_ids[example_index, candidate_index, last_index]
+    last_scored = score_mask[example_index, candidate_index, last_index]
+    eos_is_last = (lengths > 0) & (last_tokens == eos_token_id)
+    if np.any(eos_is_last & ~last_scored):
+        raise SMLArtifactError("SWAG EOS token is not scored")
+
+
 def _open_buckets(path: Path, manifest: SwagDataManifest) -> tuple[SwagBucket, ...]:
     buckets: list[SwagBucket] = []
     total_examples = 0
@@ -686,6 +722,14 @@ def _open_buckets(path: Path, manifest: SwagDataManifest) -> tuple[SwagBucket, .
             raise SMLArtifactError("SWAG score mask must be false at position zero")
         if example_count and (int(labels.min()) < 0 or int(labels.max()) >= 4):
             raise SMLArtifactError("SWAG labels must be in 0..3")
+        _validate_bucket_arrays(
+            input_ids=input_ids,
+            valid_token_mask=valid_token_mask,
+            score_mask=score_mask,
+            vocab_size=manifest.vocab_size,
+            pad_token_id=manifest.pad_token_id,
+            eos_token_id=manifest.eos_token_id,
+        )
         buckets.append(
             SwagBucket(
                 length=length,
@@ -736,110 +780,191 @@ def _iter_resolved_rows(
 ) -> Iterator[Mapping[str, object]]:
     try:
         rows = config.provider.iter_rows(resolved)
-    except SMLDataError:
-        raise
     except Exception as error:
         raise SMLDataError(_provider_failure_message(config, base, error)) from error
     try:
         yield from rows
-    except SMLDataError:
-        raise
     except Exception as error:
         raise SMLDataError(_provider_failure_message(config, base, error)) from error
 
 
-def _build_encoded_rows(
+def _close_memmap(array: np.memmap) -> None:
+    array.flush()
+    mmap_obj = getattr(array, "_mmap", None)
+    if mmap_obj is not None:
+        mmap_obj.close()
+
+
+class _BucketWriter:
+    def __init__(self, length: int, scratch: Path) -> None:
+        self.length = length
+        self.scratch = scratch
+        self.count = 0
+        self._pending_ids: list[np.ndarray] = []
+        self._pending_valid: list[np.ndarray] = []
+        self._pending_score: list[np.ndarray] = []
+        self._pending_labels: list[int] = []
+        self._capacity = 0
+        self._maps: dict[str, np.memmap] | None = None
+
+    def append(
+        self,
+        input_ids: np.ndarray,
+        valid_token_mask: np.ndarray,
+        score_mask: np.ndarray,
+        label: int,
+    ) -> None:
+        self._pending_ids.append(input_ids)
+        self._pending_valid.append(valid_token_mask)
+        self._pending_score.append(score_mask)
+        self._pending_labels.append(label)
+        if len(self._pending_ids) >= _INGEST_CHUNK_SIZE:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._pending_ids:
+            return
+        n = len(self._pending_ids)
+        self._ensure_capacity(self.count + n)
+        start = self.count
+        stop = start + n
+        assert self._maps is not None
+        self._maps["input_ids"][start:stop] = np.stack(self._pending_ids, axis=0)
+        self._maps["valid_token_mask"][start:stop] = np.stack(
+            self._pending_valid, axis=0
+        )
+        self._maps["score_mask"][start:stop] = np.stack(self._pending_score, axis=0)
+        self._maps["labels"][start:stop] = np.asarray(
+            self._pending_labels, dtype=_INT32
+        )
+        self.count = stop
+        self._pending_ids.clear()
+        self._pending_valid.clear()
+        self._pending_score.clear()
+        self._pending_labels.clear()
+
+    def _ensure_capacity(self, needed: int) -> None:
+        if self._capacity >= needed:
+            return
+        capacity = 8 if self._capacity == 0 else self._capacity
+        while capacity < needed:
+            capacity *= 2
+        specs = (
+            ("input_ids", _INT32, (4, self.length)),
+            ("valid_token_mask", _BOOL, (4, self.length)),
+            ("score_mask", _BOOL, (4, self.length)),
+            ("labels", _INT32, ()),
+        )
+        new_maps: dict[str, np.memmap] = {}
+        for name, dtype, extra in specs:
+            path = self.scratch / f"length-{self.length:04d}-{name}-{capacity}.dat"
+            mm = np.memmap(path, mode="w+", dtype=dtype, shape=(capacity, *extra))
+            if self._maps is not None:
+                mm[: self.count] = self._maps[name][: self.count]
+                old_path = Path(str(self._maps[name].filename))
+                _close_memmap(self._maps[name])
+                old_path.unlink(missing_ok=True)
+            new_maps[name] = mm
+        self._maps = new_maps
+        self._capacity = capacity
+
+    def arrays(self) -> dict[str, np.ndarray] | None:
+        self.flush()
+        if self.count == 0 or self._maps is None:
+            return None
+        return {name: mm[: self.count] for name, mm in self._maps.items()}
+
+    def close(self) -> None:
+        if self._maps is None:
+            return
+        for mm in self._maps.values():
+            _close_memmap(mm)
+        self._maps = None
+
+
+def _ingest_and_write_buckets(
     config: SwagPreparationConfig,
     base: ResolvedModel,
     resolved: ResolvedSwagSource,
-) -> tuple[dict[int, list[tuple[np.ndarray, np.ndarray, np.ndarray, int]]], int]:
+    private_path: Path,
+) -> tuple[tuple[ArrayPayloadRef, ...], int, int]:
     special = _special_ids(base)
     processor = base.tokenizer.processor
-    grouped: dict[int, list[tuple[np.ndarray, np.ndarray, np.ndarray, int]]] = {
-        boundary: [] for boundary in config.bucket_boundaries
-    }
-    dropped = 0
-    kept = 0
-    for row in _iter_resolved_rows(config, base, resolved):
-        context, endings, label = _parse_row(row)
-        encoded = _encode_candidates(
-            context=context,
-            endings=endings,
-            processor=processor,
-            bos_token_id=special["bos_token_id"],
-            eos_token_id=special["eos_token_id"],
-            vocab_size=special["vocab_size"],
-            maximum_length=config.maximum_length,
-        )
-        if encoded is None:
-            dropped += 1
-            continue
-        longest = max(len(token_ids) for token_ids, _continuation in encoded)
-        bucket_length = _select_bucket(longest, config.bucket_boundaries)
-        padded_ids = []
-        padded_valid = []
-        padded_score = []
-        for token_ids, continuation in encoded:
-            input_ids, valid_token_mask, score_mask = _pad_candidate(
-                token_ids,
-                continuation,
-                bucket_length=bucket_length,
-                pad_token_id=special["pad_token_id"],
-            )
-            padded_ids.append(input_ids)
-            padded_valid.append(valid_token_mask)
-            padded_score.append(score_mask)
-        grouped[bucket_length].append(
-            (
-                np.stack(padded_ids, axis=0),
-                np.stack(padded_valid, axis=0),
-                np.stack(padded_score, axis=0),
-                label,
-            )
-        )
-        kept += 1
-        if config.maximum_examples is not None and kept >= config.maximum_examples:
-            break
-    if kept == 0:
-        raise SMLDataError("no usable SWAG examples were produced")
-    return grouped, dropped
-
-
-def _write_buckets(
-    grouped: Mapping[int, list[tuple[np.ndarray, np.ndarray, np.ndarray, int]]],
-    private_path: Path,
-) -> tuple[tuple[ArrayPayloadRef, ...], int]:
-    references: list[ArrayPayloadRef] = []
-    example_count = 0
-    for length in sorted(grouped):
-        rows = grouped[length]
-        if not rows:
-            continue
-        input_ids = np.stack([row[0] for row in rows], axis=0).astype(
-            _INT32, copy=False
-        )
-        valid_token_mask = np.stack([row[1] for row in rows], axis=0).astype(
-            _BOOL, copy=False
-        )
-        score_mask = np.stack([row[2] for row in rows], axis=0).astype(
-            _BOOL, copy=False
-        )
-        labels = np.asarray([row[3] for row in rows], dtype=_INT32)
-        arrays = {
-            "input_ids": input_ids,
-            "valid_token_mask": valid_token_mask,
-            "score_mask": score_mask,
-            "labels": labels,
+    with tempfile.TemporaryDirectory(prefix="swag-ingest-") as scratch_name:
+        scratch = Path(scratch_name)
+        writers = {
+            boundary: _BucketWriter(boundary, scratch)
+            for boundary in config.bucket_boundaries
         }
-        for name, array in arrays.items():
-            logical_path = _logical_array_path(length, name)
-            references.append(
-                _write_npy(private_path / logical_path, array, logical_path)
-            )
-        example_count += int(labels.shape[0])
-    if example_count == 0:
-        raise SMLDataError("no usable SWAG examples were produced")
-    return tuple(references), example_count
+        dropped = 0
+        kept = 0
+        try:
+            for row in _iter_resolved_rows(config, base, resolved):
+                context, endings, label = _parse_row(row)
+                encoded = _encode_candidates(
+                    context=context,
+                    endings=endings,
+                    processor=processor,
+                    bos_token_id=special["bos_token_id"],
+                    eos_token_id=special["eos_token_id"],
+                    vocab_size=special["vocab_size"],
+                    maximum_length=config.maximum_length,
+                )
+                if encoded is None:
+                    dropped += 1
+                    continue
+                longest = max(len(token_ids) for token_ids, _continuation in encoded)
+                bucket_length = _select_bucket(longest, config.bucket_boundaries)
+                padded_ids = []
+                padded_valid = []
+                padded_score = []
+                for token_ids, continuation in encoded:
+                    input_ids, valid_token_mask, score_mask = _pad_candidate(
+                        token_ids,
+                        continuation,
+                        bucket_length=bucket_length,
+                        pad_token_id=special["pad_token_id"],
+                    )
+                    padded_ids.append(input_ids)
+                    padded_valid.append(valid_token_mask)
+                    padded_score.append(score_mask)
+                writers[bucket_length].append(
+                    np.stack(padded_ids, axis=0),
+                    np.stack(padded_valid, axis=0),
+                    np.stack(padded_score, axis=0),
+                    label,
+                )
+                kept += 1
+                if (
+                    config.maximum_examples is not None
+                    and kept >= config.maximum_examples
+                ):
+                    break
+            if kept == 0:
+                raise SMLDataError("no usable SWAG examples were produced")
+            references: list[ArrayPayloadRef] = []
+            example_count = 0
+            for length in sorted(writers):
+                writer = writers[length]
+                arrays = writer.arrays()
+                if arrays is None:
+                    continue
+                for name in _ARRAY_NAMES:
+                    logical_path = _logical_array_path(length, name)
+                    references.append(
+                        _write_npy(
+                            private_path / logical_path,
+                            arrays[name],
+                            logical_path,
+                        )
+                    )
+                example_count += writer.count
+            if example_count == 0:
+                raise SMLDataError("no usable SWAG examples were produced")
+            return tuple(references), example_count, dropped
+        finally:
+            for writer in writers.values():
+                writer.close()
 
 
 def prepare_swag_bundle(
@@ -883,8 +1008,9 @@ def prepare_swag_bundle(
     special = _special_ids(base)
 
     def build(private_path: Path) -> SwagDataManifest:
-        grouped, dropped = _build_encoded_rows(config, base, resolved)
-        bucket_refs, example_count = _write_buckets(grouped, private_path)
+        bucket_refs, example_count, dropped = _ingest_and_write_buckets(
+            config, base, resolved, private_path
+        )
         source = _resolved_source_projection(resolved)
         manifest = SwagDataManifest(
             kind="swag-data",

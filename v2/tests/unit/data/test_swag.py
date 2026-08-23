@@ -9,11 +9,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from sml.artifacts.manifest import (
+    ArrayPayloadRef,
     PayloadRef,
     SwagDataManifest,
     TokenizerManifest,
     VerificationLevel,
     canonical_json_bytes,
+    file_identity,
     read_manifest,
 )
 from sml.errors import SMLArtifactError, SMLDataError
@@ -76,6 +78,8 @@ class FakeSwagProvider:
         self.fail_resolve = False
         self.fail_iter = False
         self.fail_iter_after_rows = False
+        self.fail_iter_data_error = False
+        self.fail_iter_after_rows_data_error = False
         self.resolved_namespace = None
 
     def resolve(self, source):
@@ -106,9 +110,13 @@ class FakeSwagProvider:
         self.iter_calls += 1
         if self.fail_iter:
             raise RuntimeError("provider unavailable")
+        if self.fail_iter_data_error:
+            raise SMLDataError("the datasets package is required")
         yield from self.rows
         if self.fail_iter_after_rows:
             raise RuntimeError("provider unavailable")
+        if self.fail_iter_after_rows_data_error:
+            raise SMLDataError("the datasets package is required")
 
 
 class RecordingTokenizer:
@@ -532,6 +540,45 @@ def _rewrite_swag_manifest(path: Path, **overrides: object) -> None:
     (path / "manifest.json").write_bytes(canonical_json_bytes(manifest))
 
 
+def _rewrite_swag_array(path: Path, logical_path: str, mutate) -> None:
+    verified = read_manifest(path, SwagDataManifest, VerificationLevel.FULL)
+    array_path = path / logical_path
+    mutated = np.ascontiguousarray(
+        mutate(np.array(np.load(array_path, allow_pickle=False)))
+    )
+    with array_path.open("wb") as destination:
+        np.save(destination, mutated, allow_pickle=False)
+    with array_path.open("rb") as payload:
+        identity = file_identity(payload)
+    updated = []
+    for reference in verified.manifest.buckets:
+        if reference.payload.logical_path != logical_path:
+            updated.append(reference)
+            continue
+        spec = reference.arrays[0]
+        updated.append(
+            ArrayPayloadRef(
+                payload=replace(
+                    reference.payload,
+                    identity=identity,
+                    byte_size=array_path.stat().st_size,
+                ),
+                arrays=(replace(spec, shape=tuple(int(dim) for dim in mutated.shape)),),
+            )
+        )
+    manifest = replace(verified.manifest, buckets=tuple(updated))
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (path / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+
+def _array_logical_path(manifest: SwagDataManifest, name: str) -> str:
+    suffix = f"/{name}.npy"
+    for reference in manifest.buckets:
+        if reference.payload.logical_path.endswith(suffix):
+            return reference.payload.logical_path
+    raise AssertionError(f"missing SWAG array {name}")
+
+
 def test_huggingface_provider_pins_main_revision_to_commit_sha(monkeypatch):
     from sml.data import swag
     from sml.data.swag import HuggingFaceDatasetsSwagProvider, SwagSourceConfig
@@ -741,3 +788,287 @@ def test_iter_rows_consumption_failure_names_source_and_cache_key(tmp_path):
     assert "sha256:" in message
     assert "four" not in message
     assert "usable" not in message
+
+
+def test_iter_rows_start_data_error_is_wrapped_with_source_and_cache_key(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    provider.fail_iter_data_error = True
+    config = tiny_swag_config(provider)
+    with pytest.raises(SMLDataError) as caught:
+        prepare_swag_bundle(config, tiny_base_model(), tmp_path / "swag")
+    message = str(caught.value)
+    assert config.source.namespace in message
+    assert config.source.dataset_config in message
+    assert config.source.revision in message
+    assert "sha256:" in message
+    assert caught.value.__cause__ is not None
+
+
+def test_iter_rows_consumption_data_error_is_wrapped_with_source_and_cache_key(
+    tmp_path,
+):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    provider.fail_iter_after_rows_data_error = True
+    config = tiny_swag_config(provider)
+    with pytest.raises(SMLDataError) as caught:
+        prepare_swag_bundle(config, tiny_base_model(), tmp_path / "swag")
+    message = str(caught.value)
+    assert config.source.namespace in message
+    assert config.source.dataset_config in message
+    assert config.source.revision in message
+    assert "sha256:" in message
+    assert "four" not in message
+    assert caught.value.__cause__ is not None
+
+
+def test_parse_errors_are_not_wrapped_as_provider_failures(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((replace_row(endings=("on the mat", "in the car")),))
+    with pytest.raises(SMLDataError, match="four") as caught:
+        prepare_swag_bundle(
+            tiny_swag_config(provider),
+            tiny_base_model(),
+            tmp_path / "swag",
+        )
+    message = str(caught.value)
+    assert "unavailable" not in message
+    assert "cache key" not in message
+    assert "sha256:" not in message
+
+
+def test_different_maximum_examples_at_existing_path_is_a_collision(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW, replace_row(label=0)))
+    base = tiny_base_model()
+    output = tmp_path / "swag"
+    first = prepare_swag_bundle(
+        tiny_swag_config(provider, maximum_examples=2),
+        base,
+        output,
+    )
+    assert first.manifest.preprocessing["maximum_examples"] == 2
+    with pytest.raises(SMLArtifactError, match="collision"):
+        prepare_swag_bundle(
+            tiny_swag_config(provider, maximum_examples=1),
+            base,
+            output,
+        )
+
+
+def test_none_versus_integer_maximum_examples_is_a_collision(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    base = tiny_base_model()
+    output = tmp_path / "swag"
+    uncapped = prepare_swag_bundle(tiny_swag_config(provider), base, output)
+    assert uncapped.manifest.preprocessing["maximum_examples"] is None
+    with pytest.raises(SMLArtifactError, match="collision"):
+        prepare_swag_bundle(
+            tiny_swag_config(provider, maximum_examples=1),
+            base,
+            output,
+        )
+
+
+def test_matching_maximum_examples_reuses_existing_bundle(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW, replace_row(label=2)))
+    base = tiny_base_model()
+    output = tmp_path / "swag"
+    first = prepare_swag_bundle(
+        tiny_swag_config(provider, maximum_examples=1),
+        base,
+        output,
+    )
+    provider.fail_resolve = True
+    provider.resolve_calls = 0
+    provider.iter_calls = 0
+    second = prepare_swag_bundle(
+        tiny_swag_config(provider, maximum_examples=1),
+        base,
+        output,
+    )
+    assert provider.resolve_calls == 0
+    assert provider.iter_calls == 0
+    assert second.manifest.identity == first.manifest.identity
+
+
+def test_maximum_examples_changes_bundle_identity(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    base = tiny_base_model()
+    uncapped = prepare_swag_bundle(
+        tiny_swag_config(provider),
+        base,
+        tmp_path / "uncapped",
+    )
+    capped = prepare_swag_bundle(
+        tiny_swag_config(provider, maximum_examples=1),
+        base,
+        tmp_path / "capped",
+    )
+    assert capped.manifest.identity != uncapped.manifest.identity
+
+
+def test_load_rejects_token_id_outside_vocabulary(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    logical = _array_logical_path(prepared.manifest, "input_ids")
+
+    def mutate(array: np.ndarray) -> np.ndarray:
+        mutated = np.array(array, copy=True)
+        mutated[0, 0, 0] = prepared.manifest.vocab_size
+        return mutated
+
+    _rewrite_swag_array(output, logical, mutate)
+    with pytest.raises(SMLArtifactError, match="vocab"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_rejects_score_mask_true_where_valid_mask_is_false(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    logical = _array_logical_path(prepared.manifest, "score_mask")
+
+    def mutate(array: np.ndarray) -> np.ndarray:
+        mutated = np.array(array, copy=True)
+        mutated[0, 0, -1] = True
+        return mutated
+
+    _rewrite_swag_array(output, logical, mutate)
+    with pytest.raises(SMLArtifactError, match="score"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_rejects_padding_inconsistent_with_valid_mask(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    logical = _array_logical_path(prepared.manifest, "input_ids")
+
+    def mutate(array: np.ndarray) -> np.ndarray:
+        mutated = np.array(array, copy=True)
+        mutated[0, 0, -1] = 10
+        return mutated
+
+    _rewrite_swag_array(output, logical, mutate)
+    with pytest.raises(SMLArtifactError, match="padding|valid"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_rejects_hole_in_valid_mask(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    logical = _array_logical_path(prepared.manifest, "valid_token_mask")
+
+    def mutate(array: np.ndarray) -> np.ndarray:
+        mutated = np.array(array, copy=True)
+        mutated[0, 0, 1] = False
+        return mutated
+
+    _rewrite_swag_array(output, logical, mutate)
+    with pytest.raises(SMLArtifactError, match="padding|valid"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_rejects_candidate_without_scored_continuation(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    logical = _array_logical_path(prepared.manifest, "score_mask")
+
+    def mutate(array: np.ndarray) -> np.ndarray:
+        mutated = np.array(array, copy=True)
+        mutated[0, 0, :] = False
+        return mutated
+
+    _rewrite_swag_array(output, logical, mutate)
+    with pytest.raises(SMLArtifactError, match="scored"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_rejects_unscored_eos_when_it_is_the_last_valid_token(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    valid = np.load(output / _array_logical_path(prepared.manifest, "valid_token_mask"))
+    last = int(np.asarray(valid[0, 0]).sum()) - 1
+    assert last >= 0
+    input_ids = np.load(output / _array_logical_path(prepared.manifest, "input_ids"))
+    assert int(input_ids[0, 0, last]) == prepared.manifest.eos_token_id
+    logical = _array_logical_path(prepared.manifest, "score_mask")
+
+    def mutate(array: np.ndarray) -> np.ndarray:
+        mutated = np.array(array, copy=True)
+        mutated[0, 0, last] = False
+        return mutated
+
+    _rewrite_swag_array(output, logical, mutate)
+    with pytest.raises(SMLArtifactError, match="eos|EOS"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_chunked_ingest_does_not_stack_all_examples_at_once(tmp_path, monkeypatch):
+    from sml.data import swag
+    from sml.data.swag import prepare_swag_bundle
+
+    monkeypatch.setattr(swag, "_INGEST_CHUNK_SIZE", 2)
+    stacked_example_batches: list[int] = []
+    original_stack = np.stack
+
+    def tracking_stack(arrays, axis=0, **kwargs):
+        sequence = tuple(arrays)
+        first = sequence[0] if sequence else None
+        if getattr(first, "ndim", 0) >= 2:
+            stacked_example_batches.append(len(sequence))
+        return original_stack(sequence, axis=axis, **kwargs)
+
+    monkeypatch.setattr(swag.np, "stack", tracking_stack)
+    rows = tuple(replace_row(label=index % 4) for index in range(5))
+    bundle = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider(rows)),
+        tiny_base_model(),
+        tmp_path / "swag",
+    )
+    labels = [
+        int(label) for bucket in bundle.buckets for label in np.asarray(bucket.labels)
+    ]
+    assert bundle.manifest.example_count == 5
+    assert labels == [index % 4 for index in range(5)]
+    assert all(count <= 2 for count in stacked_example_batches)
