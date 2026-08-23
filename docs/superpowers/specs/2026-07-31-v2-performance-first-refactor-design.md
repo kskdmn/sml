@@ -6,7 +6,8 @@ Approved umbrella design for a clean replacement of the entire `v2` tree.
 This specification supersedes the former checkpoint/SWAG-only design and plan.
 
 **Execution update (2026-08-24):** Phases 1-3 are complete at `4c190f3`.
-Phase 4 is complete at `0d95441`. Task 5.1 is next.
+Phase 4 is complete at `0d95441`. Task 5.1 is complete at `232918c`.
+Task 5.2 is next.
 
 **Acceptance-policy update (2026-08-22):** Functional correctness is the
 required refactor gate. Ruff, the full v2 test suite, controlled mathematical
