@@ -7,7 +7,7 @@ This specification supersedes the former checkpoint/SWAG-only design and plan.
 
 **Execution update (2026-08-23):** Phases 1-3 are complete, including the
 recorded-source quality validator and deeply immutable checkpoint-reader
-contents at `4c190f3`. Phases 4-6 have not started; Task 4.1 is next.
+contents at `4c190f3`. Task 4.1 is complete at `7cc45ed`. Task 4.2 is next.
 
 **Acceptance-policy update (2026-08-22):** Functional correctness is the
 required refactor gate. Ruff, the full v2 test suite, controlled mathematical
