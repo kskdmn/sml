@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
@@ -19,7 +20,6 @@ from sml.artifacts.manifest import (
     SwagDataManifest,
     VerificationLevel,
     canonical_json_bytes,
-    file_identity,
     read_manifest,
     structured_identity,
 )
@@ -486,17 +486,26 @@ def _manifest_projections(manifest: SwagDataManifest) -> dict[str, object]:
     }
 
 
-def _encode_text(processor: object, text: str) -> tuple[int, ...]:
+def _encode_texts(
+    processor: object, texts: Sequence[str]
+) -> tuple[tuple[int, ...], ...]:
+    if not texts:
+        return ()
     try:
-        encoded = processor.encode(text)
+        encoded = processor.encode(list(texts))
     except Exception as error:
         raise SMLDataError("tokenizer failed while encoding SWAG text") from error
     try:
-        return tuple(int(token) for token in encoded)
+        sequences = tuple(
+            tuple(int(token) for token in sequence) for sequence in encoded
+        )
     except TypeError as error:
         raise SMLDataError(
             "tokenizer produced a non-iterable token ID range"
         ) from error
+    if len(sequences) != len(texts):
+        raise SMLDataError("tokenizer produced a mismatched encoding batch")
+    return sequences
 
 
 def _parse_row(row: Mapping[str, object]) -> tuple[str, tuple[str, ...], int]:
@@ -528,23 +537,18 @@ def _select_bucket(length: int, boundaries: tuple[int, ...]) -> int:
     raise SMLDataError("encoded SWAG candidate did not fit any bucket")
 
 
-def _encode_candidates(
+def _assemble_candidates(
     *,
-    context: str,
-    endings: tuple[str, ...],
-    processor: object,
+    context_ids: tuple[int, ...],
+    encoded_endings: Sequence[tuple[int, ...]],
     bos_token_id: int,
     eos_token_id: int,
     vocab_size: int,
     maximum_length: int,
 ) -> tuple[tuple[tuple[int, ...], tuple[int, int]], ...] | None:
-    context_ids = _encode_text(processor, context)
-    encoded_endings: list[tuple[int, ...]] = []
-    for ending in endings:
-        ending_ids = _encode_text(processor, ending)
+    for ending_ids in encoded_endings:
         if not ending_ids:
             raise SMLDataError("SWAG candidate is missing scored continuation tokens")
-        encoded_endings.append(ending_ids)
 
     candidates: list[tuple[tuple[int, ...], tuple[int, int]]] = []
     for ending_ids in encoded_endings:
@@ -581,13 +585,34 @@ def _pad_candidate(
     return input_ids, valid_token_mask, score_mask
 
 
+class _HashingWriter:
+    def __init__(self, raw) -> None:
+        self._raw = raw
+        self._digest = hashlib.sha256()
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        view = memoryview(data).cast("B")
+        self._digest.update(view)
+        written = self._raw.write(data)
+        return int(len(view) if written is None else written)
+
+    def flush(self) -> None:
+        flush = getattr(self._raw, "flush", None)
+        if flush is not None:
+            flush()
+
+    def identity(self) -> str:
+        return f"sha256:{self._digest.hexdigest()}"
+
+
 def _write_npy(path: Path, array: np.ndarray, logical_path: str) -> ArrayPayloadRef:
     contiguous = np.ascontiguousarray(array)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("xb") as destination:
-        np.save(destination, contiguous, allow_pickle=False)
-    with path.open("rb") as payload:
-        identity = file_identity(payload)
+        writer = _HashingWriter(destination)
+        np.save(writer, contiguous, allow_pickle=False)
+        writer.flush()
+        identity = writer.identity()
     dtype_name = "int32" if contiguous.dtype == _INT32 else "bool"
     return ArrayPayloadRef(
         payload=PayloadRef(
@@ -680,9 +705,21 @@ def _validate_bucket_arrays(
     candidate_index = np.arange(candidate_count)[None, :]
     last_tokens = input_ids[example_index, candidate_index, last_index]
     last_scored = score_mask[example_index, candidate_index, last_index]
-    eos_is_last = (lengths > 0) & (last_tokens == eos_token_id)
-    if np.any(eos_is_last & ~last_scored):
+    if input_ids.shape[0] and np.any(lengths <= 0):
+        raise SMLArtifactError("SWAG candidate is missing scored continuation tokens")
+    if input_ids.shape[0] and np.any(last_tokens != eos_token_id):
+        raise SMLArtifactError("SWAG candidate does not end with EOS")
+    if input_ids.shape[0] and np.any(~last_scored):
         raise SMLArtifactError("SWAG EOS token is not scored")
+    first_score = np.argmax(score_mask, axis=-1)
+    positions = np.arange(input_ids.shape[-1])
+    expected_score = (positions >= first_score[..., None]) & (
+        positions < lengths[..., None]
+    )
+    if input_ids.shape[0] and not np.array_equal(score_mask, expected_score):
+        raise SMLArtifactError(
+            "SWAG score mask must be a contiguous suffix of the valid prefix"
+        )
 
 
 def _open_buckets(path: Path, manifest: SwagDataManifest) -> tuple[SwagBucket, ...]:
@@ -898,13 +935,26 @@ def _ingest_and_write_buckets(
         }
         dropped = 0
         kept = 0
-        try:
-            for row in _iter_resolved_rows(config, base, resolved):
-                context, endings, label = _parse_row(row)
-                encoded = _encode_candidates(
-                    context=context,
-                    endings=endings,
-                    processor=processor,
+        parsed_rows: list[tuple[str, tuple[str, ...], int]] = []
+
+        def flush_parsed() -> bool:
+            nonlocal dropped, kept
+            if not parsed_rows:
+                return False
+            texts: list[str] = []
+            for context, endings, _label in parsed_rows:
+                texts.append(context)
+                texts.extend(endings)
+            encoded_texts = _encode_texts(processor, texts)
+            offset = 0
+            stop = False
+            for _context, _endings, label in parsed_rows:
+                context_ids = encoded_texts[offset]
+                encoded_endings = encoded_texts[offset + 1 : offset + 5]
+                offset += 5
+                encoded = _assemble_candidates(
+                    context_ids=context_ids,
+                    encoded_endings=encoded_endings,
                     bos_token_id=special["bos_token_id"],
                     eos_token_id=special["eos_token_id"],
                     vocab_size=special["vocab_size"],
@@ -939,7 +989,18 @@ def _ingest_and_write_buckets(
                     config.maximum_examples is not None
                     and kept >= config.maximum_examples
                 ):
+                    stop = True
                     break
+            parsed_rows.clear()
+            return stop
+
+        try:
+            for row in _iter_resolved_rows(config, base, resolved):
+                parsed_rows.append(_parse_row(row))
+                if len(parsed_rows) >= _INGEST_CHUNK_SIZE and flush_parsed():
+                    break
+            else:
+                flush_parsed()
             if kept == 0:
                 raise SMLDataError("no usable SWAG examples were produced")
             references: list[ArrayPayloadRef] = []

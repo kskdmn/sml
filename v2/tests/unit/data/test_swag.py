@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,9 +36,21 @@ VALID_ROW: dict[str, object] = {
 class RecordingProcessor:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.encode_calls: list[object] = []
 
-    def encode(self, text: str) -> list[int]:
-        self.calls.append(text)
+    def encode(self, text: str | Sequence[str]) -> list[int] | list[list[int]]:
+        self.encode_calls.append(text)
+        if isinstance(text, str):
+            self.calls.append(text)
+            return self._encode_one(text)
+        encoded = []
+        for item in text:
+            self.calls.append(item)
+            encoded.append(self._encode_one(item))
+        return encoded
+
+    @staticmethod
+    def _encode_one(text: str) -> list[int]:
         words = text.split()
         if not words:
             return []
@@ -49,9 +61,20 @@ class FixedProcessor:
     def __init__(self, encoded: Mapping[str, tuple[int, ...]]) -> None:
         self._encoded = dict(encoded)
         self.calls: list[str] = []
+        self.encode_calls: list[object] = []
 
-    def encode(self, text: str) -> list[int]:
-        self.calls.append(text)
+    def encode(self, text: str | Sequence[str]) -> list[int] | list[list[int]]:
+        self.encode_calls.append(text)
+        if isinstance(text, str):
+            self.calls.append(text)
+            return self._encode_one(text)
+        encoded = []
+        for item in text:
+            self.calls.append(item)
+            encoded.append(self._encode_one(item))
+        return encoded
+
+    def _encode_one(self, text: str) -> list[int]:
         try:
             return list(self._encoded[text])
         except KeyError as error:
@@ -273,6 +296,55 @@ def test_context_and_endings_are_encoded_separately_and_eos_is_scored(tmp_path):
     assert bucket.score_mask.dtype == np.dtype("bool")
     assert bucket.input_ids.shape == bucket.valid_token_mask.shape
     assert bucket.input_ids.shape[1:] == (4, bucket.input_ids.shape[-1])
+
+
+def test_chunk_with_multiple_rows_makes_one_tokenizer_encode_call(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import prepare_swag_bundle
+
+    monkeypatch.setattr(swag, "_INGEST_CHUNK_SIZE", 2)
+    processor = RecordingProcessor()
+    rows = (
+        VALID_ROW,
+        replace_row(label=2),
+    )
+    prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider(rows)),
+        tiny_base_model(processor=processor),
+        tmp_path / "swag",
+    )
+    assert len(processor.encode_calls) == 1
+    batched = processor.encode_calls[0]
+    assert batched == [
+        VALID_ROW["context"],
+        *VALID_ROW["endings"],
+        rows[1]["context"],
+        *rows[1]["endings"],
+    ]
+    assert processor.calls[0] == VALID_ROW["context"]
+    assert tuple(processor.calls[1:5]) == tuple(VALID_ROW["endings"])
+
+
+def test_npy_identity_is_hashed_while_writing(tmp_path, monkeypatch):
+    from sml.artifacts.manifest import file_identity
+    from sml.data import swag
+
+    opened: list[str] = []
+    original_open = Path.open
+
+    def tracking_open(self, mode="r", *args, **kwargs):
+        if self.suffix == ".npy":
+            opened.append(mode)
+        return original_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", tracking_open)
+    path = tmp_path / "array.npy"
+    reference = swag._write_npy(path, np.arange(8, dtype=np.int32), "array.npy")
+    assert opened == ["xb"]
+    with path.open("rb") as payload:
+        assert file_identity(payload) == reference.payload.identity
 
 
 def test_every_preprocessing_field_changes_bundle_identity(tmp_path):
@@ -1041,6 +1113,55 @@ def test_load_rejects_unscored_eos_when_it_is_the_last_valid_token(tmp_path):
 
     _rewrite_swag_array(output, logical, mutate)
     with pytest.raises(SMLArtifactError, match="eos|EOS"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_rejects_last_valid_token_that_is_not_eos(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    valid = np.load(output / _array_logical_path(prepared.manifest, "valid_token_mask"))
+    last = int(np.asarray(valid[0, 0]).sum()) - 1
+    logical = _array_logical_path(prepared.manifest, "input_ids")
+
+    def mutate(array: np.ndarray) -> np.ndarray:
+        mutated = np.array(array, copy=True)
+        mutated[0, 0, last] = 10
+        return mutated
+
+    _rewrite_swag_array(output, logical, mutate)
+    with pytest.raises(SMLArtifactError, match="eos|EOS"):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_rejects_score_mask_hole_in_valid_prefix(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
+    )
+    valid = np.load(output / _array_logical_path(prepared.manifest, "valid_token_mask"))
+    last = int(np.asarray(valid[0, 0]).sum()) - 1
+    logical = _array_logical_path(prepared.manifest, "score_mask")
+    score = np.load(output / logical)
+    hole = last - 1
+    assert hole >= 1
+    assert bool(score[0, 0, hole])
+    assert bool(score[0, 0, last])
+
+    def mutate(array: np.ndarray) -> np.ndarray:
+        mutated = np.array(array, copy=True)
+        mutated[0, 0, hole] = False
+        return mutated
+
+    _rewrite_swag_array(output, logical, mutate)
+    with pytest.raises(SMLArtifactError, match="score|suffix|contiguous"):
         load_swag_bundle(output, VerificationLevel.FULL)
 
 

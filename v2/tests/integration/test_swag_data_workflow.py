@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -29,9 +29,21 @@ VALID_ROW: dict[str, object] = {
 class RecordingProcessor:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.encode_calls: list[object] = []
 
-    def encode(self, text: str) -> list[int]:
-        self.calls.append(text)
+    def encode(self, text: str | Sequence[str]) -> list[int] | list[list[int]]:
+        self.encode_calls.append(text)
+        if isinstance(text, str):
+            self.calls.append(text)
+            return self._encode_one(text)
+        encoded = []
+        for item in text:
+            self.calls.append(item)
+            encoded.append(self._encode_one(item))
+        return encoded
+
+    @staticmethod
+    def _encode_one(text: str) -> list[int]:
         words = text.split()
         if not words:
             return []
