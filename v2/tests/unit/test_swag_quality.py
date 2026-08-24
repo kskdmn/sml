@@ -6,10 +6,13 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from sml.model.config import ModelConfig
+from sml.training.lora import LoRAConfig
 
 from v2.benchmarks import swag_quality
 from v2.benchmarks.swag_quality import (
     CANONICAL_STEPS,
+    MODEL_SEED,
     SwagQualityRecord,
     SwagQualityReport,
     SwagQualityWorkload,
@@ -18,6 +21,7 @@ from v2.benchmarks.swag_quality import (
     harness_content_identity,
     validate_swag_quality_records,
 )
+from v2.benchmarks.workload import structured_identity
 
 ROOT = Path(__file__).parents[3]
 
@@ -217,41 +221,68 @@ def test_raw_validation_rejects_missing_extra_changed_base_and_counts(
         ),
     )
 
-    report = validate_swag_quality_records(canonical_workload, records)
-    assert report.candidate_examples == report.oracle_examples == 8
+    with pytest.raises(ValueError, match="real-example"):
+        validate_swag_quality_records(canonical_workload, records)
+
+    passing = (
+        _record(
+            canonical_workload,
+            "candidate",
+            validation_loss=1.005,
+            accuracy=0.80,
+            examples=canonical_workload.validation_fixture.example_count,
+        ),
+        _record(
+            canonical_workload,
+            "oracle",
+            validation_loss=1.0,
+            accuracy=0.80,
+            examples=canonical_workload.validation_fixture.example_count,
+        ),
+    )
+    report = validate_swag_quality_records(canonical_workload, passing)
+    assert (
+        report.candidate_examples
+        == report.oracle_examples
+        == canonical_workload.validation_fixture.example_count
+    )
     assert decide_swag_quality(report) == "pass"
 
     with pytest.raises(ValueError, match="exactly two"):
-        validate_swag_quality_records(canonical_workload, records[:1])
+        validate_swag_quality_records(canonical_workload, passing[:1])
     with pytest.raises(ValueError, match="exactly two"):
-        validate_swag_quality_records(canonical_workload, (*records, records[0]))
+        validate_swag_quality_records(canonical_workload, (*passing, passing[0]))
 
     changed_base = _record(
         canonical_workload,
         "candidate",
         validation_loss=1.005,
         accuracy=0.80,
-        examples=8,
+        examples=canonical_workload.validation_fixture.example_count,
         frozen_base_identity="sha256:" + "f" * 64,
     )
     with pytest.raises(ValueError, match="base"):
-        validate_swag_quality_records(canonical_workload, (changed_base, records[1]))
+        validate_swag_quality_records(canonical_workload, (changed_base, passing[1]))
 
     mismatched = _record(
-        canonical_workload, "oracle", validation_loss=1.0, accuracy=0.80, examples=7
+        canonical_workload,
+        "oracle",
+        validation_loss=1.0,
+        accuracy=0.80,
+        examples=canonical_workload.validation_fixture.example_count - 1,
     )
     with pytest.raises(ValueError, match="real-example"):
-        validate_swag_quality_records(canonical_workload, (records[0], mismatched))
+        validate_swag_quality_records(canonical_workload, (passing[0], mismatched))
 
     nonfinite = _record(
         canonical_workload,
         "candidate",
         validation_loss=1.005,
         accuracy=0.80,
-        examples=8,
+        examples=canonical_workload.validation_fixture.example_count,
         finite=False,
     )
-    failed = validate_swag_quality_records(canonical_workload, (nonfinite, records[1]))
+    failed = validate_swag_quality_records(canonical_workload, (nonfinite, passing[1]))
     assert decide_swag_quality(failed) == "fail"
 
 
@@ -317,3 +348,101 @@ def test_manifest_fields_and_output_paths_fail_closed(canonical_workload):
             ROOT / "v2/benchmarks/results/swag-quality-v1.jsonl",
             ROOT / "v2/benchmarks/results/forged.json",
         )
+
+
+def _recompute_manifest_identity(manifest: dict[str, object]) -> dict[str, object]:
+    body = {key: value for key, value in manifest.items() if key != "identity"}
+    return {
+        **body,
+        "identity": structured_identity("sml-swag-quality-manifest-v1", body),
+    }
+
+
+def test_standalone_validation_rejects_over_budget_and_nonpositive_phases(
+    canonical_workload,
+):
+    destinations = swag_quality._canonical_evidence_destinations(
+        ROOT,
+        ROOT / "v2/benchmarks/manifests/swag-quality-v1.json",
+        ROOT / "v2/benchmarks/results/swag-quality-v1.jsonl",
+        ROOT / "v2/benchmarks/results/swag-quality-v1.json",
+    )
+    command = swag_quality._recording_command_document(ROOT, destinations)
+    session_identity = swag_quality._recording_session_identity(
+        "a" * 40, canonical_workload.identity, command
+    )
+    manifest = swag_quality._manifest_document(
+        workload=canonical_workload,
+        source_commit="a" * 40,
+        recording_command=command,
+        phase_times={
+            "setup": 1.0,
+            "candidate": 3.0,
+            "oracle": 4.0,
+            "validation_serialization": 2.0,
+        },
+        peak_memory=123,
+        raw_identity="sha256:" + "b" * 64,
+        raw_file_identity="sha256:" + "c" * 64,
+        raw_bytes=1_000,
+        report_identity="sha256:" + "d" * 64,
+        report_file_identity="sha256:" + "e" * 64,
+        report_bytes=500,
+        recording_session_identity=session_identity,
+    )
+
+    over_budget = _recompute_manifest_identity(
+        {
+            **manifest,
+            "phase_wall_time_seconds": {
+                "setup": 1.0,
+                "candidate": 10_000.0,
+                "oracle": 5_000.0,
+                "validation_serialization": 1.0,
+            },
+            "measured_wall_time_seconds": 15_002.0,
+        }
+    )
+    with pytest.raises(ValueError, match="budget"):
+        swag_quality._validate_manifest_fields(over_budget, canonical_workload, command)
+
+    nonpositive = _recompute_manifest_identity(
+        {
+            **manifest,
+            "phase_wall_time_seconds": {
+                "setup": 0.0,
+                "candidate": 3.0,
+                "oracle": 4.0,
+                "validation_serialization": 2.0,
+            },
+            "measured_wall_time_seconds": 9.0,
+        }
+    )
+    with pytest.raises(ValueError, match="phase"):
+        swag_quality._validate_manifest_fields(nonpositive, canonical_workload, command)
+
+
+def test_verified_source_snapshot_fully_verifies_pretraining_checkpoint(
+    monkeypatch, tmp_path
+):
+    published = tmp_path / "pretraining-run"
+    published.mkdir()
+    called: list[tuple[Path, bool]] = []
+
+    monkeypatch.setattr(
+        swag_quality,
+        "_publish_source_pretraining_run",
+        lambda *_args, **_kwargs: published,
+        raising=False,
+    )
+
+    def fake_resolve(path, *, full_verify):
+        called.append((path, full_verify))
+        raise RuntimeError("verified")
+
+    monkeypatch.setattr(
+        swag_quality, "resolve_model_artifact", fake_resolve, raising=False
+    )
+    with pytest.raises(RuntimeError, match="verified"):
+        swag_quality._verified_source_snapshot(ModelConfig(), LoRAConfig(), MODEL_SEED)
+    assert called == [(published, True)]

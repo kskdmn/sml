@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import zipfile
@@ -23,16 +24,30 @@ from typing import Literal
 
 import mlx.core as mx
 import numpy as np
-from mlx.utils import tree_flatten, tree_map
+import zstandard as zstd
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from sml.artifacts.checkpoint import open_checkpoint_reader, resolve_latest_step
+from sml.artifacts.manifest import VerificationLevel
+from sml.data.corpus import CorpusConfig
+from sml.data.pretraining import (
+    PretrainingPreparationConfig,
+    prepare_pretraining_bundle,
+)
 from sml.data.swag import SwagBatch, SwagCursor
+from sml.data.tokenizer import TokenizerTrainingConfig, train_tokenizer_bundle
+from sml.inference import resolve_model_artifact
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
 from sml.training.common import (
+    CheckpointPolicy,
     LoaderConfig,
+    OptimizerConfig,
+    PretrainingConfig,
     build_weight_decay_tree,
     initialize_adam_state,
 )
 from sml.training.lora import LoRAConfig, apply_lora, split_adapter_parameters
+from sml.training.pretrain import train
 from sml.training.swag import (
     SwagTrainingConfig,
     build_swag_kernels,
@@ -71,6 +86,7 @@ TRAINING_EXAMPLE_COUNT = 255
 VALIDATION_EXAMPLE_COUNT = 16
 SEQUENCE_LENGTH = 64
 MICROBATCH_SIZE = 2
+QUALITY_VOCAB_SIZE = 300
 SCORE_POLICY = "fp32-mean-continuation-including-eos-v1"
 MODEL_SEED = 42
 VALIDATION_SEED = 7
@@ -141,6 +157,18 @@ def _require_finite(value: object, name: str, *, minimum: float | None = None) -
     if minimum is not None and normalized < minimum:
         raise ValueError(f"{name} must be finite and at least {minimum}")
     return normalized
+
+
+def _require_phase_times(value: object) -> dict[str, float]:
+    if not isinstance(value, Mapping) or set(value) != set(_PHASE_NAMES):
+        raise ValueError("quality phase timing fields are invalid")
+    phases = {
+        name: _require_finite(value[name], f"quality {name} phase")
+        for name in _PHASE_NAMES
+    }
+    if any(item <= 0.0 for item in phases.values()):
+        raise ValueError("quality phase timing fields are invalid")
+    return phases
 
 
 def _require_bool(value: object, name: str) -> bool:
@@ -684,6 +712,107 @@ def _fixture_source_identity(split: str) -> str:
     )
 
 
+def _quality_model_config() -> ModelConfig:
+    return ModelConfig(
+        vocab_size=QUALITY_VOCAB_SIZE,
+        hidden_size=32,
+        num_layers=2,
+        num_q_heads=4,
+        num_kv_heads=2,
+        intermediate_size=64,
+        original_context_length=SEQUENCE_LENGTH,
+        rope_scaling_factor=1.0,
+        hidden_dropout=0.0,
+    )
+
+
+def _canonical_json_file_bytes(value: object) -> bytes:
+    return canonical_json_bytes(value) + b"\n"
+
+
+def _corpus_config(path: Path) -> CorpusConfig:
+    return CorpusConfig(
+        input_root=path,
+        shuffle_files=False,
+        min_text_bytes=1,
+        max_rows_per_file=None,
+    )
+
+
+def _write_quality_corpus(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps(
+            {
+                "text": (
+                    "alpha beta gamma delta epsilon zeta eta theta " * 8
+                    + f"row {index}"
+                )
+            }
+        ).encode("utf-8")
+        for index in range(24)
+    ]
+    payload = b"\n".join(lines) + b"\n"
+    (path / "tiny-0000.jsonl.zst").write_bytes(zstd.ZstdCompressor().compress(payload))
+    return path
+
+
+def _publish_source_pretraining_run(
+    workspace: Path, model_config: ModelConfig, seed: int
+) -> Path:
+    corpus = _write_quality_corpus(workspace / "corpus")
+    tokenizer = train_tokenizer_bundle(
+        TokenizerTrainingConfig(
+            corpus=_corpus_config(corpus),
+            vocab_size=model_config.vocab_size,
+            hard_vocab_limit=False,
+            num_threads=1,
+            shuffle_input_sentence=False,
+        ),
+        workspace / "tokenizer",
+    )
+    if tokenizer.manifest.vocab_size != model_config.vocab_size:
+        raise ValueError("quality tokenizer vocab_size drifted from the pinned model")
+    data = prepare_pretraining_bundle(
+        PretrainingPreparationConfig(
+            corpus=_corpus_config(corpus),
+            tokenizer_bundle=tokenizer.path,
+            sequence_length=model_config.original_context_length,
+            shuffle_window_rows=5,
+            output_shard_rows=3,
+            seed=seed,
+        ),
+        workspace / "data",
+    )
+    trained = train(
+        PretrainingConfig(
+            data=data.path,
+            output_run=workspace / "run",
+            model=model_config,
+            optimizer=OptimizerConfig(
+                learning_rate=0.01,
+                beta1=0.5,
+                beta2=0.5,
+                schedule_steps=4,
+                warmup_steps=0,
+            ),
+            loader=LoaderConfig(
+                microbatch_size=1,
+                gradient_accumulation_steps=1,
+                prefetch_depth=1,
+                epoch_seed=seed,
+            ),
+            checkpoint=CheckpointPolicy(interval=1),
+            maximum_steps=1,
+            maximum_epochs=1,
+            log_interval=1,
+            seed=seed,
+            compile=False,
+        )
+    )
+    return trained.run
+
+
 def _encode_text(text: str, vocab_size: int) -> tuple[int, ...]:
     normalized = unicodedata.normalize("NFKC", text).casefold()
     pieces = re.findall(r"\w+|[^\w\s]", normalized, flags=re.UNICODE)
@@ -822,7 +951,7 @@ def _write_npz(path: Path, arrays: Mapping[str, np.ndarray]) -> None:
 
 
 def write_canonical_fixtures(root: Path) -> None:
-    model_config = ModelConfig()
+    model_config = _quality_model_config()
     for relative, split, count in (
         (TRAINING_FIXTURE, "training", TRAINING_EXAMPLE_COUNT),
         (VALIDATION_FIXTURE, "validation", VALIDATION_EXAMPLE_COUNT),
@@ -890,7 +1019,7 @@ def _load_fixture(
     if arrays["labels"].shape != (example_count,):
         raise ValueError(f"quality {split} labels shape mismatch")
     if int(arrays["input_ids"].min()) < 0 or int(arrays["input_ids"].max()) >= (
-        ModelConfig().vocab_size
+        _quality_model_config().vocab_size
     ):
         raise ValueError(f"quality {split} fixture has out-of-vocabulary tokens")
     return arrays, SwagQualityFixture(
@@ -1014,34 +1143,63 @@ def _loader_config() -> LoaderConfig:
 
 def _verified_source_snapshot(
     model_config: ModelConfig, lora_config: LoRAConfig, seed: int
-) -> tuple[object, dict, dict, mx.array]:
-    model_key, trainer_key = mx.random.split(mx.random.key(seed))
-    model_key, adapter_key = mx.random.split(model_key)
-    model = SMLLanguageModel(model_config, key=model_key)
-    fp32_master = tree_map(lambda value: value.astype(mx.float32), model.parameters())
-    mx.eval(fp32_master)
-    _require_tree_dtype(fp32_master, mx.float32, "fp32 master")
-    _, master_nonfinite = _state_finiteness_counts(fp32_master)
-    if master_nonfinite:
-        raise ValueError("fp32 master snapshot is not finite")
-    bf16_working = tree_map(lambda value: value.astype(mx.bfloat16), fp32_master)
-    mx.eval(bf16_working)
-    _require_tree_dtype(bf16_working, mx.bfloat16, "bf16 working")
-    model.update(bf16_working)
-    apply_lora(model, lora_config, key=adapter_key)
-    adapters, frozen_base = split_adapter_parameters(model.parameters())
-    if not isinstance(adapters, dict) or not isinstance(frozen_base, dict):
-        raise ValueError("adapter parameter split must return dictionaries")
-    mx.eval(adapters, frozen_base)
-    _require_tree_dtype(adapters, mx.float32, "adapters")
-    _require_tree_dtype(frozen_base, mx.bfloat16, "frozen base")
-    _, adapter_nonfinite = _state_finiteness_counts(adapters, frozen_base)
-    if adapter_nonfinite:
-        raise ValueError("verified LoRA snapshot is not finite")
-    return model, fp32_master, frozen_base, adapters, trainer_key
+) -> tuple[object, dict, dict, dict, mx.array]:
+    with tempfile.TemporaryDirectory(prefix="sml-swag-quality-source-") as raw:
+        run = _publish_source_pretraining_run(Path(raw), model_config, seed)
+        resolved = resolve_model_artifact(run, full_verify=True)
+        if resolved.model_config.rope_scaling_factor != 1.0:
+            raise ValueError(
+                "verified SWAG source rope_scaling_factor must be exactly 1.0"
+            )
+        if resolved.model_config.vocab_size != model_config.vocab_size:
+            raise ValueError("verified SWAG source vocab_size drifted")
+        step = resolve_latest_step(
+            run,
+            writable=False,
+            verification=VerificationLevel.FULL,
+        )
+        with open_checkpoint_reader(
+            run,
+            step=step.step,
+            expected_checkpoint_identity=step.checkpoint.identity,
+            verification=VerificationLevel.FULL,
+            load_array_groups=frozenset({"model.safetensors", "master.safetensors"}),
+            hold_lock=False,
+        ) as reader:
+            contents = reader.read_contents()
+            working_flat = dict(contents.array_groups["model.safetensors"])
+            master_flat = dict(contents.array_groups["master.safetensors"])
+        working = tree_unflatten(sorted(working_flat.items()))
+        fp32_master = tree_unflatten(sorted(master_flat.items()))
+        if not isinstance(working, dict) or not isinstance(fp32_master, dict):
+            raise ValueError("verified SWAG source parameter trees must be dicts")
+        mx.eval(working, fp32_master)
+        _require_tree_dtype(fp32_master, mx.float32, "fp32 master")
+        _require_tree_dtype(working, mx.bfloat16, "bf16 working")
+        model_key, trainer_key = mx.random.split(mx.random.key(seed))
+        _model_key, adapter_key = mx.random.split(model_key)
+        model = SMLLanguageModel(resolved.model_config, key=mx.random.key(0))
+        model.update(working)
+        apply_lora(model, lora_config, key=adapter_key)
+        adapters, frozen_base = split_adapter_parameters(model.parameters())
+        if not isinstance(adapters, dict) or not isinstance(frozen_base, dict):
+            raise ValueError("adapter parameter split must return dictionaries")
+        mx.eval(adapters, frozen_base, trainer_key)
+        _require_tree_dtype(adapters, mx.float32, "adapters")
+        _require_tree_dtype(frozen_base, mx.bfloat16, "frozen base")
+        _, adapter_nonfinite = _state_finiteness_counts(
+            adapters, frozen_base, fp32_master
+        )
+        if adapter_nonfinite:
+            raise ValueError("verified LoRA snapshot is not finite")
+        return model, fp32_master, frozen_base, adapters, trainer_key
 
 
-def build_swag_quality_workload(root: Path) -> SwagQualityWorkload:
+def build_swag_quality_workload(
+    root: Path,
+    *,
+    snapshot: tuple[object, dict, dict, dict, mx.array] | None = None,
+) -> SwagQualityWorkload:
     if not isinstance(root, Path):
         raise TypeError("root must be a Path")
     training, training_fixture = _load_fixture(
@@ -1054,13 +1212,13 @@ def build_swag_quality_workload(root: Path) -> SwagQualityWorkload:
         example_count=VALIDATION_EXAMPLE_COUNT,
     )
     _require_source_disjoint(training, validation)
-    model_config = ModelConfig()
+    model_config = _quality_model_config()
     lora_config = LoRAConfig()
     optimizer_config = default_swag_optimizer_config()
     loader_config = _loader_config()
-    _model, fp32_master, frozen_base, adapters, _trainer_key = (
-        _verified_source_snapshot(model_config, lora_config, MODEL_SEED)
-    )
+    if snapshot is None:
+        snapshot = _verified_source_snapshot(model_config, lora_config, MODEL_SEED)
+    _model, fp32_master, frozen_base, adapters, _trainer_key = snapshot
     fp32_master_identity = _array_tree_identity(
         "sml-swag-quality-fp32-master-v1", fp32_master
     )
@@ -1125,8 +1283,14 @@ def validate_swag_quality_records(
         if record.frozen_base_identity != workload.frozen_bf16_base_identity:
             raise ValueError("swag quality record frozen base identity changed")
     candidate, oracle = records
-    if candidate.real_example_count != oracle.real_example_count:
-        raise ValueError("swag quality real-example counts do not match")
+    expected_examples = workload.validation_fixture.example_count
+    if (
+        candidate.real_example_count != expected_examples
+        or oracle.real_example_count != expected_examples
+    ):
+        raise ValueError(
+            "swag quality real-example counts do not match the pinned validation set"
+        )
     return SwagQualityReport(
         candidate_validation_loss=candidate.validation_loss,
         oracle_validation_loss=oracle.validation_loss,
@@ -1487,15 +1651,10 @@ def _manifest_document(
     report_bytes: int,
     recording_session_identity: str,
 ) -> dict[str, object]:
-    normalized_phases = {
-        name: _require_finite(phase_times.get(name), f"quality {name} phase")
-        for name in _PHASE_NAMES
-    }
-    if set(phase_times) != set(_PHASE_NAMES) or any(
-        value <= 0.0 for value in normalized_phases.values()
-    ):
-        raise ValueError("quality phase timing fields are invalid")
+    normalized_phases = _require_phase_times(phase_times)
     measured_wall_time = math.fsum(normalized_phases.values())
+    if measured_wall_time > QUALITY_WALL_TIME_BUDGET_SECONDS:
+        raise ValueError("quality measured wall time exceeds the 4-hour budget")
     command = dict(recording_command)
     if recording_session_identity != _recording_session_identity(
         source_commit, workload.identity, command
@@ -1548,7 +1707,7 @@ def _manifest_document(
             **body,
             "identity": structured_identity("sml-swag-quality-manifest-v1", body),
         }
-        next_manifest_size = len(canonical_json_bytes(result))
+        next_manifest_size = len(_canonical_json_file_bytes(result))
         if next_manifest_size == manifest_size:
             return result
         manifest_size = next_manifest_size
@@ -1640,12 +1799,12 @@ def _validate_manifest_fields(
         workload.production_dependency_components
     ):
         raise ValueError("swag quality manifest production components mismatch")
-    phases = raw["phase_wall_time_seconds"]
-    if not isinstance(phases, dict) or set(phases) != set(_PHASE_NAMES):
-        raise ValueError("quality phase timing fields are invalid")
-    measured = math.fsum(float(phases[name]) for name in _PHASE_NAMES)
+    phases = _require_phase_times(raw["phase_wall_time_seconds"])
+    measured = math.fsum(phases[name] for name in _PHASE_NAMES)
     if raw["measured_wall_time_seconds"] != measured:
         raise ValueError("measured wall time is not the sum of phases")
+    if measured > QUALITY_WALL_TIME_BUDGET_SECONDS:
+        raise ValueError("quality measured wall time exceeds the 4-hour budget")
     sizes = raw["artifact_byte_sizes"]
     if not isinstance(sizes, dict) or set(sizes) != {"raw", "manifest", "report"}:
         raise ValueError("quality artifact sizes are invalid")
@@ -1774,14 +1933,17 @@ def _json_object_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, obj
 
 
 def _decode_json_object(payload: bytes, *, label: str) -> dict[str, object]:
+    if not payload.endswith(b"\n") or payload.endswith(b"\n\n"):
+        raise ValueError(f"quality JSON must have one trailing newline: {label}")
+    body = payload[:-1]
     value = json.loads(
-        payload.decode("utf-8"),
+        body.decode("utf-8"),
         object_pairs_hook=_json_object_no_duplicates,
         parse_constant=lambda token: (_ for _ in ()).throw(
             ValueError(f"invalid JSON constant: {token}")
         ),
     )
-    if not isinstance(value, dict) or canonical_json_bytes(value) != payload:
+    if not isinstance(value, dict) or canonical_json_bytes(value) != body:
         raise ValueError(f"quality JSON is not a canonical object: {label}")
     return value
 
@@ -1952,18 +2114,17 @@ def _record(args: argparse.Namespace) -> int:
         raise FileExistsError("partial quality evidence exists; discard it and retry")
     mx.clear_cache()
     mx.reset_peak_memory()
-    workload = build_swag_quality_workload(root)
+    training = _load_encoded_arrays(root / TRAINING_FIXTURE)
+    validation = _load_encoded_arrays(root / VALIDATION_FIXTURE)
+    model_config = _quality_model_config()
+    lora_config = LoRAConfig()
+    snapshot = _verified_source_snapshot(model_config, lora_config, MODEL_SEED)
+    workload = build_swag_quality_workload(root, snapshot=snapshot)
     recording_command = _recording_command_document(root, destinations)
     session_identity = _recording_session_identity(
         source_commit, workload.identity, recording_command
     )
-    training = _load_encoded_arrays(root / TRAINING_FIXTURE)
-    validation = _load_encoded_arrays(root / VALIDATION_FIXTURE)
-    model_config = ModelConfig()
-    lora_config = LoRAConfig()
-    model, _fp32_master, frozen_base, adapters, trainer_key = _verified_source_snapshot(
-        model_config, lora_config, MODEL_SEED
-    )
+    model, _fp32_master, frozen_base, adapters, trainer_key = snapshot
     if (
         _array_tree_identity("sml-swag-quality-frozen-bf16-base-v1", frozen_base)
         != workload.frozen_bf16_base_identity
@@ -2000,7 +2161,7 @@ def _record(args: argparse.Namespace) -> int:
         canonical_json_bytes(document) + b"\n" for document in raw_documents
     )
     report_document = _report_document(workload.identity, raw_identity, report)
-    report_bytes = canonical_json_bytes(report_document)
+    report_bytes = _canonical_json_file_bytes(report_document)
     validation_elapsed = time.monotonic() - validation_started
     phase_times = {
         "setup": setup_elapsed,
@@ -2025,7 +2186,7 @@ def _record(args: argparse.Namespace) -> int:
         report_bytes=len(report_bytes),
         recording_session_identity=session_identity,
     )
-    manifest_bytes = canonical_json_bytes(manifest)
+    manifest_bytes = _canonical_json_file_bytes(manifest)
     try:
         _durable_create(destinations.raw_output, raw_bytes)
         _durable_create(destinations.manifest, manifest_bytes)
