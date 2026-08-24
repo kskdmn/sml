@@ -5,9 +5,9 @@
 **Execution status (2026-08-24):** Part 1 remediation closed at `4c190f3`.
 Phase 4 (Tasks 4.1-4.4) is complete with scoped review approved (`7cc45ed`,
 `28c50df`, `5199b8a`, `0d95441`). Task 5.1 is complete at `232918c`. Task 5.2
-is complete at `4a8e469`. Tasks 5.3-5.5 and 6.1-6.4 have not started. Task 5.3
-is the next live task. The checkboxes below are the live remaining-task
-procedure.
+is complete at `4a8e469`. Task 5.3 is complete at `c06beae`. Tasks 5.4-5.5 and
+6.1-6.4 have not started. Task 5.4 is the next live task. The checkboxes below
+are the live remaining-task procedure.
 
 **Goal:** Complete persistent inference/evaluation, cached SWAG LoRA fine-tuning/export, the unified CLI, and the clean removal of every replaced flat v2 path while meeting the final correctness and runnable-workflow gates.
 
