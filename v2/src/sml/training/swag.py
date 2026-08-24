@@ -1342,13 +1342,13 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
 def resume_finetune(
     run: Path,
     *,
-    data: Path,
+    data: Path | None,
     overrides: ResumeOverrides,
 ) -> SwagTrainingResult:
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
-    if not isinstance(data, Path):
-        raise TypeError("data must be a Path")
+    if data is not None and not isinstance(data, Path):
+        raise TypeError("data must be a Path or None")
     if not isinstance(overrides, ResumeOverrides):
         raise TypeError("overrides must be ResumeOverrides")
     with run_writer_lock(run):
@@ -1361,9 +1361,15 @@ def resume_finetune(
             raise SMLArtifactError("LoRA resume requires a LoRA run")
         if resolved.run.model.get("rope_scaling_factor") != 1.0:
             raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
-        config = _config_from_run(run, data, resolved.run, overrides)
+        diagnostic = resolved.run.diagnostic_data_locator
+        data_path = (
+            data if data is not None else (Path(diagnostic) if diagnostic else None)
+        )
+        if data_path is None:
+            raise SMLArtifactError("resume requires a prepared-data bundle location")
+        config = _config_from_run(run, data_path, resolved.run, overrides)
         bundle = _verified_swag(
-            data,
+            data_path,
             expected_identity=resolved.run.data_identity,
             tokenizer_identity=resolved.run.tokenizer_identity,
             base_identity=None,

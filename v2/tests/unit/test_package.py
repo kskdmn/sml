@@ -68,12 +68,26 @@ def test_module_entrypoint_is_available():
     assert "SML workflows" in completed.stdout
 
 
-def test_cli_requires_a_command_for_non_help_dispatch():
+def test_cli_requires_a_command_for_non_help_dispatch(capsys):
     from sml.cli import main
-    from sml.errors import SMLConfigurationError
 
-    with pytest.raises(SMLConfigurationError, match="a command is required"):
-        main([])
+    assert main([]) == 2
+    captured = capsys.readouterr()
+    assert "SMLConfigurationError: a command is required" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_empty_module_entrypoint_renders_configuration_error_without_traceback():
+    completed = subprocess.run(
+        [sys.executable, "-m", "sml"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "SMLConfigurationError: a command is required" in completed.stderr
+    assert "Traceback" not in completed.stderr
 
 
 def test_error_types_are_distinct_sml_exceptions():

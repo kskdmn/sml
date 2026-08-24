@@ -43,6 +43,39 @@ def test_cli_precedence_is_defaults_then_toml_then_explicit(tmp_path):
         parsed.values = {"data": Path("other")}
 
 
+def test_nested_dto_values_are_recursively_frozen(tmp_path):
+    config = tmp_path / "train.toml"
+    config.write_text(
+        '[train]\ndata = "data"\noutput = "run"\n'
+        "[train.model]\ninitializer_range = 0.03\n",
+        encoding="utf-8",
+    )
+    parsed = parse_command(["train", "--config", str(config)])
+    before = parsed.to_domain()
+    model_values = parsed.values["model"]
+
+    with pytest.raises(TypeError):
+        model_values["initializer_range"] = 0.5
+
+    assert parsed.values["model"]["initializer_range"] == 0.03
+    assert parsed.to_domain() == before
+
+
+def test_model_initializer_defaults_use_final_overlay_values(tmp_path):
+    from sml.model.config import InitializerConfig
+
+    config = tmp_path / "train.toml"
+    config.write_text(
+        '[train]\ndata = "data"\noutput = "run"\n'
+        "[train.model]\nnum_layers = 6\ninitializer_range = 0.03\n",
+        encoding="utf-8",
+    )
+
+    model = parse_command(["train", "--config", str(config)]).to_domain().model
+
+    assert model.initializers == InitializerConfig.depth_scaled(0.03, 6)
+
+
 @pytest.mark.parametrize(
     ("argv", "module_name", "workflow"),
     [
@@ -266,9 +299,30 @@ def test_resume_pretraining_uses_only_semantic_overrides(monkeypatch):
     assert kwargs["overrides"].checkpoint_interval == 2
 
 
-def test_resume_finetune_requires_data():
-    with pytest.raises(SMLConfigurationError, match="data.*required"):
-        parse_command(["finetune", "--resume", "run"])
+@pytest.mark.parametrize(
+    ("extra_args", "expected_data"),
+    [
+        ([], None),
+        (["--data", "swag"], Path("swag")),
+    ],
+)
+def test_resume_finetune_dispatches_optional_data(
+    extra_args, expected_data, monkeypatch, capsys
+):
+    import sml.training.swag
+
+    calls = []
+    monkeypatch.setattr(
+        sml.training.swag,
+        "resume_finetune",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or "resumed",
+    )
+
+    assert main(["finetune", "--resume", "run", *extra_args]) == 0
+    args, kwargs = calls[0]
+    assert args == (Path("run"),)
+    assert kwargs["data"] == expected_data
+    assert "resumed" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("command", ["train", "finetune"])

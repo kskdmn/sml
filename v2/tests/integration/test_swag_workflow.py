@@ -630,6 +630,27 @@ def test_limit_satisfied_resume_returns_before_iterator_or_kernel_construction(
     assert result.run == completed.run
 
 
+def test_resume_uses_manifest_data_locator_when_data_is_omitted(
+    tiny_base_run, tiny_swag_bundle, tmp_path
+):
+    completed = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "locator-run",
+            maximum_steps=1,
+        )
+    )
+
+    result = resume_finetune(
+        completed.run,
+        data=None,
+        overrides=ResumeOverrides(maximum_steps=1),
+    )
+
+    assert result == completed
+
+
 def test_export_uses_recovered_latest_and_rejects_direct_step_paths(
     tiny_base_run, tiny_swag_bundle, tmp_path
 ):

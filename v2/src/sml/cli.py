@@ -580,6 +580,16 @@ def _tuple_values(values: dict[str, object], *names: str) -> dict[str, object]:
     return converted
 
 
+def _freeze_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_value(nested) for key, nested in value.items()}
+        )
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(_freeze_value(item) for item in value)
+    return value
+
+
 def _replace_dataclass(instance: Any, values: Mapping[str, object]) -> Any:
     if not values:
         return instance
@@ -595,7 +605,7 @@ def _replace_dataclass(instance: Any, values: Mapping[str, object]) -> Any:
 def _build_corpus(input_root: Path, values: object) -> Any:
     from sml.data.corpus import CorpusConfig
 
-    nested = dict(values) if isinstance(values, dict) else {}
+    nested = dict(values) if isinstance(values, Mapping) else {}
     return CorpusConfig(input_root=input_root, **nested)
 
 
@@ -669,7 +679,7 @@ class _Command:
     command: ClassVar[str]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+        object.__setattr__(self, "values", _freeze_value(self.values))
 
     def to_domain(self) -> Any:
         raise NotImplementedError
@@ -773,7 +783,7 @@ class TrainCommand(_Command):
 
         model_values = dict(self.values.get("model", {}))
         initializer_values = model_values.pop("initializers", {})
-        model = _replace_dataclass(ModelConfig(), model_values)
+        model = ModelConfig(**model_values)
         if initializer_values:
             model = replace(
                 model,
@@ -978,7 +988,7 @@ class FinetuneCommand(_Command):
 
             return resume_finetune(
                 self.values["resume"],
-                data=self.values["data"],
+                data=self.values.get("data"),
                 overrides=self.to_domain(),
             )
         from sml.training.swag import finetune
@@ -1082,7 +1092,6 @@ def _validate_command(command: str, values: dict[str, object]) -> None:
                     "resume rejects fresh-run configuration: "
                     + ", ".join(sorted(forbidden))
                 )
-            _require(values, "data")
         else:
             _require(values, "checkpoint", "data", "output")
     for field_name in ("checkpoint", "resume"):
@@ -1130,12 +1139,12 @@ def parse_command(argv: Sequence[str]) -> _Command:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
-    if not arguments:
-        raise SMLConfigurationError("a command is required")
     if arguments in (["--help"], ["-h"]):
         parser.print_help()
         return 0
     try:
+        if not arguments:
+            raise SMLConfigurationError("a command is required")
         command = parse_command(arguments)
         result = command.dispatch()
     except _DOMAIN_ERRORS as error:
