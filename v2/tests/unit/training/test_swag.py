@@ -632,18 +632,54 @@ def test_swag_kernel_wrappers_do_not_eval_before_rebuilding_host_state():
     assert "mx.eval(" not in inspect.getsource(swag_module.SwagKernels.optimizer_step)
 
 
-def test_swag_host_optimizer_step_calls_public_fp32_adamw():
+def test_swag_optimizer_splits_compiled_fp32_tree_from_host_reconstruction():
     host_source = inspect.getsource(swag_module.SwagKernels.optimizer_step)
-    assert "adamw_fp32_update(" in host_source
+    assert "adamw_fp32_update(" not in host_source
     assert "_adamw_fp32_update_tree" not in host_source
-    assert "optimizer.to_tree()" not in host_source
+    assert "AdamState.from_tree(" not in host_source
+    assert "AdamState.from_compiled_tree(" in host_source
+    assert "SwagTrainerState.from_compiled_tree(" in host_source
+    assert "optimizer.to_tree()" in host_source
+    assert "_require_dtype" in host_source
+    assert "mx.eval(" not in host_source
     assert "adamw_mixed_precision_update(" not in host_source
     builder_source = inspect.getsource(swag_module.build_swag_kernels)
-    assert "_adamw_fp32_update_tree" not in builder_source
+    assert "_adamw_fp32_update_tree" in builder_source
+    assert "normalize_and_clip(" in builder_source
     assert "AdamState" not in builder_source
     module_source = inspect.getsource(swag_module)
-    assert "_adamw_fp32_update_tree" not in module_source
     assert "adamw_mixed_precision_update(" not in module_source
+    assert ".astype(mx.bfloat16)" not in module_source
+
+
+def test_compiled_swag_optimizer_core_consumes_builtin_adapter_and_adam_trees(
+    tiny_swag_runtime,
+):
+    kernels = tiny_swag_runtime.kernels(compiled=True)
+    ranking_inputs = tiny_swag_runtime.core_inputs()
+    adapters = ranking_inputs[0]
+    trainer_tree = kernels.compiled_ranking_microstep_core(*ranking_inputs)
+    optimizer = initialize_adam_state(adapters)
+    outputs = kernels.compiled_optimizer_step_core(
+        adapters,
+        optimizer.to_tree(),
+        trainer_tree,
+    )
+    mx.eval(outputs)
+    assert_builtin_array_tree(outputs)
+    next_adapters, next_adam_tree, next_trainer_tree = outputs
+    assert_tree_dtypes(next_adapters, mx.float32)
+    assert_tree_dtypes(next_adam_tree[1], mx.float32)
+    assert_tree_dtypes(next_adam_tree[2], mx.float32)
+    changed = False
+    for (_, before), (_, after) in zip(
+        tree_flatten(adapters), tree_flatten(next_adapters), strict=True
+    ):
+        if not bool(mx.array_equal(before, after).item()):
+            changed = True
+            break
+    assert changed
+    assert int(next_trainer_tree[1].item()) == 0
 
 
 def test_direct_swag_envelope_validates_numpy_arrays_and_stores_readonly_views():
@@ -695,6 +731,42 @@ def test_direct_swag_envelope_validates_numpy_arrays_and_stores_readonly_views()
             cursor,
             source_epoch=0,
         )
+
+
+def test_swag_envelope_owns_storage_independent_of_caller_arrays():
+    batch_size, candidate_count, length = 2, 4, 8
+    input_ids = np.arange(
+        batch_size * candidate_count * length, dtype=np.int32
+    ).reshape(batch_size, candidate_count, length)
+    score_mask = np.ones((batch_size, candidate_count, length), dtype=bool)
+    labels = np.arange(batch_size, dtype=np.int32)
+    example_mask = np.array([True, False])
+    valid_token_mask = np.ones((batch_size, candidate_count, length), dtype=bool)
+    cursor = SwagCursor(epoch=0, bucket_order_position=0, row_offset=1)
+    envelope = SwagBatchEnvelope(
+        input_ids,
+        score_mask,
+        labels,
+        example_mask,
+        valid_token_mask,
+        cursor,
+        source_epoch=0,
+    )
+    original_input = int(envelope.input_ids[0, 0, 0])
+    original_label = int(envelope.labels[0])
+    original_example = bool(envelope.example_mask[0])
+    original_score = bool(envelope.score_mask[0, 0, 0])
+    original_valid = bool(envelope.valid_token_mask[0, 0, 0])
+    input_ids[0, 0, 0] = original_input + 7
+    labels[0] = original_label + 3
+    example_mask[0] = not original_example
+    score_mask[0, 0, 0] = not original_score
+    valid_token_mask[0, 0, 0] = not original_valid
+    assert int(envelope.input_ids[0, 0, 0]) == original_input
+    assert int(envelope.labels[0]) == original_label
+    assert bool(envelope.example_mask[0]) is original_example
+    assert bool(envelope.score_mask[0, 0, 0]) is original_score
+    assert bool(envelope.valid_token_mask[0, 0, 0]) is original_valid
 
 
 def test_per_slot_ranking_losses_are_finite_before_masking(tiny_swag_runtime):
@@ -940,3 +1012,30 @@ def test_swag_batch_stream_rejects_loader_missing_required_attributes(
     start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
     with pytest.raises(TypeError, match="prefetch_depth"):
         SwagBatchStream(tiny_swag_runtime.bundle, object(), cursor=start)
+
+
+def test_swag_batch_stream_rejects_invalid_loader_policy_types_and_ranges(
+    tiny_swag_runtime,
+):
+    start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
+    base = {"prefetch_depth": 1, "microbatch_size": 2, "epoch_seed": 42}
+    cases = (
+        ({"prefetch_depth": 0}, ValueError, "prefetch_depth"),
+        ({"prefetch_depth": 1.5}, TypeError, "prefetch_depth"),
+        ({"microbatch_size": 0}, ValueError, "microbatch_size"),
+        ({"microbatch_size": True}, TypeError, "microbatch_size"),
+        ({"epoch_seed": -1}, ValueError, "epoch_seed"),
+        ({"epoch_seed": 2**32}, ValueError, "epoch_seed"),
+        ({"epoch_seed": True}, TypeError, "epoch_seed"),
+    )
+    for override, error, match in cases:
+        loader = SimpleNamespace(**{**base, **override})
+        with pytest.raises(error, match=match):
+            SwagBatchStream(tiny_swag_runtime.bundle, loader, cursor=start)
+    with SwagBatchStream(
+        tiny_swag_runtime.bundle,
+        SimpleNamespace(prefetch_depth=1, microbatch_size=2, epoch_seed=0),
+        cursor=start,
+    ) as stream:
+        envelope = next(iter(stream))
+        assert envelope.input_ids.shape[0] == 2

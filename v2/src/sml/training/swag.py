@@ -13,8 +13,9 @@ from sml.training.common import (
     AdamState,
     LoaderConfig,
     OptimizerConfig,
+    _adamw_fp32_update_tree,
+    _require_dtype,
     accumulate_fp32,
-    adamw_fp32_update,
     normalize_and_clip,
 )
 
@@ -172,19 +173,17 @@ class SwagKernels:
         optimizer: AdamState,
         trainer: SwagTrainerState,
     ) -> tuple[dict, AdamState, SwagTrainerState]:
-        gradients, next_trainer = self.compiled_optimizer_step_core(
+        next_adapters, next_adam_tree, next_trainer = self.compiled_optimizer_step_core(
+            adapters,
+            optimizer.to_tree(),
             trainer.to_tree(),
         )
-        next_adapters, next_optimizer = adamw_fp32_update(
-            adapters,
-            gradients,
-            optimizer,
-            self.optimizer_config,
-            self.weight_decay_tree,
-        )
+        _require_dtype(next_adapters, "parameters", mx.float32)
+        _require_dtype(next_adam_tree[1], "first_moments", mx.float32)
+        _require_dtype(next_adam_tree[2], "second_moments", mx.float32)
         return (
             next_adapters,
-            next_optimizer,
+            AdamState.from_compiled_tree(next_adam_tree),
             SwagTrainerState.from_compiled_tree(next_trainer),
         )
 
@@ -270,7 +269,7 @@ def build_swag_kernels(
             next_correct,
         )
 
-    def swag_optimizer_step_core(trainer_tree):
+    def swag_optimizer_step_core(adapters, adam_tree, trainer_tree):
         accumulators, valid_count, next_key, loss_numerator, correct_count = (
             trainer_tree
         )
@@ -278,6 +277,13 @@ def build_swag_kernels(
             accumulators,
             valid_count,
             gradient_clip_norm=kernel_config.gradient_clip_norm,
+        )
+        next_adapters, next_adam_tree = _adamw_fp32_update_tree(
+            adapters,
+            gradients,
+            adam_tree,
+            config.optimizer,
+            weight_decay_tree,
         )
         reset_accumulators = tree_map(
             lambda accumulator: accumulator - accumulator, accumulators
@@ -289,7 +295,7 @@ def build_swag_kernels(
             (loss_numerator - loss_numerator).astype(mx.float32),
             (correct_count - correct_count).astype(mx.int32),
         )
-        return gradients, next_trainer
+        return next_adapters, next_adam_tree, next_trainer
 
     return SwagKernels(
         compiled_ranking_microstep_core=(

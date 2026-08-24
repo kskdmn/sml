@@ -1295,22 +1295,30 @@ class SwagBatchEnvelope:
             raise ValueError("input_ids must have 4 candidates")
         batch_shape = tuple(int(dimension) for dimension in input_ids.shape)
         label_shape = (batch_shape[0],)
-        self._input_ids = input_ids
-        self._score_mask = _readonly_numpy_array(
-            score_mask, "score_mask", ndim=3, dtype=_BOOL, shape=batch_shape
+        self._input_ids = _owned_readonly(input_ids)
+        self._score_mask = _owned_readonly(
+            _readonly_numpy_array(
+                score_mask, "score_mask", ndim=3, dtype=_BOOL, shape=batch_shape
+            )
         )
-        self._labels = _readonly_numpy_array(
-            labels, "labels", ndim=1, dtype=_INT32, shape=label_shape
+        self._labels = _owned_readonly(
+            _readonly_numpy_array(
+                labels, "labels", ndim=1, dtype=_INT32, shape=label_shape
+            )
         )
-        self._example_mask = _readonly_numpy_array(
-            example_mask, "example_mask", ndim=1, dtype=_BOOL, shape=label_shape
+        self._example_mask = _owned_readonly(
+            _readonly_numpy_array(
+                example_mask, "example_mask", ndim=1, dtype=_BOOL, shape=label_shape
+            )
         )
-        self._valid_token_mask = _readonly_numpy_array(
-            valid_token_mask,
-            "valid_token_mask",
-            ndim=3,
-            dtype=_BOOL,
-            shape=batch_shape,
+        self._valid_token_mask = _owned_readonly(
+            _readonly_numpy_array(
+                valid_token_mask,
+                "valid_token_mask",
+                ndim=3,
+                dtype=_BOOL,
+                shape=batch_shape,
+            )
         )
         self._cursor_after = cursor_after
         self._source_epoch = source_epoch
@@ -1435,6 +1443,11 @@ def _require_swag_loader_policy(loader: object) -> SwagLoaderPolicy:
         raise TypeError(
             "loader must provide prefetch_depth, microbatch_size, and epoch_seed"
         )
+    _require_plain_int(loader.prefetch_depth, "prefetch_depth", minimum=1)
+    _require_plain_int(loader.microbatch_size, "microbatch_size", minimum=1)
+    epoch_seed = _require_plain_int(loader.epoch_seed, "epoch_seed")
+    if epoch_seed > 2**32 - 1:
+        raise ValueError("epoch_seed must be an unsigned 32-bit integer")
     return loader  # type: ignore[return-value]
 
 
