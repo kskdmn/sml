@@ -8,7 +8,7 @@ gate. The recorded-source quality validator and deeply immutable
 `VerifiedCheckpointContents` closed at `4c190f3` with scoped review approved.
 The unchecked boxes below preserve the original TDD procedure; they are not
 live task status. Part 1 is complete; Part 2 Phase 4 (Tasks 4.1-4.4) and
-Tasks 5.1-5.5 are complete. Part 2 Task 6.1 is the next live task.
+Tasks 5.1-5.5 and Task 6.1 are complete. Part 2 Task 6.2 is the next live task.
 
 **Goal:** Replace the v2 model/data/artifact foundation with the `sml` package and deliver exact, resumable BF16-compute pretraining with authoritative FP32 master parameters and FP32 optimizer state. The existing benchmark harness may be used for diagnostics, but baseline comparison is not required.
 
