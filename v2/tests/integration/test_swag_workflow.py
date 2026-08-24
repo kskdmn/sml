@@ -13,9 +13,13 @@ from sml.artifacts.checkpoint import resolve_latest_step
 from sml.artifacts.manifest import (
     BaseSnapshotManifest,
     ExportManifest,
+    LatestIndex,
+    LoRACheckpointManifest,
     LoRARunManifest,
+    PayloadRef,
     VerificationLevel,
     canonical_json_bytes,
+    file_identity,
     read_manifest,
 )
 from sml.data.corpus import CorpusConfig
@@ -273,6 +277,12 @@ def _assert_array_maps_equal(
         assert bool(mx.array_equal(array, expected[name]).item()), name
 
 
+def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
+    with path.open("rb") as payload:
+        identity = file_identity(payload)
+    return PayloadRef(logical_path, identity, path.stat().st_size)
+
+
 def _rewrite_bound_base_snapshot(run: Path, **changes: object) -> None:
     snapshot = read_manifest(
         run / "base",
@@ -294,6 +304,42 @@ def _rewrite_bound_base_snapshot(run: Path, **changes: object) -> None:
     (run / LoRARunManifest.MANIFEST_FILENAME).write_bytes(
         canonical_json_bytes(run_manifest)
     )
+    rebound_latest: LoRACheckpointManifest | None = None
+    latest = read_manifest(
+        run, LatestIndex, VerificationLevel.MANIFEST_TRUSTED
+    ).manifest
+    for step_directory in (run / "checkpoints").iterdir():
+        if not step_directory.is_dir():
+            continue
+        checkpoint = read_manifest(
+            step_directory,
+            LoRACheckpointManifest,
+            VerificationLevel.MANIFEST_TRUSTED,
+        ).manifest
+        state_path = step_directory / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["owning_run_identity"] = run_manifest.identity
+        state_path.write_bytes(canonical_json_bytes(state))
+        checkpoint = replace(
+            checkpoint,
+            owning_run_identity=run_manifest.identity,
+            scalar_state=_payload_ref(state_path, "state.json"),
+        )
+        checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+        (step_directory / LoRACheckpointManifest.MANIFEST_FILENAME).write_bytes(
+            canonical_json_bytes(checkpoint)
+        )
+        if checkpoint.step == latest.step:
+            rebound_latest = checkpoint
+    if rebound_latest is None:
+        raise AssertionError("LoRA run has no latest checkpoint to rebind")
+    latest = replace(
+        latest,
+        owning_run_identity=run_manifest.identity,
+        checkpoint_identity=rebound_latest.identity,
+    )
+    latest = replace(latest, identity=latest.recompute_identity())
+    (run / LatestIndex.MANIFEST_FILENAME).write_bytes(canonical_json_bytes(latest))
 
 
 @pytest.fixture(scope="module")
@@ -496,7 +542,7 @@ def test_resume_rejects_mismatches_before_allocation(
     )
     model["hidden_size"] = 16
     _rewrite_bound_base_snapshot(model_run, model=model)
-    with pytest.raises((SMLArtifactError, SMLConfigurationError)):
+    with pytest.raises(SMLArtifactError, match="model configuration"):
         resume_finetune(
             model_run,
             data=tiny_swag_bundle.path,
@@ -515,7 +561,7 @@ def test_resume_rejects_mismatches_before_allocation(
     )
     precision["working_parameter_dtype"] = "float32"
     _rewrite_bound_base_snapshot(precision_run, precision=precision)
-    with pytest.raises((SMLArtifactError, SMLConfigurationError)):
+    with pytest.raises(SMLArtifactError, match="canonical pretraining precision"):
         resume_finetune(
             precision_run,
             data=tiny_swag_bundle.path,
@@ -529,7 +575,7 @@ def test_resume_rejects_mismatches_before_allocation(
         tokenizer_run,
         tokenizer_identity="sha256:" + "a" * 64,
     )
-    with pytest.raises((SMLArtifactError, SMLConfigurationError)):
+    with pytest.raises(SMLArtifactError, match="tokenizer identity"):
         resume_finetune(
             tokenizer_run,
             data=tiny_swag_bundle.path,
