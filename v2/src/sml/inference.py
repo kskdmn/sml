@@ -20,6 +20,7 @@ from sml.artifacts.checkpoint import (
     run_access_lock,
 )
 from sml.artifacts.manifest import (
+    ArtifactRoot,
     BaseSnapshotManifest,
     ExportManifest,
     LoRARunManifest,
@@ -416,6 +417,18 @@ def load_owned_model_arrays(
             return reader.resolved, MappingProxyType(owned)
 
 
+def _load_safetensors(root: Path, logical_path: str) -> dict[str, mx.array]:
+    with (
+        ArtifactRoot.open(root, writable=False) as artifact,
+        artifact.open_payload(logical_path) as payload,
+    ):
+        arrays = mx.load(payload, format="safetensors")
+    if not isinstance(arrays, dict):
+        raise SMLArtifactError(f"array payload must be a mapping: {logical_path}")
+    mx.eval(*arrays.values())
+    return dict(arrays)
+
+
 def _require_unit_rope(model: Mapping[str, object], *, context: str) -> ModelConfig:
     rope_factor = model.get("rope_scaling_factor")
     if rope_factor != 1.0:
@@ -473,12 +486,10 @@ def _resolve_lora_run(path: Path, *, full_verify: bool) -> ResolvedModel:
             raise SMLArtifactError(
                 "copied base rope_scaling_factor must be exactly 1.0"
             )
-        base_arrays = dict(
-            mx.load(
-                str(path / "base" / base.manifest.working_weights.payload.logical_path)
-            )
+        base_arrays = _load_safetensors(
+            path / "base",
+            base.manifest.working_weights.payload.logical_path,
         )
-        mx.eval(*base_arrays.values())
         with open_checkpoint_reader(
             path,
             step=recovered.step,
@@ -526,10 +537,10 @@ def _resolve_export(path: Path, *, full_verify: bool) -> ResolvedModel:
     tokenizer = load_tokenizer_bundle(path / "tokenizer", verification)
     if tokenizer.manifest.identity != verified.manifest.tokenizer_identity:
         raise SMLArtifactError("export tokenizer identity does not match manifest")
-    arrays = dict(
-        mx.load(str(path / verified.manifest.model_weights.payload.logical_path))
+    arrays = _load_safetensors(
+        path,
+        verified.manifest.model_weights.payload.logical_path,
     )
-    mx.eval(*arrays.values())
     return ResolvedModel(
         artifact_kind=verified.manifest.kind,
         run_identity=None,

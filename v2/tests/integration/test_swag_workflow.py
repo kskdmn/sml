@@ -11,6 +11,7 @@ import pytest
 import zstandard as zstd
 from sml.artifacts.checkpoint import resolve_latest_step
 from sml.artifacts.manifest import (
+    BaseSnapshotManifest,
     ExportManifest,
     VerificationLevel,
     canonical_json_bytes,
@@ -368,6 +369,14 @@ def test_lora_checkpoint_omits_frozen_base(tiny_lora_run):
         trainer_accumulators=mx.float32,
     )
     assert_base_snapshot_array_dtypes(tiny_lora_run / "base", model=mx.bfloat16)
+    verified = read_manifest(
+        tiny_lora_run / "base",
+        BaseSnapshotManifest,
+        VerificationLevel.FULL,
+    )
+    assert verified.manifest.precision.get("working_parameter_dtype") == "bfloat16"
+    assert verified.manifest.precision.get("master_weights") is True
+    assert "adapter_parameter_dtype" not in verified.manifest.precision
 
 
 def test_uninterrupted_and_interrupted_adapter_state_match(

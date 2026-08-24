@@ -19,7 +19,9 @@ from sml.artifacts.checkpoint import (
     publish_checkpoint,
     publish_immutable_bundle,
     publish_run,
+    recover_latest_index,
     resolve_latest_step,
+    run_access_lock,
     run_writer_lock,
 )
 from sml.artifacts.manifest import (
@@ -48,7 +50,6 @@ from sml.data.swag import (
     load_swag_bundle,
 )
 from sml.errors import SMLArtifactError, SMLConfigurationError
-from sml.inference import resolve_model_artifact
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
 from sml.training.common import (
@@ -239,6 +240,18 @@ class _RestoredSwagState:
     optimizer: AdamState
     trainer: SwagTrainerState
     scalar: ScalarSwagState
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectedPretrainingBase:
+    step: ResolvedStep
+    working_bytes: bytes
+    tokenizer_files: dict[str, bytes]
+    model: dict[str, object]
+    precision: dict[str, object]
+    tokenizer_identity: str
+    model_config: ModelConfig
+    identity: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,33 +532,55 @@ def _optimizer_from_mapping(value: Mapping[str, object]) -> OptimizerConfig:
     return OptimizerConfig(weight_decay=weight_decay, **values)
 
 
-def _resolved_model_identity(base) -> str:
-    identity = base.identity()
+def _run_step_model_identity(resolved: ResolvedStep, tokenizer_identity: str) -> str:
     return structured_identity(
         "sml-resolved-model-identity-v1",
         {
-            "artifact_kind": identity.artifact_kind,
-            "run_identity": identity.run_identity,
-            "step": identity.step,
-            "checkpoint_identity": identity.checkpoint_identity,
-            "run_step_identity": identity.run_step_identity,
-            "tokenizer_identity": identity.tokenizer_identity,
+            "artifact_kind": resolved.run.kind,
+            "run_identity": resolved.run.identity,
+            "step": resolved.step,
+            "checkpoint_identity": resolved.checkpoint.identity,
+            "run_step_identity": resolved.run_step_identity,
+            "tokenizer_identity": tokenizer_identity,
         },
     )
 
 
-def _copy_tokenizer_directory(source: Path, destination: Path) -> None:
-    destination.mkdir()
+def _load_safetensors(root: Path, logical_path: str) -> dict[str, mx.array]:
+    with (
+        ArtifactRoot.open(root, writable=False) as artifact,
+        artifact.open_payload(logical_path) as payload,
+    ):
+        arrays = mx.load(payload, format="safetensors")
+    if not isinstance(arrays, dict):
+        raise SMLArtifactError(f"array payload must be a mapping: {logical_path}")
+    mx.eval(*arrays.values())
+    return dict(arrays)
+
+
+def _read_tokenizer_files(source: Path) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
     with ArtifactRoot.open(source, writable=False) as root:
         for name in _TOKENIZER_FILES:
             with root.open_payload(name) as payload:
-                (destination / name).write_bytes(payload.read())
+                files[name] = payload.read()
+    return files
+
+
+def _write_tokenizer_directory(destination: Path, files: Mapping[str, bytes]) -> None:
+    destination.mkdir()
+    for name in _TOKENIZER_FILES:
+        payload = files.get(name)
+        if not isinstance(payload, bytes):
+            raise SMLArtifactError(f"tokenizer payload missing: {name}")
+        (destination / name).write_bytes(payload)
 
 
 def _copy_base_snapshot(
     private_run: Path,
     *,
     base_step: ResolvedStep,
+    working_bytes: bytes,
     model: Mapping[str, object],
     precision: Mapping[str, object],
     tokenizer_identity: str,
@@ -556,10 +591,8 @@ def _copy_base_snapshot(
         raise SMLArtifactError("LoRA base must be a pretraining run")
     destination = private_run / "base"
     destination.mkdir()
-    source_path = base_step.step_directory / "model.safetensors"
-    payload = source_path.read_bytes()
     model_path = destination / "model.safetensors"
-    model_path.write_bytes(payload)
+    model_path.write_bytes(working_bytes)
     copied = _payload_ref(model_path, "model.safetensors")
     source_ref = base_step.checkpoint.model
     if (
@@ -783,6 +816,14 @@ def _parse_scalar_document(
         raise SMLArtifactError("invalid checkpoint scalar state") from error
 
 
+def _read_scalar_state(resolved: ResolvedStep) -> ScalarSwagState:
+    with (
+        ArtifactRoot.open(resolved.step_directory, writable=False) as root,
+        root.open_payload("state.json") as payload,
+    ):
+        return _parse_scalar_document(payload.read(), resolved)
+
+
 def _json_object_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -919,11 +960,14 @@ def _checkpoint_builder(
 
 def _restore_adapter_checkpoint(
     resolved: ResolvedStep,
+    *,
+    hold_lock: bool = True,
 ) -> tuple[dict, AdamState, SwagTrainerState, ScalarSwagState]:
     with open_checkpoint_reader(
         resolved.step_directory.parent.parent,
         step=resolved.step,
         expected_checkpoint_identity=resolved.checkpoint.identity,
+        hold_lock=hold_lock,
     ) as reader:
         verified = reader.resolved
         if not isinstance(verified.checkpoint, LoRACheckpointManifest):
@@ -1049,8 +1093,10 @@ def _load_base_snapshot_arrays(run: Path) -> dict[str, mx.array]:
     verified = read_manifest(run / "base", BaseSnapshotManifest, VerificationLevel.FULL)
     if verified.manifest.model.get("rope_scaling_factor") != 1.0:
         raise SMLArtifactError("copied base rope_scaling_factor must be exactly 1.0")
-    arrays = dict(mx.load(str(run / "base" / "model.safetensors")))
-    mx.eval(*arrays.values())
+    arrays = _load_safetensors(
+        run / "base",
+        verified.manifest.working_weights.payload.logical_path,
+    )
     if not arrays:
         raise SMLArtifactError("copied base snapshot has no working weights")
     for array in arrays.values():
@@ -1157,6 +1203,58 @@ def _run_training(
     return _training_result(run, scalar)
 
 
+def _select_pretraining_base(run: Path) -> _SelectedPretrainingBase:
+    with run_access_lock(run, exclusive=False):
+        recovered = recover_latest_index(
+            run,
+            writable=False,
+            verification=VerificationLevel.MANIFEST_TRUSTED,
+        )
+        if not isinstance(recovered.run, PretrainingRunManifest):
+            raise SMLArtifactError("LoRA base must be a pretraining run")
+        if recovered.run.model.get("rope_scaling_factor") != 1.0:
+            raise SMLArtifactError(
+                "copied base rope_scaling_factor must be exactly 1.0"
+            )
+        tokenizer = read_manifest(
+            run / "tokenizer",
+            TokenizerManifest,
+            VerificationLevel.FULL,
+        ).manifest
+        if tokenizer.identity != recovered.run.tokenizer_identity:
+            raise SMLArtifactError("run tokenizer identity does not match run.json")
+        tokenizer_files = _read_tokenizer_files(run / "tokenizer")
+        with open_checkpoint_reader(
+            run,
+            step=recovered.step,
+            expected_checkpoint_identity=recovered.checkpoint.identity,
+            verification=VerificationLevel.FULL,
+            load_array_groups=frozenset({"model.safetensors", "master.safetensors"}),
+            hold_lock=False,
+        ) as reader:
+            reader.read_contents()
+            working_bytes = reader.read_payload_bytes("model.safetensors")
+            base_step = reader.resolved
+        if not isinstance(base_step.run, PretrainingRunManifest):
+            raise SMLArtifactError("LoRA base must be a pretraining run")
+        model_mapping = dict(base_step.run.model)
+        precision_mapping = dict(base_step.run.precision)
+        model_config = ModelConfig(**model_mapping)
+        if model_config.rope_scaling_factor != 1.0:
+            raise SMLArtifactError("resolution never substitutes rope_scaling_factor")
+        tokenizer_identity = tokenizer.identity
+        return _SelectedPretrainingBase(
+            step=base_step,
+            working_bytes=working_bytes,
+            tokenizer_files=tokenizer_files,
+            model=model_mapping,
+            precision=precision_mapping,
+            tokenizer_identity=tokenizer_identity,
+            model_config=model_config,
+            identity=_run_step_model_identity(base_step, tokenizer_identity),
+        )
+
+
 def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
     if not isinstance(config, SwagTrainingConfig):
         raise TypeError("config must be a SwagTrainingConfig")
@@ -1166,61 +1264,48 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
             raise SMLArtifactError(
                 f"fresh run target already exists: {config.output_run}"
             )
-        base = resolve_model_artifact(config.base_checkpoint, full_verify=True)
-        if base.artifact_kind != "pretraining-run":
-            raise SMLArtifactError("LoRA base must be a pretraining run")
-        if base.model_config.rope_scaling_factor != 1.0:
-            raise SMLArtifactError(
-                "copied base rope_scaling_factor must be exactly 1.0"
-            )
-        base_step = resolve_latest_step(
-            config.base_checkpoint,
-            writable=False,
-            verification=VerificationLevel.FULL,
-        )
+        selected = _select_pretraining_base(config.base_checkpoint)
         bundle = _verified_swag(
             config.data,
             expected_identity=None,
-            tokenizer_identity=base.tokenizer.manifest.identity,
-            base_identity=_resolved_model_identity(base),
+            tokenizer_identity=selected.tokenizer_identity,
+            base_identity=selected.identity,
         )
         runtime: tuple[SMLLanguageModel, _RestoredSwagState] | None = None
-        model_mapping = dataclasses.asdict(base.model_config)
-        tokenizer_identity = base.tokenizer.manifest.identity
 
         def build(private_run: Path) -> LoRARunManifest:
             nonlocal runtime
-            _copy_tokenizer_directory(
-                config.base_checkpoint / "tokenizer",
-                private_run / "tokenizer",
+            _write_tokenizer_directory(
+                private_run / "tokenizer", selected.tokenizer_files
             )
             snapshot = _copy_base_snapshot(
                 private_run,
-                base_step=base_step,
-                model=model_mapping,
-                precision=dataclasses.asdict(config.precision),
-                tokenizer_identity=tokenizer_identity,
+                base_step=selected.step,
+                working_bytes=selected.working_bytes,
+                model=selected.model,
+                precision=selected.precision,
+                tokenizer_identity=selected.tokenizer_identity,
             )
             copied_tokenizer = read_manifest(
                 private_run / "tokenizer",
                 TokenizerManifest,
                 VerificationLevel.FULL,
             ).manifest
-            if copied_tokenizer.identity != tokenizer_identity:
+            if copied_tokenizer.identity != selected.tokenizer_identity:
                 raise SMLArtifactError("copied tokenizer identity does not match base")
             (private_run / "checkpoints").mkdir()
             manifest = _run_manifest(
                 config,
-                model=model_mapping,
-                tokenizer_identity=tokenizer_identity,
+                model=selected.model,
+                tokenizer_identity=selected.tokenizer_identity,
                 base_identity=snapshot.identity,
                 data_identity=bundle.manifest.identity,
             )
             (private_run / "run.json").write_bytes(canonical_json_bytes(manifest))
             model_key, trainer_key = mx.random.split(mx.random.key(config.seed))
             model, adapters, frozen_base = _wrap_copied_base(
-                base.model_config,
-                dict(mx.load(str(private_run / "base" / "model.safetensors"))),
+                selected.model_config,
+                _load_safetensors(private_run / "base", "model.safetensors"),
                 config.lora,
                 model_key,
             )
@@ -1275,22 +1360,13 @@ def resume_finetune(
             raise SMLArtifactError("LoRA resume requires a LoRA run")
         if resolved.run.model.get("rope_scaling_factor") != 1.0:
             raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
+        config = _config_from_run(run, data, resolved.run, overrides)
         bundle = _verified_swag(
             data,
             expected_identity=resolved.run.data_identity,
             tokenizer_identity=resolved.run.tokenizer_identity,
             base_identity=None,
         )
-        adapters, optimizer, trainer, scalar = _restore_adapter_checkpoint(resolved)
-        retained = prune_to_latest(run)
-        if retained.checkpoint.identity != resolved.checkpoint.identity:
-            raise SMLArtifactError("latest checkpoint changed during writable recovery")
-        resolved = retained
-        config = _config_from_run(run, data, resolved.run, overrides)
-        if _limit_reached(config, scalar):
-            return _training_result(run, scalar)
-
-        base_arrays = _load_base_snapshot_arrays(run)
         snapshot = read_manifest(
             run / "base",
             BaseSnapshotManifest,
@@ -1298,6 +1374,31 @@ def resume_finetune(
         ).manifest
         if snapshot.identity != resolved.run.base_identity:
             raise SMLArtifactError("run base snapshot identity does not match run.json")
+        if snapshot.model.get("rope_scaling_factor") != 1.0:
+            raise SMLArtifactError(
+                "copied base rope_scaling_factor must be exactly 1.0"
+            )
+        if snapshot.tokenizer_identity != resolved.run.tokenizer_identity:
+            raise SMLArtifactError(
+                "run base tokenizer identity does not match run.json"
+            )
+        tokenizer = read_manifest(
+            run / "tokenizer",
+            TokenizerManifest,
+            VerificationLevel.FULL,
+        ).manifest
+        if tokenizer.identity != resolved.run.tokenizer_identity:
+            raise SMLArtifactError("run tokenizer identity does not match run.json")
+        retained = prune_to_latest(run)
+        if retained.checkpoint.identity != resolved.checkpoint.identity:
+            raise SMLArtifactError("latest checkpoint changed during writable recovery")
+        resolved = retained
+        scalar = _read_scalar_state(resolved)
+        if _limit_reached(config, scalar):
+            return _training_result(run, scalar)
+
+        adapters, optimizer, trainer, scalar = _restore_adapter_checkpoint(resolved)
+        base_arrays = _load_base_snapshot_arrays(run)
         model_config = ModelConfig(**_mapping_dict(resolved.run.model, "model"))
         model_key, _trainer_key = mx.random.split(mx.random.key(config.seed))
         model, _initialized, frozen_base = _wrap_copied_base(
@@ -1335,39 +1436,63 @@ def export_merged(checkpoint: Path, output: Path) -> ExportResult:
     checkpoint = _reject_direct_step_path(checkpoint)
     if not isinstance(output, Path):
         raise TypeError("output must be a Path")
-    resolved = resolve_latest_step(
-        checkpoint,
-        writable=False,
-        verification=VerificationLevel.FULL,
-    )
-    if not isinstance(resolved.run, LoRARunManifest):
-        raise SMLArtifactError("merged export requires a LoRA run")
-    if resolved.run.model.get("rope_scaling_factor") != 1.0:
-        raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
-    adapters, _optimizer, _trainer, _scalar = _restore_adapter_checkpoint(resolved)
-    base_arrays = _load_base_snapshot_arrays(checkpoint)
-    model_config = ModelConfig(**_mapping_dict(resolved.run.model, "model"))
-    lora = lora_config_from_mapping(_mapping_dict(resolved.run.lora, "lora"))
-    model_key, _ignored = mx.random.split(mx.random.key(0))
-    model, _initialized, _frozen = _wrap_copied_base(
-        model_config,
-        base_arrays,
-        lora,
-        model_key,
-    )
-    load_lora_state_dict(model, dict(tree_flatten(adapters)))
-    merged = merged_model_weights(model)
-    mx.eval(*merged.values())
-    tokenizer_source = checkpoint / "tokenizer"
+    with run_access_lock(checkpoint, exclusive=False):
+        recovered = recover_latest_index(
+            checkpoint,
+            writable=False,
+            verification=VerificationLevel.MANIFEST_TRUSTED,
+        )
+        if not isinstance(recovered.run, LoRARunManifest):
+            raise SMLArtifactError("merged export requires a LoRA run")
+        if recovered.run.model.get("rope_scaling_factor") != 1.0:
+            raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
+        snapshot = read_manifest(
+            checkpoint / "base",
+            BaseSnapshotManifest,
+            VerificationLevel.FULL,
+        ).manifest
+        if snapshot.identity != recovered.run.base_identity:
+            raise SMLArtifactError("run base snapshot identity does not match run.json")
+        if snapshot.model.get("rope_scaling_factor") != 1.0:
+            raise SMLArtifactError(
+                "copied base rope_scaling_factor must be exactly 1.0"
+            )
+        tokenizer = read_manifest(
+            checkpoint / "tokenizer",
+            TokenizerManifest,
+            VerificationLevel.FULL,
+        ).manifest
+        if tokenizer.identity != recovered.run.tokenizer_identity:
+            raise SMLArtifactError("export tokenizer identity does not match the run")
+        tokenizer_files = _read_tokenizer_files(checkpoint / "tokenizer")
+        adapters, _optimizer, _trainer, _scalar = _restore_adapter_checkpoint(
+            recovered,
+            hold_lock=False,
+        )
+        base_arrays = _load_base_snapshot_arrays(checkpoint)
+        model_config = ModelConfig(**_mapping_dict(recovered.run.model, "model"))
+        lora = lora_config_from_mapping(_mapping_dict(recovered.run.lora, "lora"))
+        model_key, _ignored = mx.random.split(mx.random.key(0))
+        model, _initialized, _frozen = _wrap_copied_base(
+            model_config,
+            base_arrays,
+            lora,
+            model_key,
+        )
+        load_lora_state_dict(model, dict(tree_flatten(adapters)))
+        merged = merged_model_weights(model)
+        mx.eval(*merged.values())
+        run_manifest = recovered.run
+        source_step = recovered.step
 
     def build(private_path: Path) -> ExportManifest:
-        _copy_tokenizer_directory(tokenizer_source, private_path / "tokenizer")
-        tokenizer = read_manifest(
+        _write_tokenizer_directory(private_path / "tokenizer", tokenizer_files)
+        copied_tokenizer = read_manifest(
             private_path / "tokenizer",
             TokenizerManifest,
             VerificationLevel.FULL,
         ).manifest
-        if tokenizer.identity != resolved.run.tokenizer_identity:
+        if copied_tokenizer.identity != run_manifest.tokenizer_identity:
             raise SMLArtifactError("export tokenizer identity does not match the run")
         weights_path = private_path / "model.safetensors"
         mx.save_safetensors(str(weights_path), dict(sorted(merged.items())))
@@ -1384,14 +1509,14 @@ def export_merged(checkpoint: Path, output: Path) -> ExportResult:
             kind="export",
             version=1,
             identity=_PLACEHOLDER_IDENTITY,
-            model=dict(resolved.run.model),
-            precision=dict(resolved.run.precision),
-            tokenizer_identity=resolved.run.tokenizer_identity,
+            model=dict(run_manifest.model),
+            precision=dict(run_manifest.precision),
+            tokenizer_identity=run_manifest.tokenizer_identity,
             model_weights=model_ref,
             tokenizer_model=tokenizer_model,
             tokenizer_vocab=tokenizer_vocab,
-            diagnostic_source_run_identity=resolved.run.identity,
-            diagnostic_source_step=resolved.step,
+            diagnostic_source_run_identity=run_manifest.identity,
+            diagnostic_source_step=source_step,
         )
         return replace(manifest, identity=manifest.recompute_identity())
 

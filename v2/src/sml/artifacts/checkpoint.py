@@ -1770,6 +1770,38 @@ class CheckpointReader:
         )
         return contents
 
+    def read_payload_bytes(self, logical_path: str) -> bytes:
+        """Copy one proven payload through the owned step descriptor."""
+
+        if not isinstance(logical_path, str):
+            raise TypeError("logical_path must be a string")
+        if self._owned_step.descriptor < 0:
+            raise SMLArtifactError("checkpoint reader is closed")
+        _require_named_directory_inode(
+            self._fs,
+            self._owned_step.name,
+            parent_descriptor=self._checkpoints_descriptor,
+            directory_descriptor=self._owned_step.descriptor,
+            context="named checkpoint step before payload copy",
+        )
+        local_apfs = _descriptor_is_local_apfs(self._owned_step.descriptor)
+        with (
+            ArtifactRoot(
+                os.dup(self._owned_step.descriptor),
+                local_apfs=local_apfs,
+            ) as root,
+            root.open_payload(logical_path) as payload,
+        ):
+            data = payload.read()
+        _require_named_directory_inode(
+            self._fs,
+            self._owned_step.name,
+            parent_descriptor=self._checkpoints_descriptor,
+            directory_descriptor=self._owned_step.descriptor,
+            context="named checkpoint step after payload copy",
+        )
+        return data
+
 
 def _checkpoint_dtype_name(array: mx.array) -> str:
     mx = _mlx_core()
