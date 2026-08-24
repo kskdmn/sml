@@ -27,7 +27,6 @@ from sml.artifacts.manifest import (
 )
 from sml.errors import SMLArtifactError, SMLDataError
 from sml.inference import ResolvedModel
-from sml.training.common import LoaderConfig
 
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
 _INT32 = np.dtype("<i4")
@@ -1423,20 +1422,35 @@ class _ProducerFailure:
         self.error = error
 
 
+class SwagLoaderPolicy(Protocol):
+    prefetch_depth: int
+    microbatch_size: int
+    epoch_seed: int
+
+
+def _require_swag_loader_policy(loader: object) -> SwagLoaderPolicy:
+    required = ("prefetch_depth", "microbatch_size", "epoch_seed")
+    missing = [name for name in required if not hasattr(loader, name)]
+    if missing:
+        raise TypeError(
+            "loader must provide prefetch_depth, microbatch_size, and epoch_seed"
+        )
+    return loader  # type: ignore[return-value]
+
+
 class SwagBatchStream:
     """Bounded CPU prefetch over permuted SWAG buckets with fixed-shape tails."""
 
     def __init__(
         self,
         bundle: SwagDataBundle,
-        loader: LoaderConfig,
+        loader: SwagLoaderPolicy,
         *,
         cursor: SwagCursor,
     ) -> None:
         if not isinstance(bundle, SwagDataBundle):
             raise TypeError("bundle must be a SwagDataBundle")
-        if not isinstance(loader, LoaderConfig):
-            raise TypeError("loader must be a LoaderConfig")
+        loader = _require_swag_loader_policy(loader)
         if not isinstance(cursor, SwagCursor):
             raise TypeError("cursor must be a SwagCursor")
         self._bundle = bundle

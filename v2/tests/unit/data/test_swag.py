@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
@@ -1250,3 +1251,11 @@ def test_chunked_ingest_does_not_stack_all_examples_at_once(tmp_path, monkeypatc
     assert bundle.manifest.example_count == 5
     assert labels == [index % 4 for index in range(5)]
     assert all(count <= 2 for count in stacked_example_batches)
+
+
+def test_swag_data_module_does_not_import_training():
+    from sml.data import swag as data_swag
+
+    source = inspect.getsource(data_swag)
+    assert "sml.training" not in source
+    assert "LoaderConfig" not in source

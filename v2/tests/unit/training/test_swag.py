@@ -4,6 +4,7 @@ import inspect
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -631,12 +632,18 @@ def test_swag_kernel_wrappers_do_not_eval_before_rebuilding_host_state():
     assert "mx.eval(" not in inspect.getsource(swag_module.SwagKernels.optimizer_step)
 
 
-def test_compiled_swag_optimizer_uses_private_fp32_update_helper():
-    source = inspect.getsource(swag_module)
-    assert "_adamw_fp32_update_tree" in source
-    assert "adamw_fp32_update_tree" not in source.replace("_adamw_fp32_update_tree", "")
-    assert "adamw_mixed_precision_update(" not in source
-    assert "AdamState" not in inspect.getsource(swag_module.build_swag_kernels)
+def test_swag_host_optimizer_step_calls_public_fp32_adamw():
+    host_source = inspect.getsource(swag_module.SwagKernels.optimizer_step)
+    assert "adamw_fp32_update(" in host_source
+    assert "_adamw_fp32_update_tree" not in host_source
+    assert "optimizer.to_tree()" not in host_source
+    assert "adamw_mixed_precision_update(" not in host_source
+    builder_source = inspect.getsource(swag_module.build_swag_kernels)
+    assert "_adamw_fp32_update_tree" not in builder_source
+    assert "AdamState" not in builder_source
+    module_source = inspect.getsource(swag_module)
+    assert "_adamw_fp32_update_tree" not in module_source
+    assert "adamw_mixed_precision_update(" not in module_source
 
 
 def test_direct_swag_envelope_validates_numpy_arrays_and_stores_readonly_views():
@@ -916,3 +923,20 @@ def test_permutation_uses_loader_epoch_seed_not_training_seed():
     assert "PCG64" in stream_source
     assert "SeedSequence" in stream_source
     assert "epoch_seed" in stream_source
+    assert "sml.training" not in stream_source
+
+
+def test_swag_batch_stream_accepts_structural_loader(tiny_swag_runtime):
+    loader = SimpleNamespace(prefetch_depth=1, microbatch_size=2, epoch_seed=42)
+    start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
+    with SwagBatchStream(tiny_swag_runtime.bundle, loader, cursor=start) as stream:
+        envelope = next(iter(stream))
+        assert envelope.input_ids.shape[0] == 2
+
+
+def test_swag_batch_stream_rejects_loader_missing_required_attributes(
+    tiny_swag_runtime,
+):
+    start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
+    with pytest.raises(TypeError, match="prefetch_depth"):
+        SwagBatchStream(tiny_swag_runtime.bundle, object(), cursor=start)

@@ -13,8 +13,8 @@ from sml.training.common import (
     AdamState,
     LoaderConfig,
     OptimizerConfig,
-    _adamw_fp32_update_tree,
     accumulate_fp32,
+    adamw_fp32_update,
     normalize_and_clip,
 )
 
@@ -144,6 +144,8 @@ class SwagKernels:
     compiled_ranking_microstep_core: object
     compiled_optimizer_step_core: object
     kernel_config: SwagKernelConfig
+    optimizer_config: OptimizerConfig
+    weight_decay_tree: dict
 
     def ranking_microstep(
         self,
@@ -170,14 +172,19 @@ class SwagKernels:
         optimizer: AdamState,
         trainer: SwagTrainerState,
     ) -> tuple[dict, AdamState, SwagTrainerState]:
-        next_adapters, next_adam, next_trainer = self.compiled_optimizer_step_core(
-            adapters,
-            optimizer.to_tree(),
+        gradients, next_trainer = self.compiled_optimizer_step_core(
             trainer.to_tree(),
+        )
+        next_adapters, next_optimizer = adamw_fp32_update(
+            adapters,
+            gradients,
+            optimizer,
+            self.optimizer_config,
+            self.weight_decay_tree,
         )
         return (
             next_adapters,
-            AdamState.from_compiled_tree(next_adam),
+            next_optimizer,
             SwagTrainerState.from_compiled_tree(next_trainer),
         )
 
@@ -263,7 +270,7 @@ def build_swag_kernels(
             next_correct,
         )
 
-    def swag_optimizer_step_core(adapters, adam_tree, trainer_tree):
+    def swag_optimizer_step_core(trainer_tree):
         accumulators, valid_count, next_key, loss_numerator, correct_count = (
             trainer_tree
         )
@@ -271,13 +278,6 @@ def build_swag_kernels(
             accumulators,
             valid_count,
             gradient_clip_norm=kernel_config.gradient_clip_norm,
-        )
-        next_adapters, next_adam = _adamw_fp32_update_tree(
-            adapters,
-            gradients,
-            adam_tree,
-            config.optimizer,
-            weight_decay_tree,
         )
         reset_accumulators = tree_map(
             lambda accumulator: accumulator - accumulator, accumulators
@@ -289,7 +289,7 @@ def build_swag_kernels(
             (loss_numerator - loss_numerator).astype(mx.float32),
             (correct_count - correct_count).astype(mx.int32),
         )
-        return next_adapters, next_adam, next_trainer
+        return gradients, next_trainer
 
     return SwagKernels(
         compiled_ranking_microstep_core=(
@@ -303,6 +303,8 @@ def build_swag_kernels(
             else swag_optimizer_step_core
         ),
         kernel_config=kernel_config,
+        optimizer_config=config.optimizer,
+        weight_decay_tree=weight_decay_tree,
     )
 
 
