@@ -8,7 +8,7 @@ This specification supersedes the former checkpoint/SWAG-only design and plan.
 **Execution update (2026-08-24):** Phases 1-3 are complete at `4c190f3`.
 Phase 4 is complete at `0d95441`. Task 5.1 is complete at `232918c`.
 Task 5.2 is complete at `4a8e469`. Task 5.3 is complete at `c06beae`.
-Task 5.4 is next.
+Task 5.4 is complete at `4ebb4b7`. Task 5.5 is next.
 
 **Acceptance-policy update (2026-08-22):** Functional correctness is the
 required refactor gate. Ruff, the full v2 test suite, controlled mathematical
