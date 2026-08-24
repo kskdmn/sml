@@ -527,6 +527,9 @@ def tiny_swag_runtime(tmp_path: Path) -> TinySwagRuntime:
     adapters, frozen_base = split_adapter_parameters(model.parameters())
     mx.eval(adapters, frozen_base)
     config = SwagTrainingConfig(
+        base_checkpoint=tmp_path / "unused-base",
+        data=tmp_path / "unused-data",
+        output_run=tmp_path / "unused-run",
         loader=LoaderConfig(
             microbatch_size=4,
             gradient_accumulation_steps=16,

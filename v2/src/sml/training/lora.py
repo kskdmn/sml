@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -104,6 +105,60 @@ class LoRAPrecisionConfig:
             actual = getattr(self, field_name)
             if actual != value or type(actual) is not type(value):
                 raise SMLConfigurationError(f"{field_name} must be {value!r}")
+
+
+def lora_config_from_mapping(value: Mapping[str, object]) -> LoRAConfig:
+    if not isinstance(value, Mapping):
+        raise SMLConfigurationError("lora must be a mapping")
+    values = dict(value)
+    initializer_values = values.pop("initializer")
+    if not isinstance(initializer_values, Mapping):
+        raise SMLConfigurationError("initializer must be a mapping")
+    target_modules = values.get("target_modules")
+    if isinstance(target_modules, list):
+        values["target_modules"] = tuple(target_modules)
+    return LoRAConfig(
+        initializer=LoRAInitializerConfig(**dict(initializer_values)),
+        **values,
+    )
+
+
+def split_adapter_parameters(parameters: object) -> tuple[object, object]:
+    """Split LoRA adapter leaves from the frozen BF16 base parameter tree."""
+
+    if isinstance(parameters, dict):
+        adapters: dict = {}
+        frozen: dict = {}
+        for key, value in parameters.items():
+            if key in {"lora_a", "lora_b"}:
+                adapters[key] = value
+            elif isinstance(value, (dict, list, tuple)):
+                nested_adapters, nested_frozen = split_adapter_parameters(value)
+                if nested_adapters:
+                    adapters[key] = nested_adapters
+                if nested_frozen:
+                    frozen[key] = nested_frozen
+            elif key == "scale":
+                frozen[key] = value.astype(mx.bfloat16)
+            else:
+                frozen[key] = value
+        return adapters, frozen
+    if isinstance(parameters, list):
+        adapter_items = []
+        frozen_items = []
+        has_adapters = False
+        has_frozen = False
+        for value in parameters:
+            nested_adapters, nested_frozen = split_adapter_parameters(value)
+            adapter_items.append(nested_adapters)
+            frozen_items.append(nested_frozen)
+            has_adapters = has_adapters or bool(nested_adapters)
+            has_frozen = has_frozen or bool(nested_frozen)
+        return (
+            adapter_items if has_adapters else {},
+            frozen_items if has_frozen else {},
+        )
+    return {}, parameters
 
 
 def _lora_scale(config: LoRAConfig) -> mx.array:

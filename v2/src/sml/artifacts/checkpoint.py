@@ -962,7 +962,7 @@ def _format_logical_paths(paths: set[tuple[str, ...]]) -> list[str]:
 def _verify_pretraining_nested_tokenizer(
     fs: FilesystemOps,
     temporary_descriptor: int,
-    manifest: PretrainingDataManifest,
+    manifest: PretrainingDataManifest | ExportManifest,
 ) -> None:
     expected_model_path = "tokenizer/tokenizer.model"
     expected_vocab_path = "tokenizer/tokenizer.vocab"
@@ -1013,22 +1013,18 @@ def _verify_pretraining_nested_tokenizer(
         )
     if nested.identity != manifest.tokenizer_identity:
         raise SMLArtifactError(
-            "nested tokenizer identity does not match pretraining manifest"
+            "nested tokenizer identity does not match parent manifest"
         )
     if (
         nested.model.identity != manifest.tokenizer_model.identity
         or nested.model.byte_size != manifest.tokenizer_model.byte_size
     ):
-        raise SMLArtifactError(
-            "nested tokenizer model does not match pretraining manifest"
-        )
+        raise SMLArtifactError("nested tokenizer model does not match parent manifest")
     if (
         nested.vocab.identity != manifest.tokenizer_vocab.identity
         or nested.vocab.byte_size != manifest.tokenizer_vocab.byte_size
     ):
-        raise SMLArtifactError(
-            "nested tokenizer vocab does not match pretraining manifest"
-        )
+        raise SMLArtifactError("nested tokenizer vocab does not match parent manifest")
 
 
 def _verify_closed_world(
@@ -1041,7 +1037,7 @@ def _verify_closed_world(
 ) -> None:
     references = tuple(_payload_references(manifest))
     expected_files, expected_directories = _expected_closed_world(references)
-    if isinstance(manifest, PretrainingDataManifest):
+    if isinstance(manifest, (PretrainingDataManifest, ExportManifest)):
         _verify_pretraining_nested_tokenizer(fs, temporary_descriptor, manifest)
         expected_files.add(("tokenizer", TokenizerManifest.MANIFEST_FILENAME))
     if manifest_present:
@@ -1071,7 +1067,7 @@ def _verify_closed_world(
                     raise SMLArtifactError(
                         "publisher-owned manifest changed before immutable commit"
                     )
-    if isinstance(manifest, PretrainingDataManifest):
+    if isinstance(manifest, (PretrainingDataManifest, ExportManifest)):
         _verify_pretraining_nested_tokenizer(fs, temporary_descriptor, manifest)
 
 
@@ -1373,6 +1369,55 @@ def publish_immutable_bundle[M](
         return _publish_with_lock(target, build, fs=fs)
 
 
+def _verify_run_base_snapshot(
+    run: Path,
+    run_descriptor: int,
+    manifest: LoRARunManifest,
+    *,
+    fs: FilesystemOps,
+) -> None:
+    base_descriptor = -1
+    try:
+        base_descriptor, base_stat = _opened_entry(
+            fs,
+            "base",
+            parent_descriptor=run_descriptor,
+            flags=_OPEN_DIRECTORY,
+        )
+        if not stat.S_ISDIR(base_stat.st_mode):
+            raise SMLArtifactError("run base snapshot is not a directory")
+        base = _read_manifest_from_descriptor(
+            base_descriptor,
+            BaseSnapshotManifest,
+            VerificationLevel.FULL,
+            context=str(run / "base"),
+        )
+        _verify_closed_world(
+            fs,
+            base_descriptor,
+            base,
+            manifest_present=True,
+            full=True,
+        )
+        if base.identity != manifest.base_identity:
+            raise SMLArtifactError("run base snapshot identity does not match run.json")
+        if base.tokenizer_identity != manifest.tokenizer_identity:
+            raise SMLArtifactError(
+                "run base tokenizer identity does not match run.json"
+            )
+        rope_factor = base.model.get("rope_scaling_factor")
+        if rope_factor != 1.0:
+            raise SMLArtifactError(
+                "copied base rope_scaling_factor must be exactly 1.0"
+            )
+        run_rope = manifest.model.get("rope_scaling_factor")
+        if run_rope != 1.0:
+            raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
+    finally:
+        if base_descriptor >= 0:
+            os.close(base_descriptor)
+
+
 def _validate_private_run(
     run: Path,
     run_descriptor: int,
@@ -1381,6 +1426,8 @@ def _validate_private_run(
     fs: FilesystemOps,
 ) -> RunManifest:
     expected_entries = {"run.json", "tokenizer", "latest.json", "checkpoints"}
+    if isinstance(expected, LoRARunManifest):
+        expected_entries = {*expected_entries, "base"}
     actual_entries = set(fs.listdir(run_descriptor))
     if actual_entries != expected_entries:
         raise SMLArtifactError(
@@ -1423,6 +1470,14 @@ def _validate_private_run(
         )
         if tokenizer.identity != manifest.tokenizer_identity:
             raise SMLArtifactError("run tokenizer identity does not match run.json")
+
+        if isinstance(manifest, LoRARunManifest):
+            _verify_run_base_snapshot(
+                run,
+                run_descriptor,
+                manifest,
+                fs=fs,
+            )
 
         checkpoints_descriptor = _open_checkpoints_directory(
             run,
@@ -2128,13 +2183,26 @@ def _verify_checkpoint_semantics(
                 master_specs=master_specs,
             )
     else:
-        adapters = groups["adapters.safetensors"]
-        _verify_optimizer_and_trainer_groups(
-            adapters,
-            groups["optimizer.safetensors"],
-            groups["trainer.safetensors"],
-            step=manifest.step,
-        )
+        if (
+            "adapters.safetensors" in groups
+            and "optimizer.safetensors" in groups
+            and "trainer.safetensors" in groups
+        ):
+            adapters = groups["adapters.safetensors"]
+            _verify_optimizer_and_trainer_groups(
+                adapters,
+                groups["optimizer.safetensors"],
+                groups["trainer.safetensors"],
+                step=manifest.step,
+            )
+        else:
+            adapter_specs = _array_specs_by_name(manifest.adapters)
+            _validate_optimizer_and_trainer_specs(
+                set(adapter_specs),
+                manifest.optimizer,
+                manifest.trainer,
+                master_specs=adapter_specs,
+            )
     return VerifiedCheckpointContents(scalar, groups)
 
 
