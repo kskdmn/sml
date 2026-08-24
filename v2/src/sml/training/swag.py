@@ -20,6 +20,7 @@ from sml.artifacts.checkpoint import (
     publish_immutable_bundle,
     publish_run,
     recover_latest_index,
+    require_lora_base_snapshot,
     resolve_latest_step,
     run_access_lock,
     run_writer_lock,
@@ -1372,16 +1373,7 @@ def resume_finetune(
             BaseSnapshotManifest,
             VerificationLevel.FULL,
         ).manifest
-        if snapshot.identity != resolved.run.base_identity:
-            raise SMLArtifactError("run base snapshot identity does not match run.json")
-        if snapshot.model.get("rope_scaling_factor") != 1.0:
-            raise SMLArtifactError(
-                "copied base rope_scaling_factor must be exactly 1.0"
-            )
-        if snapshot.tokenizer_identity != resolved.run.tokenizer_identity:
-            raise SMLArtifactError(
-                "run base tokenizer identity does not match run.json"
-            )
+        require_lora_base_snapshot(snapshot, resolved.run)
         tokenizer = read_manifest(
             run / "tokenizer",
             TokenizerManifest,
@@ -1451,12 +1443,7 @@ def export_merged(checkpoint: Path, output: Path) -> ExportResult:
             BaseSnapshotManifest,
             VerificationLevel.FULL,
         ).manifest
-        if snapshot.identity != recovered.run.base_identity:
-            raise SMLArtifactError("run base snapshot identity does not match run.json")
-        if snapshot.model.get("rope_scaling_factor") != 1.0:
-            raise SMLArtifactError(
-                "copied base rope_scaling_factor must be exactly 1.0"
-            )
+        require_lora_base_snapshot(snapshot, recovered.run)
         tokenizer = read_manifest(
             checkpoint / "tokenizer",
             TokenizerManifest,

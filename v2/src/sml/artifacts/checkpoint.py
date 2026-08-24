@@ -1369,6 +1369,52 @@ def publish_immutable_bundle[M](
         return _publish_with_lock(target, build, fs=fs)
 
 
+_CANONICAL_PRETRAINING_PRECISION = {
+    "master_parameter_dtype": "float32",
+    "working_parameter_dtype": "bfloat16",
+    "gradient_accumulator_dtype": "float32",
+    "optimizer_state_dtype": "float32",
+    "update_dtype": "float32",
+    "master_weights": True,
+    "dynamic_loss_scaling": False,
+}
+
+
+def require_lora_base_snapshot(
+    snapshot: BaseSnapshotManifest,
+    run: LoRARunManifest,
+) -> None:
+    """Reject identity-consistent copied bases with the wrong model or precision."""
+
+    if not isinstance(snapshot, BaseSnapshotManifest):
+        raise TypeError("snapshot must be a BaseSnapshotManifest")
+    if not isinstance(run, LoRARunManifest):
+        raise TypeError("run must be a LoRARunManifest")
+    if snapshot.identity != run.base_identity:
+        raise SMLArtifactError("run base snapshot identity does not match run.json")
+    if snapshot.tokenizer_identity != run.tokenizer_identity:
+        raise SMLArtifactError("run base tokenizer identity does not match run.json")
+    if snapshot.model.get("rope_scaling_factor") != 1.0:
+        raise SMLArtifactError("copied base rope_scaling_factor must be exactly 1.0")
+    if run.model.get("rope_scaling_factor") != 1.0:
+        raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
+    if dict(snapshot.model) != dict(run.model):
+        raise SMLArtifactError(
+            "copied base model configuration does not match run.json"
+        )
+    actual = dict(snapshot.precision)
+    if set(actual) != set(_CANONICAL_PRETRAINING_PRECISION):
+        raise SMLArtifactError(
+            "copied base precision is not a canonical pretraining precision"
+        )
+    for key, expected in _CANONICAL_PRETRAINING_PRECISION.items():
+        value = actual[key]
+        if value != expected or type(value) is not type(expected):
+            raise SMLArtifactError(
+                "copied base precision is not a canonical pretraining precision"
+            )
+
+
 def _verify_run_base_snapshot(
     run: Path,
     run_descriptor: int,
@@ -1399,20 +1445,7 @@ def _verify_run_base_snapshot(
             manifest_present=True,
             full=True,
         )
-        if base.identity != manifest.base_identity:
-            raise SMLArtifactError("run base snapshot identity does not match run.json")
-        if base.tokenizer_identity != manifest.tokenizer_identity:
-            raise SMLArtifactError(
-                "run base tokenizer identity does not match run.json"
-            )
-        rope_factor = base.model.get("rope_scaling_factor")
-        if rope_factor != 1.0:
-            raise SMLArtifactError(
-                "copied base rope_scaling_factor must be exactly 1.0"
-            )
-        run_rope = manifest.model.get("rope_scaling_factor")
-        if run_rope != 1.0:
-            raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
+        require_lora_base_snapshot(base, manifest)
     finally:
         if base_descriptor >= 0:
             os.close(base_descriptor)
@@ -3567,6 +3600,7 @@ __all__ = [
     "publish_immutable_bundle",
     "publish_run",
     "recover_latest_index",
+    "require_lora_base_snapshot",
     "resolve_exact_step",
     "resolve_latest_step",
     "run_access_lock",

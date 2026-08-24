@@ -13,6 +13,7 @@ from sml.artifacts.checkpoint import resolve_latest_step
 from sml.artifacts.manifest import (
     BaseSnapshotManifest,
     ExportManifest,
+    LoRARunManifest,
     VerificationLevel,
     canonical_json_bytes,
     read_manifest,
@@ -272,6 +273,29 @@ def _assert_array_maps_equal(
         assert bool(mx.array_equal(array, expected[name]).item()), name
 
 
+def _rewrite_bound_base_snapshot(run: Path, **changes: object) -> None:
+    snapshot = read_manifest(
+        run / "base",
+        BaseSnapshotManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    snapshot = replace(snapshot, **changes)
+    snapshot = replace(snapshot, identity=snapshot.recompute_identity())
+    (run / "base" / BaseSnapshotManifest.MANIFEST_FILENAME).write_bytes(
+        canonical_json_bytes(snapshot)
+    )
+    run_manifest = read_manifest(
+        run,
+        LoRARunManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    run_manifest = replace(run_manifest, base_identity=snapshot.identity)
+    run_manifest = replace(run_manifest, identity=run_manifest.recompute_identity())
+    (run / LoRARunManifest.MANIFEST_FILENAME).write_bytes(
+        canonical_json_bytes(run_manifest)
+    )
+
+
 @pytest.fixture(scope="module")
 def _tiny_base_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     root = tmp_path_factory.mktemp("swag-workflow-base")
@@ -457,6 +481,58 @@ def test_resume_rejects_mismatches_before_allocation(
         resume_finetune(
             trained.run,
             data=other_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
+    assert allocated == []
+
+    model_run = tmp_path / "mismatch-model-run"
+    shutil.copytree(trained.run, model_run)
+    model = dict(
+        read_manifest(
+            model_run / "base",
+            BaseSnapshotManifest,
+            VerificationLevel.MANIFEST_TRUSTED,
+        ).manifest.model
+    )
+    model["hidden_size"] = 16
+    _rewrite_bound_base_snapshot(model_run, model=model)
+    with pytest.raises((SMLArtifactError, SMLConfigurationError)):
+        resume_finetune(
+            model_run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
+    assert allocated == []
+
+    precision_run = tmp_path / "mismatch-precision-run"
+    shutil.copytree(trained.run, precision_run)
+    precision = dict(
+        read_manifest(
+            precision_run / "base",
+            BaseSnapshotManifest,
+            VerificationLevel.MANIFEST_TRUSTED,
+        ).manifest.precision
+    )
+    precision["working_parameter_dtype"] = "float32"
+    _rewrite_bound_base_snapshot(precision_run, precision=precision)
+    with pytest.raises((SMLArtifactError, SMLConfigurationError)):
+        resume_finetune(
+            precision_run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
+    assert allocated == []
+
+    tokenizer_run = tmp_path / "mismatch-tokenizer-run"
+    shutil.copytree(trained.run, tokenizer_run)
+    _rewrite_bound_base_snapshot(
+        tokenizer_run,
+        tokenizer_identity="sha256:" + "a" * 64,
+    )
+    with pytest.raises((SMLArtifactError, SMLConfigurationError)):
+        resume_finetune(
+            tokenizer_run,
+            data=tiny_swag_bundle.path,
             overrides=ResumeOverrides(maximum_steps=2),
         )
     assert allocated == []

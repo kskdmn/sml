@@ -17,6 +17,7 @@ from sml.artifacts.checkpoint import (
     ResolvedStep,
     open_checkpoint_reader,
     recover_latest_index,
+    require_lora_base_snapshot,
     run_access_lock,
 )
 from sml.artifacts.manifest import (
@@ -480,12 +481,7 @@ def _resolve_lora_run(path: Path, *, full_verify: bool) -> ResolvedModel:
             raise SMLArtifactError("LoRA resolution requires a LoRA run")
         model_config = _require_unit_rope(recovered.run.model, context="LoRA run")
         base = read_manifest(path / "base", BaseSnapshotManifest, verification)
-        if base.manifest.identity != recovered.run.base_identity:
-            raise SMLArtifactError("run base snapshot identity does not match run.json")
-        if base.manifest.model.get("rope_scaling_factor") != 1.0:
-            raise SMLArtifactError(
-                "copied base rope_scaling_factor must be exactly 1.0"
-            )
+        require_lora_base_snapshot(base.manifest, recovered.run)
         base_arrays = _load_safetensors(
             path / "base",
             base.manifest.working_weights.payload.logical_path,
