@@ -809,6 +809,107 @@ def test_swag_producer_transfers_owned_envelope_arrays_without_recopying(
         assert owned.flags.owndata
 
 
+def test_assemble_batch_arrays_fills_staging_without_extra_copies(monkeypatch):
+    length = 4
+    bucket = swag_data.SwagBucket(
+        length=length,
+        input_ids=np.arange(2 * 4 * length, dtype=np.int32).reshape(2, 4, length),
+        valid_token_mask=np.ones((2, 4, length), dtype=bool),
+        score_mask=np.ones((2, 4, length), dtype=bool),
+        labels=np.array([1, 3], dtype=np.int32),
+    )
+    manifest = SimpleNamespace(pad_token_id=3, bos_token_id=1, eos_token_id=2)
+    staging: list[np.ndarray] = []
+    original_empty = swag_data.np.empty
+    original_zeros = swag_data.np.zeros
+    original_array = swag_data.np.array
+    original_owned = swag_data._owned_readonly
+    copy_true_calls: list[object] = []
+    owned_calls: list[int] = []
+
+    def tracking_empty(*args, **kwargs):
+        array = original_empty(*args, **kwargs)
+        staging.append(array)
+        return array
+
+    def tracking_zeros(*args, **kwargs):
+        array = original_zeros(*args, **kwargs)
+        staging.append(array)
+        return array
+
+    def tracking_array(*args, **kwargs):
+        if kwargs.get("copy") is True:
+            copy_true_calls.append(args[0] if args else None)
+        return original_array(*args, **kwargs)
+
+    def tracking_owned(array):
+        owned_calls.append(id(array))
+        return original_owned(array)
+
+    monkeypatch.setattr(swag_data.np, "empty", tracking_empty)
+    monkeypatch.setattr(swag_data.np, "zeros", tracking_zeros)
+    monkeypatch.setattr(swag_data.np, "array", tracking_array)
+    monkeypatch.setattr(swag_data, "_owned_readonly", tracking_owned)
+
+    assembled = swag_data._assemble_batch_arrays(
+        bucket,
+        (0,),
+        batch_size=2,
+        manifest=manifest,
+    )
+    assert copy_true_calls == []
+    assert owned_calls == []
+    for array in assembled:
+        assert any(array.ctypes.data == staged.ctypes.data for staged in staging)
+        assert not array.flags.writeable
+        assert array.flags.owndata
+    np.testing.assert_array_equal(assembled[0][0], bucket.input_ids[0])
+    assert int(assembled[3][0]) == 1
+    assert bool(assembled[4][0]) is True
+    assert bool(assembled[4][1]) is False
+
+    input_ids, valid_token_mask, score_mask, labels, example_mask = assembled
+    cursor = SwagCursor(epoch=0, bucket_order_position=0, row_offset=1)
+    envelope = SwagBatchEnvelope._owned(
+        input_ids,
+        score_mask,
+        labels,
+        example_mask,
+        valid_token_mask,
+        cursor,
+        source_epoch=0,
+    )
+    pairs = (
+        (input_ids, envelope.input_ids),
+        (valid_token_mask, envelope.valid_token_mask),
+        (score_mask, envelope.score_mask),
+        (labels, envelope.labels),
+        (example_mask, envelope.example_mask),
+    )
+    for owned, stored in pairs:
+        assert stored.ctypes.data == owned.ctypes.data
+        assert not stored.flags.writeable
+
+    caller_ids = np.arange(2 * 4 * length, dtype=np.int32).reshape(2, 4, length)
+    caller_score = np.ones((2, 4, length), dtype=bool)
+    caller_labels = np.arange(2, dtype=np.int32)
+    caller_example = np.array([True, False])
+    caller_valid = np.ones((2, 4, length), dtype=bool)
+    public = SwagBatchEnvelope(
+        caller_ids,
+        caller_score,
+        caller_labels,
+        caller_example,
+        caller_valid,
+        cursor,
+        source_epoch=0,
+    )
+    original_input = int(public.input_ids[0, 0, 0])
+    caller_ids[0, 0, 0] = original_input + 7
+    assert int(public.input_ids[0, 0, 0]) == original_input
+    assert public.input_ids.ctypes.data != caller_ids.ctypes.data
+
+
 def test_per_slot_ranking_losses_are_finite_before_masking(tiny_swag_runtime):
     padded = _first_padded_batch(tiny_swag_runtime)
     real_mask = _example_mask_host(padded)

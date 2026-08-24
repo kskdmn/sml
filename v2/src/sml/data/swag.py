@@ -1242,9 +1242,9 @@ def _assemble_batch_arrays(
     labels = np.empty((batch_size,), dtype=_INT32)
     example_mask = np.zeros((batch_size,), dtype=_BOOL)
     for slot, row_index in enumerate(row_indices):
-        input_ids[slot] = np.array(bucket.input_ids[row_index], copy=True)
-        valid_token_mask[slot] = np.array(bucket.valid_token_mask[row_index], copy=True)
-        score_mask[slot] = np.array(bucket.score_mask[row_index], copy=True)
+        input_ids[slot] = bucket.input_ids[row_index]
+        valid_token_mask[slot] = bucket.valid_token_mask[row_index]
+        score_mask[slot] = bucket.score_mask[row_index]
         labels[slot] = int(bucket.labels[row_index])
         example_mask[slot] = True
     if len(row_indices) < batch_size:
@@ -1255,12 +1255,14 @@ def _assemble_batch_arrays(
             score_mask[slot] = syn_score
             labels[slot] = 0
             example_mask[slot] = False
+    for array in (input_ids, valid_token_mask, score_mask, labels, example_mask):
+        array.setflags(write=False)
     return (
-        _owned_readonly(input_ids),
-        _owned_readonly(valid_token_mask),
-        _owned_readonly(score_mask),
-        _owned_readonly(labels),
-        _owned_readonly(example_mask),
+        input_ids,
+        valid_token_mask,
+        score_mask,
+        labels,
+        example_mask,
     )
 
 
