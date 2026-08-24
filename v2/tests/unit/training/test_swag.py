@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from mlx.utils import tree_flatten, tree_map
 from sml.artifacts.manifest import PayloadRef, TokenizerManifest, VerificationLevel
+from sml.data import swag as swag_data
 from sml.data.swag import (
     SwagBatch,
     SwagBatchEnvelope,
@@ -767,6 +768,45 @@ def test_swag_envelope_owns_storage_independent_of_caller_arrays():
     assert bool(envelope.example_mask[0]) is original_example
     assert bool(envelope.score_mask[0, 0, 0]) is original_score
     assert bool(envelope.valid_token_mask[0, 0, 0]) is original_valid
+
+
+def test_swag_producer_transfers_owned_envelope_arrays_without_recopying(
+    tiny_swag_runtime, monkeypatch
+):
+    captured: list[
+        tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    ] = []
+    original_assemble = swag_data._assemble_batch_arrays
+
+    def capture_assemble(*args, **kwargs):
+        arrays = original_assemble(*args, **kwargs)
+        captured.append(arrays)
+        return arrays
+
+    monkeypatch.setattr(swag_data, "_assemble_batch_arrays", capture_assemble)
+    loader = replace(
+        tiny_swag_runtime.config.loader,
+        microbatch_size=2,
+        prefetch_depth=1,
+    )
+    start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
+    with SwagBatchStream(tiny_swag_runtime.bundle, loader, cursor=start) as stream:
+        envelope = next(iter(stream))
+    assert captured
+    assembled = captured[0]
+    pairs = (
+        (assembled[0], envelope.input_ids),
+        (assembled[1], envelope.valid_token_mask),
+        (assembled[2], envelope.score_mask),
+        (assembled[3], envelope.labels),
+        (assembled[4], envelope.example_mask),
+    )
+    for owned, stored in pairs:
+        assert stored.ctypes.data == owned.ctypes.data
+        assert np.shares_memory(stored, owned)
+        assert not stored.flags.writeable
+        assert not owned.flags.writeable
+        assert owned.flags.owndata
 
 
 def test_per_slot_ranking_losses_are_finite_before_masking(tiny_swag_runtime):

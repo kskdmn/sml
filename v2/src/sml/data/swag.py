@@ -1155,6 +1155,26 @@ def _readonly_numpy_array(
     return readonly
 
 
+def _envelope_array(
+    array: object,
+    name: str,
+    *,
+    ndim: int,
+    dtype: np.dtype,
+    shape: tuple[int, ...] | None = None,
+    copy: bool,
+) -> np.ndarray:
+    if not copy:
+        if not isinstance(array, np.ndarray):
+            raise TypeError(f"{name} must be a NumPy array")
+        if array.flags.writeable or not array.flags.owndata:
+            raise ValueError(f"{name} must be non-writeable owned storage")
+    validated = _readonly_numpy_array(array, name, ndim=ndim, dtype=dtype, shape=shape)
+    if copy:
+        return _owned_readonly(validated)
+    return validated
+
+
 @dataclass(frozen=True, slots=True)
 class SwagCursor:
     """Canonical location of the next real SWAG example, never a padded slot."""
@@ -1287,38 +1307,91 @@ class SwagBatchEnvelope:
         *,
         source_epoch: int,
     ) -> None:
+        self._initialize(
+            input_ids,
+            score_mask,
+            labels,
+            example_mask,
+            valid_token_mask,
+            cursor_after,
+            source_epoch=source_epoch,
+            copy=True,
+        )
+
+    @classmethod
+    def _owned(
+        cls,
+        input_ids: np.ndarray,
+        score_mask: np.ndarray,
+        labels: np.ndarray,
+        example_mask: np.ndarray,
+        valid_token_mask: np.ndarray,
+        cursor_after: SwagCursor,
+        *,
+        source_epoch: int,
+    ) -> SwagBatchEnvelope:
+        envelope = cls.__new__(cls)
+        envelope._initialize(
+            input_ids,
+            score_mask,
+            labels,
+            example_mask,
+            valid_token_mask,
+            cursor_after,
+            source_epoch=source_epoch,
+            copy=False,
+        )
+        return envelope
+
+    def _initialize(
+        self,
+        input_ids: np.ndarray,
+        score_mask: np.ndarray,
+        labels: np.ndarray,
+        example_mask: np.ndarray,
+        valid_token_mask: np.ndarray,
+        cursor_after: SwagCursor,
+        *,
+        source_epoch: int,
+        copy: bool,
+    ) -> None:
         if not isinstance(cursor_after, SwagCursor):
             raise TypeError("cursor_after must be a SwagCursor")
         _require_plain_int(source_epoch, "source_epoch")
-        input_ids = _readonly_numpy_array(input_ids, "input_ids", ndim=3, dtype=_INT32)
+        input_ids = _envelope_array(
+            input_ids, "input_ids", ndim=3, dtype=_INT32, copy=copy
+        )
         if input_ids.shape[1] != 4:
             raise ValueError("input_ids must have 4 candidates")
         batch_shape = tuple(int(dimension) for dimension in input_ids.shape)
         label_shape = (batch_shape[0],)
-        self._input_ids = _owned_readonly(input_ids)
-        self._score_mask = _owned_readonly(
-            _readonly_numpy_array(
-                score_mask, "score_mask", ndim=3, dtype=_BOOL, shape=batch_shape
-            )
+        self._input_ids = input_ids
+        self._score_mask = _envelope_array(
+            score_mask,
+            "score_mask",
+            ndim=3,
+            dtype=_BOOL,
+            shape=batch_shape,
+            copy=copy,
         )
-        self._labels = _owned_readonly(
-            _readonly_numpy_array(
-                labels, "labels", ndim=1, dtype=_INT32, shape=label_shape
-            )
+        self._labels = _envelope_array(
+            labels, "labels", ndim=1, dtype=_INT32, shape=label_shape, copy=copy
         )
-        self._example_mask = _owned_readonly(
-            _readonly_numpy_array(
-                example_mask, "example_mask", ndim=1, dtype=_BOOL, shape=label_shape
-            )
+        self._example_mask = _envelope_array(
+            example_mask,
+            "example_mask",
+            ndim=1,
+            dtype=_BOOL,
+            shape=label_shape,
+            copy=copy,
         )
-        self._valid_token_mask = _owned_readonly(
-            _readonly_numpy_array(
-                valid_token_mask,
-                "valid_token_mask",
-                ndim=3,
-                dtype=_BOOL,
-                shape=batch_shape,
-            )
+        self._valid_token_mask = _envelope_array(
+            valid_token_mask,
+            "valid_token_mask",
+            ndim=3,
+            dtype=_BOOL,
+            shape=batch_shape,
+            copy=copy,
         )
         self._cursor_after = cursor_after
         self._source_epoch = source_epoch
@@ -1528,7 +1601,7 @@ class SwagBatchStream:
             remaining_buckets=len(plan) - cursor.bucket_order_position - 1,
         )
         input_ids, valid_token_mask, score_mask, labels, example_mask = arrays
-        envelope = SwagBatchEnvelope(
+        envelope = SwagBatchEnvelope._owned(
             input_ids,
             score_mask,
             labels,
