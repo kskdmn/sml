@@ -189,6 +189,133 @@ def _task_record(
     )
 
 
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [(1.0, "1.0"), (2, "2")],
+)
+def test_task_metadata_version_canonicalizes_finite_provider_scalars(
+    version: float,
+    expected: str,
+) -> None:
+    from sml import evaluation
+
+    assert evaluation._metadata_version({"metadata": {"version": version}}) == expected
+
+
+@pytest.mark.parametrize("version", [True, float("nan"), float("inf")])
+def test_task_metadata_version_rejects_nonfinite_or_boolean_provider_values(
+    version: object,
+) -> None:
+    from sml import evaluation
+
+    with pytest.raises(SMLRuntimeError, match="metadata version"):
+        evaluation._metadata_version({"metadata": {"version": version}})
+
+
+@pytest.mark.parametrize("task_name", ["hellaswag", "winogrande"])
+def test_installed_task_config_keeps_numeric_metadata_and_nested_callables(
+    task_name: str,
+) -> None:
+    import lm_eval
+    from lm_eval.config.task import TaskConfig
+    from lm_eval.tasks._yaml_loader import load_yaml
+
+    task_directory = Path(lm_eval.__file__).resolve().parent / "tasks" / task_name
+    filename = "hellaswag.yaml" if task_name == "hellaswag" else "default.yaml"
+    config = TaskConfig(**load_yaml(task_directory / filename))
+    values = config.to_dict()
+    assert values["metadata"]["version"] == 1.0
+    assert any(callable(value) for value in values["fewshot_config"].values())
+
+
+def test_task_provenance_serializes_nested_provider_callables(fake_provider) -> None:
+    record = _task_record(fake_provider)
+    nested = record.few_shot_config["fewshot_config"]
+    assert nested["process_docs"] == "offline.serialized._offline_process_docs"
+    assert nested["doc_to_text"] == "offline.serialized._offline_doc_to_text"
+    assert nested["doc_to_target"] == "offline.serialized._offline_doc_to_target"
+    assert nested["doc_to_choice"] == "offline.serialized._offline_doc_to_choice"
+
+
+def test_task_provenance_prefers_effective_fewshot_config_split(fake_provider) -> None:
+    from sml import evaluation
+    from sml.artifacts.manifest import structured_identity
+
+    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    loaded = manager.load(["hellaswag"])
+    task = loaded["tasks"]["hellaswag"]
+    recorder = evaluation._EvaluationRequestRecorder()
+    recorder.record("loglikelihood", task.instances)
+    record = evaluation._resolve_task_record(
+        task_name="hellaswag",
+        task=task,
+        provider=fake_provider,
+        manager=manager,
+        recorder=recorder,
+        provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
+        limit=None,
+        padding="right",
+        seeds=evaluation._evaluation_seeds(),
+        provider_versions=evaluation._provider_versions(),
+    )
+    assert record.dataset_fingerprint == structured_identity(
+        "sml-evaluation-dataset-v1",
+        (
+            ("validation", "validation-fingerprint"),
+            ("fewshot-config", "fewshot-config-fingerprint"),
+        ),
+    )
+
+
+def test_offline_provider_task4_invocation_records_effective_zero_shot_provenance(
+    fake_provider,
+    tiny_session: InferenceSession,
+) -> None:
+    from sml import evaluation
+
+    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    recorder = evaluation._EvaluationRequestRecorder()
+    raw_result = fake_provider.simple_evaluate(
+        model=evaluation._lm_eval_model(tiny_session, "right", recorder),
+        tasks=["hellaswag", "winogrande"],
+        num_fewshot=0,
+        limit=2,
+        log_samples=True,
+        task_manager=manager,
+        system_instruction=None,
+        apply_chat_template=False,
+        fewshot_as_multiturn=True,
+        gen_kwargs=None,
+        bootstrap_iters=100000,
+        predict_only=False,
+        **evaluation._evaluation_seeds(),
+    )
+    loaded = manager.loaded["tasks"]
+    assert raw_result["config"]["log_samples"] is True
+    assert raw_result["n-shot"] == {"hellaswag": 0, "winogrande": 0}
+    assert all(config["num_fewshot"] == 0 for config in raw_result["configs"].values())
+    records = tuple(
+        evaluation._resolve_task_record(
+            task_name=task_name,
+            task=loaded[task_name],
+            provider=fake_provider,
+            manager=manager,
+            recorder=recorder,
+            provider_result=raw_result,
+            limit=2,
+            padding="right",
+            seeds=evaluation._evaluation_seeds(),
+            provider_versions=evaluation._provider_versions(),
+        )
+        for task_name in ("hellaswag", "winogrande")
+    )
+    assert all(record.few_shot_config["num_fewshot"] == 0 for record in records)
+    assert all(record.dataset_revision == "version:1.0.0" for record in records)
+    assert all(
+        record.ordered_request_identity.startswith("sha256:") for record in records
+    )
+
+
 def test_request_recorder_hashes_actual_order_per_task() -> None:
     from sml import evaluation
 
@@ -243,7 +370,13 @@ def test_task_provenance_hashes_yaml_include_config_and_dataset(fake_provider) -
     }
     assert record.few_shot_config == {
         "fewshot_as_multiturn": True,
-        "fewshot_config": None,
+        "fewshot_config": {
+            "doc_to_choice": "offline.serialized._offline_doc_to_choice",
+            "doc_to_target": "offline.serialized._offline_doc_to_target",
+            "doc_to_text": "offline.serialized._offline_doc_to_text",
+            "process_docs": "offline.serialized._offline_process_docs",
+            "split": "fewshot-config",
+        },
         "fewshot_split": "train",
         "num_fewshot": 1,
     }
@@ -389,7 +522,7 @@ def test_task_provenance_rejects_unsafe_include_closure(
     [
         ("validation", "_fingerprint", "", "fingerprint"),
         ("validation", "info", SimpleNamespace(version=""), "version"),
-        ("train", "_fingerprint", "", "fingerprint"),
+        ("fewshot-config", "_fingerprint", "", "fingerprint"),
     ],
 )
 def test_task_provenance_requires_selected_dataset_identities(

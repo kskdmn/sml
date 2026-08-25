@@ -57,6 +57,10 @@ class _Config:
     def to_dict(self) -> dict[str, object]:
         return dict(self._values)
 
+    def serialize_function(self, value: object) -> str:
+        name = getattr(value, "__name__", type(value).__name__)
+        return f"offline.serialized.{name}"
+
 
 class _Task:
     def __init__(self, task_name: str, values: dict[str, object]) -> None:
@@ -80,6 +84,7 @@ class _Task:
             "validation": _Split("validation-fingerprint", _Info("1.0.0")),
             "test": _Split("test-fingerprint", _Info("2.0.0")),
             "train": _Split("train-fingerprint", _Info("1.0.0")),
+            "fewshot-config": _Split("fewshot-config-fingerprint", _Info("1.0.0")),
         }
 
 
@@ -104,7 +109,7 @@ class TaskManager:
 def _task_config(task_name: str) -> dict[str, object]:
     return {
         "task": task_name,
-        "metadata": {"version": "1.0.0"},
+        "metadata": {"version": 1.0},
         "output_type": "loglikelihood",
         "description": "offline task",
         "process_docs": "offline.process_docs",
@@ -117,7 +122,13 @@ def _task_config(task_name: str) -> dict[str, object]:
         "padding": "left",
         "num_fewshot": 1,
         "fewshot_split": "train",
-        "fewshot_config": None,
+        "fewshot_config": {
+            "split": "fewshot-config",
+            "process_docs": _offline_process_docs,
+            "doc_to_text": _offline_doc_to_text,
+            "doc_to_target": _offline_doc_to_target,
+            "doc_to_choice": _offline_doc_to_choice,
+        },
         "generation_kwargs": {"temperature": 0.0},
         "metric_list": [{"metric": "acc"}],
         "filter_list": [{"filter": "none"}],
@@ -128,6 +139,22 @@ def _task_config(task_name: str) -> dict[str, object]:
         "test_split": "test",
         "dataset_kwargs": {},
     }
+
+
+def _offline_process_docs(value: object) -> object:
+    return value
+
+
+def _offline_doc_to_text(value: object) -> str:
+    return str(value)
+
+
+def _offline_doc_to_target(value: object) -> str:
+    return str(value)
+
+
+def _offline_doc_to_choice(value: object) -> list[str]:
+    return [str(value)]
 
 
 def load_yaml(
@@ -165,7 +192,7 @@ def simple_evaluate(
 ) -> dict[str, object]:
     if not isinstance(model, LM):
         raise TypeError("offline lm-eval requires an LM adapter")
-    if num_fewshot != 0 or log_samples is not False:
+    if num_fewshot != 0 or not isinstance(log_samples, bool):
         raise RuntimeError("unexpected offline lm-eval policy")
     if limit is not None and limit <= 0:
         raise RuntimeError("offline lm-eval limit must be positive")
@@ -175,10 +202,13 @@ def simple_evaluate(
     loaded_tasks = loaded["tasks"]
     if not isinstance(loaded_tasks, dict):
         raise TypeError("offline lm-eval tasks are malformed")
-    results: dict[str, object] = {}
-    for task, loaded_task in loaded_tasks.items():
+    for loaded_task in loaded_tasks.values():
         if not isinstance(loaded_task, _Task):
             raise TypeError("offline lm-eval task is malformed")
+        if loaded_task.config._values["num_fewshot"] != 0:
+            loaded_task.config._values["num_fewshot"] = num_fewshot
+    results: dict[str, object] = {}
+    for task, loaded_task in loaded_tasks.items():
         scored = model.loglikelihood(list(loaded_task.instances))
         generated = model.generate_until(
             [
@@ -196,12 +226,18 @@ def simple_evaluate(
         }
     return {
         "results": results,
-        "configs": {task: _task_config(task) for task in tasks},
+        "configs": {
+            task: loaded_task.config.to_dict()
+            for task, loaded_task in loaded_tasks.items()
+        },
         "versions": {task: "1.0.0" for task in tasks},
-        "n-shot": {task: 1 for task in tasks},
+        "n-shot": {
+            task: loaded_task.config.to_dict()["num_fewshot"]
+            for task, loaded_task in loaded_tasks.items()
+        },
         "higher_is_better": {task: {"acc,none": True} for task in tasks},
         "n-samples": {task: {"effective": 2, "original": 2} for task in tasks},
-        "config": {"bootstrap_iters": 100000, "log_samples": False},
+        "config": {"bootstrap_iters": 100000, "log_samples": log_samples},
         "git_hash": "offline-lm-eval-commit",
         "date": "2026-08-25T00:00:00Z",
     }

@@ -284,7 +284,7 @@ def _resolve_yaml_sources(
     return primary, tuple(closure)
 
 
-def _task_config(task: object) -> Mapping[str, object]:
+def _task_config(task: object) -> tuple[Mapping[str, object], object]:
     config = getattr(task, "config", None)
     to_dict = getattr(config, "to_dict", None)
     if not callable(to_dict):
@@ -292,7 +292,7 @@ def _task_config(task: object) -> Mapping[str, object]:
     values = to_dict()
     if not isinstance(values, Mapping):
         raise SMLRuntimeError("lm-eval task config is malformed")
-    return values
+    return values, config
 
 
 def _metadata_version(config: Mapping[str, object]) -> str:
@@ -300,9 +300,37 @@ def _metadata_version(config: Mapping[str, object]) -> str:
     if not isinstance(metadata, Mapping):
         raise SMLRuntimeError("lm-eval task metadata version is missing")
     version = metadata.get("version")
-    if not isinstance(version, str) or not version:
+    try:
+        normalized = normalize_json_value(version, context="lm-eval metadata version")
+    except (TypeError, ValueError) as error:
+        raise SMLRuntimeError("lm-eval task metadata version is invalid") from error
+    if isinstance(normalized, bool) or not isinstance(normalized, (str, int, float)):
         raise SMLRuntimeError("lm-eval task metadata version is missing")
-    return version
+    text = str(normalized)
+    if not text:
+        raise SMLRuntimeError("lm-eval task metadata version is missing")
+    return text
+
+
+def _serialize_provider_value(config: object, value: object) -> object:
+    if callable(value):
+        serializer = getattr(config, "serialize_function", None)
+        if not callable(serializer):
+            raise SMLRuntimeError("lm-eval task callable serializer is unavailable")
+        serialized = serializer(value)
+        if callable(serialized):
+            raise SMLRuntimeError("lm-eval task callable serialization is malformed")
+        return _serialize_provider_value(config, serialized)
+    if isinstance(value, Mapping):
+        serialized_mapping: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise SMLRuntimeError("lm-eval task config key is malformed")
+            serialized_mapping[key] = _serialize_provider_value(config, item)
+        return serialized_mapping
+    if isinstance(value, (list, tuple)):
+        return tuple(_serialize_provider_value(config, item) for item in value)
+    return value
 
 
 def _dataset_identity(
@@ -320,7 +348,13 @@ def _dataset_identity(
     if isinstance(num_fewshot, bool) or not isinstance(num_fewshot, int):
         raise SMLRuntimeError("lm-eval task num_fewshot is malformed")
     if num_fewshot > 0:
-        fewshot_split = config.get("fewshot_split")
+        fewshot_config = config.get("fewshot_config")
+        nested_split = (
+            fewshot_config.get("split") if isinstance(fewshot_config, Mapping) else None
+        )
+        fewshot_split = (
+            nested_split if nested_split is not None else config.get("fewshot_split")
+        )
         if not isinstance(fewshot_split, str) or not fewshot_split:
             raise SMLRuntimeError("lm-eval task few-shot split is missing")
         if fewshot_split not in selected_splits:
@@ -415,7 +449,7 @@ def _resolve_task_record(
     task_yaml, include_closure = _resolve_yaml_sources(
         provider, getattr(entry, "yaml_path", None)
     )
-    config = _task_config(task)
+    config, config_object = _task_config(task)
     task_metadata_version = _metadata_version(config)
     dataset_revision, dataset_fingerprint = _dataset_identity(task, config)
     if not isinstance(provider_result, Mapping):
@@ -446,7 +480,9 @@ def _resolve_task_record(
     few_shot_config = {
         "num_fewshot": config.get("num_fewshot"),
         "fewshot_split": config.get("fewshot_split"),
-        "fewshot_config": config.get("fewshot_config"),
+        "fewshot_config": _serialize_provider_value(
+            config_object, config.get("fewshot_config")
+        ),
         "fewshot_as_multiturn": True,
     }
     generation_config = {
