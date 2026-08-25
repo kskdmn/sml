@@ -1,10 +1,13 @@
 # ruff: noqa: F811
 from __future__ import annotations
 
+import importlib
 import math
 import os
 import socket
-from dataclasses import dataclass
+import sys
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +30,7 @@ from test_inference import (  # noqa: F401
 
 IN_VOCAB_CONTEXTS = ("alpha", "alpha beta", "alpha beta gamma")
 IN_VOCAB_CONTINUATIONS = (" beta", " gamma", " delta")
+_PROVIDER_STUBS = Path(__file__).resolve().parents[1] / "fixtures" / "provider_stubs"
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +128,389 @@ def fake_lm_eval(monkeypatch: pytest.MonkeyPatch):
     module = SimpleNamespace(simple_evaluate=simple_evaluate, calls=calls)
     monkeypatch.setattr(evaluation, "_import_lm_eval", lambda: module)
     return module
+
+
+@pytest.fixture
+def fake_provider(monkeypatch: pytest.MonkeyPatch):
+    """Load the checked-in 0.4.12-shaped provider without using the network."""
+    from sml import evaluation
+
+    original = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "lm_eval" or name.startswith("lm_eval.")
+    }
+    for name in tuple(original):
+        del sys.modules[name]
+    monkeypatch.syspath_prepend(str(_PROVIDER_STUBS))
+    importlib.invalidate_caches()
+    module = importlib.import_module("lm_eval")
+    task_module = importlib.import_module("lm_eval.tasks")
+    loader_module = importlib.import_module("lm_eval.tasks._yaml_loader")
+    try:
+        yield evaluation._LMEvalProvider(
+            simple_evaluate=module.simple_evaluate,
+            task_manager_type=task_module.TaskManager,
+            load_yaml=loader_module.load_yaml,
+            package_root=Path(module.__file__).resolve().parent,
+            package_version=module.__version__,
+        )
+    finally:
+        for name in tuple(sys.modules):
+            if name == "lm_eval" or name.startswith("lm_eval."):
+                del sys.modules[name]
+        sys.modules.update(original)
+
+
+def _task_record(
+    fake_provider,
+    *,
+    provider_result: Mapping[str, object] | None = None,
+):
+    from sml import evaluation
+
+    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    loaded = manager.load(["hellaswag"])
+    task = loaded["tasks"]["hellaswag"]
+    recorder = evaluation._EvaluationRequestRecorder()
+    recorder.record("loglikelihood", task.instances)
+    return evaluation._resolve_task_record(
+        task_name="hellaswag",
+        task=task,
+        provider=fake_provider,
+        manager=manager,
+        recorder=recorder,
+        provider_result=provider_result
+        or {"results": {"hellaswag": {"acc,none": 0.5}}, "git_hash": "abc123"},
+        limit=2,
+        padding="right",
+        seeds=evaluation._evaluation_seeds(),
+        provider_versions=evaluation._provider_versions(),
+    )
+
+
+def test_request_recorder_hashes_actual_order_per_task() -> None:
+    from sml import evaluation
+
+    first = SimpleNamespace(
+        task_name="hellaswag", doc_id=2, repeats=1, args=("a", " b")
+    )
+    second = SimpleNamespace(
+        task_name="hellaswag", doc_id=1, repeats=1, args=("c", " d")
+    )
+    recorder = evaluation._EvaluationRequestRecorder()
+    recorder.record("loglikelihood", (first, second))
+    reversed_recorder = evaluation._EvaluationRequestRecorder()
+    reversed_recorder.record("loglikelihood", (second, first))
+    assert recorder.identity_for("hellaswag") != reversed_recorder.identity_for(
+        "hellaswag"
+    )
+
+
+def test_request_recorder_requires_unambiguous_task_ownership() -> None:
+    from sml import evaluation
+
+    recorder = evaluation._EvaluationRequestRecorder()
+    with pytest.raises(SMLRuntimeError, match="task_name|ownership"):
+        recorder.record(
+            "loglikelihood",
+            (SimpleNamespace(doc_id=1, repeats=1, args=("a", " b")),),
+        )
+
+
+def test_task_provenance_hashes_yaml_include_config_and_dataset(fake_provider) -> None:
+    record = _task_record(fake_provider)
+    assert record.task_yaml.logical_name == "tasks/hellaswag.yaml"
+    assert [source.logical_name for source in record.include_template_closure] == [
+        "tasks/common.yaml"
+    ]
+    assert record.dataset_revision == "version:1.0.0"
+    assert record.dataset_fingerprint.startswith("sha256:")
+    assert record.metric_payload == {"acc,none": 0.5}
+    assert record.prompt_config == {
+        "adapter_padding": "right",
+        "apply_chat_template": False,
+        "description": "offline task",
+        "doc_to_choice": None,
+        "doc_to_target": "offline.doc_to_target",
+        "doc_to_text": "offline.doc_to_text",
+        "fewshot_delimiter": "\n\n",
+        "gen_prefix": "",
+        "output_type": "loglikelihood",
+        "process_docs": "offline.process_docs",
+        "system_instruction": None,
+        "target_delimiter": " ",
+    }
+    assert record.few_shot_config == {
+        "fewshot_as_multiturn": True,
+        "fewshot_config": None,
+        "fewshot_split": "train",
+        "num_fewshot": 1,
+    }
+    assert record.generation_config == {
+        "generation_kwargs": {"temperature": 0.0},
+        "provider_gen_kwargs": None,
+    }
+    assert record.metric_normalization_config == {
+        "bootstrap_iters": 100000,
+        "doc_to_decontamination_query": None,
+        "filter_list": ({"filter": "none"},),
+        "log_samples": True,
+        "metric_list": ({"metric": "acc"},),
+        "predict_only": False,
+        "repeats": 1,
+        "should_decontaminate": False,
+    }
+    assert str(fake_provider.package_root) not in str(record)
+
+
+def test_recording_manager_captures_one_exact_valid_load(fake_provider) -> None:
+    from sml import evaluation
+
+    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    loaded = manager.load(["hellaswag"])
+    assert manager.loaded is loaded
+    with pytest.raises(SMLRuntimeError, match="second|once"):
+        manager.load(["hellaswag"])
+
+
+def test_recording_manager_rejects_malformed_load_result() -> None:
+    from sml import evaluation
+
+    class MalformedTaskManager:
+        def load(self, _task_list: object) -> dict[str, object]:
+            return {"groups": {}, "group_map": {}}
+
+    manager = evaluation._RecordingTaskManager(MalformedTaskManager())
+    with pytest.raises(SMLRuntimeError, match="malformed"):
+        manager.load(["hellaswag"])
+
+
+def test_task_provenance_rejects_missing_index_yaml_path(fake_provider) -> None:
+    from sml import evaluation
+
+    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    loaded = manager.load(["hellaswag"])
+    manager.task_index["hellaswag"] = SimpleNamespace(yaml_path=None)
+    recorder = evaluation._EvaluationRequestRecorder()
+    recorder.record("loglikelihood", loaded["tasks"]["hellaswag"].instances)
+    with pytest.raises(SMLRuntimeError, match="YAML|yaml"):
+        evaluation._resolve_task_record(
+            task_name="hellaswag",
+            task=loaded["tasks"]["hellaswag"],
+            provider=fake_provider,
+            manager=manager,
+            recorder=recorder,
+            provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
+            limit=None,
+            padding="right",
+            seeds=evaluation._evaluation_seeds(),
+            provider_versions=evaluation._provider_versions(),
+        )
+
+
+def test_task_provenance_rejects_missing_indexed_yaml_file(fake_provider) -> None:
+    from sml import evaluation
+
+    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    loaded = manager.load(["hellaswag"])
+    manager.task_index["hellaswag"] = SimpleNamespace(
+        yaml_path=fake_provider.package_root / "tasks" / "missing.yaml"
+    )
+    recorder = evaluation._EvaluationRequestRecorder()
+    recorder.record("loglikelihood", loaded["tasks"]["hellaswag"].instances)
+    with pytest.raises(SMLRuntimeError, match="YAML|yaml"):
+        evaluation._resolve_task_record(
+            task_name="hellaswag",
+            task=loaded["tasks"]["hellaswag"],
+            provider=fake_provider,
+            manager=manager,
+            recorder=recorder,
+            provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
+            limit=None,
+            padding="right",
+            seeds=evaluation._evaluation_seeds(),
+            provider_versions=evaluation._provider_versions(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("primary", "included", "message"),
+    [
+        (
+            "include: common.yaml\ntask: hellaswag\n",
+            "include: hellaswag.yaml\n",
+            "cycle",
+        ),
+        ("include: ../../outside.yaml\ntask: hellaswag\n", "", "outside|escape"),
+    ],
+)
+def test_task_provenance_rejects_unsafe_include_closure(
+    fake_provider,
+    tmp_path: Path,
+    primary: str,
+    included: str,
+    message: str,
+) -> None:
+    from sml import evaluation
+
+    root = tmp_path / "lm_eval"
+    tasks = root / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "hellaswag.yaml").write_text(primary, encoding="utf-8")
+    if included:
+        (tasks / "common.yaml").write_text(included, encoding="utf-8")
+    (tmp_path / "outside.yaml").write_text("metadata: {}\n", encoding="utf-8")
+    provider = replace(fake_provider, package_root=root)
+    manager = evaluation._RecordingTaskManager(provider.make_task_manager())
+    loaded = manager.load(["hellaswag"])
+    manager.task_index["hellaswag"] = SimpleNamespace(
+        yaml_path=tasks / "hellaswag.yaml"
+    )
+    recorder = evaluation._EvaluationRequestRecorder()
+    recorder.record("loglikelihood", loaded["tasks"]["hellaswag"].instances)
+    with pytest.raises(SMLRuntimeError, match=message):
+        evaluation._resolve_task_record(
+            task_name="hellaswag",
+            task=loaded["tasks"]["hellaswag"],
+            provider=provider,
+            manager=manager,
+            recorder=recorder,
+            provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
+            limit=None,
+            padding="right",
+            seeds=evaluation._evaluation_seeds(),
+            provider_versions=evaluation._provider_versions(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("split", "attribute", "value", "message"),
+    [
+        ("validation", "_fingerprint", "", "fingerprint"),
+        ("validation", "info", SimpleNamespace(version=""), "version"),
+        ("train", "_fingerprint", "", "fingerprint"),
+    ],
+)
+def test_task_provenance_requires_selected_dataset_identities(
+    fake_provider,
+    split: str,
+    attribute: str,
+    value: object,
+    message: str,
+) -> None:
+    from sml import evaluation
+
+    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    loaded = manager.load(["hellaswag"])
+    task = loaded["tasks"]["hellaswag"]
+    object.__setattr__(task.dataset[split], attribute, value)
+    recorder = evaluation._EvaluationRequestRecorder()
+    recorder.record("loglikelihood", task.instances)
+    with pytest.raises(SMLRuntimeError, match=message):
+        evaluation._resolve_task_record(
+            task_name="hellaswag",
+            task=task,
+            provider=fake_provider,
+            manager=manager,
+            recorder=recorder,
+            provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
+            limit=None,
+            padding="right",
+            seeds=evaluation._evaluation_seeds(),
+            provider_versions=evaluation._provider_versions(),
+        )
+
+
+def test_task_provenance_selects_test_when_validation_is_not_declared(
+    fake_provider,
+) -> None:
+    from sml import evaluation
+
+    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    loaded = manager.load(["hellaswag"])
+    task = loaded["tasks"]["hellaswag"]
+    task.config._values["validation_split"] = None
+    task.config._values["num_fewshot"] = 0
+    task.dataset["test"] = replace(
+        task.dataset["test"], info=SimpleNamespace(version="3.0.0")
+    )
+    recorder = evaluation._EvaluationRequestRecorder()
+    recorder.record("loglikelihood", task.instances)
+    record = evaluation._resolve_task_record(
+        task_name="hellaswag",
+        task=task,
+        provider=fake_provider,
+        manager=manager,
+        recorder=recorder,
+        provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
+        limit=None,
+        padding="right",
+        seeds=evaluation._evaluation_seeds(),
+        provider_versions=evaluation._provider_versions(),
+    )
+    assert record.dataset_revision == "version:3.0.0"
+
+
+def test_task_provenance_rejects_missing_task_metric(fake_provider) -> None:
+    with pytest.raises(SMLRuntimeError, match="metric|result"):
+        _task_record(fake_provider, provider_result={"results": {}})
+
+
+class _DuplicateMetricMapping(Mapping[str, object]):
+    def __getitem__(self, key: str) -> object:
+        if key != "acc,none":
+            raise KeyError(key)
+        return 0.5
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(("acc,none", "acc,none"))
+
+    def __len__(self) -> int:
+        return 2
+
+    def items(self):
+        return (("acc,none", 0.5), ("acc,none", 0.75))
+
+
+def test_task_provenance_rejects_ambiguous_duplicate_metric_keys(fake_provider) -> None:
+    with pytest.raises(SMLRuntimeError, match="duplicate|ambiguous"):
+        _task_record(
+            fake_provider,
+            provider_result={"results": {"hellaswag": _DuplicateMetricMapping()}},
+        )
+
+
+def test_sml_eval_lm_records_both_methods_in_dispatch_order(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sml import evaluation
+
+    recorder = evaluation._EvaluationRequestRecorder()
+    lm = SMLEvalLM(tiny_session, recorder=recorder)
+    monkeypatch.setattr(
+        tiny_session,
+        "generate_batch",
+        lambda items: tuple(
+            GenerationResult("ok", (), None, tiny_session.model_identity) for _ in items
+        ),
+    )
+    generated = SimpleNamespace(
+        task_name="hellaswag",
+        doc_id=3,
+        repeats=1,
+        args=("alpha", {"max_gen_toks": 1, "until": []}),
+    )
+    scored = SimpleNamespace(
+        task_name="hellaswag", doc_id=2, repeats=1, args=("alpha", " beta")
+    )
+    lm.generate_until([generated])
+    lm.loglikelihood([scored])
+    expected = evaluation._EvaluationRequestRecorder()
+    expected.record("generate_until", (generated,))
+    expected.record("loglikelihood", (scored,))
+    assert recorder.identity_for("hellaswag") == expected.identity_for("hellaswag")
 
 
 def test_score_cardinality_reuses_fixed_compiled_bucket(

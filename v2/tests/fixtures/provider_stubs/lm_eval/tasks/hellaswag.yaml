@@ -1,0 +1,3 @@
+include: common.yaml
+task: hellaswag
+dataset_path: offline/hellaswag

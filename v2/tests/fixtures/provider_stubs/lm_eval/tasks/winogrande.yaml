@@ -1,0 +1,3 @@
+include: common.yaml
+task: winogrande
+dataset_path: offline/winogrande
