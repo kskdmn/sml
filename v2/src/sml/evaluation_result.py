@@ -105,14 +105,17 @@ def normalize_json_value(value: object, *, context: str) -> JsonValue:
             raise ValueError(f"{context} contains a non-finite number")
         return value
     if isinstance(value, Mapping):
-        for key in value:
+        keys = tuple(value)
+        for key in keys:
             if not isinstance(key, str):
                 raise TypeError(f"{context} object keys must be strings")
             _require_utf8(key, f"{context} object key")
+        if len(keys) != len(set(keys)):
+            raise ValueError(f"{context} contains duplicate JSON object key")
         return MappingProxyType(
             {
                 key: normalize_json_value(value[key], context=f"{context}.{key}")
-                for key in sorted(value)
+                for key in sorted(keys)
             }
         )
     if isinstance(value, (list, tuple)):
@@ -268,7 +271,10 @@ class EvaluationResult:
             raise ValueError("provider_result task mappings must exactly match tasks")
         for task in tasks:
             metrics = results[task.task_name]
-            if not isinstance(metrics, Mapping) or metrics != task.metric_payload:
+            if not isinstance(metrics, Mapping) or (
+                canonical_json_bytes(metrics)
+                != canonical_json_bytes(task.metric_payload)
+            ):
                 raise ValueError(
                     "provider result metrics must match task metric_payload"
                 )
@@ -692,6 +698,14 @@ def _read_existing_result(parent: int, destination: str) -> EvaluationResult:
             os.close(descriptor)
 
 
+def _cleanup_temporary_output(parent: int, temporary: str) -> None:
+    try:
+        os.unlink(temporary, dir_fd=parent)
+    except FileNotFoundError:
+        pass
+    os.fsync(parent)
+
+
 def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
     """Durably publish *result* once, accepting only exact idempotent reuse."""
     if not isinstance(path, Path):
@@ -702,6 +716,7 @@ def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
     except (OSError, ValueError):
         raise SMLRuntimeError("evaluation output collision: " + str(path)) from None
     temporary: str | None = None
+    primary_error: BaseException | None = None
     try:
         descriptor, temporary = _open_temporary_output(parent, path.name)
         with os.fdopen(descriptor, "wb") as output:
@@ -725,22 +740,25 @@ def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
                 ) from None
             if existing != result:
                 raise SMLRuntimeError("evaluation output collision: " + str(path))
-        try:
-            os.unlink(temporary, dir_fd=parent)
-        except FileNotFoundError:
-            pass
-        else:
-            temporary = None
-        os.fsync(parent)
+        _cleanup_temporary_output(parent, temporary)
+        temporary = None
+    except BaseException as error:
+        primary_error = error
+        if temporary is not None:
+            try:
+                _cleanup_temporary_output(parent, temporary)
+            except OSError as cleanup_error:
+                error.add_note(f"evaluation output cleanup failed: {cleanup_error!r}")
+        raise
     finally:
         try:
-            if temporary is not None:
-                try:
-                    os.unlink(temporary, dir_fd=parent)
-                except FileNotFoundError:
-                    pass
-        finally:
             os.close(parent)
+        except OSError as close_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                f"evaluation output parent close failed: {close_error!r}"
+            )
 
 
 __all__ = (

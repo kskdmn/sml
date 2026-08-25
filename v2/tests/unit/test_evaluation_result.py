@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import stat
 import threading
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +32,25 @@ from sml.evaluation_result import (
     read_evaluation_result,
 )
 from sml.inference import ModelIdentity
+
+
+class DuplicateTaskKeyMapping(Mapping[str, object]):
+    """A hostile Mapping whose iteration exposes the same task key twice."""
+
+    def __init__(self, value: object) -> None:
+        self._value = value
+
+    def __getitem__(self, key: str) -> object:
+        if key != "hellaswag":
+            raise KeyError(key)
+        return self._value
+
+    def __iter__(self):
+        yield "hellaswag"
+        yield "hellaswag"
+
+    def __len__(self) -> int:
+        return 2
 
 
 def model_identity() -> ModelIdentity:
@@ -492,6 +513,64 @@ def test_reader_rejects_a_freshly_identifiable_provider_metric_contradiction(
         read_evaluation_result(path)
 
 
+def test_result_rejects_type_distinct_provider_metrics() -> None:
+    """Breaks if JSON true can satisfy a task metric whose value is the number 1."""
+    with pytest.raises(ValueError, match="metric_payload"):
+        EvaluationResult(
+            kind="evaluation-result",
+            version=1,
+            identity="sha256:" + "0" * 64,
+            model=model_identity(),
+            tasks=(make_task_record(metric_payload={"m": 1}),),
+            provider_result={
+                "results": {"hellaswag": {"m": True}},
+                "configs": {"hellaswag": {}},
+            },
+        )
+
+
+def test_reader_rejects_a_freshly_identifiable_type_distinct_metric(
+    tmp_path: Path,
+) -> None:
+    """Breaks if strict reading conflates true and 1 after identity verification."""
+    document = json.loads(
+        evaluation_result_bytes(identified_result(metric_payload={"m": 1}))
+    )
+    document["provider_result"]["results"]["hellaswag"]["m"] = True
+    projection = dict(document)
+    projection.pop("identity")
+    document["identity"] = structured_identity("sml-evaluation-result-v1", projection)
+    path = tmp_path / "type-distinct-metric.json"
+    path.write_bytes(canonical_json_bytes(document) + b"\n")
+
+    with pytest.raises(SMLArtifactError):
+        read_evaluation_result(path)
+
+
+@pytest.mark.parametrize("mapping_name", ("results", "configs"))
+def test_result_rejects_duplicate_task_keys_from_hostile_mappings(
+    mapping_name: str,
+) -> None:
+    """Breaks if normalization collapses duplicate Mapping iteration keys."""
+    provider_result: dict[str, object] = {
+        "results": {"hellaswag": {"acc,none": 0.5}},
+        "configs": {"hellaswag": {}},
+    }
+    provider_result[mapping_name] = DuplicateTaskKeyMapping(
+        {"acc,none": 0.5} if mapping_name == "results" else {}
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        EvaluationResult(
+            kind="evaluation-result",
+            version=1,
+            identity="sha256:" + "0" * 64,
+            model=model_identity(),
+            tasks=(make_task_record(),),
+            provider_result=provider_result,  # type: ignore[arg-type]
+        )
+
+
 def test_concurrent_publication_is_atomic_idempotent_and_never_overwrites(
     tmp_path: Path,
 ) -> None:
@@ -635,6 +714,83 @@ def test_publication_closes_parent_when_temporary_cleanup_fails(
         len(events) - 1 - events[::-1].index(("unlink", parent_descriptors[-1]))
     )
     assert ("close", parent_descriptors[-1]) in events[cleanup_index + 1 :]
+
+
+@pytest.mark.parametrize("missing_temporary", (False, True))
+def test_collision_cleanup_unlinks_then_fsyncs_parent_before_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_temporary: bool
+) -> None:
+    """Breaks if collision cleanup leaves a successful/no-entry unlink non-durable."""
+    path = tmp_path / "evaluation.json"
+    publish_evaluation_result(path, identified_result())
+    events: list[str] = []
+    real_close = os.close
+    real_fstat = os.fstat
+    real_fsync = os.fsync
+    real_unlink = os.unlink
+
+    def record_unlink(name: str, *, dir_fd: int | None = None) -> None:
+        events.append("unlink")
+        real_unlink(name, dir_fd=dir_fd)
+        if missing_temporary:
+            raise FileNotFoundError(name)
+
+    def record_fsync(descriptor: int) -> None:
+        kind = "parent" if stat.S_ISDIR(real_fstat(descriptor).st_mode) else "file"
+        events.append(f"fsync:{kind}")
+        real_fsync(descriptor)
+
+    def record_close(descriptor: int) -> None:
+        kind = "parent" if stat.S_ISDIR(real_fstat(descriptor).st_mode) else "file"
+        events.append(f"close:{kind}")
+        real_close(descriptor)
+
+    monkeypatch.setattr(evaluation_result_module.os, "unlink", record_unlink)
+    monkeypatch.setattr(evaluation_result_module.os, "fsync", record_fsync)
+    monkeypatch.setattr(evaluation_result_module.os, "close", record_close)
+    with pytest.raises(SMLRuntimeError, match="collision"):
+        publish_evaluation_result(
+            path, identified_result(metric_payload={"acc,none": 0.75})
+        )
+
+    cleanup_index = len(events) - 1 - events[::-1].index("unlink")
+    assert events[cleanup_index:] == ["unlink", "fsync:parent", "close:parent"]
+
+
+def test_collision_preserves_primary_error_and_notes_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Breaks if a cleanup failure replaces or hides the primary collision error."""
+    path = tmp_path / "evaluation.json"
+    publish_evaluation_result(path, identified_result())
+    events: list[str] = []
+    real_close = os.close
+    real_fstat = os.fstat
+    real_fsync = os.fsync
+
+    def fail_parent_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(real_fstat(descriptor).st_mode):
+            events.append("fsync:parent")
+            raise OSError("injected cleanup fsync failure")
+        real_fsync(descriptor)
+
+    def record_close(descriptor: int) -> None:
+        kind = "parent" if stat.S_ISDIR(real_fstat(descriptor).st_mode) else "file"
+        events.append(f"close:{kind}")
+        real_close(descriptor)
+
+    monkeypatch.setattr(evaluation_result_module.os, "fsync", fail_parent_fsync)
+    monkeypatch.setattr(evaluation_result_module.os, "close", record_close)
+    with pytest.raises(SMLRuntimeError, match="collision") as error:
+        publish_evaluation_result(
+            path, identified_result(metric_payload={"acc,none": 0.75})
+        )
+
+    assert any(
+        "injected cleanup fsync failure" in note for note in error.value.__notes__
+    )
+    cleanup_index = len(events) - 1 - events[::-1].index("fsync:parent")
+    assert events[cleanup_index:] == ["fsync:parent", "close:parent"]
 
 
 def test_publication_recovers_when_another_writer_creates_missing_parent(
