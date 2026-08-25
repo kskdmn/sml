@@ -6,7 +6,8 @@ import json
 import math
 import os
 import re
-import tempfile
+import secrets
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -542,12 +543,8 @@ def _result_from_payload(payload: object) -> EvaluationResult:
     )
 
 
-def read_evaluation_result(path: Path) -> EvaluationResult:
-    """Strictly read one canonical evaluation result file."""
-    if not isinstance(path, Path):
-        raise TypeError("path must be a Path")
+def _result_from_bytes(raw_bytes: bytes) -> EvaluationResult:
     try:
-        raw_bytes = path.read_bytes()
         raw = json.loads(
             raw_bytes.decode("utf-8"),
             object_pairs_hook=_json_object_no_duplicates,
@@ -571,12 +568,101 @@ def read_evaluation_result(path: Path) -> EvaluationResult:
         raise SMLArtifactError("invalid evaluation result") from error
 
 
-def _fsync_parent(path: Path) -> None:
-    directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+def read_evaluation_result(path: Path) -> EvaluationResult:
+    """Strictly read one canonical evaluation result file."""
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
     try:
-        os.fsync(directory)
+        raw_bytes = path.read_bytes()
+    except OSError as error:
+        raise SMLArtifactError("invalid evaluation result") from error
+    return _result_from_bytes(raw_bytes)
+
+
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
+_REGULAR_FILE_OPEN_FLAGS = (
+    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
+_TEMPORARY_FILE_OPEN_FLAGS = (
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _open_publication_parent(path: Path) -> int:
+    if path.name in ("", ".", ".."):
+        raise ValueError("evaluation output must name a file")
+    components = path.parent.parts
+    if path.is_absolute():
+        descriptor = os.open(path.anchor, _DIRECTORY_OPEN_FLAGS)
+        components = components[1:]
+    else:
+        descriptor = os.open(".", _DIRECTORY_OPEN_FLAGS)
+    try:
+        for component in components:
+            if component == ".":
+                continue
+            try:
+                child = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
+            except FileNotFoundError:
+                os.mkdir(component, dir_fd=descriptor)
+                os.fsync(descriptor)
+                child = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
+            previous = descriptor
+            descriptor = child
+            os.close(previous)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_temporary_output(parent: int, destination: str) -> tuple[int, str]:
+    for _ in range(100):
+        name = f".{destination}.{secrets.token_hex(16)}.tmp"
+        try:
+            return (
+                os.open(
+                    name,
+                    _TEMPORARY_FILE_OPEN_FLAGS,
+                    0o600,
+                    dir_fd=parent,
+                ),
+                name,
+            )
+        except FileExistsError:
+            continue
+    raise OSError("could not create evaluation result temporary file")
+
+
+def _read_existing_result(parent: int, destination: str) -> EvaluationResult:
+    try:
+        entry = os.stat(destination, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISREG(entry.st_mode):
+            raise SMLArtifactError("evaluation output collision is not a regular file")
+        descriptor = os.open(
+            destination,
+            _REGULAR_FILE_OPEN_FLAGS,
+            dir_fd=parent,
+        )
+    except OSError as error:
+        raise SMLArtifactError("invalid existing evaluation result") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SMLArtifactError("evaluation output collision is not a regular file")
+        if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+            raise SMLArtifactError("evaluation output changed during collision check")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        current = os.stat(destination, dir_fd=parent, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise SMLArtifactError("evaluation output changed during collision check")
+        return _result_from_bytes(b"".join(chunks))
     finally:
-        os.close(directory)
+        os.close(descriptor)
 
 
 def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
@@ -584,30 +670,42 @@ def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
     if not isinstance(path, Path):
         raise TypeError("path must be a Path")
     payload = evaluation_result_bytes(result)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
     try:
+        parent = _open_publication_parent(path)
+    except (OSError, ValueError):
+        raise SMLRuntimeError("evaluation output collision: " + str(path)) from None
+    temporary: str | None = None
+    try:
+        descriptor, temporary = _open_temporary_output(parent, path.name)
         with os.fdopen(descriptor, "wb") as output:
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
         try:
-            os.link(temporary, path)
+            os.link(
+                temporary,
+                path.name,
+                src_dir_fd=parent,
+                dst_dir_fd=parent,
+                follow_symlinks=False,
+            )
         except FileExistsError:
             try:
-                existing = read_evaluation_result(path)
+                existing = _read_existing_result(parent, path.name)
             except SMLArtifactError:
                 raise SMLRuntimeError(
                     "evaluation output collision: " + str(path)
                 ) from None
             if existing != result:
                 raise SMLRuntimeError("evaluation output collision: " + str(path))
-        _fsync_parent(path)
+        os.fsync(parent)
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            try:
+                os.unlink(temporary, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+        os.close(parent)
 
 
 __all__ = (

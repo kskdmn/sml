@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -8,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import sml.evaluation_result as evaluation_result_module
 from sml.artifacts.manifest import VerificationLevel, canonical_json_bytes
 from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.evaluation_result import (
@@ -92,6 +95,15 @@ def identified_result() -> EvaluationResult:
     task = replace(task, task_identity=evaluation_task_identity(task))
     result = make_result(model=model_identity(), tasks=(task,))
     return replace(result, identity=evaluation_result_identity(result))
+
+
+def _publish_fifo_result(path: Path, outcomes) -> None:
+    try:
+        publish_evaluation_result(path, identified_result())
+    except SMLRuntimeError as error:
+        outcomes.put(str(error))
+    else:
+        outcomes.put("accepted")
 
 
 def test_json_normalization_is_closed_finite_and_deeply_immutable() -> None:
@@ -363,3 +375,85 @@ def test_concurrent_publication_is_atomic_idempotent_and_never_overwrites(
             path, second_result if winner == first_result else first_result
         )
     assert path.read_bytes() == persisted
+
+
+def test_publication_durably_creates_each_missing_parent_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Breaks if a crash can lose a newly created parent directory entry."""
+    path = tmp_path / "first" / "second" / "evaluation.json"
+    observed_fsyncs: set[tuple[int, int]] = set()
+    real_fsync = os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        observed_fsyncs.add((metadata.st_dev, metadata.st_ino))
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(evaluation_result_module.os, "fsync", record_fsync)
+    publish_evaluation_result(path, identified_result())
+
+    containing_directories = (tmp_path, tmp_path / "first")
+    assert {
+        (directory.stat().st_dev, directory.stat().st_ino)
+        for directory in containing_directories
+    } <= observed_fsyncs
+
+
+def test_publication_rejects_a_symlinked_parent_without_external_write(
+    tmp_path: Path,
+) -> None:
+    """Breaks if publication follows a parent symlink outside its namespace."""
+    external = tmp_path / "external"
+    external.mkdir()
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(external, target_is_directory=True)
+    path = linked_parent / "evaluation.json"
+
+    with pytest.raises(SMLRuntimeError) as error:
+        publish_evaluation_result(path, identified_result())
+
+    assert str(error.value) == f"evaluation output collision: {path}"
+    assert not (external / "evaluation.json").exists()
+
+
+def test_publication_rejects_an_equal_destination_symlink(tmp_path: Path) -> None:
+    """Breaks if an externally retargetable destination counts as idempotent."""
+    result = identified_result()
+    backing = tmp_path / "backing.json"
+    backing.write_bytes(evaluation_result_bytes(result))
+    path = tmp_path / "evaluation.json"
+    path.symlink_to(backing)
+
+    with pytest.raises(SMLRuntimeError) as error:
+        publish_evaluation_result(path, result)
+
+    assert str(error.value) == f"evaluation output collision: {path}"
+    assert path.is_symlink()
+    assert backing.read_bytes() == evaluation_result_bytes(result)
+
+
+def test_publication_rejects_a_fifo_destination_without_blocking(
+    tmp_path: Path,
+) -> None:
+    """Breaks if collision validation follows a FIFO and can block indefinitely."""
+    path = tmp_path / "evaluation.fifo"
+    os.mkfifo(path)
+    context = multiprocessing.get_context("spawn")
+    outcomes = context.Queue()
+    process = context.Process(target=_publish_fifo_result, args=(path, outcomes))
+    try:
+        process.start()
+        process.join(timeout=2)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            pytest.fail("publication blocked while reading a FIFO collision")
+        assert process.exitcode == 0
+        assert outcomes.get(timeout=1) == f"evaluation output collision: {path}"
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        outcomes.close()
+        outcomes.join_thread()
