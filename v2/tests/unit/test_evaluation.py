@@ -306,6 +306,33 @@ def test_offline_provider_task4_invocation_records_effective_zero_shot_provenanc
     )
     loaded = manager.loaded["tasks"]
     assert raw_result["config"]["log_samples"] is True
+    expected_samples = {
+        task_name: [
+            {
+                "request_type": "loglikelihood",
+                "doc_id": 2,
+                "repeats": 1,
+                "arguments": ["alpha", " beta"],
+            },
+            {
+                "request_type": "loglikelihood",
+                "doc_id": 1,
+                "repeats": 1,
+                "arguments": ["gamma", " delta"],
+            },
+            {
+                "request_type": "generate_until",
+                "doc_id": 3,
+                "repeats": 1,
+                "arguments": [
+                    "alpha",
+                    {"max_gen_toks": 1, "until": ["omega"]},
+                ],
+            },
+        ]
+        for task_name in ("hellaswag", "winogrande")
+    }
+    assert raw_result["samples"] == expected_samples
     assert raw_result["n-shot"] == {"hellaswag": 0, "winogrande": 0}
     assert all(config["num_fewshot"] == 0 for config in raw_result["configs"].values())
     records = tuple(

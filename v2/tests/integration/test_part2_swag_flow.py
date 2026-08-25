@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ import pytest
 from sml.artifacts.manifest import ExportManifest, VerificationLevel, read_manifest
 from sml.data.swag import SwagPreparationConfig, SwagSourceConfig, prepare_swag_bundle
 from sml.evaluation import evaluate, read_evaluation_result
+from sml.evaluation_result import normalize_json_value
 from sml.inference import GenerationRequest, InferenceSession, resolve_model_artifact
 from sml.model.config import ModelConfig
 from sml.training.common import ResumeOverrides
@@ -48,6 +50,52 @@ def fake_swag_provider() -> FakeSwagProvider:
 def read_export_manifest(path: Path) -> SimpleNamespace:
     verified = read_manifest(path, ExportManifest, VerificationLevel.FULL)
     return SimpleNamespace(model_config=ModelConfig(**dict(verified.manifest.model)))
+
+
+def _installed(name: str) -> bool:
+    try:
+        metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+def _expected_provider_versions() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (name, metadata.version(name))
+            for name in ("lm-eval", "mlx", "numpy", "sentencepiece")
+            if _installed(name)
+        )
+    )
+
+
+def _expected_provider_samples(task_name: str) -> dict[str, object]:
+    return {
+        task_name: [
+            {
+                "request_type": "loglikelihood",
+                "doc_id": 2,
+                "repeats": 1,
+                "arguments": ["alpha", " beta"],
+            },
+            {
+                "request_type": "loglikelihood",
+                "doc_id": 1,
+                "repeats": 1,
+                "arguments": ["gamma", " delta"],
+            },
+            {
+                "request_type": "generate_until",
+                "doc_id": 3,
+                "repeats": 1,
+                "arguments": [
+                    "alpha",
+                    {"max_gen_toks": 1, "until": ["omega"]},
+                ],
+            },
+        ]
+    }
 
 
 def assert_complete_export_evaluation(path: Path) -> None:
@@ -128,10 +176,9 @@ def assert_complete_export_evaluation(path: Path) -> None:
     assert task.lm_eval_source_commit == "offline-lm-eval-commit"
     assert task.dataset_revision == "version:1.0.0"
     assert task.dataset_fingerprint.startswith("sha256:")
-    assert tuple(item.name for item in task.provider_versions) == tuple(
-        sorted(item.name for item in task.provider_versions)
+    assert tuple((item.name, item.version) for item in task.provider_versions) == (
+        _expected_provider_versions()
     )
-    assert all(item.version for item in task.provider_versions)
     assert result.provider_result["results"] == {"hellaswag": task.metric_payload}
     assert set(result.provider_result) == {
         "results",
@@ -140,10 +187,12 @@ def assert_complete_export_evaluation(path: Path) -> None:
         "n-shot",
         "higher_is_better",
         "n-samples",
+        "samples",
         "config",
         "git_hash",
         "date",
     }
+    assert set(result.provider_result["configs"]) == {"hellaswag"}
     provider_config = result.provider_result["configs"]["hellaswag"]
     assert set(provider_config) == {
         "task",
@@ -214,6 +263,11 @@ def assert_complete_export_evaluation(path: Path) -> None:
     assert result.provider_result["n-samples"] == {
         "hellaswag": {"effective": 2, "original": 2}
     }
+    assert normalize_json_value(
+        result.provider_result["samples"], context="persisted provider samples"
+    ) == normalize_json_value(
+        _expected_provider_samples("hellaswag"), context="expected provider samples"
+    )
     assert result.provider_result["config"] == {
         "bootstrap_iters": 100000,
         "log_samples": True,

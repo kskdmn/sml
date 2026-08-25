@@ -55,6 +55,34 @@ def _expected_provider_config(task_name: str) -> dict[str, object]:
     }
 
 
+def _expected_provider_samples(task_name: str) -> dict[str, object]:
+    return {
+        task_name: [
+            {
+                "request_type": "loglikelihood",
+                "doc_id": 2,
+                "repeats": 1,
+                "arguments": ["alpha", " beta"],
+            },
+            {
+                "request_type": "loglikelihood",
+                "doc_id": 1,
+                "repeats": 1,
+                "arguments": ["gamma", " delta"],
+            },
+            {
+                "request_type": "generate_until",
+                "doc_id": 3,
+                "repeats": 1,
+                "arguments": [
+                    "alpha",
+                    {"max_gen_toks": 1, "until": ["omega"]},
+                ],
+            },
+        ]
+    }
+
+
 def _expected_provider_versions() -> tuple[tuple[str, str], ...]:
     return tuple(
         sorted(
@@ -175,6 +203,7 @@ def _assert_complete_evaluation(
         "n-shot": {task_name: 0},
         "higher_is_better": {task_name: {"acc,none": True}},
         "n-samples": {task_name: {"effective": 2, "original": 2}},
+        "samples": _expected_provider_samples(task_name),
         "config": {"bootstrap_iters": 100000, "log_samples": True},
         "git_hash": "offline-lm-eval-commit",
         "date": "2026-08-25T00:00:00Z",

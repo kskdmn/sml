@@ -208,23 +208,41 @@ def simple_evaluate(
         if loaded_task.config._values["num_fewshot"] != 0:
             loaded_task.config._values["num_fewshot"] = num_fewshot
     results: dict[str, object] = {}
+    samples: dict[str, object] = {}
     for task, loaded_task in loaded_tasks.items():
         scored = model.loglikelihood(list(loaded_task.instances))
-        generated = model.generate_until(
-            [
-                _Request(
-                    ("alpha", {"max_gen_toks": 1, "until": ["omega"]}),
-                    task_name=task,
-                    doc_id=3,
-                    repeats=1,
-                )
-            ]
-        )
+        generation_requests = [
+            _Request(
+                ("alpha", {"max_gen_toks": 1, "until": ["omega"]}),
+                task_name=task,
+                doc_id=3,
+                repeats=1,
+            )
+        ]
+        generated = model.generate_until(generation_requests)
         results[task] = {
             "acc,none": sum(bool(item[1]) for item in scored) / len(scored),
             "generated": generated,
         }
-    return {
+        if log_samples:
+            samples[task] = [
+                {
+                    "request_type": "loglikelihood",
+                    "doc_id": request.doc_id,
+                    "repeats": request.repeats,
+                    "arguments": list(request.args),
+                }
+                for request in loaded_task.instances
+            ] + [
+                {
+                    "request_type": "generate_until",
+                    "doc_id": request.doc_id,
+                    "repeats": request.repeats,
+                    "arguments": list(request.args),
+                }
+                for request in generation_requests
+            ]
+    result: dict[str, object] = {
         "results": results,
         "configs": {
             task: loaded_task.config.to_dict()
@@ -241,3 +259,6 @@ def simple_evaluate(
         "git_hash": "offline-lm-eval-commit",
         "date": "2026-08-25T00:00:00Z",
     }
+    if log_samples:
+        result["samples"] = samples
+    return result
