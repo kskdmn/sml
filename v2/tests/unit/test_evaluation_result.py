@@ -95,6 +95,32 @@ def test_json_normalization_is_closed_finite_and_deeply_immutable() -> None:
             normalize_json_value(invalid, context="provider result")
 
 
+def test_numpy_normalization_accepts_only_lossless_json_scalar_kinds() -> None:
+    minimum = np.int64(np.iinfo(np.int64).min)
+    maximum = np.int64(np.iinfo(np.int64).max)
+    assert normalize_json_value(np.bool_(True), context="provider result") is True
+    assert normalize_json_value(minimum, context="provider result") == int(minimum)
+    assert normalize_json_value(maximum, context="provider result") == int(maximum)
+    assert (
+        normalize_json_value(
+            np.float64(np.finfo(np.float64).max), context="provider result"
+        )
+        == np.finfo(np.float64).max
+    )
+    assert normalize_json_value(np.longdouble("1.5"), context="provider result") == 1.5
+
+    with np.errstate(over="ignore"):
+        outside_float_range = np.longdouble(np.finfo(float).max) * 2
+    for invalid in (
+        outside_float_range,
+        np.datetime64("2026-08-25"),
+        np.complex128(1 + 2j),
+        np.str_("provider string"),
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            normalize_json_value(invalid, context="provider result")
+
+
 def test_source_identity_requires_a_portable_logical_path() -> None:
     for logical_name in ("/private/tmp/task.yaml", "C:\\task.yaml", "../task.yaml"):
         with pytest.raises(SMLArtifactError):
@@ -128,6 +154,92 @@ def test_task_and_result_identities_cover_metrics_requests_and_model() -> None:
         )
         != result.identity
     )
+
+
+def test_identity_projections_are_pinned_selective_and_complete() -> None:
+    task = make_task_record()
+    expected_task_identity = (
+        "sha256:d429fd4328a410283b8d0c490f03a3c9fba8975837ecfe088aad5072ef1b6b65"
+    )
+    assert evaluation_task_identity(task) == expected_task_identity
+    assert (
+        evaluation_task_identity(
+            replace(
+                task,
+                task_identity="sha256:" + "5" * 64,
+                metric_payload={"acc,none": 0.75},
+            )
+        )
+        == expected_task_identity
+    )
+
+    for changed_task in (
+        replace(task, task_name="winogrande"),
+        replace(
+            task,
+            task_yaml=EvaluationSourceIdentity(
+                logical_name="tasks/hellaswag.yaml",
+                content_identity="sha256:" + "6" * 64,
+            ),
+        ),
+        replace(task, include_template_closure=()),
+        replace(task, task_metadata_version="2.0"),
+        replace(task, prompt_config={"description": "changed"}),
+        replace(task, few_shot_config={"num_fewshot": 0}),
+        replace(task, generation_config={"temperature": 1.0}),
+        replace(task, metric_normalization_config={"acc,none": "sum"}),
+        replace(task, seeds={"fewshot": 4321}),
+        replace(task, limit=None),
+        replace(task, ordered_request_identity="sha256:" + "7" * 64),
+        replace(task, lm_eval_package_version="0.4.13"),
+        replace(task, lm_eval_source_commit="commit-1"),
+        replace(task, dataset_revision="revision-2"),
+        replace(task, dataset_fingerprint="fingerprint-2"),
+        replace(
+            task,
+            provider_versions=(
+                EvaluationProviderVersion(name="datasets", version="3.1.0"),
+                EvaluationProviderVersion(name="lm-eval", version="0.4.12"),
+            ),
+        ),
+    ):
+        assert evaluation_task_identity(changed_task) != expected_task_identity
+
+    identified_task = replace(task, task_identity=expected_task_identity)
+    result = make_result(model=model_identity(), tasks=(identified_task,))
+    expected_result_identity = (
+        "sha256:39e98d9d734e1ec04311cf61c479535072b44939f696c2502dfcf289eca64435"
+    )
+    assert evaluation_result_identity(result) == expected_result_identity
+    for changed_result in (
+        replace(result, model=replace(model_identity(), step=8)),
+        replace(
+            result, tasks=(replace(identified_task, metric_payload={"acc,none": 0.75}),)
+        ),
+        replace(result, provider_result={"results": {"hellaswag": {"acc,none": 0.75}}}),
+    ):
+        assert evaluation_result_identity(changed_result) != expected_result_identity
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("artifact_kind", ""),
+        ("run_identity", "not-an-identity"),
+        ("step", True),
+        ("step", -1),
+        ("checkpoint_identity", "not-an-identity"),
+        ("run_step_identity", "not-an-identity"),
+        ("tokenizer_identity", "not-an-identity"),
+        ("verification", "full"),
+    ),
+)
+def test_result_rejects_malformed_model_identity(field: str, value: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        make_result(
+            model=replace(model_identity(), **{field: value}),
+            tasks=(make_task_record(),),
+        )
 
 
 def test_records_reject_unordered_or_invalid_values() -> None:

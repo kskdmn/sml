@@ -11,7 +11,11 @@ from typing import Literal
 
 import numpy as np
 
-from sml.artifacts.manifest import parse_logical_path, structured_identity
+from sml.artifacts.manifest import (
+    VerificationLevel,
+    parse_logical_path,
+    structured_identity,
+)
 from sml.inference import ModelIdentity
 
 type JsonScalar = None | bool | int | float | str
@@ -39,6 +43,12 @@ def _require_identity(value: object, name: str) -> str:
     return value
 
 
+def _require_optional_identity(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    return _require_identity(value, name)
+
+
 def _require_tuple(value: object, name: str) -> tuple[object, ...]:
     if not isinstance(value, tuple):
         raise TypeError(f"{name} must be a tuple")
@@ -56,10 +66,21 @@ def _normalize_mapping(value: object, name: str) -> JsonObject:
 
 def normalize_json_value(value: object, *, context: str) -> JsonValue:
     """Return a finite, JSON-compatible value with immutable containers."""
+    if isinstance(value, np.generic):
+        if isinstance(value, np.bool_):
+            return bool(value)
+        if isinstance(value, np.integer):
+            return int(value)
+        if isinstance(value, np.floating):
+            normalized_float = float(value)
+            if not bool(np.isfinite(value)) or not math.isfinite(normalized_float):
+                raise ValueError(f"{context} contains a non-finite number")
+            return normalized_float
+        raise TypeError(
+            f"{context} contains unsupported NumPy scalar {type(value).__name__}"
+        )
     if value is None or isinstance(value, (bool, str)):
         return value
-    if isinstance(value, np.generic):
-        return normalize_json_value(value.item(), context=context)
     if isinstance(value, int):
         return value
     if isinstance(value, float):
@@ -81,6 +102,22 @@ def normalize_json_value(value: object, *, context: str) -> JsonValue:
             for index, item in enumerate(value)
         )
     raise TypeError(f"{context} contains unsupported value {type(value).__name__}")
+
+
+def _validate_model_identity(model: ModelIdentity) -> None:
+    _require_string(model.artifact_kind, "model artifact_kind")
+    _require_optional_identity(model.run_identity, "model run_identity")
+    if model.step is not None and (
+        isinstance(model.step, bool)
+        or not isinstance(model.step, int)
+        or model.step < 0
+    ):
+        raise ValueError("model step must be a non-negative integer or null")
+    _require_optional_identity(model.checkpoint_identity, "model checkpoint_identity")
+    _require_optional_identity(model.run_step_identity, "model run_step_identity")
+    _require_identity(model.tokenizer_identity, "model tokenizer_identity")
+    if not isinstance(model.verification, VerificationLevel):
+        raise TypeError("model verification must be a VerificationLevel")
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,6 +230,7 @@ class EvaluationResult:
         _require_identity(self.identity, "identity")
         if not isinstance(self.model, ModelIdentity):
             raise TypeError("model must be a ModelIdentity")
+        _validate_model_identity(self.model)
         tasks = _require_tuple(self.tasks, "tasks")
         if not tasks:
             raise ValueError("tasks must contain at least one task")
