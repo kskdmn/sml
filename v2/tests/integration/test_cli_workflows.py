@@ -6,14 +6,184 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from importlib import metadata
 from pathlib import Path
 
 import pytest
 import zstandard as zstd
+from sml.artifacts.manifest import VerificationLevel
+from sml.evaluation import read_evaluation_result
+from sml.evaluation_result import normalize_json_value
 
 V2_ROOT = Path(__file__).resolve().parents[2]
 PROVIDER_STUBS = V2_ROOT / "tests" / "fixtures" / "provider_stubs"
 RESOLVED_SWAG_COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _expected_provider_config(task_name: str) -> dict[str, object]:
+    return {
+        "task": task_name,
+        "metadata": {"version": 1.0},
+        "output_type": "loglikelihood",
+        "description": "offline task",
+        "process_docs": "offline.process_docs",
+        "doc_to_text": "offline.doc_to_text",
+        "doc_to_target": "offline.doc_to_target",
+        "doc_to_choice": None,
+        "target_delimiter": " ",
+        "fewshot_delimiter": "\n\n",
+        "gen_prefix": "",
+        "padding": "left",
+        "num_fewshot": 0,
+        "fewshot_split": "train",
+        "fewshot_config": {
+            "split": "fewshot-config",
+            "process_docs": "offline.serialized._offline_process_docs",
+            "doc_to_text": "offline.serialized._offline_doc_to_text",
+            "doc_to_target": "offline.serialized._offline_doc_to_target",
+            "doc_to_choice": "offline.serialized._offline_doc_to_choice",
+        },
+        "generation_kwargs": {"temperature": 0.0},
+        "metric_list": [{"metric": "acc"}],
+        "filter_list": [{"filter": "none"}],
+        "repeats": 1,
+        "should_decontaminate": False,
+        "doc_to_decontamination_query": None,
+        "validation_split": "validation",
+        "test_split": "test",
+        "dataset_kwargs": {},
+    }
+
+
+def _expected_provider_versions() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        sorted(
+            (name, metadata.version(name))
+            for name in ("lm-eval", "mlx", "numpy", "sentencepiece")
+            if _installed(name)
+        )
+    )
+
+
+def _installed(name: str) -> bool:
+    try:
+        metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+def _assert_complete_evaluation(
+    path: Path,
+    *,
+    task_name: str,
+    artifact_kind: str,
+    verification: VerificationLevel,
+    step: int,
+    run_identity: bool,
+) -> None:
+    result = read_evaluation_result(path)
+    assert result.kind == "evaluation-result"
+    assert result.version == 1
+    assert result.identity.startswith("sha256:")
+    assert result.model.artifact_kind == artifact_kind
+    if run_identity:
+        assert result.model.run_identity is not None
+        assert result.model.run_identity.startswith("sha256:")
+    else:
+        assert result.model.run_identity is None
+    assert result.model.step == step
+    if run_identity:
+        assert result.model.checkpoint_identity is not None
+        assert result.model.checkpoint_identity.startswith("sha256:")
+        assert result.model.run_step_identity is not None
+        assert result.model.run_step_identity.startswith("sha256:")
+    else:
+        assert result.model.checkpoint_identity is None
+        assert result.model.run_step_identity is None
+    assert result.model.tokenizer_identity.startswith("sha256:")
+    assert result.model.verification is verification
+
+    assert len(result.tasks) == 1
+    task = result.tasks[0]
+    assert task.task_name == task_name
+    assert task.task_identity.startswith("sha256:")
+    assert task.task_yaml.logical_name == f"tasks/{task_name}.yaml"
+    assert task.task_yaml.content_identity.startswith("sha256:")
+    assert [source.logical_name for source in task.include_template_closure] == [
+        "tasks/common.yaml"
+    ]
+    assert all(
+        source.content_identity.startswith("sha256:")
+        for source in task.include_template_closure
+    )
+    assert task.task_metadata_version == "1.0"
+    assert task.prompt_config == {
+        "adapter_padding": "right",
+        "apply_chat_template": False,
+        "description": "offline task",
+        "doc_to_choice": None,
+        "doc_to_target": "offline.doc_to_target",
+        "doc_to_text": "offline.doc_to_text",
+        "fewshot_delimiter": "\n\n",
+        "gen_prefix": "",
+        "output_type": "loglikelihood",
+        "process_docs": "offline.process_docs",
+        "system_instruction": None,
+        "target_delimiter": " ",
+    }
+    assert task.few_shot_config == {
+        "fewshot_as_multiturn": True,
+        "fewshot_config": _expected_provider_config(task_name)["fewshot_config"],
+        "fewshot_split": "train",
+        "num_fewshot": 0,
+    }
+    assert task.generation_config == {
+        "generation_kwargs": {"temperature": 0.0},
+        "provider_gen_kwargs": None,
+    }
+    assert task.metric_normalization_config == {
+        "bootstrap_iters": 100000,
+        "doc_to_decontamination_query": None,
+        "filter_list": ({"filter": "none"},),
+        "log_samples": True,
+        "metric_list": ({"metric": "acc"},),
+        "predict_only": False,
+        "repeats": 1,
+        "should_decontaminate": False,
+    }
+    assert task.seeds == {
+        "random_seed": 0,
+        "numpy_random_seed": 1234,
+        "torch_random_seed": 1234,
+        "fewshot_random_seed": 1234,
+    }
+    assert task.limit is None
+    assert task.ordered_request_identity.startswith("sha256:")
+    assert task.lm_eval_package_version == "0.4.12"
+    assert task.lm_eval_source_commit == "offline-lm-eval-commit"
+    assert task.dataset_revision == "version:1.0.0"
+    assert task.dataset_fingerprint.startswith("sha256:")
+    assert tuple((item.name, item.version) for item in task.provider_versions) == (
+        _expected_provider_versions()
+    )
+    assert "acc,none" in task.metric_payload
+    expected_provider_result = {
+        "results": {task_name: task.metric_payload},
+        "configs": {task_name: _expected_provider_config(task_name)},
+        "versions": {task_name: "1.0.0"},
+        "n-shot": {task_name: 0},
+        "higher_is_better": {task_name: {"acc,none": True}},
+        "n-samples": {task_name: {"effective": 2, "original": 2}},
+        "config": {"bootstrap_iters": 100000, "log_samples": True},
+        "git_hash": "offline-lm-eval-commit",
+        "date": "2026-08-25T00:00:00Z",
+    }
+    assert normalize_json_value(
+        result.provider_result, context="persisted provider result"
+    ) == normalize_json_value(
+        expected_provider_result, context="expected provider result"
+    )
 
 
 @dataclass(slots=True)
@@ -331,35 +501,26 @@ def test_every_cli_workflow_runs_offline_in_subprocesses(
     assert _latest_step(workspace.lora_run) == 2
     assert _manifest(workspace.export)["kind"] == "export"
 
-    base_evaluation = json.loads(workspace.base_evaluation.read_text(encoding="utf-8"))
-    assert base_evaluation["kind"] == "evaluation-result"
-    assert base_evaluation["version"] == 1
-    assert base_evaluation["identity"].startswith("sha256:")
-    assert base_evaluation["model"]["artifact_kind"] == "pretraining-run"
-    assert base_evaluation["model"]["step"] == 1
-    assert base_evaluation["model"]["verification"] == "manifest-trusted"
-    assert base_evaluation["tasks"][0]["task_name"] == "hellaswag"
-    assert "acc,none" in base_evaluation["tasks"][0]["metric_payload"]
-    assert base_evaluation["provider_result"]["results"]["hellaswag"]
-    assert base_evaluation["tasks"][0]["dataset_fingerprint"].startswith("sha256:")
+    _assert_complete_evaluation(
+        workspace.base_evaluation,
+        task_name="hellaswag",
+        artifact_kind="pretraining-run",
+        verification=VerificationLevel.MANIFEST_TRUSTED,
+        step=1,
+        run_identity=True,
+    )
     assert (
         str(workspace.base_evaluation.parent).encode()
         not in workspace.base_evaluation.read_bytes()
     )
 
-    export_evaluation = json.loads(
-        workspace.export_evaluation.read_text(encoding="utf-8")
-    )
-    assert export_evaluation["kind"] == "evaluation-result"
-    assert export_evaluation["version"] == 1
-    assert export_evaluation["identity"].startswith("sha256:")
-    assert export_evaluation["model"]["artifact_kind"] == "export"
-    assert export_evaluation["model"]["verification"] == "full"
-    assert export_evaluation["tasks"][0]["task_name"] == "winogrande"
-    assert "acc,none" in export_evaluation["tasks"][0]["metric_payload"]
-    assert export_evaluation["provider_result"]["results"]["winogrande"]
-    assert export_evaluation["tasks"][0]["ordered_request_identity"].startswith(
-        "sha256:"
+    _assert_complete_evaluation(
+        workspace.export_evaluation,
+        task_name="winogrande",
+        artifact_kind="export",
+        verification=VerificationLevel.FULL,
+        step=1,
+        run_identity=False,
     )
     assert (
         str(workspace.export_evaluation.parent).encode()

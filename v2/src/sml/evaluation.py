@@ -204,6 +204,10 @@ class _EvaluationRequestRecorder:
             raise SMLRuntimeError(f"no recorded evaluation requests for {task_name}")
         return structured_identity("sml-evaluation-requests-v1", tuple(requests))
 
+    @property
+    def task_names(self) -> frozenset[str]:
+        return frozenset(self._requests)
+
 
 def _evaluation_seeds() -> dict[str, int]:
     return dict(_EVALUATION_SEEDS)
@@ -676,27 +680,35 @@ def _provider_versions() -> tuple[tuple[str, str], ...]:
     return tuple(sorted(found, key=lambda item: item[0]))
 
 
+def _exact_task_mapping(
+    value: object,
+    requested_tasks: tuple[str, ...],
+    *,
+    context: str,
+) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise SMLRuntimeError(f"lm-eval provider {context} is not a mapping")
+    task_names = tuple(value)
+    if (
+        any(not isinstance(task_name, str) or not task_name for task_name in task_names)
+        or len(task_names) != len(set(task_names))
+        or set(task_names) != set(requested_tasks)
+    ):
+        raise SMLRuntimeError(
+            f"lm-eval provider {context} must contain exactly the requested task keys"
+        )
+    return value
+
+
 def _validate_provider_result(
     raw_result: object,
     requested_tasks: tuple[str, ...],
 ) -> Mapping[str, object]:
     if not isinstance(raw_result, Mapping):
         raise SMLRuntimeError("lm-eval provider result is not a mapping")
-    results = raw_result.get("results")
-    if not isinstance(results, Mapping):
-        raise SMLRuntimeError("lm-eval provider result has no results mapping")
-    result_task_names = tuple(results)
-    if (
-        any(
-            not isinstance(task_name, str) or not task_name
-            for task_name in result_task_names
-        )
-        or len(result_task_names) != len(set(result_task_names))
-        or set(result_task_names) != set(requested_tasks)
-    ):
-        raise SMLRuntimeError(
-            "lm-eval provider results must contain exactly the requested task keys"
-        )
+    results = _exact_task_mapping(
+        raw_result.get("results"), requested_tasks, context="results"
+    )
     for task_name in requested_tasks:
         metrics = results.get(task_name)
         if not isinstance(metrics, Mapping):
@@ -704,6 +716,24 @@ def _validate_provider_result(
                 f"lm-eval metric result is malformed for task: {task_name}"
             )
     return raw_result
+
+
+def _serialize_provider_configs(
+    raw_result: Mapping[str, object],
+    requested_tasks: tuple[str, ...],
+    loaded_tasks: tuple[object, ...],
+) -> Mapping[str, object]:
+    configs = _exact_task_mapping(
+        raw_result.get("configs"), requested_tasks, context="configs"
+    )
+    serialized = dict(raw_result)
+    serialized["configs"] = {
+        task_name: _serialize_provider_value(
+            getattr(task, "config", None), configs[task_name]
+        )
+        for task_name, task in zip(requested_tasks, loaded_tasks, strict=True)
+    }
+    return serialized
 
 
 def _loaded_tasks(
@@ -725,7 +755,23 @@ def _loaded_tasks(
         raise SMLRuntimeError(
             "lm-eval loaded tasks must contain exactly the requested task keys"
         )
-    return tuple(loaded_tasks[task_name] for task_name in requested_tasks)
+    ordered_tasks = tuple(loaded_tasks[task_name] for task_name in requested_tasks)
+    for task_name, task in zip(requested_tasks, ordered_tasks, strict=True):
+        if getattr(task, "task_name", None) != task_name:
+            raise SMLRuntimeError(
+                "lm-eval loaded task task_name does not match its mapping key"
+            )
+    return ordered_tasks
+
+
+def _validate_recorded_task_names(
+    recorder: _EvaluationRequestRecorder,
+    requested_tasks: tuple[str, ...],
+) -> None:
+    if recorder.task_names != frozenset(requested_tasks):
+        raise SMLRuntimeError(
+            "lm-eval recorded requests must contain exactly the requested tasks"
+        )
 
 
 def evaluate(config: EvaluationConfig) -> EvaluationResult:
@@ -759,6 +805,10 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
     )
     provider_result = _validate_provider_result(raw_result, config.tasks)
     loaded_tasks = _loaded_tasks(manager, config.tasks)
+    provider_result = _serialize_provider_configs(
+        provider_result, config.tasks, loaded_tasks
+    )
+    _validate_recorded_task_names(recorder, config.tasks)
     provider_versions = _provider_versions()
     task_records = tuple(
         _resolve_task_record(
@@ -781,7 +831,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
         identity="sha256:" + "0" * 64,
         model=session.model_identity,
         tasks=task_records,
-        provider_result=normalize_json_value(raw_result, context="lm-eval result"),
+        provider_result=normalize_json_value(provider_result, context="lm-eval result"),
     )
     result = replace(result, identity=evaluation_result_identity(result))
     publish_evaluation_result(config.output, result)

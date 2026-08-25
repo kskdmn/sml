@@ -892,7 +892,17 @@ def test_evaluate_preserves_complete_provider_result_and_task_metrics(
 
     persisted = read_evaluation_result(config.output)
     assert persisted == result
-    assert result.provider_result["configs"] == fake_lm_eval.result["configs"]
+    nested_config = fake_lm_eval.result["configs"]["hellaswag"]["fewshot_config"]
+    assert callable(nested_config["process_docs"])
+    assert set(result.provider_result) == set(fake_lm_eval.result)
+    assert result.provider_result["results"] == fake_lm_eval.result["results"]
+    assert result.provider_result["configs"]["hellaswag"]["fewshot_config"] == {
+        "doc_to_choice": "offline.serialized._offline_doc_to_choice",
+        "doc_to_target": "offline.serialized._offline_doc_to_target",
+        "doc_to_text": "offline.serialized._offline_doc_to_text",
+        "process_docs": "offline.serialized._offline_process_docs",
+        "split": "fewshot-config",
+    }
     assert result.tasks[0].metric_payload == {
         "acc,none": 0.5,
         "acc_stderr,none": 0.01,
@@ -910,6 +920,88 @@ def test_evaluate_fails_before_publish_when_provider_result_is_incomplete(
     config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
 
     with pytest.raises(SMLRuntimeError, match="results"):
+        evaluate(config)
+
+    assert not config.output.exists()
+
+
+def test_evaluate_fails_before_publish_for_mismatched_loaded_task_ownership(
+    tiny_pretraining_run: Path,
+    fake_provider,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from sml import evaluation
+
+    class MismatchedTaskManager(fake_provider.task_manager_type):
+        def load(self, task_list):
+            loaded = super().load(task_list)
+            loaded["tasks"]["hellaswag"].task_name = "winogrande"
+            return loaded
+
+    def simple_evaluate(**kwargs: object) -> dict[str, object]:
+        manager = kwargs["task_manager"]
+        loaded = manager.load(kwargs["tasks"])
+        task = loaded["tasks"]["hellaswag"]
+        kwargs["model"].loglikelihood(task.instances)
+        return {
+            "results": {"hellaswag": {"acc,none": 0.5}},
+            "configs": {"hellaswag": {}},
+        }
+
+    monkeypatch.setattr(
+        evaluation,
+        "_import_lm_eval",
+        lambda: replace(
+            fake_provider,
+            simple_evaluate=simple_evaluate,
+            task_manager_type=MismatchedTaskManager,
+        ),
+    )
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+
+    with pytest.raises(SMLRuntimeError, match="task_name|ownership"):
+        evaluate(config)
+
+    assert not config.output.exists()
+
+
+def test_evaluate_fails_before_publish_for_extra_recorded_task_requests(
+    tiny_pretraining_run: Path,
+    fake_provider,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from sml import evaluation
+
+    def simple_evaluate(**kwargs: object) -> dict[str, object]:
+        manager = kwargs["task_manager"]
+        loaded = manager.load(kwargs["tasks"])
+        task = loaded["tasks"]["hellaswag"]
+        kwargs["model"].loglikelihood(task.instances)
+        kwargs["model"].loglikelihood(
+            (
+                SimpleNamespace(
+                    args=("alpha", " beta"),
+                    task_name="winogrande",
+                    doc_id=99,
+                    repeats=1,
+                ),
+            )
+        )
+        return {
+            "results": {"hellaswag": {"acc,none": 0.5}},
+            "configs": {"hellaswag": {}},
+        }
+
+    monkeypatch.setattr(
+        evaluation,
+        "_import_lm_eval",
+        lambda: replace(fake_provider, simple_evaluate=simple_evaluate),
+    )
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+
+    with pytest.raises(SMLRuntimeError, match="recorded.*tasks|requests"):
         evaluate(config)
 
     assert not config.output.exists()
