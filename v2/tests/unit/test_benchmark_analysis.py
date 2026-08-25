@@ -7,7 +7,7 @@ import stat
 import subprocess
 import sys
 import threading
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -108,6 +108,44 @@ from v2.benchmarks.workload import (
     structured_identity,
     write_paired_pretraining_representations,
 )
+
+_LEGACY_MODULE_NAMES = frozenset(
+    {
+        "config",
+        "evaluate_sml",
+        "ft_swag",
+        "infer_sml",
+        "lora",
+        "prepare_pretraining_data",
+        "pretraining_format",
+        "sml",
+        "tokenizer",
+        "train_sml",
+        "train_tokenizer",
+        "utils",
+    }
+)
+
+
+@contextmanager
+def _isolated_legacy_modules():
+    def is_legacy_name(name):
+        return name in _LEGACY_MODULE_NAMES or name.startswith("sml.")
+
+    saved = {
+        name: module for name, module in sys.modules.items() if is_legacy_name(name)
+    }
+    original_path = list(sys.path)
+    for name in saved:
+        sys.modules.pop(name)
+    try:
+        yield
+    finally:
+        for name in tuple(sys.modules):
+            if is_legacy_name(name):
+                sys.modules.pop(name)
+        sys.modules.update(saved)
+        sys.path[:] = original_path
 
 
 class _RecoveryClock:
@@ -983,7 +1021,7 @@ def test_final_mode_is_inferred_only_for_the_strict_ten_pair_protocol():
 
 
 def test_legacy_adapter_executes_every_metric_against_real_tiny_mlx_workload(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, request
 ):
     import mlx.core as mx
 
@@ -1029,9 +1067,20 @@ def test_legacy_adapter_executes_every_metric_against_real_tiny_mlx_workload(
         fixed_canonical_rows(row_count=32, row_width=9, vocab_size=32),
         tmp_path,
     )
+    cleanup = ExitStack()
+    request.addfinalizer(cleanup.close)
+    source_root = tmp_path / "legacy-source"
+    cleanup.enter_context(
+        benchmark_runner._managed_detached_worktree(
+            Path.cwd(),
+            benchmark_runner.PINNED_BASELINE_SOURCE_COMMIT,
+            source_root,
+        )
+    )
+    cleanup.enter_context(_isolated_legacy_modules())
 
     for metric in METRIC_NAMES:
-        native = legacy.resolve_native_workload(metric, workload, Path.cwd())
+        native = legacy.resolve_native_workload(metric, workload, source_root)
         assert native.native_configuration["rope_scaling_factor"] == 1.0
         if metric == "swag-end-to-end":
             assert native.native_configuration["sequence_length"] == 8

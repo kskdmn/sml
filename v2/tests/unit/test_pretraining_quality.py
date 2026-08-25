@@ -189,7 +189,7 @@ def test_workload_binds_an_exact_closed_base_training_import_surface(
     assert "v2/src/sml/training/pretrain.py" in expected_components
     assert "v2/src/sml/model/language_model.py" in expected_components
     assert "v2/src/sml/artifacts/checkpoint.py" in expected_components
-    assert "v2/src/sml/inference.py" not in expected_components
+    assert "v2/src/sml/__init__.py" in expected_components
     assert "v2/src/sml/cli.py" not in expected_components
     quality_module._validate_production_dependency_closure(
         ROOT,
@@ -240,7 +240,7 @@ def test_production_provenance_ignores_an_unrelated_future_sml_module(tmp_path):
 
     before_components = production_dependency_components(tmp_path)
     before_identity = production_dependency_content_identity(tmp_path)
-    unrelated = tmp_path / "v2/src/sml/inference.py"
+    unrelated = tmp_path / "v2/src/sml/future_workflow.py"
     unrelated.write_text("UNRELATED_FUTURE_MODULE = True\n")
 
     assert production_dependency_components(tmp_path) == before_components
@@ -498,12 +498,41 @@ def test_canonical_evidence_validates_after_unrelated_checkpoint_source_edit():
         assert captured == []
 
 
-def test_canonical_evidence_validates_without_the_temporary_flat_bridge():
-    path = ROOT / "v2/src/sml.py"
-    with _temporary_current_tree_bytes(path, None):
-        with pytest.raises(FileNotFoundError, match="sml.py"):
-            production_dependency_components(ROOT)
-        assert quality_module._validate(_canonical_validate_args()) == 0
+def test_current_closure_excludes_bridge_and_recorded_evidence_still_validates():
+    assert Path("v2/src/sml.py") not in production_dependency_components(ROOT)
+    assert quality_module._validate(_canonical_validate_args()) == 0
+
+
+def test_recorded_validator_rejects_re_signed_bridge_omission():
+    manifest = json.loads(
+        (ROOT / quality_module.CANONICAL_MANIFEST_PATH).read_text(encoding="utf-8")
+    )
+    source_commit = manifest["source_commit"]
+    workload = PretrainingQualityWorkload.from_dict(manifest["workload"])
+    retained_components = tuple(
+        component
+        for component in workload.production_dependency_components
+        if component != quality_module.LEGACY_BRIDGE_COMPONENT.as_posix()
+    )
+    assert len(retained_components) + 1 == len(
+        workload.production_dependency_components
+    )
+    production_identity = quality_module._production_dependency_identity(
+        tuple(Path(component) for component in retained_components),
+        lambda component: quality_module._git_bytes(
+            ROOT, "show", f"{source_commit}:{component.as_posix()}"
+        ),
+    )
+    tampered = replace(
+        workload,
+        identity="sha256:" + "0" * 64,
+        production_dependency_components=retained_components,
+        production_dependency_identity=production_identity,
+    )
+    tampered = replace(tampered, identity=tampered.recompute_identity())
+
+    with pytest.raises(ValueError, match="component set changed"):
+        quality_module._validate_harness_commit(ROOT, source_commit, tampered)
 
 
 def test_canonical_standalone_validator_accepts_the_unchanged_evidence_set():

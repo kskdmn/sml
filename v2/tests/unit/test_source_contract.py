@@ -2,9 +2,9 @@ import ast
 import re
 from pathlib import Path
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-REPO_ROOT = PROJECT_DIR.parent
-SCAN_ROOTS = (PROJECT_DIR / "src", PROJECT_DIR / "tests", PROJECT_DIR / "README.md")
+PROJECT = Path(__file__).resolve().parents[2]
+REPO_ROOT = PROJECT.parent
+SCAN_ROOTS = (PROJECT / "src", PROJECT / "tests", PROJECT / "README.md")
 LEGACY_TENSOR_LIB = "tor" + "ch"
 LEGACY_FRAMEWORK = "py" + LEGACY_TENSOR_LIB
 LEGACY_APPLE_ACCELERATOR = "m" + "ps"
@@ -12,7 +12,7 @@ LEGACY_OTHER_ACCELERATOR = "cu" + "da"
 DEVICE_FLAG = "--" + "device"
 RESOLVE_DEVICE = "resolve_" + "device"
 DEVICE_NAME = "device_" + "name"
-FORBIDDEN_TEXT_PATTERNS = (
+FORBIDDEN_MLX_ONLY_PATTERNS = (
     re.compile(rf"\b{LEGACY_TENSOR_LIB}\b", re.IGNORECASE),
     re.compile(rf"\b{LEGACY_TENSOR_LIB}\s*\.", re.IGNORECASE),
     re.compile(rf"\b{LEGACY_FRAMEWORK}\b", re.IGNORECASE),
@@ -24,18 +24,18 @@ FORBIDDEN_TEXT_PATTERNS = (
 )
 
 
-def iter_scan_files():
+def _iter_mlx_only_scan_files():
     for root in SCAN_ROOTS:
         if root.is_file():
             yield root
             continue
         for path in root.rglob("*.py"):
-            if path.name == "test_mlx_only_source.py":
+            if path == Path(__file__):
                 continue
             yield path
 
 
-def find_legacy_imports(path: Path) -> list[str]:
+def _find_legacy_imports(path: Path) -> list[str]:
     if path.suffix != ".py":
         return []
 
@@ -53,15 +53,72 @@ def find_legacy_imports(path: Path) -> list[str]:
     return offenders
 
 
-def test_v2_source_and_tests_are_mlx_only():
+def test_final_v2_source_has_only_package_modules():
+    source_root = PROJECT / "src"
+
+    assert (
+        sorted(path.name for path in source_root.iterdir() if path.suffix == ".py")
+        == []
+    )
+    assert (source_root / "sml" / "__main__.py").is_file()
+
+
+def test_final_source_has_no_bridge_or_legacy_imports():
+    package_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (PROJECT / "src" / "sml").rglob("*.py")
+    )
+
+    for forbidden in (
+        "spec_from_file_location",
+        "sml._legacy",
+        "LEGACY_BRIDGE_EXPORTS",
+        "train_sml",
+        "infer_sml",
+        "evaluate_sml",
+        "ft_swag",
+        "from config import",
+    ):
+        assert forbidden not in package_source
+
+
+def test_v2_source_tests_and_readme_are_mlx_only():
     offenders: list[str] = []
-    for path in iter_scan_files():
+    for path in _iter_mlx_only_scan_files():
         text = path.read_text(encoding="utf-8")
         relative_path = path.relative_to(REPO_ROOT)
-        for detail in find_legacy_imports(path):
+        for detail in _find_legacy_imports(path):
             offenders.append(f"{relative_path}: {detail}")
-        for pattern in FORBIDDEN_TEXT_PATTERNS:
+        for pattern in FORBIDDEN_MLX_ONLY_PATTERNS:
             if pattern.search(text):
                 offenders.append(f"{relative_path}: {pattern.pattern}")
 
     assert offenders == []
+
+
+def test_readme_documents_only_unified_commands_and_directory_artifacts():
+    readme = (PROJECT / "README.md").read_text(encoding="utf-8")
+
+    for command in (
+        "tokenize",
+        "prepare pretraining",
+        "prepare swag",
+        "train",
+        "infer",
+        "evaluate",
+        "finetune",
+        "export",
+        "verify",
+    ):
+        assert f"uv run python -m sml {command}" in readme
+    for forbidden in (
+        ".npz",
+        "v2/src/config.py",
+        "v2/src/evaluate_sml.py",
+        "v2/src/ft_swag.py",
+        "v2/src/infer_sml.py",
+        "v2/src/prepare_pretraining_data.py",
+        "v2/src/train_sml.py",
+        "v2/src/train_tokenizer.py",
+    ):
+        assert forbidden not in readme

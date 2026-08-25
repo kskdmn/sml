@@ -59,8 +59,8 @@ HARNESS_COMPONENTS = (
 )
 PRODUCTION_SOURCE_TREE = Path("v2/src/sml")
 PRODUCTION_MODULE_ROOT = Path("v2/src")
+LEGACY_BRIDGE_COMPONENT = Path("v2/src/sml.py")
 PRODUCTION_DEPENDENCY_FIXED_COMPONENTS = (
-    Path("v2/src/sml.py"),
     Path("v2/benchmarks/schema.py"),
     Path("v2/benchmarks/workload.py"),
 )
@@ -259,9 +259,11 @@ def _local_module_components(
 def _production_dependency_closure(
     available: set[Path],
     read_component: Callable[[Path], bytes],
+    *,
+    fixed_components: Sequence[Path] = PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
 ) -> tuple[Path, ...]:
     required = {
-        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
+        *fixed_components,
         *PRODUCTION_IMPORT_ENTRYPOINTS,
     }
     missing_required = required - available
@@ -270,7 +272,7 @@ def _production_dependency_closure(
             "missing quality production entry components: "
             f"{sorted(path.as_posix() for path in missing_required)!r}"
         )
-    components = set(PRODUCTION_DEPENDENCY_FIXED_COMPONENTS)
+    components = set(fixed_components)
     pending = sorted(required, key=lambda path: path.as_posix())
     scanned: set[Path] = set()
     while pending:
@@ -678,7 +680,10 @@ class PretrainingQualityWorkload:
         ):
             raise ValueError("quality production dependency order changed")
         for path in production_paths:
-            if path in PRODUCTION_DEPENDENCY_FIXED_COMPONENTS:
+            if path in (
+                *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
+                LEGACY_BRIDGE_COMPONENT,
+            ):
                 continue
             if path.suffix != ".py" or not path.is_relative_to(PRODUCTION_SOURCE_TREE):
                 raise ValueError("quality production import closure is incomplete")
@@ -3486,10 +3491,17 @@ def _git_bytes(root: Path, *arguments: str) -> bytes:
     ).stdout
 
 
-def _git_production_dependency_components(root: Path, commit: str) -> tuple[Path, ...]:
+def _git_production_dependency_components(
+    root: Path,
+    commit: str,
+) -> tuple[Path, ...]:
+    possible_fixed_components = (
+        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
+        LEGACY_BRIDGE_COMPONENT,
+    )
     scopes = (
         PRODUCTION_SOURCE_TREE,
-        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
+        *possible_fixed_components,
         *PRODUCTION_IMPORT_ENTRYPOINTS,
     )
     entries = _git_bytes(
@@ -3512,15 +3524,19 @@ def _git_production_dependency_components(root: Path, commit: str) -> tuple[Path
         is_source = path.suffix == ".py" and path.is_relative_to(PRODUCTION_SOURCE_TREE)
         if (
             not is_source
-            and path not in PRODUCTION_DEPENDENCY_FIXED_COMPONENTS
+            and path not in possible_fixed_components
             and path not in PRODUCTION_IMPORT_ENTRYPOINTS
         ):
             continue
         available.add(path)
         modes[path] = (mode, object_type)
+    fixed_components = PRODUCTION_DEPENDENCY_FIXED_COMPONENTS
+    if LEGACY_BRIDGE_COMPONENT in available:
+        fixed_components = (*fixed_components, LEGACY_BRIDGE_COMPONENT)
     components = _production_dependency_closure(
         available,
         lambda component: _git_bytes(root, "show", f"{commit}:{component.as_posix()}"),
+        fixed_components=fixed_components,
     )
     if any(modes[component] != (b"100644", b"blob") for component in components):
         raise ValueError("recorded production import closure contains a non-file")
@@ -3550,7 +3566,10 @@ def _validate_harness_commit(
             digest.update(_git_bytes(root, "show", f"{commit}:{component.as_posix()}"))
         if f"sha256:{digest.hexdigest()}" != workload.harness_identity:
             raise ValueError("recorded harness commit does not contain harness bytes")
-        production_components = _git_production_dependency_components(root, commit)
+        production_components = _git_production_dependency_components(
+            root,
+            commit,
+        )
         if tuple(path.as_posix() for path in production_components) != (
             workload.production_dependency_components
         ):

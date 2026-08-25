@@ -235,23 +235,17 @@ def test_capture_driver_converts_bfloat16_control_values_through_float32():
 
 
 def test_capture_driver_raw_forward_supports_consecutive_compiled_calls():
-    from sml import SMLConfig, SMLLanguageModel
+    from mlx import nn
+
+    class CompatibleLegacyModel:
+        def __init__(self):
+            self.embed_tokens = nn.Embedding(16, 8)
+            self.layers = [nn.Linear(8, 8)]
+            self.norm = nn.RMSNorm(8)
+            self.lm_head = nn.Linear(8, 16)
 
     capture_module = _load_capture_module()
-    model = SMLLanguageModel(
-        SMLConfig(
-            vocab_size=16,
-            hidden_size=8,
-            num_layers=1,
-            num_q_heads=2,
-            num_kv_heads=1,
-            intermediate_size=16,
-            original_max_position_embeddings=8,
-            rope_scaling_factor=1.0,
-            hidden_dropout=0.0,
-        )
-    )
-    model.eval()
+    model = CompatibleLegacyModel()
     compiled = mx.compile(
         lambda token_ids: capture_module._legacy_forward_without_validation(
             model, token_ids

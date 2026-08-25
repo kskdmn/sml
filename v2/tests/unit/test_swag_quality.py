@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -98,6 +99,38 @@ def test_harness_identity_hashes_only_the_two_reviewed_files_in_order():
         expected.update((ROOT / relative).read_bytes())
 
     assert harness_content_identity(ROOT) == f"sha256:{expected.hexdigest()}"
+
+
+def test_recorded_validator_rejects_re_signed_bridge_omission():
+    manifest = json.loads(
+        (ROOT / swag_quality.CANONICAL_MANIFEST_PATH).read_text(encoding="utf-8")
+    )
+    source_commit = manifest["source_commit"]
+    workload = SwagQualityWorkload.from_dict(manifest["workload"])
+    retained_components = tuple(
+        component
+        for component in workload.production_dependency_components
+        if component != swag_quality.LEGACY_BRIDGE_COMPONENT.as_posix()
+    )
+    assert len(retained_components) + 1 == len(
+        workload.production_dependency_components
+    )
+    production_identity = swag_quality._production_dependency_identity(
+        tuple(Path(component) for component in retained_components),
+        lambda component: swag_quality._git_bytes(
+            ROOT, "show", f"{source_commit}:{component.as_posix()}"
+        ),
+    )
+    tampered = replace(
+        workload,
+        identity="sha256:" + "0" * 64,
+        production_dependency_components=retained_components,
+        production_dependency_identity=production_identity,
+    )
+    tampered = replace(tampered, identity=tampered.recompute_identity())
+
+    with pytest.raises(ValueError, match="component set changed"):
+        swag_quality._validate_harness_commit(ROOT, source_commit, tampered)
 
 
 def test_workload_pins_256_steps_disjoint_encoded_examples_and_identities(
