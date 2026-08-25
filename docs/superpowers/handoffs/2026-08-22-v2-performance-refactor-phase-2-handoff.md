@@ -1,11 +1,11 @@
-# V2 Refactor Handoff: Part 2 Task 6.2 Next
+# V2 Refactor Handoff: Part 2 Task 6.4 Next
 
 **Recorded:** 2026-08-22 (Asia/Shanghai)
 
-**Last updated:** 2026-08-24 (Asia/Shanghai)
+**Last updated:** 2026-08-25 (Asia/Shanghai)
 
 **Purpose:** Give a fresh session enough repository-backed context to continue
-Part 2 at Task 6.2, without reading the prior conversation.
+Part 2 at Task 6.4, without reading the prior conversation.
 
 ## Superseding Acceptance Policy
 
@@ -41,8 +41,10 @@ they verify correctness rather than speed.
 
 - Audit starting point: 4225c54 (docs(v2): align refactor plans and handoff),
   with a clean tracked worktree on 2026-08-23.
-- Branch: main, tracking origin/main. Do not reset or replace the local history
-  with an older remote tip. After provenance close, local main is at 4c190f3.
+- Branch: main, tracking origin/main. Local main is ahead of origin/main; do
+  not reset to the remote tip and do not push unless asked. Current HEAD:
+  f02c99a (`refactor(v2): cut over to unified sml package`). Part 1 closed at
+  4c190f3.
 - Documentation-audit base before this consistency update:
   ddad9a8 (docs(v2): record residual Part 1 provenance blocker).
 - Latest Part 1 repair/evidence HEAD before provenance remediation:
@@ -162,28 +164,56 @@ they verify correctness rather than speed.
   source checkpoints remain practical; the 256-step compiled-versus-eager
   contract is unchanged.
 - Task 6.1 complete at 9aa0f18 (`feat(v2): unify typed workflow cli` plus
-  DTO-freeze/optional-resume-data fix). Scoped review over `00a1bc5..9aa0f18`
-  approved with 0 Critical, 0 Important, 0 Minor. Frozen TOML overlays, lazy
-  typed dispatch, optional finetune resume `--data` via the LoRA diagnostic
-  locator, recursively frozen DTOs, and empty-invocation domain errors without
-  traceback. Focused CLI tests 48 passed; full v2 suite 1305 passed; Ruff
-  clean; `python -m sml --help` lists the exact commands without importing
-  `datasets` or `lm_eval`; `uv.lock` unchanged. Task 6.2 is next.
+  DTO-freeze/optional-resume-data fix). Docs-close is 1bca398. Scoped review
+  over `00a1bc5..9aa0f18` approved with 0 Critical, 0 Important, 0 Minor.
+  Frozen TOML overlays, lazy typed dispatch, optional finetune resume `--data`
+  via the LoRA diagnostic locator, recursively frozen DTOs, and
+  empty-invocation domain errors without traceback. Focused CLI tests 48
+  passed; full v2 suite 1305 passed; Ruff clean; `python -m sml --help` lists
+  the exact commands without importing `datasets` or `lm_eval`; `uv.lock`
+  unchanged.
+- Task 6.2 complete at cb04413 (`test(v2): cover unified cli workflows`). The
+  complete CLI runs through real subprocesses and tiny local artifacts, with
+  test-owned `datasets`, `huggingface_hub`, and `lm_eval` providers and offline
+  environment flags. It covers every fresh workflow, base/export inference and
+  evaluation, both resume paths, relocated matching data, manifest-trusted
+  versus FULL reads, FULL verification, direct step-path/`--step` rejection,
+  and exit codes 2-5. Task 6.1's production wiring required no change. Local
+  scoped review found 0 Critical, 0 Important, and 0 Minor after restoring
+  relocated fixture data in `finally`. The new tests passed 3/3; combined CLI
+  workflow/config tests passed 16/16; Ruff was clean with all 121 files
+  formatted; all 1,308 v2 tests passed in 77.48 seconds; help imported neither
+  `datasets` nor `lm_eval`; `uv.lock` was unchanged. This established the
+  reviewed base for Task 6.3.
+- Task 6.3 complete at f02c99a (`refactor(v2): cut over to unified sml
+  package`). The flat source modules, replaced flat tests, migration bridge,
+  shared test helper, and obsolete repository NPZ inspector are deleted.
+  `sml.__init__` exports supported owner-module types directly, the README
+  documents only unified commands and directory artifacts, and the package-era
+  source contract preserves the MLX-only guard. Current quality closure
+  discovery excludes the deleted bridge; recorded-source validation detects
+  the historical bridge independently from the recorded Git tree, so a
+  re-signed component-omission attack fails while immutable canonical evidence
+  still validates. Independent review closed two Important findings and ended
+  at 0 Critical, 0 Important, 0 Minor. Ruff passed, all 95 v2 Python files were
+  formatted, all 1,104 v2 tests passed in 103.26 seconds, unified CLI help
+  passed, canonical evidence and `uv.lock` were unchanged, and
+  `git diff --check` passed. Task 6.4 is next.
 
 ## Related Specifications and Plans
 
 | File | Role | Done | Remaining under current policy |
 | --- | --- | --- | --- |
-| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Part 1 foundation, model, artifacts, tokenizer, prepared data, pretraining, integration, numerical quality run, recorded-source validator, and frozen checkpoint contents | Phases 4-6; performance remains optional |
+| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Phases 1-5 and Tasks 6.1-6.3 | Task 6.4; performance remains optional |
 | docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | All task bodies, the controlled run, the repeated functional gate, recorded-source validation, and checkpoint-content freeze | None required under the current policy |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning is complete; Phase 4, Tasks 5.1-5.5, and Task 6.1 are implemented and reviewed | Tasks 6.2-6.4 |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning is complete; Phase 4, Tasks 5.1-5.5, and Tasks 6.1-6.3 are implemented and reviewed | Task 6.4 |
 | docs/superpowers/specs/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge-design.md | Real prepared-data benchmark owner design | Production goal implemented at ffb29f97b7770d06a95df41c2b612c07a9fa6c1b | Nothing required; screen is optional |
 | docs/superpowers/plans/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge.md | Bridge implementation plan | Task 1 complete at ffb29f9 | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-stop-interruptible-pretraining-stream-design.md | Full-queue shutdown correctness design | Implemented and reviewed at 8e2291f1c87244fa8acd33d375c9e49961bb70fa | Nothing required; timing rerun is optional |
 | docs/superpowers/plans/2026-08-16-v2-stop-interruptible-pretraining-stream.md | Shutdown fix plan | Task 1 complete at 8e2291f | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-prepared-data-100-unit-measurement-design.md | Versioned 20/100 benchmark protocol | Harness design implemented | Baseline capture/comparison only if explicitly desired |
 | docs/superpowers/plans/2026-08-16-v2-prepared-data-100-unit-measurement.md | Versioned protocol implementation plan | Required Tasks 1 and 4 complete; Task 1 reviewed at 8c3b1be | Tasks 2 and 3 remain optional diagnostic procedures only |
-| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through Task 6.1 close at 9aa0f18 | Keep current as Task 6.2 and later tasks complete |
+| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through Task 6.3 at f02c99a | Keep current through final Task 6.4 acceptance |
 
 ## Supporting Benchmark Documents
 
@@ -297,6 +327,34 @@ standalone validator, unrelated-module probe, and relocated-checkout validator
 all returned `pass`. The residual future-source concern is closed: validation
 no longer rebuilds an expected workload from current-tree bytes.
 
+### Phase 4
+
+| Task | Status | Implementation commit(s) |
+| --- | --- | --- |
+| 4.1: persistent inference sessions | Complete and reviewed | 2b302a6, a9bf718, 7cc45ed |
+| 4.2: batched compiled prefill/decode | Complete and reviewed | 8f8ce22, 28c50df |
+| 4.3: batched lm-eval scoring | Complete and reviewed | 125663b, 5199b8a |
+| 4.4: inference/evaluation workflow gate | Complete and reviewed | 0d95441 |
+
+### Phase 5
+
+| Task | Status | Implementation commit(s) |
+| --- | --- | --- |
+| 5.1: strict FP32 LoRA adapters | Complete and reviewed | 6c7aec5, 232918c |
+| 5.2: immutable encoded SWAG buckets | Complete and reviewed | 3ab3c14, 61a74a3, d032798, 284a041, 4a8e469 |
+| 5.3: compiled SWAG ranking kernels | Complete and reviewed | deaba83, 1c76aec, 778d85d, 31fbe78, aaf1080, c06beae |
+| 5.4: LoRA runs, resume, and merged export | Complete and reviewed | c512bca, c92c26b, 3cc0bbe, 4ebb4b7 |
+| 5.5: complete SWAG flow and controlled quality | Complete and reviewed | d8edb4c, 1a2bbcd, 8bab6ff, 360d040, e89ce2b |
+
+### Phase 6
+
+| Task | Status | Implementation commit(s) |
+| --- | --- | --- |
+| 6.1: frozen TOML configuration and unified lazy CLI | Complete and reviewed | a1e55c8, 9aa0f18; docs-close 1bca398 |
+| 6.2: local CLI workflow subprocess smoke | Complete and locally reviewed | cb04413 |
+| 6.3: delete flat implementation and migration bridge | Complete and reviewed | f02c99a |
+| 6.4: final correctness and workflow gate | Not started | Next live task |
+
 ## Part 1 Final Architecture Review Status
 
 The whole-plan review found cross-task issues not caught by the task-scoped
@@ -381,13 +439,112 @@ Deferred provenance-test Minors (do not block Task 4.1):
    `workload identity mismatch`.
 4. Near-duplicate git-repo fixtures in quality provenance tests.
 
+## Standing Production Facts
+
+These bind Task 6.4. Do not silently revert them.
+
+Environment: Python 3.12.13, `uv run`, highest version directory `v2`. Run
+MLX pytest outside the sandbox. Do not edit top-level files or `uv.lock`
+without approval. Work continues on the user-authorized `main` checkout; do
+not create a worktree unless asked. Do not push unless asked.
+
+### CLI (Tasks 6.1-6.2)
+
+- Commands are exactly `tokenize`, `prepare pretraining`, `prepare swag`,
+  `train`, `infer`, `evaluate`, `finetune`, `export`, and `verify`.
+- Precedence is frozen dataclass defaults, then TOML, then explicit CLI.
+  `argparse.Namespace` never enters a domain API. Command DTO values are
+  recursively frozen.
+- `infer.max_new_tokens` defaults to 128. `infer` and `evaluate` default to
+  `full_verify=False` and accept `--full`. `prepare swag` and `export` always
+  fully verify recovered latest state. Evaluation requires an explicit
+  `--output`. Historical `--step` and direct `step-*` paths are rejected.
+- Empty invocation (`python -m sml` / `main([])`) prints a focused
+  `SMLConfigurationError` to stderr, exits 2, and must not traceback.
+  Unexpected exceptions still propagate with traceback.
+- `resume_finetune(run, *, data: Path | None, overrides)` accepts omitted
+  `--data` and recovers `LoRARunManifest.diagnostic_data_locator` in the
+  domain, matching pretraining `resume`. Do not read `run.json` in the CLI.
+- `[train.model]` `rope_scaling_factor` must be `1.0`. The CLI has no
+  inference/export RoPE override; finetune preserves the copied-base value.
+- Import `datasets` only inside the Hugging Face SWAG provider and `lm_eval`
+  only inside evaluation construction. Help must not load either package.
+- Overlaying `[train.model]` without `[train.model.initializers]` must derive
+  `InitializerConfig` from the final `initializer_range` and `num_layers`.
+- The Task 6.2 subprocess fixture prepends
+  `v2/tests/fixtures/provider_stubs` and `v2/src` to `PYTHONPATH`, forces Hugging
+  Face offline mode, and owns `datasets`, `huggingface_hub`, and `lm_eval`
+  providers. The hub stub is required because production resolves an immutable
+  SWAG commit through `HfApi` before loading `datasets`. Do not replace these
+  test-owned providers with live network calls or a production test switch.
+
+### LoRA and SWAG (Tasks 5.1-5.5)
+
+- Compiled `adapter_loss` merges two trees (`adapters`, `frozen_base`) only
+  for `forward_arrays`. Unwrapped `_linear` stays `weight`. Live wrapped
+  `_linear` applies LoRA when the param dict is wrapped.
+- `adamw_fp32_update(parameters, gradients, state, config, weight_decay_tree)`
+  is the host/test contract. `AdamState` must not cross `mx.compile`. Compiled
+  `swag_optimizer_step_core` uses private `_adamw_fp32_update_tree`.
+- `finetune` creates a new LoRA run only. `require_lora_base_snapshot` is the
+  public copied-base validator. Copied-base `rope_scaling_factor` stays `1.0`.
+- Do not import `training` from `data`.
+
+### Quality evidence
+
+- Do not regenerate canonical **pretraining** quality evidence
+  (`v2/benchmarks/quality.py` / `pretraining-quality-v1.*`). Validation binds
+  to `source_commit`.
+- Do not regenerate SWAG quality evidence unless a later change alters that
+  harness, fixtures, telemetry, or decision rule.
+- Current-tree production closures exclude deleted `v2/src/sml.py`. Validation
+  of recorded evidence reconstructs the historical fixed bridge from the
+  recorded Git tree independently of the evidence component list, then
+  compares the independently reconstructed closure and its bytes with the
+  workload. Preserve both omission-tamper regressions.
+- The controlled SWAG quality Transformer is pinned at 2 layers / hidden 32 /
+  vocab 300 so FULL-verified source checkpoints remain practical. The 256-step
+  compiled-versus-eager contract is unchanged. Do not silently enlarge it to
+  production `ModelConfig()`.
+
+## Deferred Minors
+
+Non-blocking. Point the final whole-branch review at this list.
+
+Part 1 provenance (do not block Part 2):
+
+1. The mismatch table omits production closure bytes/modes; the sibling
+   descendant test still covers them.
+2. Provenance tests mutate the live checkout of `checkpoint.py` / `sml.py`.
+3. The embedded-identity rejection matches broad `identity` rather than
+   `workload identity mismatch`.
+4. Near-duplicate git-repo fixtures in quality provenance tests.
+5. Task 3.1: an extremely large Python integer passed to scalar validation
+   can surface `OverflowError` instead of the project configuration-error
+   type.
+
+Part 2:
+
+- Task 4.4: stale round-zero statements in `task-4.4-report.md`.
+- Task 5.2: `int()` token coercion in encode (`v2/src/sml/data/swag.py`).
+  Identity-field mutation prepares remain plan-mandated; encoding stays v1.
+- Task 5.3: `from_envelope` try/finally; large `test_swag.py`.
+- Task 5.4: BF16 adapter rewrite can fail on payload hash before dtype
+  (`v2/tests/integration/test_swag_workflow.py`); `swag.py` growth mixing
+  kernels and artifact/run orchestration.
+- Task 5.5: no review Minor. Standing fact above: quality model is 2×32 /
+  vocab 300 rather than production `ModelConfig()`.
+- Task 6.1: none.
+- Task 6.2: none.
+- Task 6.3: none.
+
 ## Remaining Part 2 Tasks
 
 | Phase | Tasks | Status | Required gate |
 | --- | --- | --- | --- |
 | 4: inference and evaluation | 4.1-4.4 | Complete at 0d95441 | Correctness, inference/evaluation integration, applicable CLI smoke |
 | 5: LoRA and SWAG | 5.1-5.5 | Complete at e89ce2b | Correctness, controlled SWAG quality, resume/export/inference workflow |
-| 6: unified CLI and cutover | 6.1-6.4 | 6.1 complete at 9aa0f18; next: Task 6.2 | Full Ruff/pytest, all CLI workflows, clean cutover, unchanged uv.lock |
+| 6: unified CLI and cutover | 6.1-6.4 | Tasks 6.1-6.3 complete through f02c99a; next: Task 6.4 | Full Ruff/pytest, controlled-quality validation, all CLI workflows, clean cutover, unchanged uv.lock |
 
 No Phase 4, 5, 6, or final performance result file is required.
 
@@ -407,25 +564,39 @@ No Phase 4, 5, 6, or final performance result file is required.
 | v2/benchmarks/manifests/swag-quality-v1.json | Present, immutable Task 5.5 evidence | Preserve |
 | v2/benchmarks/results/swag-quality-v1.jsonl | Present, immutable Task 5.5 raw evidence | Preserve |
 | v2/benchmarks/results/swag-quality-v1.json | Present, immutable Task 5.5 report | Preserve |
+| v2/benchmarks/fixtures/swag-quality-train-v1.npz | Present, immutable Task 5.5 fixture | Preserve |
+| v2/benchmarks/fixtures/swag-quality-validation-v1.npz | Present, immutable Task 5.5 fixture | Preserve |
 
 The absent files are not blockers and should not be fabricated.
 
 ## Takeover Procedure
 
-1. Read this handoff, the umbrella design, and the Part 2 Task 6.2 contract.
-2. Confirm the latest main commit and inspect git status. Preserve unrelated
-   user changes if any exist, and preserve the local commits recorded above
-   that are not on the audited origin/main tip.
-3. Execute Task 6.2 test-first. Exercise every unified CLI workflow locally
-   through subprocesses and provider stubs only. Do not implement docs/cutover
-   or final gates. Do not regenerate canonical pretraining or SWAG quality
-   evidence.
-4. Run MLX pytest outside the sandbox; rerun canonical quality only if a later
-   change necessarily alters the recorded evidence identity.
-5. Follow the updated functional gate at the end of each phase. Do not pause
-   for baseline capture or performance comparison.
-6. Keep this handoff current with completed commits, fresh test evidence, and
-   the next functional task.
+1. Read this handoff, the umbrella design, and the Part 2 Task 6.4 contract
+   in `docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md`.
+2. Confirm HEAD is f02c99a (or a later documentation/final-gate commit) and
+   inspect git status. The expected inherited change is this handoff only;
+   preserve unrelated user changes and local commits not on origin/main.
+3. Execute Task 6.4 without changing production behavior unless a final gate
+   exposes a real defect. Run Ruff, format check, the full v2 suite outside the
+   sandbox, both standalone controlled-quality validators, the complete CLI
+   subprocess workflow suite, unified CLI help, and the final integration
+   workflow set. Confirm the flat layout and bridge remain absent.
+4. Do not regenerate canonical pretraining or SWAG quality evidence. Their
+   validators must reconstruct and verify their recorded source commits from
+   Git; current-tree bytes are not the expected recorded workload.
+5. Confirm `uv.lock` and all canonical evidence/fixtures remain byte-identical,
+   `git diff --check` passes, and the final accepted implementation plus this
+   handoff are committed so `git status --short` is clean. Performance capture
+   remains optional and non-blocking.
+6. Request a final whole-scope review, resolve any Critical/Important findings,
+   and record final acceptance evidence here. Do not push unless asked.
+
+SDD notes for a continuing session: the gitignored ledger is
+`.superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-2/progress.md`.
+Successful task reviewers used `gpt-5.6-sol-medium`. Task 5.4/5.5
+`cursor-grok-4.6-xhigh` implementers stalled (hex-dumps / no progress); do
+not resume those agents. Prefer a tightly scoped mid-tier implementer and
+do not dump identifiers as hex.
 
 ## Invariants That Remain Strict
 
@@ -441,15 +612,20 @@ The absent files are not blockers and should not be fabricated.
 
 ## Ignored Review and Historical Records
 
+The active Part 2 SDD workspace is
+`.superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-2/`,
+especially `progress.md`, `task-6.1-brief.md`, `task-6.1-report.md`,
+`task-6.1-review.md`, `task-6.1-fix-round-1.md`, and
+`task-6.1-rereview-1.md`. That workspace is gitignored supporting evidence;
+this tracked handoff is the authoritative status.
+
 The active Part 1 final-review evidence is preserved in
-.superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-1/, especially
+`.superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-1/`, especially
 `part1-final-review.md`, `part1-final-fix-report.md`,
 `part1-final-re-review.md`, `part1-provenance-review.md`, and `progress.md`.
-That workspace is supporting evidence; this tracked handoff is the
-authoritative status.
 
 The historical benchmark workspace
-.superpowers/sdd/2026-08-16-v2-prepared-data-100-unit-measurement/
+`.superpowers/sdd/2026-08-16-v2-prepared-data-100-unit-measurement/`
 contains Task 1 reports, rejected benchmark diagnostics, review packages, and
 the old execution ledger. Those files are useful history but are not required
 takeover state.
