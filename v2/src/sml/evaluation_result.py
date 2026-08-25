@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import re
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Literal
 
@@ -13,9 +17,11 @@ import numpy as np
 
 from sml.artifacts.manifest import (
     VerificationLevel,
+    canonical_json_bytes,
     parse_logical_path,
     structured_identity,
 )
+from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.inference import ModelIdentity
 
 type JsonScalar = None | bool | int | float | str
@@ -323,3 +329,296 @@ def evaluation_result_identity(result: EvaluationResult) -> str:
             "provider_result": result.provider_result,
         },
     )
+
+
+def _source_payload(source: EvaluationSourceIdentity) -> dict[str, str]:
+    return {
+        "logical_name": source.logical_name,
+        "content_identity": source.content_identity,
+    }
+
+
+def _provider_payload(provider: EvaluationProviderVersion) -> dict[str, str]:
+    return {"name": provider.name, "version": provider.version}
+
+
+def _task_payload(record: EvaluationTaskRecord) -> dict[str, object]:
+    return {
+        "task_name": record.task_name,
+        "task_identity": record.task_identity,
+        "task_yaml": _source_payload(record.task_yaml),
+        "include_template_closure": [
+            _source_payload(source) for source in record.include_template_closure
+        ],
+        "task_metadata_version": record.task_metadata_version,
+        "prompt_config": record.prompt_config,
+        "few_shot_config": record.few_shot_config,
+        "generation_config": record.generation_config,
+        "metric_normalization_config": record.metric_normalization_config,
+        "seeds": record.seeds,
+        "limit": record.limit,
+        "ordered_request_identity": record.ordered_request_identity,
+        "lm_eval_package_version": record.lm_eval_package_version,
+        "lm_eval_source_commit": record.lm_eval_source_commit,
+        "dataset_revision": record.dataset_revision,
+        "dataset_fingerprint": record.dataset_fingerprint,
+        "provider_versions": [
+            _provider_payload(provider) for provider in record.provider_versions
+        ],
+        "metric_payload": record.metric_payload,
+    }
+
+
+def _result_payload(result: EvaluationResult) -> dict[str, object]:
+    return {
+        "kind": result.kind,
+        "version": result.version,
+        "identity": result.identity,
+        "model": _model_projection(result.model),
+        "tasks": [_task_payload(task) for task in result.tasks],
+        "provider_result": result.provider_result,
+    }
+
+
+def evaluation_result_bytes(result: EvaluationResult) -> bytes:
+    """Return the canonical persisted representation of a self-identifying result."""
+    if not isinstance(result, EvaluationResult):
+        raise TypeError("result must be an EvaluationResult")
+    for task in result.tasks:
+        if evaluation_task_identity(task) != task.task_identity:
+            raise ValueError("evaluation task identity mismatch")
+    if evaluation_result_identity(result) != result.identity:
+        raise ValueError("evaluation result identity mismatch")
+    return canonical_json_bytes(_result_payload(result)) + b"\n"
+
+
+def _json_object_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise SMLArtifactError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    raise SMLArtifactError(f"evaluation result contains non-finite number: {value}")
+
+
+def _require_field_set(
+    payload: object, expected: frozenset[str], context: str
+) -> dict[str, object]:
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise SMLArtifactError(f"{context} has invalid fields")
+    return payload
+
+
+def _source_from_payload(payload: object) -> EvaluationSourceIdentity:
+    raw = _require_field_set(
+        payload,
+        frozenset({"logical_name", "content_identity"}),
+        "evaluation source",
+    )
+    return EvaluationSourceIdentity(
+        logical_name=raw["logical_name"],  # type: ignore[arg-type]
+        content_identity=raw["content_identity"],  # type: ignore[arg-type]
+    )
+
+
+def _provider_from_payload(payload: object) -> EvaluationProviderVersion:
+    raw = _require_field_set(
+        payload, frozenset({"name", "version"}), "evaluation provider"
+    )
+    return EvaluationProviderVersion(
+        name=raw["name"],  # type: ignore[arg-type]
+        version=raw["version"],  # type: ignore[arg-type]
+    )
+
+
+def _model_from_payload(payload: object) -> ModelIdentity:
+    raw = _require_field_set(
+        payload,
+        frozenset(
+            {
+                "artifact_kind",
+                "run_identity",
+                "step",
+                "checkpoint_identity",
+                "run_step_identity",
+                "tokenizer_identity",
+                "verification",
+            }
+        ),
+        "evaluation model",
+    )
+    verification = raw["verification"]
+    if not isinstance(verification, str):
+        raise TypeError("model verification must be a string")
+    return ModelIdentity(
+        artifact_kind=raw["artifact_kind"],  # type: ignore[arg-type]
+        run_identity=raw["run_identity"],  # type: ignore[arg-type]
+        step=raw["step"],  # type: ignore[arg-type]
+        checkpoint_identity=raw["checkpoint_identity"],  # type: ignore[arg-type]
+        run_step_identity=raw["run_step_identity"],  # type: ignore[arg-type]
+        tokenizer_identity=raw["tokenizer_identity"],  # type: ignore[arg-type]
+        verification=VerificationLevel(verification),
+    )
+
+
+def _task_from_payload(payload: object) -> EvaluationTaskRecord:
+    raw = _require_field_set(
+        payload,
+        frozenset(
+            {
+                "task_name",
+                "task_identity",
+                "task_yaml",
+                "include_template_closure",
+                "task_metadata_version",
+                "prompt_config",
+                "few_shot_config",
+                "generation_config",
+                "metric_normalization_config",
+                "seeds",
+                "limit",
+                "ordered_request_identity",
+                "lm_eval_package_version",
+                "lm_eval_source_commit",
+                "dataset_revision",
+                "dataset_fingerprint",
+                "provider_versions",
+                "metric_payload",
+            }
+        ),
+        "evaluation task",
+    )
+    closure = raw["include_template_closure"]
+    providers = raw["provider_versions"]
+    if not isinstance(closure, list):
+        raise TypeError("include_template_closure must be a JSON array")
+    if not isinstance(providers, list):
+        raise TypeError("provider_versions must be a JSON array")
+    task = EvaluationTaskRecord(
+        task_name=raw["task_name"],  # type: ignore[arg-type]
+        task_identity=raw["task_identity"],  # type: ignore[arg-type]
+        task_yaml=_source_from_payload(raw["task_yaml"]),
+        include_template_closure=tuple(_source_from_payload(item) for item in closure),
+        task_metadata_version=raw["task_metadata_version"],  # type: ignore[arg-type]
+        prompt_config=raw["prompt_config"],  # type: ignore[arg-type]
+        few_shot_config=raw["few_shot_config"],  # type: ignore[arg-type]
+        generation_config=raw["generation_config"],  # type: ignore[arg-type]
+        metric_normalization_config=raw["metric_normalization_config"],  # type: ignore[arg-type]
+        seeds=raw["seeds"],  # type: ignore[arg-type]
+        limit=raw["limit"],  # type: ignore[arg-type]
+        ordered_request_identity=raw["ordered_request_identity"],  # type: ignore[arg-type]
+        lm_eval_package_version=raw["lm_eval_package_version"],  # type: ignore[arg-type]
+        lm_eval_source_commit=raw["lm_eval_source_commit"],  # type: ignore[arg-type]
+        dataset_revision=raw["dataset_revision"],  # type: ignore[arg-type]
+        dataset_fingerprint=raw["dataset_fingerprint"],  # type: ignore[arg-type]
+        provider_versions=tuple(_provider_from_payload(item) for item in providers),
+        metric_payload=raw["metric_payload"],  # type: ignore[arg-type]
+    )
+    if evaluation_task_identity(task) != task.task_identity:
+        raise SMLArtifactError("evaluation task identity mismatch")
+    return task
+
+
+def _result_from_payload(payload: object) -> EvaluationResult:
+    raw = _require_field_set(
+        payload,
+        frozenset({"kind", "version", "identity", "model", "tasks", "provider_result"}),
+        "evaluation result",
+    )
+    tasks = raw["tasks"]
+    if not isinstance(tasks, list):
+        raise TypeError("evaluation tasks must be a JSON array")
+    return EvaluationResult(
+        kind=raw["kind"],  # type: ignore[arg-type]
+        version=raw["version"],  # type: ignore[arg-type]
+        identity=raw["identity"],  # type: ignore[arg-type]
+        model=_model_from_payload(raw["model"]),
+        tasks=tuple(_task_from_payload(task) for task in tasks),
+        provider_result=raw["provider_result"],  # type: ignore[arg-type]
+    )
+
+
+def read_evaluation_result(path: Path) -> EvaluationResult:
+    """Strictly read one canonical evaluation result file."""
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
+    try:
+        raw_bytes = path.read_bytes()
+        raw = json.loads(
+            raw_bytes.decode("utf-8"),
+            object_pairs_hook=_json_object_no_duplicates,
+            parse_constant=_reject_json_constant,
+        )
+        result = _result_from_payload(raw)
+        if evaluation_result_bytes(result) != raw_bytes:
+            raise SMLArtifactError("evaluation result is not canonical")
+        if evaluation_result_identity(result) != result.identity:
+            raise SMLArtifactError("evaluation result identity mismatch")
+        return result
+    except SMLArtifactError:
+        raise
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise SMLArtifactError("invalid evaluation result") from error
+
+
+def _fsync_parent(path: Path) -> None:
+    directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
+    """Durably publish *result* once, accepting only exact idempotent reuse."""
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
+    payload = evaluation_result_bytes(result)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            try:
+                existing = read_evaluation_result(path)
+            except SMLArtifactError:
+                raise SMLRuntimeError(
+                    "evaluation output collision: " + str(path)
+                ) from None
+            if existing != result:
+                raise SMLRuntimeError("evaluation output collision: " + str(path))
+        _fsync_parent(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+__all__ = (
+    "EvaluationProviderVersion",
+    "EvaluationResult",
+    "EvaluationSourceIdentity",
+    "EvaluationTaskRecord",
+    "evaluation_result_bytes",
+    "evaluation_result_identity",
+    "evaluation_task_identity",
+    "normalize_json_value",
+    "publish_evaluation_result",
+    "read_evaluation_result",
+)

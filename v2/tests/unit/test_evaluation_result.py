@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pytest
-from sml.artifacts.manifest import VerificationLevel
-from sml.errors import SMLArtifactError
+from sml.artifacts.manifest import VerificationLevel, canonical_json_bytes
+from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.evaluation_result import (
     EvaluationProviderVersion,
     EvaluationResult,
     EvaluationSourceIdentity,
     EvaluationTaskRecord,
+    evaluation_result_bytes,
     evaluation_result_identity,
     evaluation_task_identity,
     normalize_json_value,
+    publish_evaluation_result,
+    read_evaluation_result,
 )
 from sml.inference import ModelIdentity
 
@@ -79,6 +85,13 @@ def make_result(
         tasks=tasks,
         provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
     )
+
+
+def identified_result() -> EvaluationResult:
+    task = make_task_record()
+    task = replace(task, task_identity=evaluation_task_identity(task))
+    result = make_result(model=model_identity(), tasks=(task,))
+    return replace(result, identity=evaluation_result_identity(result))
 
 
 def test_json_normalization_is_closed_finite_and_deeply_immutable() -> None:
@@ -262,3 +275,91 @@ def test_records_reject_unordered_or_invalid_values() -> None:
             make_result(model=model_identity(), tasks=(make_task_record(),)),
             version=1.0,
         )
+
+
+def test_reader_rejects_strict_schema_and_tampered_identities(tmp_path: Path) -> None:
+    """Breaks if the reader accepts malformed or altered persisted results."""
+    result = identified_result()
+    canonical = evaluation_result_bytes(result)
+    path = tmp_path / "evaluation.json"
+    path.write_bytes(canonical)
+    assert read_evaluation_result(path) == result
+
+    decoded = json.loads(canonical)
+    boolean_version = dict(decoded)
+    boolean_version["version"] = True
+    boolean_step = json.loads(canonical)
+    boolean_step["model"]["step"] = True
+    boolean_limit = json.loads(canonical)
+    boolean_limit["tasks"][0]["limit"] = False
+    invalid_verification = json.loads(canonical)
+    invalid_verification["model"]["verification"] = "invalid"
+
+    documents = (
+        canonical.replace(b'"version":1', b'"version":1,"extra":true'),
+        canonical.replace(
+            b'"kind":"evaluation-result"',
+            b'"kind":"evaluation-result","kind":"evaluation-result"',
+        ),
+        canonical.replace(b'"provider_result":', b'"extra":true,"provider_result":'),
+        json.dumps(json.loads(canonical), indent=2, sort_keys=True).encode() + b"\n",
+        canonical.replace(result.identity.encode(), ("sha256:" + "f" * 64).encode()),
+        canonical.replace(b"0.5", b"NaN", 1),
+        canonical_json_bytes(boolean_version) + b"\n",
+        canonical_json_bytes(boolean_step) + b"\n",
+        canonical_json_bytes(boolean_limit) + b"\n",
+        canonical_json_bytes(invalid_verification) + b"\n",
+    )
+    for index, payload in enumerate(documents):
+        bad = tmp_path / f"bad-{index}.json"
+        bad.write_bytes(payload)
+        with pytest.raises(SMLArtifactError):
+            read_evaluation_result(bad)
+
+
+def test_concurrent_publication_is_atomic_idempotent_and_never_overwrites(
+    tmp_path: Path,
+) -> None:
+    """Breaks if publishing can expose partial bytes or replace a winner."""
+    path = tmp_path / "nested" / "evaluation.json"
+    first_result = identified_result()
+    second_result = replace(first_result, provider_result={"results": {}})
+    second_result = replace(
+        second_result, identity=evaluation_result_identity(second_result)
+    )
+    start = threading.Barrier(2)
+
+    def publish_simultaneously(result: EvaluationResult) -> EvaluationResult:
+        start.wait()
+        publish_evaluation_result(path, result)
+        return result
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (
+            executor.submit(publish_simultaneously, first_result),
+            executor.submit(publish_simultaneously, second_result),
+        )
+        outcomes = []
+        collisions = []
+        for future in futures:
+            try:
+                outcomes.append(future.result())
+            except SMLRuntimeError as error:
+                collisions.append(error)
+
+    assert len(outcomes) == 1
+    assert len(collisions) == 1
+    assert "collision" in str(collisions[0])
+    winner = outcomes[0]
+    persisted = path.read_bytes()
+    assert read_evaluation_result(path) == winner
+    assert persisted == evaluation_result_bytes(winner)
+    assert str(tmp_path).encode() not in persisted
+
+    publish_evaluation_result(path, winner)
+    assert path.read_bytes() == persisted
+    with pytest.raises(SMLRuntimeError, match="collision"):
+        publish_evaluation_result(
+            path, second_result if winner == first_result else first_result
+        )
+    assert path.read_bytes() == persisted
