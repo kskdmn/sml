@@ -62,6 +62,18 @@ class _Config:
         return f"offline.serialized.{name}"
 
 
+def _serialized_config_value(config: _Config, value: object) -> object:
+    if callable(value):
+        return config.serialize_function(value)
+    if isinstance(value, dict):
+        return {
+            key: _serialized_config_value(config, item) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return tuple(_serialized_config_value(config, item) for item in value)
+    return value
+
+
 class _Task:
     def __init__(self, task_name: str, values: dict[str, object]) -> None:
         self.task_name = task_name
@@ -227,7 +239,9 @@ def simple_evaluate(
     return {
         "results": results,
         "configs": {
-            task: loaded_task.config.to_dict()
+            task: _serialized_config_value(
+                loaded_task.config, loaded_task.config.to_dict()
+            )
             for task, loaded_task in loaded_tasks.items()
         },
         "versions": {task: "1.0.0" for task in tasks},

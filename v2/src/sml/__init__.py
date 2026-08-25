@@ -11,7 +11,13 @@ from sml.errors import (
     SMLDataError,
     SMLRuntimeError,
 )
-from sml.evaluation import EvaluationConfig, EvaluationResult
+from sml.evaluation import (
+    EvaluationConfig,
+    EvaluationProviderVersion,
+    EvaluationResult,
+    EvaluationSourceIdentity,
+    EvaluationTaskRecord,
+)
 from sml.inference import (
     GenerationRequest,
     GenerationResult,
@@ -37,7 +43,10 @@ __all__ = (
     "CheckpointPolicy",
     "CorpusConfig",
     "EvaluationConfig",
+    "EvaluationProviderVersion",
     "EvaluationResult",
+    "EvaluationSourceIdentity",
+    "EvaluationTaskRecord",
     "ExportResult",
     "GenerationConfig",
     "GenerationRequest",

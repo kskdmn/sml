@@ -1,32 +1,32 @@
-"""Batched lm-eval scoring and atomically persisted evaluation metadata."""
+"""Batched lm-eval scoring and strict evaluation artifact publication."""
 
 from __future__ import annotations
 
 import hashlib
 import importlib.metadata
-import json
-import os
-import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
-from sml.artifacts.manifest import VerificationLevel, structured_identity
+from sml.artifacts.manifest import structured_identity
 from sml.errors import SMLRuntimeError
 from sml.evaluation_result import (
     EvaluationProviderVersion,
+    EvaluationResult,
     EvaluationSourceIdentity,
     EvaluationTaskRecord,
+    evaluation_result_identity,
     evaluation_task_identity,
     normalize_json_value,
+    publish_evaluation_result,
+    read_evaluation_result,
 )
 from sml.inference import (
     GenerationConfig,
     GenerationRequest,
     InferenceRuntimeConfig,
     InferenceSession,
-    ModelIdentity,
 )
 
 _ALLOWED_TASKS = frozenset({"hellaswag", "winogrande"})
@@ -78,20 +78,14 @@ class EvaluationConfig:
         for task in self.tasks:
             if task not in _ALLOWED_TASKS:
                 raise ValueError("tasks must be hellaswag or winogrande")
+        if len(set(self.tasks)) != len(self.tasks):
+            raise ValueError("tasks must not contain duplicate task names")
         if self.limit is not None and (
             isinstance(self.limit, bool)
             or not isinstance(self.limit, int)
             or self.limit <= 0
         ):
             raise ValueError("limit must be positive")
-
-
-@dataclass(frozen=True, slots=True)
-class EvaluationResult:
-    output: Path
-    model: ModelIdentity
-    tasks: tuple[str, ...]
-    provider_versions: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -682,83 +676,56 @@ def _provider_versions() -> tuple[tuple[str, str], ...]:
     return tuple(sorted(found, key=lambda item: item[0]))
 
 
-def _result_payload(result: EvaluationResult) -> dict[str, object]:
-    model = result.model
-    return {
-        "output": str(result.output),
-        "model": {
-            "artifact_kind": model.artifact_kind,
-            "run_identity": model.run_identity,
-            "step": model.step,
-            "checkpoint_identity": model.checkpoint_identity,
-            "run_step_identity": model.run_step_identity,
-            "tokenizer_identity": model.tokenizer_identity,
-            "verification": model.verification.value,
-        },
-        "tasks": list(result.tasks),
-        "provider_versions": [list(pair) for pair in result.provider_versions],
-    }
+def _validate_provider_result(
+    raw_result: object,
+    requested_tasks: tuple[str, ...],
+) -> Mapping[str, object]:
+    if not isinstance(raw_result, Mapping):
+        raise SMLRuntimeError("lm-eval provider result is not a mapping")
+    results = raw_result.get("results")
+    if not isinstance(results, Mapping):
+        raise SMLRuntimeError("lm-eval provider result has no results mapping")
+    result_task_names = tuple(results)
+    if (
+        any(
+            not isinstance(task_name, str) or not task_name
+            for task_name in result_task_names
+        )
+        or len(result_task_names) != len(set(result_task_names))
+        or set(result_task_names) != set(requested_tasks)
+    ):
+        raise SMLRuntimeError(
+            "lm-eval provider results must contain exactly the requested task keys"
+        )
+    for task_name in requested_tasks:
+        metrics = results.get(task_name)
+        if not isinstance(metrics, Mapping):
+            raise SMLRuntimeError(
+                f"lm-eval metric result is malformed for task: {task_name}"
+            )
+    return raw_result
 
 
-def _result_from_payload(payload: dict[str, object]) -> EvaluationResult:
-    model_payload = payload["model"]
-    if not isinstance(model_payload, dict):
-        raise SMLRuntimeError("evaluation result model metadata is invalid")
-    return EvaluationResult(
-        output=Path(str(payload["output"])),
-        model=ModelIdentity(
-            artifact_kind=str(model_payload["artifact_kind"]),
-            run_identity=model_payload["run_identity"],
-            step=model_payload["step"],
-            checkpoint_identity=model_payload["checkpoint_identity"],
-            run_step_identity=model_payload["run_step_identity"],
-            tokenizer_identity=str(model_payload["tokenizer_identity"]),
-            verification=VerificationLevel(model_payload["verification"]),
-        ),
-        tasks=tuple(payload["tasks"]),  # type: ignore[arg-type]
-        provider_versions=tuple(
-            (str(name), str(version))
-            for name, version in payload["provider_versions"]  # type: ignore[misc]
-        ),
-    )
-
-
-def _dumps_result(result: EvaluationResult) -> str:
-    return json.dumps(_result_payload(result), indent=2, sort_keys=True) + "\n"
-
-
-def read_evaluation_result(path: Path) -> EvaluationResult:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return _result_from_payload(payload)
-
-
-def _persist_evaluation_result(result: EvaluationResult) -> None:
-    text = _dumps_result(result)
-    path = result.output
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        try:
-            os.link(tmp_path, path)
-        except FileExistsError:
-            if path.read_text(encoding="utf-8") != text:
-                raise SMLRuntimeError(f"evaluation output collision: {path}") from None
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+def _loaded_tasks(
+    manager: _RecordingTaskManager,
+    requested_tasks: tuple[str, ...],
+) -> tuple[object, ...]:
+    loaded_tasks = manager.loaded.get("tasks")
+    if not isinstance(loaded_tasks, Mapping):
+        raise SMLRuntimeError("lm-eval task manager returned malformed task mapping")
+    loaded_task_names = tuple(loaded_tasks)
+    if (
+        any(
+            not isinstance(task_name, str) or not task_name
+            for task_name in loaded_task_names
+        )
+        or len(loaded_task_names) != len(set(loaded_task_names))
+        or set(loaded_task_names) != set(requested_tasks)
+    ):
+        raise SMLRuntimeError(
+            "lm-eval loaded tasks must contain exactly the requested task keys"
+        )
+    return tuple(loaded_tasks[task_name] for task_name in requested_tasks)
 
 
 def evaluate(config: EvaluationConfig) -> EvaluationResult:
@@ -769,28 +736,64 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
         full_verify=config.full_verify,
         runtime=config.runtime,
     )
-    lm_eval = _import_lm_eval()
-    lm = _lm_eval_model(session, padding=config.padding)
-    lm_eval.simple_evaluate(
+    provider = _import_lm_eval()
+    manager = _RecordingTaskManager(provider.make_task_manager())
+    recorder = _EvaluationRequestRecorder()
+    lm = _lm_eval_model(session, padding=config.padding, recorder=recorder)
+    raw_result = provider.simple_evaluate(
         model=lm,
         tasks=list(config.tasks),
         num_fewshot=0,
+        batch_size=None,
+        device=None,
         limit=config.limit,
-        log_samples=False,
+        task_manager=manager,
+        system_instruction=None,
+        apply_chat_template=False,
+        fewshot_as_multiturn=True,
+        gen_kwargs=None,
+        bootstrap_iters=_BOOTSTRAP_ITERS,
+        log_samples=True,
+        predict_only=False,
+        **_evaluation_seeds(),
+    )
+    provider_result = _validate_provider_result(raw_result, config.tasks)
+    loaded_tasks = _loaded_tasks(manager, config.tasks)
+    provider_versions = _provider_versions()
+    task_records = tuple(
+        _resolve_task_record(
+            task_name=task_name,
+            task=task,
+            provider=provider,
+            manager=manager,
+            recorder=recorder,
+            provider_result=provider_result,
+            limit=config.limit,
+            padding=config.padding,
+            seeds=_evaluation_seeds(),
+            provider_versions=provider_versions,
+        )
+        for task_name, task in zip(config.tasks, loaded_tasks, strict=True)
     )
     result = EvaluationResult(
-        output=config.output,
+        kind="evaluation-result",
+        version=1,
+        identity="sha256:" + "0" * 64,
         model=session.model_identity,
-        tasks=config.tasks,
-        provider_versions=_provider_versions(),
+        tasks=task_records,
+        provider_result=normalize_json_value(raw_result, context="lm-eval result"),
     )
-    _persist_evaluation_result(result)
+    result = replace(result, identity=evaluation_result_identity(result))
+    publish_evaluation_result(config.output, result)
     return result
 
 
 __all__ = (
     "EvaluationConfig",
+    "EvaluationProviderVersion",
     "EvaluationResult",
+    "EvaluationSourceIdentity",
+    "EvaluationTaskRecord",
     "LoglikelihoodRequest",
     "LoglikelihoodResult",
     "SMLEvalLM",

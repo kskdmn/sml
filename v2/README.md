@@ -74,7 +74,10 @@ Evaluate one or more supported lm-eval tasks and atomically write the result:
 uv run python -m sml evaluate --checkpoint v2/output/base-run --task hellaswag --task winogrande --output v2/output/evaluation.json
 ```
 
-Use `--limit` for a smoke run and `--full` for full payload verification.
+Use `--limit` for a smoke run and `--full` for full payload verification. The
+immutable JSON artifact preserves complete provider metrics plus resolved
+task, model, dataset, and ordered-request provenance; its destination path is
+intentionally excluded from the artifact and its identity.
 
 ### SWAG data
 

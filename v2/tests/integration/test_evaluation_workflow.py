@@ -17,8 +17,13 @@ from sml.evaluation import (
     read_evaluation_result,
     score_loglikelihood_batch,
 )
+from sml.evaluation_result import evaluation_result_identity
 from sml.inference import InferenceSession
-from test_evaluation import fake_lm_eval, tiny_evaluation_config  # noqa: F401
+from test_evaluation import (  # noqa: F401
+    fake_lm_eval,
+    fake_provider,
+    tiny_evaluation_config,
+)
 from test_inference import (  # noqa: F401
     _tiny_run_template,
     publish_new_valid_step,
@@ -32,19 +37,18 @@ def test_evaluation_result_pins_resolved_identity(
     fake_lm_eval,
     tmp_path: Path,
 ) -> None:
-    result = evaluate(
-        tiny_evaluation_config(tiny_pretraining_run, tmp_path, tasks=("hellaswag",))
+    config = tiny_evaluation_config(
+        tiny_pretraining_run, tmp_path, tasks=("hellaswag",)
     )
+    result = evaluate(config)
     pinned = result.model
     publish_new_valid_step(tiny_pretraining_run, step=pinned.step + 1)
-    persisted = read_evaluation_result(result.output)
+    persisted = read_evaluation_result(config.output)
     assert persisted.model == pinned
-    assert persisted.tasks == ("hellaswag",)
-    assert persisted.output == result.output
-    assert persisted.provider_versions == result.provider_versions
-    assert persisted.provider_versions == tuple(
-        sorted(persisted.provider_versions, key=lambda item: item[0])
-    )
+    assert persisted.tasks[0].task_name == "hellaswag"
+    assert persisted.tasks[0].metric_payload["acc,none"] == 0.5
+    assert persisted.provider_result == result.provider_result
+    assert persisted.identity == evaluation_result_identity(persisted)
 
 
 def test_evaluate_is_idempotent_for_identical_output(
@@ -71,25 +75,18 @@ def test_evaluate_rejects_conflicting_existing_output(
         evaluate(config)
 
 
-def test_evaluate_supports_repeated_tasks(
+def test_evaluate_rejects_repeated_tasks_before_provider_execution(
     tiny_pretraining_run: Path,
     fake_lm_eval,
     tmp_path: Path,
 ) -> None:
-    result = evaluate(
+    with pytest.raises(ValueError, match="duplicate"):
         tiny_evaluation_config(
             tiny_pretraining_run,
             tmp_path,
             tasks=("hellaswag", "winogrande", "hellaswag"),
         )
-    )
-    assert result.tasks == ("hellaswag", "winogrande", "hellaswag")
-    assert fake_lm_eval.calls
-    assert fake_lm_eval.calls[0]["tasks"] == [
-        "hellaswag",
-        "winogrande",
-        "hellaswag",
-    ]
+    assert not fake_lm_eval.calls
 
 
 def test_score_loglikelihood_batch_returns_finite_boolean_scores(

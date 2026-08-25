@@ -17,7 +17,11 @@ from sml.inference import GenerationRequest, InferenceSession, resolve_model_art
 from sml.model.config import ModelConfig
 from sml.training.common import ResumeOverrides
 from sml.training.swag import export_merged, finetune, resume_finetune
-from test_evaluation import fake_lm_eval, tiny_evaluation_config  # noqa: F401
+from test_evaluation import (  # noqa: F401
+    fake_lm_eval,
+    fake_provider,
+    tiny_evaluation_config,
+)
 from test_swag_workflow import (  # noqa: F401
     FakeSwagProvider,
     _swag_rows,
@@ -71,4 +75,11 @@ def test_encoded_swag_to_exported_evaluation(
     )
     assert inference_result.model.verification is VerificationLevel.FULL
     assert evaluation_result.model.artifact_kind == "export"
+    assert evaluation_result.model.verification is VerificationLevel.MANIFEST_TRUSTED
+    assert evaluation_result.tasks[0].task_name == "hellaswag"
+    assert "acc,none" in evaluation_result.tasks[0].metric_payload
+    assert evaluation_result.tasks[0].ordered_request_identity.startswith("sha256:")
+    assert evaluation_result.provider_result["results"]["hellaswag"] == dict(
+        evaluation_result.tasks[0].metric_payload
+    )
     assert read_export_manifest(exported.path).model_config.rope_scaling_factor == 1.0

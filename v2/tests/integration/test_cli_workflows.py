@@ -332,17 +332,39 @@ def test_every_cli_workflow_runs_offline_in_subprocesses(
     assert _manifest(workspace.export)["kind"] == "export"
 
     base_evaluation = json.loads(workspace.base_evaluation.read_text(encoding="utf-8"))
+    assert base_evaluation["kind"] == "evaluation-result"
+    assert base_evaluation["version"] == 1
+    assert base_evaluation["identity"].startswith("sha256:")
     assert base_evaluation["model"]["artifact_kind"] == "pretraining-run"
     assert base_evaluation["model"]["step"] == 1
     assert base_evaluation["model"]["verification"] == "manifest-trusted"
-    assert base_evaluation["tasks"] == ["hellaswag"]
+    assert base_evaluation["tasks"][0]["task_name"] == "hellaswag"
+    assert "acc,none" in base_evaluation["tasks"][0]["metric_payload"]
+    assert base_evaluation["provider_result"]["results"]["hellaswag"]
+    assert base_evaluation["tasks"][0]["dataset_fingerprint"].startswith("sha256:")
+    assert (
+        str(workspace.base_evaluation.parent).encode()
+        not in workspace.base_evaluation.read_bytes()
+    )
 
     export_evaluation = json.loads(
         workspace.export_evaluation.read_text(encoding="utf-8")
     )
+    assert export_evaluation["kind"] == "evaluation-result"
+    assert export_evaluation["version"] == 1
+    assert export_evaluation["identity"].startswith("sha256:")
     assert export_evaluation["model"]["artifact_kind"] == "export"
     assert export_evaluation["model"]["verification"] == "full"
-    assert export_evaluation["tasks"] == ["winogrande"]
+    assert export_evaluation["tasks"][0]["task_name"] == "winogrande"
+    assert "acc,none" in export_evaluation["tasks"][0]["metric_payload"]
+    assert export_evaluation["provider_result"]["results"]["winogrande"]
+    assert export_evaluation["tasks"][0]["ordered_request_identity"].startswith(
+        "sha256:"
+    )
+    assert (
+        str(workspace.export_evaluation.parent).encode()
+        not in workspace.export_evaluation.read_bytes()
+    )
     assert "manifest-trusted" in workspace.results["base_infer_default"].stdout
     assert "VerificationLevel.FULL" in workspace.results["base_infer_full"].stdout
     assert "artifact_kind='export'" in workspace.results["export_infer"].stdout

@@ -18,8 +18,10 @@ from sml.evaluation import (
     LoglikelihoodRequest,
     SMLEvalLM,
     evaluate,
+    read_evaluation_result,
     score_loglikelihood_batch,
 )
+from sml.evaluation_result import evaluation_result_identity
 from sml.inference import GenerationResult, InferenceSession
 from test_inference import (  # noqa: F401
     _tiny_run_template,
@@ -115,18 +117,30 @@ def tiny_evaluation_config(
 
 
 @pytest.fixture
-def fake_lm_eval(monkeypatch: pytest.MonkeyPatch):
+def fake_lm_eval(fake_provider, monkeypatch: pytest.MonkeyPatch):
     from sml import evaluation
 
     calls: list[dict[str, object]] = []
 
     def simple_evaluate(**kwargs: object) -> dict[str, object]:
         calls.append(kwargs)
-        tasks = tuple(kwargs.get("tasks") or ())
-        return {"results": {task: {"acc,none": 0.0} for task in tasks}}
+        raw_result = fake_provider.simple_evaluate(**kwargs)
+        if module.result is not None:
+            return module.result
+        raw_result = dict(raw_result)
+        raw_result["results"] = {
+            task_name: {"acc,none": 0.5, "acc_stderr,none": 0.01}
+            for task_name in raw_result["results"]
+        }
+        module.result = raw_result
+        return raw_result
 
-    module = SimpleNamespace(simple_evaluate=simple_evaluate, calls=calls)
-    monkeypatch.setattr(evaluation, "_import_lm_eval", lambda: module)
+    module = SimpleNamespace(result=None, calls=calls)
+    monkeypatch.setattr(
+        evaluation,
+        "_import_lm_eval",
+        lambda: replace(fake_provider, simple_evaluate=simple_evaluate),
+    )
     return module
 
 
@@ -823,13 +837,13 @@ def test_evaluation_config_requires_positive_limit(tmp_path: Path) -> None:
         )
 
 
-def test_evaluation_config_allows_repeated_supported_tasks(tmp_path: Path) -> None:
-    config = EvaluationConfig(
-        checkpoint=tmp_path,
-        tasks=("hellaswag", "winogrande", "hellaswag"),
-        output=tmp_path / "out.json",
-    )
-    assert config.tasks == ("hellaswag", "winogrande", "hellaswag")
+def test_evaluation_config_rejects_duplicate_task_names(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        EvaluationConfig(
+            checkpoint=tmp_path,
+            tasks=("hellaswag", "winogrande", "hellaswag"),
+            output=tmp_path / "out.json",
+        )
 
 
 def test_evaluation_config_rejects_unknown_tasks(tmp_path: Path) -> None:
@@ -863,8 +877,42 @@ def test_evaluate_does_not_use_the_network(
 
     monkeypatch.setattr(socket, "create_connection", fail_network)
     result = evaluate(tiny_evaluation_config(tiny_pretraining_run, tmp_path))
-    assert result.output.exists()
+    assert read_evaluation_result(tmp_path / "evaluation.json") == result
     assert fake_lm_eval.calls
+
+
+def test_evaluate_preserves_complete_provider_result_and_task_metrics(
+    tiny_pretraining_run: Path,
+    fake_lm_eval,
+    tmp_path: Path,
+) -> None:
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+
+    result = evaluate(config)
+
+    persisted = read_evaluation_result(config.output)
+    assert persisted == result
+    assert result.provider_result["configs"] == fake_lm_eval.result["configs"]
+    assert result.tasks[0].metric_payload == {
+        "acc,none": 0.5,
+        "acc_stderr,none": 0.01,
+    }
+    assert str(tmp_path).encode() not in config.output.read_bytes()
+    assert result.identity == evaluation_result_identity(result)
+
+
+def test_evaluate_fails_before_publish_when_provider_result_is_incomplete(
+    tiny_pretraining_run: Path,
+    fake_lm_eval,
+    tmp_path: Path,
+) -> None:
+    fake_lm_eval.result = {"configs": {}}
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+
+    with pytest.raises(SMLRuntimeError, match="results"):
+        evaluate(config)
+
+    assert not config.output.exists()
 
 
 def test_sml_eval_lm_loglikelihood_uses_batch_scorer(
@@ -889,7 +937,6 @@ def test_evaluate_passes_installed_lm_eval_lm(
     evaluate(tiny_evaluation_config(tiny_pretraining_run, tmp_path))
     model = fake_lm_eval.calls[0]["model"]
     assert isinstance(model, LM)
-    assert getattr(model, "cache_hook", None) is not None
 
 
 def test_evaluation_publish_does_not_replace_destination(
@@ -906,9 +953,10 @@ def test_evaluation_publish_does_not_replace_destination(
         return real_replace(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(os, "replace", tracking_replace)
-    result = evaluate(tiny_evaluation_config(tiny_pretraining_run, tmp_path))
-    assert all(path != result.output for path in replaced)
-    assert result.output.exists()
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+    evaluate(config)
+    assert all(path != config.output for path in replaced)
+    assert config.output.exists()
 
 
 def test_compiled_scoring_kernel_receives_request_mask(
