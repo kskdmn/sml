@@ -32,10 +32,18 @@ type JsonObject = Mapping[str, JsonValue]
 _IDENTITY_PATTERN = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
+def _require_utf8(value: str, name: str) -> str:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError(f"{name} must be UTF-8 encodable") from error
+    return value
+
+
 def _require_string(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} must be a nonempty string")
-    return value
+    return _require_utf8(value, name)
 
 
 def _require_optional_string(value: object, name: str) -> str | None:
@@ -86,8 +94,10 @@ def normalize_json_value(value: object, *, context: str) -> JsonValue:
         raise TypeError(
             f"{context} contains unsupported NumPy scalar {type(value).__name__}"
         )
-    if value is None or isinstance(value, (bool, str)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, str):
+        return _require_utf8(value, context)
     if isinstance(value, int):
         return value
     if isinstance(value, float):
@@ -95,8 +105,10 @@ def normalize_json_value(value: object, *, context: str) -> JsonValue:
             raise ValueError(f"{context} contains a non-finite number")
         return value
     if isinstance(value, Mapping):
-        if any(not isinstance(key, str) for key in value):
-            raise TypeError(f"{context} object keys must be strings")
+        for key in value:
+            if not isinstance(key, str):
+                raise TypeError(f"{context} object keys must be strings")
+            _require_utf8(key, f"{context} object key")
         return MappingProxyType(
             {
                 key: normalize_json_value(value[key], context=f"{context}.{key}")
@@ -246,11 +258,21 @@ class EvaluationResult:
         task_names = tuple(task.task_name for task in tasks)
         if len(task_names) != len(set(task_names)):
             raise ValueError("task names must be unique")
-        object.__setattr__(
-            self,
-            "provider_result",
-            _normalize_mapping(self.provider_result, "provider_result"),
-        )
+        provider_result = _normalize_mapping(self.provider_result, "provider_result")
+        results = provider_result.get("results")
+        configs = provider_result.get("configs")
+        if not isinstance(results, Mapping) or not isinstance(configs, Mapping):
+            raise TypeError("provider_result must contain results and configs mappings")
+        task_name_set = set(task_names)
+        if set(results) != task_name_set or set(configs) != task_name_set:
+            raise ValueError("provider_result task mappings must exactly match tasks")
+        for task in tasks:
+            metrics = results[task.task_name]
+            if not isinstance(metrics, Mapping) or metrics != task.metric_payload:
+                raise ValueError(
+                    "provider result metrics must match task metric_payload"
+                )
+        object.__setattr__(self, "provider_result", provider_result)
 
 
 def _source_projection(source: EvaluationSourceIdentity) -> dict[str, str]:
@@ -606,8 +628,12 @@ def _open_publication_parent(path: Path) -> int:
             try:
                 child = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
             except FileNotFoundError:
-                os.mkdir(component, dir_fd=descriptor)
-                os.fsync(descriptor)
+                try:
+                    os.mkdir(component, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                else:
+                    os.fsync(descriptor)
                 child = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
             previous = descriptor
             descriptor = child
@@ -637,6 +663,7 @@ def _open_temporary_output(parent: int, destination: str) -> tuple[int, str]:
 
 
 def _read_existing_result(parent: int, destination: str) -> EvaluationResult:
+    descriptor: int | None = None
     try:
         entry = os.stat(destination, dir_fd=parent, follow_symlinks=False)
         if not stat.S_ISREG(entry.st_mode):
@@ -646,9 +673,6 @@ def _read_existing_result(parent: int, destination: str) -> EvaluationResult:
             _REGULAR_FILE_OPEN_FLAGS,
             dir_fd=parent,
         )
-    except OSError as error:
-        raise SMLArtifactError("invalid existing evaluation result") from error
-    try:
         opened = os.fstat(descriptor)
         if not stat.S_ISREG(opened.st_mode):
             raise SMLArtifactError("evaluation output collision is not a regular file")
@@ -661,8 +685,11 @@ def _read_existing_result(parent: int, destination: str) -> EvaluationResult:
         if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
             raise SMLArtifactError("evaluation output changed during collision check")
         return _result_from_bytes(b"".join(chunks))
+    except OSError as error:
+        raise SMLArtifactError("invalid existing evaluation result") from error
     finally:
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
@@ -698,14 +725,22 @@ def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
                 ) from None
             if existing != result:
                 raise SMLRuntimeError("evaluation output collision: " + str(path))
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        else:
+            temporary = None
         os.fsync(parent)
     finally:
-        if temporary is not None:
-            try:
-                os.unlink(temporary, dir_fd=parent)
-            except FileNotFoundError:
-                pass
-        os.close(parent)
+        try:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary, dir_fd=parent)
+                except FileNotFoundError:
+                    pass
+        finally:
+            os.close(parent)
 
 
 __all__ = (

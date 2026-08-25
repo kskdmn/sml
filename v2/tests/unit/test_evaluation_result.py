@@ -11,7 +11,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 import sml.evaluation_result as evaluation_result_module
-from sml.artifacts.manifest import VerificationLevel, canonical_json_bytes
+from sml.artifacts.manifest import (
+    VerificationLevel,
+    canonical_json_bytes,
+    structured_identity,
+)
 from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.evaluation_result import (
     EvaluationProviderVersion,
@@ -86,12 +90,17 @@ def make_result(
         identity="sha256:" + "0" * 64,
         model=model,
         tasks=tasks,
-        provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
+        provider_result={
+            "results": {task.task_name: task.metric_payload for task in tasks},
+            "configs": {task.task_name: {} for task in tasks},
+        },
     )
 
 
-def identified_result() -> EvaluationResult:
-    task = make_task_record()
+def identified_result(
+    *, metric_payload: object = {"acc,none": 0.5}
+) -> EvaluationResult:
+    task = make_task_record(metric_payload=metric_payload)
     task = replace(task, task_identity=evaluation_task_identity(task))
     result = make_result(model=model_identity(), tasks=(task,))
     return replace(result, identity=evaluation_result_identity(result))
@@ -118,6 +127,21 @@ def test_json_normalization_is_closed_finite_and_deeply_immutable() -> None:
     for invalid in (float("nan"), float("inf"), b"bytes", Path("local"), {1: "x"}):
         with pytest.raises((TypeError, ValueError)):
             normalize_json_value(invalid, context="provider result")
+
+
+@pytest.mark.parametrize("value", ("bad\ud800value", {"bad\ud800key": "value"}))
+def test_normalization_rejects_strings_that_cannot_be_encoded_as_utf8(
+    value: object,
+) -> None:
+    """Breaks if a persisted JSON string survives normalization but cannot encode."""
+    with pytest.raises(ValueError, match="UTF-8"):
+        normalize_json_value(value, context="provider result")
+
+
+def test_record_strings_reject_values_that_cannot_be_encoded_as_utf8() -> None:
+    """Breaks if schema strings defer UTF-8 failure until identity serialization."""
+    with pytest.raises(ValueError, match="UTF-8"):
+        replace(make_task_record(), task_metadata_version="bad\ud800version")
 
 
 def test_numpy_normalization_accepts_only_lossless_json_scalar_kinds() -> None:
@@ -164,7 +188,10 @@ def test_task_and_result_identities_cover_metrics_requests_and_model() -> None:
     changed_request = replace(task, ordered_request_identity="sha256:" + "2" * 64)
     assert (
         evaluation_result_identity(
-            replace(result, identity="sha256:" + "0" * 64, tasks=(changed_metric,))
+            replace(
+                make_result(model=model_identity(), tasks=(changed_metric,)),
+                identity="sha256:" + "0" * 64,
+            )
         )
         != result.identity
     )
@@ -233,15 +260,18 @@ def test_identity_projections_are_pinned_selective_and_complete() -> None:
     identified_task = replace(task, task_identity=expected_task_identity)
     result = make_result(model=model_identity(), tasks=(identified_task,))
     expected_result_identity = (
-        "sha256:39e98d9d734e1ec04311cf61c479535072b44939f696c2502dfcf289eca64435"
+        "sha256:cdd96169a9ea984c07b065378d465e3ca160db14209761b4d64cbad94f8ad6f8"
     )
     assert evaluation_result_identity(result) == expected_result_identity
     for changed_result in (
         replace(result, model=replace(model_identity(), step=8)),
         replace(
-            result, tasks=(replace(identified_task, metric_payload={"acc,none": 0.75}),)
+            make_result(
+                model=model_identity(),
+                tasks=(replace(identified_task, metric_payload={"acc,none": 0.75}),),
+            ),
+            identity="sha256:" + "0" * 64,
         ),
-        replace(result, provider_result={"results": {"hellaswag": {"acc,none": 0.75}}}),
     ):
         assert evaluation_result_identity(changed_result) != expected_result_identity
 
@@ -329,16 +359,147 @@ def test_reader_rejects_strict_schema_and_tampered_identities(tmp_path: Path) ->
             read_evaluation_result(bad)
 
 
+@pytest.mark.parametrize(
+    ("record_name", "fields"),
+    (
+        (
+            "result",
+            ("kind", "version", "identity", "model", "tasks", "provider_result"),
+        ),
+        (
+            "model",
+            (
+                "artifact_kind",
+                "run_identity",
+                "step",
+                "checkpoint_identity",
+                "run_step_identity",
+                "tokenizer_identity",
+                "verification",
+            ),
+        ),
+        (
+            "task",
+            (
+                "task_name",
+                "task_identity",
+                "task_yaml",
+                "include_template_closure",
+                "task_metadata_version",
+                "prompt_config",
+                "few_shot_config",
+                "generation_config",
+                "metric_normalization_config",
+                "seeds",
+                "limit",
+                "ordered_request_identity",
+                "lm_eval_package_version",
+                "lm_eval_source_commit",
+                "dataset_revision",
+                "dataset_fingerprint",
+                "provider_versions",
+                "metric_payload",
+            ),
+        ),
+        ("primary source", ("logical_name", "content_identity")),
+        ("include source", ("logical_name", "content_identity")),
+        ("provider version", ("name", "version")),
+    ),
+)
+def test_reader_requires_exact_fields_for_every_persisted_record_shape(
+    tmp_path: Path, record_name: str, fields: tuple[str, ...]
+) -> None:
+    """Breaks if any persisted nested record accepts a missing or extra field."""
+    canonical = evaluation_result_bytes(identified_result())
+
+    def target(document: dict[str, object]) -> dict[str, object]:
+        task = document["tasks"][0]  # type: ignore[index]
+        if record_name == "result":
+            return document
+        if record_name == "model":
+            return document["model"]  # type: ignore[return-value]
+        if record_name == "task":
+            return task
+        if record_name == "primary source":
+            return task["task_yaml"]  # type: ignore[index, return-value]
+        if record_name == "include source":
+            return task["include_template_closure"][0]  # type: ignore[index, return-value]
+        return task["provider_versions"][0]  # type: ignore[index, return-value]
+
+    for field in fields:
+        document = json.loads(canonical)
+        record = target(document)
+        record.pop(field)
+        path = tmp_path / f"{record_name}-missing-{field}.json"
+        path.write_bytes(canonical_json_bytes(document) + b"\n")
+        with pytest.raises(SMLArtifactError):
+            read_evaluation_result(path)
+
+    document = json.loads(canonical)
+    target(document)["unexpected"] = True
+    path = tmp_path / f"{record_name}-extra.json"
+    path.write_bytes(canonical_json_bytes(document) + b"\n")
+    with pytest.raises(SMLArtifactError):
+        read_evaluation_result(path)
+
+
+@pytest.mark.parametrize(
+    "provider_result",
+    (
+        {"results": {"hellaswag": {"acc,none": 0.5}}},
+        {
+            "results": {"hellaswag": {"acc,none": 0.5}},
+            "configs": {"other": {}},
+        },
+        {
+            "results": {"hellaswag": {"acc,none": 0.5}, "other": {}},
+            "configs": {"hellaswag": {}, "other": {}},
+        },
+        {
+            "results": {"hellaswag": {"acc,none": 0.75}},
+            "configs": {"hellaswag": {}},
+        },
+    ),
+)
+def test_result_rejects_provider_task_key_or_metric_contradictions(
+    provider_result: object,
+) -> None:
+    """Breaks if a constructible result can contradict its task records."""
+    with pytest.raises((TypeError, ValueError)):
+        EvaluationResult(
+            kind="evaluation-result",
+            version=1,
+            identity="sha256:" + "0" * 64,
+            model=model_identity(),
+            tasks=(make_task_record(),),
+            provider_result=provider_result,  # type: ignore[arg-type]
+        )
+
+
+def test_reader_rejects_a_freshly_identifiable_provider_metric_contradiction(
+    tmp_path: Path,
+) -> None:
+    """Breaks if strict reading accepts a self-identifying contradictory artifact."""
+    document = json.loads(evaluation_result_bytes(identified_result()))
+    document["provider_result"]["results"]["hellaswag"]["acc,none"] = 0.75
+    projection = dict(document)
+    projection.pop("identity")
+    document["identity"] = structured_identity("sml-evaluation-result-v1", projection)
+    path = tmp_path / "contradictory.json"
+    path.write_bytes(canonical_json_bytes(document) + b"\n")
+
+    with pytest.raises(SMLArtifactError):
+        read_evaluation_result(path)
+
+
 def test_concurrent_publication_is_atomic_idempotent_and_never_overwrites(
     tmp_path: Path,
 ) -> None:
     """Breaks if publishing can expose partial bytes or replace a winner."""
     path = tmp_path / "nested" / "evaluation.json"
+    path.parent.mkdir()
     first_result = identified_result()
-    second_result = replace(first_result, provider_result={"results": {}})
-    second_result = replace(
-        second_result, identity=evaluation_result_identity(second_result)
-    )
+    second_result = identified_result(metric_payload={"acc,none": 0.75})
     start = threading.Barrier(2)
 
     def publish_simultaneously(result: EvaluationResult) -> EvaluationResult:
@@ -375,6 +536,124 @@ def test_concurrent_publication_is_atomic_idempotent_and_never_overwrites(
             path, second_result if winner == first_result else first_result
         )
     assert path.read_bytes() == persisted
+
+
+def test_identical_concurrent_publication_is_idempotent_for_every_writer(
+    tmp_path: Path,
+) -> None:
+    """Breaks if equal concurrent writers spuriously report a collision."""
+    path = tmp_path / "evaluation.json"
+    result = identified_result()
+    start = threading.Barrier(4)
+
+    def publish_simultaneously() -> None:
+        start.wait()
+        publish_evaluation_result(path, result)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = tuple(executor.submit(publish_simultaneously) for _ in range(4))
+        for future in futures:
+            future.result()
+
+    assert read_evaluation_result(path) == result
+
+
+@pytest.mark.parametrize("operation", ("stat", "fstat", "read"))
+def test_collision_validation_normalizes_destination_os_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    """Breaks if destination-race I/O errors leak a non-collision exception."""
+    path = tmp_path / "evaluation.json"
+    winner = identified_result()
+    publish_evaluation_result(path, winner)
+    loser = identified_result(metric_payload={"acc,none": 0.75})
+
+    def fail_collision_validation(*args: object, **kwargs: object) -> object:
+        raise OSError("injected destination race")
+
+    monkeypatch.setattr(
+        evaluation_result_module.os, operation, fail_collision_validation
+    )
+    with pytest.raises(SMLRuntimeError) as error:
+        publish_evaluation_result(path, loser)
+    assert str(error.value) == f"evaluation output collision: {path}"
+
+
+@pytest.mark.parametrize("already_published", (False, True))
+def test_publication_unlinks_temporary_entry_before_parent_fsync(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, already_published: bool
+) -> None:
+    """Breaks if cleanup is not durably committed with publication or reuse."""
+    path = tmp_path / "evaluation.json"
+    result = identified_result()
+    if already_published:
+        publish_evaluation_result(path, result)
+    events: list[str] = []
+    real_unlink = os.unlink
+    real_fsync = os.fsync
+
+    def record_unlink(name: str, *, dir_fd: int | None = None) -> None:
+        events.append("unlink")
+        real_unlink(name, dir_fd=dir_fd)
+
+    def record_fsync(descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(evaluation_result_module.os, "unlink", record_unlink)
+    monkeypatch.setattr(evaluation_result_module.os, "fsync", record_fsync)
+    publish_evaluation_result(path, result)
+
+    assert events.index("unlink") < len(events) - 1
+    assert events[-1] == "fsync"
+
+
+def test_publication_closes_parent_when_temporary_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Breaks if a temporary unlink error leaks the retained parent descriptor."""
+    path = tmp_path / "evaluation.json"
+    events: list[tuple[str, int]] = []
+    parent_descriptors: list[int] = []
+    real_close = os.close
+
+    def fail_unlink(name: str, *, dir_fd: int | None = None) -> None:
+        assert dir_fd is not None
+        parent_descriptors.append(dir_fd)
+        events.append(("unlink", dir_fd))
+        raise OSError("injected cleanup failure")
+
+    def record_close(descriptor: int) -> None:
+        events.append(("close", descriptor))
+        real_close(descriptor)
+
+    monkeypatch.setattr(evaluation_result_module.os, "unlink", fail_unlink)
+    monkeypatch.setattr(evaluation_result_module.os, "close", record_close)
+    with pytest.raises(OSError, match="injected cleanup failure"):
+        publish_evaluation_result(path, identified_result())
+    cleanup_index = (
+        len(events) - 1 - events[::-1].index(("unlink", parent_descriptors[-1]))
+    )
+    assert ("close", parent_descriptors[-1]) in events[cleanup_index + 1 :]
+
+
+def test_publication_recovers_when_another_writer_creates_missing_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Breaks if a missing-parent mkdir race is reported as a collision."""
+    path = tmp_path / "racing-parent" / "evaluation.json"
+    real_mkdir = os.mkdir
+
+    def create_then_report_race(
+        name: str, mode: int = 0o777, *, dir_fd: int | None = None
+    ) -> None:
+        real_mkdir(name, mode, dir_fd=dir_fd)
+        raise FileExistsError(name)
+
+    monkeypatch.setattr(evaluation_result_module.os, "mkdir", create_then_report_race)
+    result = identified_result()
+    publish_evaluation_result(path, result)
+    assert read_evaluation_result(path) == result
 
 
 def test_publication_durably_creates_each_missing_parent_link(
