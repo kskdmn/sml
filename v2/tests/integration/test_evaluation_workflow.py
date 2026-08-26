@@ -89,15 +89,17 @@ def test_evaluate_rejects_repeated_tasks_before_provider_execution(
     assert not fake_lm_eval.calls
 
 
-def test_score_loglikelihood_batch_returns_finite_boolean_scores(
+@pytest.mark.parametrize("padding", ["left", "right"])
+def test_score_loglikelihood_batch_returns_finite_boolean_scores_for_both_padding_layouts(
     tiny_session: InferenceSession,
+    padding: str,
 ) -> None:
     requests = (
         LoglikelihoodRequest(context="alpha", continuation=" beta"),
         LoglikelihoodRequest(context="alpha beta", continuation=" gamma"),
         LoglikelihoodRequest(context="alpha beta gamma", continuation=" delta"),
     )
-    results = score_loglikelihood_batch(tiny_session, requests, padding="right")
+    results = score_loglikelihood_batch(tiny_session, requests, padding=padding)
     assert len(results) == len(requests)
     for result in results:
         assert math.isfinite(result.log_likelihood)

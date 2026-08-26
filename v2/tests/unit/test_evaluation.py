@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import math
 import os
 import socket
@@ -11,7 +12,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import mlx.core as mx
 import pytest
+from sml import inference
 from sml.errors import SMLRuntimeError
 from sml.evaluation import (
     EvaluationConfig,
@@ -102,6 +105,59 @@ def assert_loglikelihood_results_close(
             abs=atol,
             rel=rtol,
         )
+
+
+def independent_scoring_oracle(
+    session: InferenceSession,
+    requests: tuple[LoglikelihoodRequest, ...],
+) -> tuple[SimpleNamespace, ...]:
+    processor = session.resolved_model.tokenizer.processor
+    results: list[SimpleNamespace] = []
+    for request in requests:
+        context_ids = tuple(int(token) for token in processor.encode(request.context))
+        token_ids = tuple(
+            int(token)
+            for token in processor.encode(request.context + request.continuation)
+        )
+        assert token_ids[: len(context_ids)] == context_ids
+        assert context_ids
+        assert len(token_ids) > len(context_ids)
+
+        input_ids = mx.array([token_ids], dtype=mx.int32)
+        attention_mask = mx.ones(input_ids.shape, dtype=mx.bool_)
+        positions = mx.arange(len(token_ids), dtype=mx.int32)[None, :]
+        logits, _cache_state, _next_key = session._model.forward_arrays(
+            session._parameters,
+            input_ids,
+            attention_mask=attention_mask,
+            positions=positions,
+            cache_state=None,
+            training=False,
+            key=None,
+        )
+        predictor_rows = logits[0, :-1, :].astype(mx.float32)
+        mx.eval(predictor_rows)
+
+        log_likelihood = 0.0
+        greedy_match = True
+        host_predictors = predictor_rows.tolist()
+        for target_position in range(len(context_ids), len(token_ids)):
+            row = host_predictors[target_position - 1]
+            maximum = max(row)
+            log_normalizer = maximum + math.log(
+                math.fsum(math.exp(value - maximum) for value in row)
+            )
+            target_id = token_ids[target_position]
+            log_likelihood += row[target_id] - log_normalizer
+            greedy_id = max(range(len(row)), key=row.__getitem__)
+            greedy_match = greedy_match and greedy_id == target_id
+        results.append(
+            SimpleNamespace(
+                log_likelihood=log_likelihood,
+                greedy_match=greedy_match,
+            )
+        )
+    return tuple(results)
 
 
 def tiny_evaluation_config(
@@ -1105,6 +1161,102 @@ def test_score_cardinality_reuses_fixed_compiled_bucket(
     assert set(compile_spy.scoring_keys) == compiled_after_three
     assert len(compiled_after_three) == 1
     assert next(iter(compiled_after_three)).batch_size_bucket == 4
+
+
+def test_target_log_probabilities_gather_before_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    predictor = mx.array(
+        [[[1.0, 2.0, 3.0], [3.0, 1.0, -1.0]]],
+        dtype=mx.float32,
+    )
+    targets = mx.array([[2, 0]], dtype=mx.int32)
+    calls: list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+    original = inference.mx.take_along_axis
+
+    def spy(array: mx.array, indices: mx.array, *, axis: int) -> mx.array:
+        result = original(array, indices, axis=axis)
+        calls.append(
+            (
+                tuple(array.shape),
+                tuple(indices.shape),
+                tuple(result.shape),
+            )
+        )
+        return result
+
+    monkeypatch.setattr(inference.mx, "take_along_axis", spy)
+    actual = inference._target_log_probabilities(predictor, targets)
+    expected = mx.array(
+        [[-0.4076059644443804, -0.1429316284998996]],
+        dtype=mx.float32,
+    )
+    mx.eval(actual, expected)
+
+    assert tuple(actual.shape) == (1, 2)
+    assert actual.dtype == mx.float32
+    assert calls == [((1, 2, 3), (1, 2, 1), (1, 2, 1))]
+    assert bool(mx.allclose(actual, expected, atol=1e-7, rtol=1e-7).item())
+    source = inspect.getsource(inference._target_log_probabilities)
+    assert "take_along_axis" in source
+    assert "predictor_logits_fp32 -" not in source
+
+
+def test_compiled_scoring_uses_token_shaped_target_log_probabilities(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]] = []
+    original = inference._target_log_probabilities
+
+    def spy(
+        predictor_logits_fp32: mx.array,
+        target_token_ids: mx.array,
+    ) -> mx.array:
+        result = original(predictor_logits_fp32, target_token_ids)
+        calls.append(
+            (
+                tuple(predictor_logits_fp32.shape),
+                tuple(target_token_ids.shape),
+                tuple(result.shape),
+            )
+        )
+        return result
+
+    monkeypatch.setattr(inference, "_target_log_probabilities", spy)
+    results = score_loglikelihood_batch(
+        tiny_session,
+        scoring_requests(3),
+        padding="right",
+    )
+
+    assert len(results) == 3
+    assert len(calls) == 1
+    predictor_shape, target_shape, result_shape = calls[0]
+    assert predictor_shape[:-1] == target_shape == result_shape
+    assert predictor_shape[-1] == tiny_session.resolved_model.model_config.vocab_size
+
+    source = inspect.getsource(InferenceSession._compiled_scoring_kernel)
+    assert "_target_log_probabilities(" in source
+    assert "log_probs" not in source
+
+
+@pytest.mark.parametrize("padding", ["left", "right"])
+def test_heterogeneous_batch_scoring_matches_independent_numeric_oracle(
+    tiny_session: InferenceSession,
+    padding: str,
+) -> None:
+    requests = heterogeneous_scoring_requests()
+    expected = independent_scoring_oracle(tiny_session, requests)
+
+    actual = score_loglikelihood_batch(tiny_session, requests, padding=padding)
+
+    assert_loglikelihood_results_close(
+        actual,
+        expected,
+        atol=1e-5,
+        rtol=1e-5,
+    )
 
 
 def test_continuation_only_scoring_is_finite(tiny_session: InferenceSession) -> None:

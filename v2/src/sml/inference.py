@@ -376,6 +376,21 @@ def _pad_scoring_row(
     return padded_ids, attention, target_mask
 
 
+def _target_log_probabilities(
+    predictor_logits_fp32: mx.array,
+    target_token_ids: mx.array,
+) -> mx.array:
+    target_logits = mx.take_along_axis(
+        predictor_logits_fp32,
+        mx.expand_dims(target_token_ids, axis=-1),
+        axis=-1,
+    )
+    target_logits = mx.squeeze(target_logits, axis=-1)
+    return (target_logits - mx.logsumexp(predictor_logits_fp32, axis=-1)).astype(
+        mx.float32
+    )
+
+
 def _require_run_path(path: Path) -> Path:
     if not isinstance(path, Path):
         raise TypeError("path must be a Path")
@@ -954,11 +969,7 @@ class InferenceSession:
             )
             predictor = logits[:, :-1, :].astype(mx.float32)
             targets = input_ids[:, 1:]
-            log_z = mx.logsumexp(predictor, axis=-1, keepdims=True)
-            log_probs = predictor - log_z
-            gathered = mx.take_along_axis(log_probs, targets[..., None], axis=-1)[
-                ..., 0
-            ]
+            gathered = _target_log_probabilities(predictor, targets)
             continuation_mask = target_mask[:, 1:]
             log_likelihood = mx.sum(
                 gathered * continuation_mask.astype(mx.float32),
