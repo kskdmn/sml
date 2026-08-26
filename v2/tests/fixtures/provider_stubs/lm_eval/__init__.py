@@ -91,17 +91,30 @@ class _Task:
             "train": _Split("train-fingerprint", _Info("1.0.0")),
             "fewshot-config": _Split("fewshot-config-fingerprint", _Info("1.0.0")),
         }
-        # 0.4.12 retains task_docs and its sampler input after construction.
-        # The accessor objects model later processing results and deliberately
-        # differ, so provenance tests reject repeat processing after evaluation.
-        self.task_docs = _Split("retained-test-fingerprint", _Info("1.0.0"))
-        self.eval_docs = _Split("reprocessed-test-fingerprint", _Info("1.0.0"))
+        # 0.4.12 initializes task_docs, then doc_iterator() later reads
+        # eval_docs again. Keep those values distinct to prove provenance binds
+        # to the processed object that provider execution actually iterates.
+        self.task_docs = _Split("initial-test-fingerprint", _Info("1.0.0"))
+        self._eval_docs = _Split("evaluated-test-fingerprint", _Info("1.0.0"))
+        self._eval_docs_sequence: tuple[_Split, ...] = ()
+        self.eval_docs_calls = 0
         self._fewshot_docs = _Split(
             "reprocessed-fewshot-config-fingerprint", _Info("1.0.0")
         )
         self.sampler = _Sampler(
             _Split("retained-fewshot-config-fingerprint", _Info("1.0.0"))
         )
+
+    @property
+    def eval_docs(self) -> _Split:
+        self.eval_docs_calls += 1
+        if self._eval_docs_sequence:
+            index = min(self.eval_docs_calls - 1, len(self._eval_docs_sequence) - 1)
+            return self._eval_docs_sequence[index]
+        return self._eval_docs
+
+    def doc_iterator(self):
+        return iter(((0, self.eval_docs),))
 
     def fewshot_docs(self) -> _Split:
         return self._fewshot_docs
@@ -225,6 +238,7 @@ def simple_evaluate(
             raise TypeError("offline lm-eval task is malformed")
         if loaded_task.config._values["num_fewshot"] != 0:
             loaded_task.config._values["num_fewshot"] = num_fewshot
+        tuple(loaded_task.doc_iterator())
     results: dict[str, object] = {}
     samples: dict[str, object] = {}
     for task, loaded_task in loaded_tasks.items():

@@ -151,11 +151,44 @@ class _RecordingTaskManager:
             raise SMLRuntimeError(
                 "lm-eval task manager returned malformed task mapping"
             )
+        for task in loaded["tasks"].values():
+            _capture_effective_eval_docs(task)
         self._loaded = loaded
         return loaded
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._inner, name)
+
+
+_EFFECTIVE_EVAL_DOCS_ATTR = "_sml_effective_eval_docs"
+_EFFECTIVE_EVAL_DOCS_UNSET = object()
+
+
+def _capture_effective_eval_docs(task: object) -> None:
+    """Cache the provider object first returned to doc_iterator()."""
+    task_type = type(task)
+    eval_docs = getattr(task_type, "eval_docs", None)
+    getter = getattr(eval_docs, "fget", None)
+    if not callable(getter):
+        raise SMLRuntimeError("lm-eval task eval_docs property is unavailable")
+
+    class _EffectiveEvalDocsTask(task_type):
+        @property
+        def eval_docs(self) -> object:
+            cached = getattr(
+                self, _EFFECTIVE_EVAL_DOCS_ATTR, _EFFECTIVE_EVAL_DOCS_UNSET
+            )
+            if cached is _EFFECTIVE_EVAL_DOCS_UNSET:
+                cached = getter(self)
+                setattr(self, _EFFECTIVE_EVAL_DOCS_ATTR, cached)
+            return cached
+
+    try:
+        task.__class__ = _EffectiveEvalDocsTask
+    except TypeError as error:
+        raise SMLRuntimeError(
+            "lm-eval task cannot retain effective evaluation docs"
+        ) from error
 
 
 class _EvaluationRequestRecorder:
@@ -343,9 +376,11 @@ def _dataset_identity(
     evaluation_split = test_split if test_split is not None else validation_split
     if not isinstance(evaluation_split, str) or not evaluation_split:
         raise SMLRuntimeError("lm-eval task has no selected evaluation split")
-    evaluation_docs = getattr(task, "task_docs", None)
-    if evaluation_docs is None:
-        raise SMLRuntimeError("lm-eval task retained evaluation docs are unavailable")
+    evaluation_docs = getattr(
+        task, _EFFECTIVE_EVAL_DOCS_ATTR, _EFFECTIVE_EVAL_DOCS_UNSET
+    )
+    if evaluation_docs is _EFFECTIVE_EVAL_DOCS_UNSET:
+        raise SMLRuntimeError("lm-eval task did not iterate effective evaluation docs")
     selected_datasets: list[tuple[str, object]] = [(evaluation_split, evaluation_docs)]
     num_fewshot = config.get("num_fewshot")
     if isinstance(num_fewshot, bool) or not isinstance(num_fewshot, int):
@@ -433,7 +468,7 @@ def _lm_eval_source_commit() -> str | None:
         ) from error
     try:
         direct_url_text = distribution.read_text("direct_url.json")
-    except OSError as error:
+    except (OSError, UnicodeDecodeError) as error:
         raise SMLRuntimeError("lm-eval direct_url metadata is malformed") from error
     if direct_url_text is None:
         return None
@@ -448,15 +483,23 @@ def _lm_eval_source_commit() -> str | None:
     url = direct_url.get("url")
     if not isinstance(url, str) or not url:
         raise SMLRuntimeError("lm-eval direct_url metadata is malformed")
-    if "vcs_info" not in direct_url:
+    provenance_branches = tuple(
+        branch
+        for branch in ("vcs_info", "archive_info", "dir_info")
+        if branch in direct_url
+    )
+    if len(provenance_branches) != 1:
+        raise SMLRuntimeError("lm-eval direct_url metadata is malformed")
+    branch = provenance_branches[0]
+    branch_value = direct_url[branch]
+    if not isinstance(branch_value, Mapping):
+        raise SMLRuntimeError("lm-eval direct_url metadata is malformed")
+    if branch != "vcs_info":
         return None
-    vcs_info = direct_url["vcs_info"]
-    if not isinstance(vcs_info, Mapping):
-        raise SMLRuntimeError("lm-eval direct_url VCS metadata is malformed")
-    vcs = vcs_info.get("vcs")
+    vcs = branch_value.get("vcs")
     if not isinstance(vcs, str) or not vcs:
         raise SMLRuntimeError("lm-eval direct_url VCS metadata is malformed")
-    commit_id = vcs_info.get("commit_id")
+    commit_id = branch_value.get("commit_id")
     if not isinstance(commit_id, str) or not commit_id:
         raise SMLRuntimeError("lm-eval direct_url source commit is malformed")
     return commit_id

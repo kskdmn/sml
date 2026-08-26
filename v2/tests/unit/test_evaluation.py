@@ -186,6 +186,7 @@ def _task_record(
     manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
+    tuple(task.doc_iterator())
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     return evaluation._resolve_task_record(
@@ -259,6 +260,7 @@ def test_task_provenance_prefers_effective_fewshot_config_split(fake_provider) -
     manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
+    tuple(task.doc_iterator())
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     record = evaluation._resolve_task_record(
@@ -276,7 +278,7 @@ def test_task_provenance_prefers_effective_fewshot_config_split(fake_provider) -
     assert record.dataset_fingerprint == structured_identity(
         "sml-evaluation-dataset-v1",
         (
-            ("test", "retained-test-fingerprint"),
+            ("test", "evaluated-test-fingerprint"),
             ("fewshot-config", "retained-fewshot-config-fingerprint"),
         ),
     )
@@ -512,7 +514,7 @@ def test_task_provenance_records_processed_eval_and_fewshot_dataset_objects(
     assert record.dataset_fingerprint == structured_identity(
         "sml-evaluation-dataset-v1",
         (
-            ("test", "retained-test-fingerprint"),
+            ("test", "evaluated-test-fingerprint"),
             ("fewshot-config", "retained-fewshot-config-fingerprint"),
         ),
     )
@@ -542,6 +544,7 @@ def test_task_provenance_preserves_explicit_provider_filter_pipeline(
     manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
+    tuple(task.doc_iterator())
     task.config._values["filter_list"] = [
         {
             "name": "exact-match",
@@ -621,6 +624,10 @@ def test_lm_eval_source_commit_uses_public_pep_610_distribution_metadata(
     )
     assert evaluation._lm_eval_source_commit() is None
     distribution._direct_url = (
+        '{"url":"file:///tmp/lm-eval","dir_info":{"editable":true}}'
+    )
+    assert evaluation._lm_eval_source_commit() is None
+    distribution._direct_url = (
         '{"url":"https://github.com/EleutherAI/lm-evaluation-harness",'
         '"vcs_info":{"vcs":"git","commit_id":"0123456789abcdef"}}'
     )
@@ -640,6 +647,11 @@ def test_lm_eval_source_commit_uses_public_pep_610_distribution_metadata(
         '{"url":"https://example.invalid","vcs_info":{"vcs":"","commit_id":"abc"}}',
         '{"url":"https://example.invalid","vcs_info":{"vcs":"git"}}',
         '{"url":"https://example.invalid","vcs_info":{"vcs":"git","commit_id":""}}',
+        '{"url":"https://example.invalid"}',
+        '{"url":"https://example.invalid","archive_info":"not-a-mapping"}',
+        '{"url":"https://example.invalid","dir_info":[]}',
+        '{"url":"https://example.invalid","archive_info":{},"dir_info":{}}',
+        '{"url":"https://example.invalid","vcs_info":{"vcs":"git","commit_id":"abc"},"archive_info":{}}',
     ),
 )
 def test_lm_eval_source_commit_fails_closed_for_malformed_pep_610_metadata(
@@ -666,59 +678,98 @@ def test_lm_eval_source_commit_fails_closed_for_malformed_pep_610_metadata(
         evaluation._lm_eval_source_commit()
 
 
-def test_dataset_provenance_avoids_reprocessing_accessors() -> None:
-    """Catches post-evaluation accessors rerunning mutable provider processing."""
+def test_lm_eval_source_commit_normalizes_undecodable_public_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches leaked UnicodeDecodeError from Distribution.read_text()."""
+    from importlib import metadata
+
+    from sml import evaluation
+
+    class PublicDistribution:
+        def read_text(self, filename: str) -> str | None:
+            assert filename == "direct_url.json"
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(metadata, "distribution", lambda name: PublicDistribution())
+
+    with pytest.raises(SMLRuntimeError, match="direct_url"):
+        evaluation._lm_eval_source_commit()
+
+
+def test_provider_iteration_captures_first_effective_eval_dataset(
+    fake_provider,
+    tiny_session: InferenceSession,
+) -> None:
+    """Catches provenance using task_docs or a post-run eval_docs recomputation."""
     from sml import evaluation
     from sml.artifacts.manifest import structured_identity
 
-    retained_eval = SimpleNamespace(
-        _fingerprint="retained-eval", info=SimpleNamespace(version="1.0.0")
-    )
-    retained_fewshot = SimpleNamespace(
-        _fingerprint="retained-fewshot", info=SimpleNamespace(version="1.0.0")
-    )
-    calls = {"eval": 0, "fewshot": 0}
-
-    class Task:
-        task_docs = retained_eval
-        sampler = SimpleNamespace(df=retained_fewshot)
-
-        @property
-        def eval_docs(self):
-            calls["eval"] += 1
-            return SimpleNamespace(
-                _fingerprint=f"mutable-eval-{calls['eval']}",
-                info=SimpleNamespace(version="1.0.0"),
+    class IteratingTaskManager(fake_provider.task_manager_type):
+        def load(self, task_list: list[str]) -> dict[str, object]:
+            loaded = super().load(task_list)
+            task = loaded["tasks"]["hellaswag"]
+            task._eval_docs_sequence = (
+                SimpleNamespace(
+                    _fingerprint="provider-first-eval",
+                    info=SimpleNamespace(version="1.0.0"),
+                ),
+                SimpleNamespace(
+                    _fingerprint="provider-recomputed-eval",
+                    info=SimpleNamespace(version="1.0.0"),
+                ),
             )
+            return loaded
 
-        def fewshot_docs(self):
-            calls["fewshot"] += 1
-            return SimpleNamespace(
-                _fingerprint=f"mutable-fewshot-{calls['fewshot']}",
-                info=SimpleNamespace(version="1.0.0"),
-            )
-
-    revision, fingerprint = evaluation._dataset_identity(
-        Task(),
-        {
-            "test_split": "test",
-            "num_fewshot": 1,
-            "fewshot_config": {"split": "train"},
-            "dataset_kwargs": {},
-        },
+    manager = evaluation._RecordingTaskManager(IteratingTaskManager())
+    recorder = evaluation._EvaluationRequestRecorder()
+    raw_result = fake_provider.simple_evaluate(
+        model=evaluation._lm_eval_model(tiny_session, "right", recorder),
+        tasks=["hellaswag"],
+        num_fewshot=0,
+        limit=1,
+        log_samples=True,
+        task_manager=manager,
+        system_instruction=None,
+        apply_chat_template=False,
+        fewshot_as_multiturn=True,
+        gen_kwargs=None,
+        bootstrap_iters=100000,
+        predict_only=False,
+        **evaluation._evaluation_seeds(),
+    )
+    task = manager.loaded["tasks"]["hellaswag"]
+    first_iteration = tuple(task.doc_iterator())
+    second_iteration = tuple(task.doc_iterator())
+    record = evaluation._resolve_task_record(
+        task_name="hellaswag",
+        task=task,
+        provider=fake_provider,
+        manager=manager,
+        recorder=recorder,
+        provider_result=raw_result,
+        limit=1,
+        padding="right",
+        seeds=evaluation._evaluation_seeds(),
+        provider_versions=evaluation._provider_versions(),
     )
 
-    assert calls == {"eval": 0, "fewshot": 0}
-    assert revision == "version:1.0.0"
-    assert fingerprint == structured_identity(
+    assert first_iteration[0][1] is second_iteration[0][1]
+    assert task.eval_docs_calls == 1
+    assert record.dataset_fingerprint == structured_identity(
         "sml-evaluation-dataset-v1",
-        (("test", "retained-eval"), ("train", "retained-fewshot")),
+        (("test", "provider-first-eval"),),
     )
 
 
 @pytest.mark.parametrize(
     ("available", "expected_split"),
     (
+        (
+            {"fewshot_config": {"split": "nested"}, "fewshot_split": "top-level"},
+            "nested",
+        ),
+        ({"fewshot_split": "top-level"}, "top-level"),
         ({"training_split": "train"}, "train"),
         ({"validation_split": "validation"}, "validation"),
         ({"test_split": "test"}, "test"),
@@ -733,8 +784,8 @@ def test_dataset_provenance_mirrors_provider_fewshot_fallback_order(
     from sml.artifacts.manifest import structured_identity
 
     task = SimpleNamespace(
-        task_docs=SimpleNamespace(
-            _fingerprint="retained-eval", info=SimpleNamespace(version="1.0.0")
+        _sml_effective_eval_docs=SimpleNamespace(
+            _fingerprint="evaluated-eval", info=SimpleNamespace(version="1.0.0")
         ),
         sampler=SimpleNamespace(
             df=SimpleNamespace(
@@ -756,7 +807,7 @@ def test_dataset_provenance_mirrors_provider_fewshot_fallback_order(
 
     assert fingerprint == structured_identity(
         "sml-evaluation-dataset-v1",
-        (("test", "retained-eval"), (expected_split, f"retained-{expected_split}")),
+        (("test", "evaluated-eval"), (expected_split, f"retained-{expected_split}")),
     )
 
 
@@ -898,8 +949,8 @@ def test_task_provenance_rejects_unsafe_include_closure(
 @pytest.mark.parametrize(
     ("dataset_object", "attribute", "value", "message"),
     [
-        ("task_docs", "_fingerprint", "", "fingerprint"),
-        ("task_docs", "info", SimpleNamespace(version=""), "version"),
+        ("eval_docs", "_fingerprint", "", "fingerprint"),
+        ("eval_docs", "info", SimpleNamespace(version=""), "version"),
         ("sampler_docs", "_fingerprint", "", "fingerprint"),
     ],
 )
@@ -915,8 +966,9 @@ def test_task_provenance_requires_selected_dataset_identities(
     manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
-    dataset = task.task_docs if dataset_object == "task_docs" else task.sampler.df
+    dataset = task._eval_docs if dataset_object == "eval_docs" else task.sampler.df
     object.__setattr__(dataset, attribute, value)
+    tuple(task.doc_iterator())
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     with pytest.raises(SMLRuntimeError, match=message):
@@ -944,7 +996,8 @@ def test_task_provenance_selects_test_when_validation_is_not_declared(
     task = loaded["tasks"]["hellaswag"]
     task.config._values["validation_split"] = None
     task.config._values["num_fewshot"] = 0
-    object.__setattr__(task.task_docs, "info", SimpleNamespace(version="3.0.0"))
+    object.__setattr__(task._eval_docs, "info", SimpleNamespace(version="3.0.0"))
+    tuple(task.doc_iterator())
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     record = evaluation._resolve_task_record(
