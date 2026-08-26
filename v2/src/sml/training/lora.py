@@ -168,6 +168,32 @@ def _lora_scale(config: LoRAConfig) -> float:
     return alpha / math.sqrt(rank)
 
 
+def _lora_policy_order(module_path: str) -> tuple[int, int]:
+    parts = module_path.split(".")
+    if len(parts) != 4 or parts[0] != "layers":
+        raise SMLConfigurationError(f"noncanonical LoRA module path: {module_path}")
+    try:
+        layer_index = int(parts[1])
+    except ValueError as error:
+        raise SMLConfigurationError(
+            f"noncanonical LoRA module path: {module_path}"
+        ) from error
+    if layer_index < 0 or str(layer_index) != parts[1]:
+        raise SMLConfigurationError(f"noncanonical LoRA module path: {module_path}")
+
+    projection = parts[3]
+    try:
+        projection_index = _ALLOWED_TARGET_MODULES.index(projection)
+    except ValueError as error:
+        raise SMLConfigurationError(
+            f"noncanonical LoRA module path: {module_path}"
+        ) from error
+    expected_parent = "self_attn" if projection_index < 4 else "mlp"
+    if parts[2] != expected_parent:
+        raise SMLConfigurationError(f"noncanonical LoRA module path: {module_path}")
+    return layer_index, projection_index
+
+
 class LoRALinear(nn.Module):
     def __init__(
         self,
@@ -261,7 +287,9 @@ def apply_lora(model, config: LoRAConfig, *, key: mx.array):
                 scale=scale,
                 dropout=config.dropout,
             )
-            for name, _module in targets
+            for name, _module in sorted(
+                targets, key=lambda target: _lora_policy_order(target[0])
+            )
         )
     )
     model.lora_forward_policy = policy

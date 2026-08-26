@@ -334,24 +334,24 @@ def test_apply_lora_wraps_only_configured_linear_targets(tiny_model, tiny_lora_c
 def test_lora_policy_is_canonical_static_and_scale_is_not_a_parameter(
     tiny_model,
 ) -> None:
-    """Catches retaining LoRA scale as an MLX parameter instead of static policy."""
+    """Catches policy order following traversal or config order instead of execution."""
     config = tiny_lora_config(
         rank=3,
         alpha=1.0,
         scaling_mode="lora",
         dropout=0.25,
-        target_modules=("q_proj", "v_proj", "down_proj"),
+        target_modules=("down_proj", "v_proj", "q_proj"),
     )
     adapted = apply_lora(tiny_model, config, key=mx.random.key(4))
     policy = adapted.lora_forward_policy
     assert isinstance(policy, LoRAForwardPolicy)
     assert tuple(spec.module_path for spec in policy.adapters) == (
-        "layers.1.mlp.down_proj",
-        "layers.1.self_attn.v_proj",
-        "layers.1.self_attn.q_proj",
-        "layers.0.mlp.down_proj",
-        "layers.0.self_attn.v_proj",
         "layers.0.self_attn.q_proj",
+        "layers.0.self_attn.v_proj",
+        "layers.0.mlp.down_proj",
+        "layers.1.self_attn.q_proj",
+        "layers.1.self_attn.v_proj",
+        "layers.1.mlp.down_proj",
     )
     assert all(spec.dropout == 0.25 for spec in policy.adapters)
     parameters = dict(tree_flatten(adapted.parameters()))
