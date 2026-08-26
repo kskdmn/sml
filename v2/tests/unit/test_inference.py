@@ -281,6 +281,91 @@ def test_session_generate_returns_tokens_and_releases_lease(
     assert tiny_session.buffer_pool.active_leases == 0
 
 
+def test_short_prompt_and_long_generation_select_independent_buckets(
+    tiny_session: InferenceSession,
+) -> None:
+    prompt = "alpha"
+    request = GenerationRequest(max_new_tokens=16)
+    prompt_ids = tiny_session._encode_prompt(prompt)
+
+    bucket = tiny_session._bucketize(((prompt, request),))[0]
+
+    assert bucket.prefill_length_bucket == tiny_session._select_length_bucket(
+        len(prompt_ids)
+    )
+    assert bucket.cache_capacity_bucket == tiny_session._select_length_bucket(
+        len(prompt_ids) + request.max_new_tokens
+    )
+    assert bucket.prefill_length_bucket < bucket.cache_capacity_bucket
+
+
+def test_generation_compile_cache_keys_both_length_domains(
+    tiny_session: InferenceSession,
+) -> None:
+    prompt = "alpha"
+    request = GenerationRequest(max_new_tokens=16)
+    bucket = tiny_session._bucketize(((prompt, request),))[0]
+
+    tiny_session.generate(prompt, request)
+
+    assert (
+        bucket.prefill_length_bucket,
+        bucket.cache_capacity_bucket,
+        bucket.batch_size_bucket,
+        bucket.kernel_key,
+    ) in tiny_session._compiled
+
+
+def test_prompt_shape_change_with_same_capacity_uses_distinct_compile_keys(
+    tiny_session: InferenceSession,
+) -> None:
+    short_prompt = "alpha"
+    long_prompt = "alpha beta gamma delta"
+    short_prompt_ids = tiny_session._encode_prompt(short_prompt)
+    long_prompt_ids = tiny_session._encode_prompt(long_prompt)
+    shared_required_length = len(long_prompt_ids) + 8
+    short_request = GenerationRequest(
+        max_new_tokens=shared_required_length - len(short_prompt_ids)
+    )
+    long_request = GenerationRequest(
+        max_new_tokens=shared_required_length - len(long_prompt_ids)
+    )
+    short_bucket = tiny_session._bucketize(((short_prompt, short_request),))[0]
+    long_bucket = tiny_session._bucketize(((long_prompt, long_request),))[0]
+    assert short_bucket.prefill_length_bucket != long_bucket.prefill_length_bucket
+    assert short_bucket.cache_capacity_bucket == long_bucket.cache_capacity_bucket
+
+    tiny_session.generate(short_prompt, short_request)
+    tiny_session.generate(long_prompt, long_request)
+
+    assert len(tiny_session._compiled) == 2
+    assert {key[0] for key in tiny_session._compiled} == {
+        short_bucket.prefill_length_bucket,
+        long_bucket.prefill_length_bucket,
+    }
+
+
+def test_capacity_change_with_same_prompt_shape_uses_distinct_compile_keys(
+    tiny_session: InferenceSession,
+) -> None:
+    prompt = "alpha"
+    small = GenerationRequest(max_new_tokens=1)
+    large = GenerationRequest(max_new_tokens=8)
+    small_bucket = tiny_session._bucketize(((prompt, small),))[0]
+    large_bucket = tiny_session._bucketize(((prompt, large),))[0]
+    assert small_bucket.prefill_length_bucket == large_bucket.prefill_length_bucket
+    assert small_bucket.cache_capacity_bucket != large_bucket.cache_capacity_bucket
+
+    tiny_session.generate(prompt, small)
+    tiny_session.generate(prompt, large)
+
+    assert len(tiny_session._compiled) == 2
+    assert {key[1] for key in tiny_session._compiled} == {
+        small_bucket.cache_capacity_bucket,
+        large_bucket.cache_capacity_bucket,
+    }
+
+
 def test_session_compile_cache_reuses_shape_and_policy_key(
     tiny_session: InferenceSession,
 ) -> None:
@@ -301,6 +386,7 @@ def test_session_compile_cache_reuses_shape_and_policy_key(
     assert len(tiny_session._compiled) == 1
     first_key = next(iter(tiny_session._compiled))
     assert first_key == (
+        tiny_session._select_length_bucket(len(prompt_ids)),
         small_bucket,
         1,
         GenerationKernelKey(
@@ -315,6 +401,7 @@ def test_session_compile_cache_reuses_shape_and_policy_key(
     tiny_session.generate(prompt, sampled)
     assert len(tiny_session._compiled) == 3
     assert (
+        tiny_session._select_length_bucket(len(prompt_ids)),
         large_bucket,
         1,
         GenerationKernelKey(
@@ -325,6 +412,7 @@ def test_session_compile_cache_reuses_shape_and_policy_key(
         ),
     ) in tiny_session._compiled
     assert (
+        tiny_session._select_length_bucket(len(prompt_ids)),
         small_bucket,
         1,
         GenerationKernelKey(
@@ -471,7 +559,8 @@ inference_module = inference
 
 @dataclass(frozen=True, slots=True)
 class _CompileSpyKey:
-    length_bucket: int
+    prefill_length_bucket: int
+    cache_capacity_bucket: int
     batch_size_bucket: int
     kernel_key: GenerationKernelKey
 
@@ -485,12 +574,13 @@ class _CompileSpy:
         compiled = self._session._compiled
         keys: set[_CompileSpyKey] = set()
         for key in compiled:
-            if isinstance(key, tuple) and len(key) == 3:
-                keys.add(_CompileSpyKey(key[0], key[1], key[2]))
+            if isinstance(key, tuple) and len(key) == 4:
+                keys.add(_CompileSpyKey(key[0], key[1], key[2], key[3]))
             else:
                 keys.add(
                     _CompileSpyKey(
-                        key.length_bucket,
+                        key.prefill_length_bucket,
+                        key.cache_capacity_bucket,
                         key.batch_size_bucket,
                         key.kernel_key,
                     )

@@ -165,7 +165,8 @@ class ScoringKernelKey:
 class _PreparedRequest:
     caller_index: int
     prompt_ids: tuple[int, ...]
-    length_bucket: int
+    prefill_length_bucket: int
+    cache_capacity_bucket: int
     kernel_key: GenerationKernelKey
     seed: int
     key: mx.array
@@ -175,7 +176,8 @@ class _PreparedRequest:
 
 @dataclass(frozen=True, slots=True)
 class GenerationBucket:
-    length_bucket: int
+    prefill_length_bucket: int
+    cache_capacity_bucket: int
     batch_size_bucket: int
     kernel_key: GenerationKernelKey
     keys: mx.array
@@ -653,7 +655,7 @@ class InferenceSession:
             try:
                 lease = self.buffer_pool.lease(
                     batch_size=bucket.batch_size_bucket,
-                    capacity=bucket.length_bucket,
+                    capacity=bucket.cache_capacity_bucket,
                     config=self._resolved.model_config,
                 )
                 bucket_results = self._decode_chunk(bucket, lease)
@@ -671,7 +673,8 @@ class InferenceSession:
         prepared: list[_PreparedRequest] = []
         for caller_index, (text, request) in enumerate(items):
             prompt_ids = self._encode_prompt(text)
-            length_bucket = self._select_length_bucket(
+            prefill_length_bucket = self._select_length_bucket(len(prompt_ids))
+            cache_capacity_bucket = self._select_length_bucket(
                 len(prompt_ids) + request.max_new_tokens
             )
             seed = request.config.seed
@@ -681,7 +684,8 @@ class InferenceSession:
                 _PreparedRequest(
                     caller_index=caller_index,
                     prompt_ids=prompt_ids,
-                    length_bucket=length_bucket,
+                    prefill_length_bucket=prefill_length_bucket,
+                    cache_capacity_bucket=cache_capacity_bucket,
                     kernel_key=GenerationKernelKey.from_config(request.config),
                     seed=seed,
                     key=mx.random.key(seed),
@@ -690,10 +694,14 @@ class InferenceSession:
                 )
             )
 
-        groups: dict[tuple[int, GenerationKernelKey], list[_PreparedRequest]] = {}
-        group_order: list[tuple[int, GenerationKernelKey]] = []
+        groups: dict[tuple[int, int, GenerationKernelKey], list[_PreparedRequest]] = {}
+        group_order: list[tuple[int, int, GenerationKernelKey]] = []
         for item in prepared:
-            group_key = (item.length_bucket, item.kernel_key)
+            group_key = (
+                item.prefill_length_bucket,
+                item.cache_capacity_bucket,
+                item.kernel_key,
+            )
             if group_key not in groups:
                 groups[group_key] = []
                 group_order.append(group_key)
@@ -708,7 +716,11 @@ class InferenceSession:
                 batch_size_bucket = self._select_batch_size_bucket(len(chunk))
                 buckets.append(
                     self._pad_bucket(
-                        chunk, group_key[0], batch_size_bucket, group_key[1]
+                        chunk,
+                        group_key[0],
+                        group_key[1],
+                        batch_size_bucket,
+                        group_key[2],
                     )
                 )
         return tuple(buckets)
@@ -722,7 +734,8 @@ class InferenceSession:
     def _pad_bucket(
         self,
         members: Sequence[_PreparedRequest],
-        length_bucket: int,
+        prefill_length_bucket: int,
+        cache_capacity_bucket: int,
         batch_size_bucket: int,
         kernel_key: GenerationKernelKey,
     ) -> GenerationBucket:
@@ -754,7 +767,8 @@ class InferenceSession:
             keys.append(mx.random.key(0))
             real_mask.append(False)
         return GenerationBucket(
-            length_bucket=length_bucket,
+            prefill_length_bucket=prefill_length_bucket,
+            cache_capacity_bucket=cache_capacity_bucket,
             batch_size_bucket=batch_size_bucket,
             kernel_key=kernel_key,
             keys=mx.stack(keys),
@@ -961,11 +975,17 @@ class InferenceSession:
 
     def _compiled_kernels(
         self,
-        length_bucket: int,
+        prefill_length_bucket: int,
+        cache_capacity_bucket: int,
         batch_size_bucket: int,
         kernel_key: GenerationKernelKey,
     ):
-        key = (length_bucket, batch_size_bucket, kernel_key)
+        key = (
+            prefill_length_bucket,
+            cache_capacity_bucket,
+            batch_size_bucket,
+            kernel_key,
+        )
         compiled = self._compiled.get(key)
         if compiled is not None:
             return compiled
@@ -1071,12 +1091,13 @@ class InferenceSession:
 
     def _decode_chunk(self, bucket: GenerationBucket, lease: _Lease):
         prefill, decode_chunk = self._compiled_kernels(
-            bucket.length_bucket,
+            bucket.prefill_length_bucket,
+            bucket.cache_capacity_bucket,
             bucket.batch_size_bucket,
             bucket.kernel_key,
         )
         pad_id = self._resolved.model_config.pad_token_id
-        capacity = bucket.length_bucket
+        capacity = bucket.cache_capacity_bucket
         batch_size = bucket.batch_size_bucket
         rows = []
         for prompt in bucket.prompt_ids:
