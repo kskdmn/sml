@@ -234,7 +234,9 @@ def _first_padded_batch(runtime: TinySwagRuntime) -> SwagBatch:
         prefetch_depth=1,
     )
     start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
-    with SwagBatchStream(runtime.bundle, loader, cursor=start) as stream:
+    with SwagBatchStream._borrowing_bundle(
+        runtime.bundle, loader, cursor=start
+    ) as stream:
         for envelope in stream:
             batch = SwagBatch.from_envelope(envelope)
             if not bool(np.array(batch.example_mask).all()):
@@ -407,7 +409,9 @@ class TinySwagRuntime:
     def core_inputs(self) -> tuple:
         loader = replace(self.config.loader, microbatch_size=2, prefetch_depth=1)
         cursor = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
-        with SwagBatchStream(self.bundle, loader, cursor=cursor) as stream:
+        with SwagBatchStream._borrowing_bundle(
+            self.bundle, loader, cursor=cursor
+        ) as stream:
             envelope = next(iter(stream))
             batch = SwagBatch.from_envelope(envelope)
         adapters = clone_tree(self.initial_adapters)
@@ -454,7 +458,9 @@ class TinySwagRuntime:
         real_examples = 0
         optimizer_steps = 0
         cursor = start
-        with SwagBatchStream(self.bundle, loader, cursor=start) as stream:
+        with SwagBatchStream._borrowing_bundle(
+            self.bundle, loader, cursor=start
+        ) as stream:
             for envelope in stream:
                 batch = SwagBatch.from_envelope(envelope)
                 real_examples += int(
@@ -516,7 +522,7 @@ class TinySwagRuntime:
 
 
 @pytest.fixture
-def tiny_swag_runtime(tmp_path: Path) -> TinySwagRuntime:
+def tiny_swag_runtime(tmp_path: Path) -> Iterator[TinySwagRuntime]:
     bundle = prepare_swag_bundle(
         tiny_swag_config(FakeSwagProvider(five_swag_rows())),
         tiny_base_model(),
@@ -539,7 +545,7 @@ def tiny_swag_runtime(tmp_path: Path) -> TinySwagRuntime:
         compile=False,
         seed=7,
     )
-    return TinySwagRuntime(
+    runtime = TinySwagRuntime(
         bundle=bundle,
         model=model,
         frozen_base=frozen_base,
@@ -547,6 +553,10 @@ def tiny_swag_runtime(tmp_path: Path) -> TinySwagRuntime:
         weight_decay_tree=build_weight_decay_tree(adapters, WeightDecayPolicy()),
         config=config,
     )
+    try:
+        yield runtime
+    finally:
+        bundle.close()
 
 
 def test_candidate_score_is_fp32_mean_including_eos():
@@ -824,7 +834,9 @@ def test_swag_producer_transfers_owned_envelope_arrays_without_recopying(
         prefetch_depth=1,
     )
     start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
-    with SwagBatchStream(tiny_swag_runtime.bundle, loader, cursor=start) as stream:
+    with SwagBatchStream._borrowing_bundle(
+        tiny_swag_runtime.bundle, loader, cursor=start
+    ) as stream:
         envelope = next(iter(stream))
     assert captured
     assembled = captured[0]
@@ -979,7 +991,9 @@ def test_synthetic_slots_have_no_loss_accuracy_gradient_progress_or_cursor_contr
         prefetch_depth=1,
     )
     start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
-    with SwagBatchStream(tiny_swag_runtime.bundle, loader, cursor=start) as stream:
+    with SwagBatchStream._borrowing_bundle(
+        tiny_swag_runtime.bundle, loader, cursor=start
+    ) as stream:
         batches = [SwagBatch.from_envelope(envelope) for envelope in stream]
     assert any(not bool(np.array(batch.example_mask).all()) for batch in batches)
     tail = next(
@@ -1031,7 +1045,9 @@ def test_full_prefetch_queue_owns_distinct_readonly_storage_and_cannot_advance_c
         prefetch_depth=3,
     )
     start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
-    with SwagBatchStream(tiny_swag_runtime.bundle, loader, cursor=start) as stream:
+    with SwagBatchStream._borrowing_bundle(
+        tiny_swag_runtime.bundle, loader, cursor=start
+    ) as stream:
         iterator = iter(stream)
         envelopes: list[SwagBatchEnvelope] = [next(iterator)]
         while len(envelopes) < loader.prefetch_depth:
@@ -1061,7 +1077,9 @@ def test_bucket_tail_compile_shape_is_fixed(tiny_swag_runtime):
     )
     shapes = []
     start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
-    with SwagBatchStream(tiny_swag_runtime.bundle, loader, cursor=start) as stream:
+    with SwagBatchStream._borrowing_bundle(
+        tiny_swag_runtime.bundle, loader, cursor=start
+    ) as stream:
         for envelope in stream:
             batch = SwagBatch.from_envelope(envelope)
             shapes.append(tuple(int(dimension) for dimension in batch.input_ids.shape))
@@ -1128,7 +1146,9 @@ def test_second_compiled_step_sees_returned_adapter_optimizer_and_key_state(
         )
         keys = [key0]
         start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
-        with SwagBatchStream(runtime.bundle, loader, cursor=start) as stream:
+        with SwagBatchStream._borrowing_bundle(
+            runtime.bundle, loader, cursor=start
+        ) as stream:
             iterator = iter(stream)
             for _step in range(2):
                 batch = SwagBatch.from_envelope(next(iterator))
@@ -1220,7 +1240,9 @@ def test_permutation_uses_loader_epoch_seed_not_training_seed():
 def test_swag_batch_stream_accepts_structural_loader(tiny_swag_runtime):
     loader = SimpleNamespace(prefetch_depth=1, microbatch_size=2, epoch_seed=42)
     start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
-    with SwagBatchStream(tiny_swag_runtime.bundle, loader, cursor=start) as stream:
+    with SwagBatchStream._borrowing_bundle(
+        tiny_swag_runtime.bundle, loader, cursor=start
+    ) as stream:
         envelope = next(iter(stream))
         assert envelope.input_ids.shape[0] == 2
 
@@ -1230,7 +1252,9 @@ def test_swag_batch_stream_rejects_loader_missing_required_attributes(
 ):
     start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
     with pytest.raises(TypeError, match="prefetch_depth"):
-        SwagBatchStream(tiny_swag_runtime.bundle, object(), cursor=start)
+        SwagBatchStream._borrowing_bundle(
+            tiny_swag_runtime.bundle, object(), cursor=start
+        )
 
 
 def test_swag_batch_stream_rejects_invalid_loader_policy_types_and_ranges(
@@ -1250,8 +1274,10 @@ def test_swag_batch_stream_rejects_invalid_loader_policy_types_and_ranges(
     for override, error, match in cases:
         loader = SimpleNamespace(**{**base, **override})
         with pytest.raises(error, match=match):
-            SwagBatchStream(tiny_swag_runtime.bundle, loader, cursor=start)
-    with SwagBatchStream(
+            SwagBatchStream._borrowing_bundle(
+                tiny_swag_runtime.bundle, loader, cursor=start
+            )
+    with SwagBatchStream._borrowing_bundle(
         tiny_swag_runtime.bundle,
         SimpleNamespace(prefetch_depth=1, microbatch_size=2, epoch_seed=0),
         cursor=start,

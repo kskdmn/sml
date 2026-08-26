@@ -27,7 +27,12 @@ from sml.data.pretraining import (
     PretrainingPreparationConfig,
     prepare_pretraining_bundle,
 )
-from sml.data.swag import SwagPreparationConfig, SwagSourceConfig, prepare_swag_bundle
+from sml.data.swag import (
+    SwagDataBundle,
+    SwagPreparationConfig,
+    SwagSourceConfig,
+    prepare_swag_bundle,
+)
 from sml.data.tokenizer import TokenizerTrainingConfig, train_tokenizer_bundle
 from sml.errors import SMLArtifactError, SMLConfigurationError
 from sml.inference import InferenceSession, resolve_model_artifact
@@ -364,9 +369,9 @@ def tiny_base_run(tmp_path: Path, _tiny_base_template: Path) -> Path:
 
 
 @pytest.fixture
-def tiny_swag_bundle(tiny_base_run: Path, tmp_path: Path):
+def tiny_swag_bundle(tiny_base_run: Path, tmp_path: Path) -> Iterator[SwagDataBundle]:
     resolved = resolve_model_artifact(tiny_base_run, full_verify=True)
-    return prepare_swag_bundle(
+    bundle = prepare_swag_bundle(
         SwagPreparationConfig(
             provider=FakeSwagProvider(_swag_rows(5)),
             source=SwagSourceConfig(revision="deadbeef" * 5),
@@ -376,6 +381,10 @@ def tiny_swag_bundle(tiny_base_run: Path, tmp_path: Path):
         resolved,
         tmp_path / "swag-bundle",
     )
+    try:
+        yield bundle
+    finally:
+        bundle.close()
 
 
 @pytest.fixture
@@ -642,6 +651,121 @@ def test_limit_satisfied_resume_returns_before_iterator_or_kernel_construction(
     )
     assert result.step == completed.step == 1
     assert result.run == completed.run
+
+
+def test_finetune_closes_swag_bundle_exactly_once_on_success(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    original_verified = swag_module._verified_swag
+    original_close = SwagDataBundle.close
+    opened: list[SwagDataBundle] = []
+    close_counts: dict[int, int] = {}
+
+    def record_verified(*args, **kwargs):
+        bundle = original_verified(*args, **kwargs)
+        opened.append(bundle)
+        return bundle
+
+    def record_close(bundle):
+        close_counts[id(bundle)] = close_counts.get(id(bundle), 0) + 1
+        original_close(bundle)
+
+    monkeypatch.setattr(swag_module, "_verified_swag", record_verified)
+    monkeypatch.setattr(SwagDataBundle, "close", record_close)
+    finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "close-success-run",
+            maximum_steps=1,
+        )
+    )
+
+    assert len(opened) == 1
+    assert opened[0]._closed
+    assert close_counts == {id(opened[0]): 1}
+
+
+@pytest.mark.parametrize("failure_stage", ("setup", "training"))
+def test_finetune_closes_swag_bundle_when_setup_or_training_fails(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch, failure_stage
+):
+    original_verified = swag_module._verified_swag
+    original_close = SwagDataBundle.close
+    opened: list[SwagDataBundle] = []
+    close_counts: dict[int, int] = {}
+
+    def record_verified(*args, **kwargs):
+        bundle = original_verified(*args, **kwargs)
+        opened.append(bundle)
+        return bundle
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError(f"{failure_stage} failed")
+
+    def record_close(bundle):
+        close_counts[id(bundle)] = close_counts.get(id(bundle), 0) + 1
+        original_close(bundle)
+
+    monkeypatch.setattr(swag_module, "_verified_swag", record_verified)
+    monkeypatch.setattr(SwagDataBundle, "close", record_close)
+    monkeypatch.setattr(
+        swag_module,
+        "publish_run" if failure_stage == "setup" else "_run_training",
+        fail,
+    )
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        finetune(
+            tiny_swag_training_config(
+                tiny_base_run,
+                tiny_swag_bundle,
+                tmp_path / f"close-{failure_stage}-run",
+                maximum_steps=1,
+            )
+        )
+
+    assert len(opened) == 1
+    assert opened[0]._closed
+    assert close_counts == {id(opened[0]): 1}
+
+
+def test_limit_satisfied_resume_closes_swag_bundle(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    completed = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "close-resume-run",
+            maximum_steps=1,
+        )
+    )
+    original_verified = swag_module._verified_swag
+    original_close = SwagDataBundle.close
+    opened: list[SwagDataBundle] = []
+    close_counts: dict[int, int] = {}
+
+    def record_verified(*args, **kwargs):
+        bundle = original_verified(*args, **kwargs)
+        opened.append(bundle)
+        return bundle
+
+    def record_close(bundle):
+        close_counts[id(bundle)] = close_counts.get(id(bundle), 0) + 1
+        original_close(bundle)
+
+    monkeypatch.setattr(swag_module, "_verified_swag", record_verified)
+    monkeypatch.setattr(SwagDataBundle, "close", record_close)
+    result = resume_finetune(
+        completed.run,
+        data=tiny_swag_bundle.path,
+        overrides=ResumeOverrides(maximum_steps=1),
+    )
+
+    assert result == completed
+    assert len(opened) == 1
+    assert opened[0]._closed
+    assert close_counts == {id(opened[0]): 1}
 
 
 def test_resume_uses_manifest_data_locator_when_data_is_omitted(

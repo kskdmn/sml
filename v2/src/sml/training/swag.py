@@ -644,13 +644,23 @@ def _verified_swag(
     base_identity: str | None,
 ) -> SwagDataBundle:
     bundle = load_swag_bundle(path, VerificationLevel.FULL)
-    if expected_identity is not None and bundle.manifest.identity != expected_identity:
-        raise SMLArtifactError("prepared SWAG identity does not match run.json")
-    if bundle.manifest.tokenizer_identity != tokenizer_identity:
-        raise SMLArtifactError("prepared SWAG tokenizer identity does not match")
-    if base_identity is not None and bundle.manifest.base_identity != base_identity:
-        raise SMLArtifactError("prepared SWAG base identity does not match")
-    return bundle
+    try:
+        if (
+            expected_identity is not None
+            and bundle.manifest.identity != expected_identity
+        ):
+            raise SMLArtifactError("prepared SWAG identity does not match run.json")
+        if bundle.manifest.tokenizer_identity != tokenizer_identity:
+            raise SMLArtifactError("prepared SWAG tokenizer identity does not match")
+        if base_identity is not None and bundle.manifest.base_identity != base_identity:
+            raise SMLArtifactError("prepared SWAG base identity does not match")
+        return bundle
+    except BaseException as error:
+        try:
+            bundle.close()
+        except BaseException as close_error:
+            raise error from close_error
+        raise
 
 
 def _resolved_fresh_config(config: SwagTrainingConfig) -> SwagTrainingConfig:
@@ -1153,7 +1163,9 @@ def _run_training(
         window_microsteps = 0
         window_examples = 0
         pending_cursor: SwagCursor | None = None
-        with SwagBatchStream(bundle, config.loader, cursor=scalar.cursor) as stream:
+        with SwagBatchStream._borrowing_bundle(
+            bundle, config.loader, cursor=scalar.cursor
+        ) as stream:
             for envelope in stream:
                 if _limit_reached(config, scalar):
                     break
@@ -1289,71 +1301,76 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
             tokenizer_identity=selected.tokenizer_identity,
             base_identity=selected.identity,
         )
-        runtime: tuple[SMLLanguageModel, _RestoredSwagState] | None = None
+        with bundle:
+            runtime: tuple[SMLLanguageModel, _RestoredSwagState] | None = None
 
-        def build(private_run: Path) -> LoRARunManifest:
-            nonlocal runtime
-            _write_tokenizer_directory(
-                private_run / "tokenizer", selected.tokenizer_files
+            def build(private_run: Path) -> LoRARunManifest:
+                nonlocal runtime
+                _write_tokenizer_directory(
+                    private_run / "tokenizer", selected.tokenizer_files
+                )
+                snapshot = _copy_base_snapshot(
+                    private_run,
+                    base_step=selected.step,
+                    working_bytes=selected.working_bytes,
+                    model=selected.model,
+                    precision=selected.precision,
+                    tokenizer_identity=selected.tokenizer_identity,
+                )
+                copied_tokenizer = read_manifest(
+                    private_run / "tokenizer",
+                    TokenizerManifest,
+                    VerificationLevel.FULL,
+                ).manifest
+                if copied_tokenizer.identity != selected.tokenizer_identity:
+                    raise SMLArtifactError(
+                        "copied tokenizer identity does not match base"
+                    )
+                (private_run / "checkpoints").mkdir()
+                manifest = _run_manifest(
+                    config,
+                    model=selected.model,
+                    tokenizer_identity=selected.tokenizer_identity,
+                    base_identity=snapshot.identity,
+                    data_identity=bundle.manifest.identity,
+                )
+                (private_run / "run.json").write_bytes(canonical_json_bytes(manifest))
+                model_key, trainer_key = mx.random.split(mx.random.key(config.seed))
+                model, adapters, frozen_base = _wrap_copied_base(
+                    selected.model_config,
+                    _load_safetensors(private_run / "base", "model.safetensors"),
+                    config.lora,
+                    model_key,
+                )
+                optimizer = initialize_adam_state(adapters)
+                trainer = initial_swag_trainer_state(adapters, key=trainer_key)
+                mx.eval(adapters, optimizer.to_tree(), trainer.to_tree(), frozen_base)
+                restored = _RestoredSwagState(
+                    adapters,
+                    frozen_base,
+                    optimizer,
+                    trainer,
+                    ScalarSwagState(0, 0, 0, SwagCursor.initial()),
+                )
+                publish_checkpoint(private_run, _checkpoint_builder(manifest, restored))
+                runtime = (model, restored)
+                return manifest
+
+            published: Published[LoRARunManifest] = publish_run(
+                config.output_run, build
             )
-            snapshot = _copy_base_snapshot(
-                private_run,
-                base_step=selected.step,
-                working_bytes=selected.working_bytes,
-                model=selected.model,
-                precision=selected.precision,
-                tokenizer_identity=selected.tokenizer_identity,
-            )
-            copied_tokenizer = read_manifest(
-                private_run / "tokenizer",
-                TokenizerManifest,
-                VerificationLevel.FULL,
-            ).manifest
-            if copied_tokenizer.identity != selected.tokenizer_identity:
-                raise SMLArtifactError("copied tokenizer identity does not match base")
-            (private_run / "checkpoints").mkdir()
-            manifest = _run_manifest(
+            if runtime is None:
+                raise SMLArtifactError("fresh run builder did not return runtime state")
+            if published.manifest.identity != published.manifest.recompute_identity():
+                raise SMLArtifactError("published run identity changed during creation")
+            return _run_training(
+                config.output_run,
+                published.manifest,
                 config,
-                model=selected.model,
-                tokenizer_identity=selected.tokenizer_identity,
-                base_identity=snapshot.identity,
-                data_identity=bundle.manifest.identity,
+                runtime[0],
+                runtime[1],
+                bundle,
             )
-            (private_run / "run.json").write_bytes(canonical_json_bytes(manifest))
-            model_key, trainer_key = mx.random.split(mx.random.key(config.seed))
-            model, adapters, frozen_base = _wrap_copied_base(
-                selected.model_config,
-                _load_safetensors(private_run / "base", "model.safetensors"),
-                config.lora,
-                model_key,
-            )
-            optimizer = initialize_adam_state(adapters)
-            trainer = initial_swag_trainer_state(adapters, key=trainer_key)
-            mx.eval(adapters, optimizer.to_tree(), trainer.to_tree(), frozen_base)
-            restored = _RestoredSwagState(
-                adapters,
-                frozen_base,
-                optimizer,
-                trainer,
-                ScalarSwagState(0, 0, 0, SwagCursor.initial()),
-            )
-            publish_checkpoint(private_run, _checkpoint_builder(manifest, restored))
-            runtime = (model, restored)
-            return manifest
-
-        published: Published[LoRARunManifest] = publish_run(config.output_run, build)
-        if runtime is None:
-            raise SMLArtifactError("fresh run builder did not return runtime state")
-        if published.manifest.identity != published.manifest.recompute_identity():
-            raise SMLArtifactError("published run identity changed during creation")
-        return _run_training(
-            config.output_run,
-            published.manifest,
-            config,
-            runtime[0],
-            runtime[1],
-            bundle,
-        )
 
 
 def resume_finetune(
@@ -1391,52 +1408,55 @@ def resume_finetune(
             tokenizer_identity=resolved.run.tokenizer_identity,
             base_identity=None,
         )
-        snapshot = read_manifest(
-            run / "base",
-            BaseSnapshotManifest,
-            VerificationLevel.FULL,
-        ).manifest
-        require_lora_base_snapshot(snapshot, resolved.run)
-        tokenizer = read_manifest(
-            run / "tokenizer",
-            TokenizerManifest,
-            VerificationLevel.FULL,
-        ).manifest
-        if tokenizer.identity != resolved.run.tokenizer_identity:
-            raise SMLArtifactError("run tokenizer identity does not match run.json")
-        retained = prune_to_latest(run)
-        if retained.checkpoint.identity != resolved.checkpoint.identity:
-            raise SMLArtifactError("latest checkpoint changed during writable recovery")
-        resolved = retained
-        scalar = _read_scalar_state(resolved)
-        if _limit_reached(config, scalar):
-            return _training_result(run, scalar)
+        with bundle:
+            snapshot = read_manifest(
+                run / "base",
+                BaseSnapshotManifest,
+                VerificationLevel.FULL,
+            ).manifest
+            require_lora_base_snapshot(snapshot, resolved.run)
+            tokenizer = read_manifest(
+                run / "tokenizer",
+                TokenizerManifest,
+                VerificationLevel.FULL,
+            ).manifest
+            if tokenizer.identity != resolved.run.tokenizer_identity:
+                raise SMLArtifactError("run tokenizer identity does not match run.json")
+            retained = prune_to_latest(run)
+            if retained.checkpoint.identity != resolved.checkpoint.identity:
+                raise SMLArtifactError(
+                    "latest checkpoint changed during writable recovery"
+                )
+            resolved = retained
+            scalar = _read_scalar_state(resolved)
+            if _limit_reached(config, scalar):
+                return _training_result(run, scalar)
 
-        adapters, optimizer, trainer, scalar = _restore_adapter_checkpoint(resolved)
-        base_arrays = _load_base_snapshot_arrays(run)
-        model_config = ModelConfig(**_mapping_dict(resolved.run.model, "model"))
-        model_key, _trainer_key = mx.random.split(mx.random.key(config.seed))
-        model, _initialized, frozen_base = _wrap_copied_base(
-            model_config,
-            base_arrays,
-            config.lora,
-            model_key,
-        )
-        restored = _RestoredSwagState(
-            adapters,
-            frozen_base,
-            optimizer,
-            trainer,
-            scalar,
-        )
-        return _run_training(
-            run,
-            resolved.run,
-            config,
-            model,
-            restored,
-            bundle,
-        )
+            adapters, optimizer, trainer, scalar = _restore_adapter_checkpoint(resolved)
+            base_arrays = _load_base_snapshot_arrays(run)
+            model_config = ModelConfig(**_mapping_dict(resolved.run.model, "model"))
+            model_key, _trainer_key = mx.random.split(mx.random.key(config.seed))
+            model, _initialized, frozen_base = _wrap_copied_base(
+                model_config,
+                base_arrays,
+                config.lora,
+                model_key,
+            )
+            restored = _RestoredSwagState(
+                adapters,
+                frozen_base,
+                optimizer,
+                trainer,
+                scalar,
+            )
+            return _run_training(
+                run,
+                resolved.run,
+                config,
+                model,
+                restored,
+                bundle,
+            )
 
 
 def _reject_direct_step_path(path: Path) -> Path:

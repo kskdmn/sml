@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import io
+import shutil
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import replace
@@ -11,6 +13,8 @@ import numpy as np
 import pytest
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
+    ArraySpec,
+    OpenedArtifact,
     PayloadRef,
     SwagDataManifest,
     TokenizerManifest,
@@ -348,20 +352,28 @@ def test_npy_identity_is_hashed_while_writing(tmp_path, monkeypatch):
         assert file_identity(payload) == reference.payload.identity
 
 
-def test_every_preprocessing_field_changes_bundle_identity(tmp_path):
+def test_every_preprocessing_field_changes_bundle_identity(tmp_path, monkeypatch):
+    from sml.data import swag
     from sml.data.swag import SWAG_IDENTITY_FIELDS, prepare_swag_bundle
 
     provider = FakeSwagProvider((VALID_ROW,))
     base = tiny_base_model()
     config = tiny_swag_config(provider)
+    monkeypatch.setattr(swag, "_validate_recorded_projections", lambda _manifest: None)
     first = prepare_swag_bundle(config, base, tmp_path / "first")
-    for field in SWAG_IDENTITY_FIELDS:
-        changed = prepare_swag_bundle(
-            change_identity_field(config, field),
-            base,
-            tmp_path / field,
-        )
-        assert changed.manifest.identity != first.manifest.identity, field
+    try:
+        for field in SWAG_IDENTITY_FIELDS:
+            changed = prepare_swag_bundle(
+                change_identity_field(config, field),
+                base,
+                tmp_path / field,
+            )
+            try:
+                assert changed.manifest.identity != first.manifest.identity, field
+            finally:
+                changed.close()
+    finally:
+        first.close()
 
 
 def test_overlength_candidate_drops_complete_row(tmp_path):
@@ -652,6 +664,589 @@ def _array_logical_path(manifest: SwagDataManifest, name: str) -> str:
     raise AssertionError(f"missing SWAG array {name}")
 
 
+def _npy_bytes(array: np.ndarray, *, version: tuple[int, int] = (1, 0)) -> bytes:
+    payload = io.BytesIO()
+    np.lib.format.write_array(payload, array, version=version, allow_pickle=False)
+    return payload.getvalue()
+
+
+def _object_npy_bytes(_array: np.ndarray) -> bytes:
+    payload = io.BytesIO()
+    np.lib.format.write_array(
+        payload,
+        np.array(["object"], dtype=object),
+        version=(1, 0),
+        allow_pickle=True,
+    )
+    return payload.getvalue()
+
+
+def _replace_array_bytes(
+    path: Path,
+    manifest: SwagDataManifest,
+    logical_path: str,
+    payload_bytes: bytes,
+) -> SwagDataManifest:
+    array_path = path / logical_path
+    array_path.write_bytes(payload_bytes)
+    with array_path.open("rb") as payload:
+        identity = file_identity(payload)
+    references = tuple(
+        replace(
+            reference,
+            payload=replace(
+                reference.payload,
+                identity=identity,
+                byte_size=len(payload_bytes),
+            ),
+        )
+        if reference.payload.logical_path == logical_path
+        else reference
+        for reference in manifest.buckets
+    )
+    updated = replace(manifest, buckets=references)
+    updated = replace(updated, identity=updated.recompute_identity())
+    (path / "manifest.json").write_bytes(canonical_json_bytes(updated))
+    return updated
+
+
+@pytest.mark.parametrize(
+    ("name", "payload_factory", "message"),
+    [
+        (
+            "unsupported-version",
+            lambda array: _npy_bytes(array, version=(3, 0)),
+            "version",
+        ),
+        (
+            "fortran-order",
+            lambda array: _npy_bytes(np.asfortranarray(array)),
+            "C order",
+        ),
+        (
+            "dtype",
+            lambda array: _npy_bytes(array.astype("<i8")),
+            "dtype",
+        ),
+        ("object-dtype", _object_npy_bytes, "dtype"),
+        (
+            "shape",
+            lambda array: _npy_bytes(array.reshape(-1)),
+            "shape",
+        ),
+        (
+            "trailing-bytes",
+            lambda array: _npy_bytes(array) + b"trailing",
+            "size",
+        ),
+        (
+            "short-bytes",
+            lambda array: _npy_bytes(array)[:-1],
+            "size",
+        ),
+        (
+            "invalid-data-offset",
+            lambda array: _npy_bytes(array)[:9] + b"\xff\xff" + _npy_bytes(array)[11:],
+            "header",
+        ),
+    ],
+)
+def test_load_swag_bundle_rejects_invalid_descriptor_bound_npy(
+    tmp_path, name, payload_factory, message
+):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    output = tmp_path / name
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider((VALID_ROW,))),
+        tiny_base_model(),
+        output,
+    )
+    manifest = prepared.manifest
+    logical_path = _array_logical_path(manifest, "input_ids")
+    original = np.array(prepared.buckets[0].input_ids)
+    prepared.close()
+    _replace_array_bytes(
+        output,
+        manifest,
+        logical_path,
+        payload_factory(original),
+    )
+
+    with pytest.raises(SMLArtifactError, match=message):
+        load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_load_swag_bundle_uses_retained_root_after_path_replacement(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider((VALID_ROW,))),
+        tiny_base_model(),
+        output,
+    )
+    expected = np.array(prepared.buckets[0].input_ids)
+    prepared.close()
+    original_open = swag.open_artifact
+
+    def replace_after_open(path, manifest_types, verification):
+        artifact = original_open(path, manifest_types, verification)
+        retained = output.with_name("retained-swag")
+        output.rename(retained)
+        shutil.copytree(retained, output)
+        logical_path = _array_logical_path(artifact.manifest, "input_ids")
+        replacement = np.zeros_like(expected)
+        _replace_array_bytes(
+            output, artifact.manifest, logical_path, _npy_bytes(replacement)
+        )
+        return artifact
+
+    monkeypatch.setattr(swag, "open_artifact", replace_after_open, raising=False)
+    loaded = load_swag_bundle(output, VerificationLevel.FULL)
+    try:
+        assert np.array_equal(loaded.buckets[0].input_ids, expected)
+    finally:
+        loaded.close()
+
+
+@pytest.mark.parametrize(
+    "array_name", ("input_ids", "valid_token_mask", "score_mask", "labels")
+)
+def test_load_swag_bundle_uses_proven_payload_after_path_replacement(
+    tmp_path, monkeypatch, array_name
+):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider((VALID_ROW,))),
+        tiny_base_model(),
+        output,
+    )
+    manifest = prepared.manifest
+    expected = np.array(getattr(prepared.buckets[0], array_name))
+    prepared.close()
+    logical_path = _array_logical_path(manifest, array_name)
+    original_open_payload = OpenedArtifact.open_payload
+
+    def replace_after_proof(artifact, reference):
+        payload = original_open_payload(artifact, reference)
+        if reference.logical_path == logical_path:
+            source = output / logical_path
+            retained = source.with_suffix(".proven.npy")
+            source.rename(retained)
+            replacement = np.zeros_like(expected)
+            source.write_bytes(_npy_bytes(replacement))
+        return payload
+
+    monkeypatch.setattr(OpenedArtifact, "open_payload", replace_after_proof)
+    loaded = load_swag_bundle(output, VerificationLevel.FULL)
+    assert np.array_equal(getattr(loaded.buckets[0], array_name), expected)
+    with pytest.raises(SMLArtifactError, match="changed during use"):
+        loaded.close()
+
+
+def test_swag_mapping_is_read_only_and_close_detects_in_place_mutation(tmp_path):
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider((VALID_ROW,))),
+        tiny_base_model(),
+        output,
+    )
+    manifest = prepared.manifest
+    prepared.close()
+    loaded = load_swag_bundle(output, VerificationLevel.FULL)
+    with pytest.raises(ValueError, match="read-only"):
+        loaded.buckets[0].input_ids[0, 0, 0] = 7
+
+    logical_path = _array_logical_path(manifest, "input_ids")
+    payload_path = output / logical_path
+    with payload_path.open("r+b") as payload:
+        payload.seek(-1, 2)
+        final_byte = payload.read(1)
+        payload.seek(-1, 2)
+        payload.write(bytes([final_byte[0] ^ 1]))
+        payload.flush()
+    with pytest.raises(SMLArtifactError, match="changed during use"):
+        loaded.close()
+    with pytest.raises(SMLDataError, match="closed"):
+        _ = loaded.buckets
+
+
+def test_swag_bundle_close_releases_views_mappings_payloads_then_root_once(
+    tmp_path, monkeypatch
+):
+    from sml.artifacts.manifest import ArtifactRoot
+    from sml.data import swag
+    from sml.data.swag import prepare_swag_bundle
+
+    events: list[str] = []
+    original_release = swag._OwnedNpyMapping._release_view
+    original_mapping_close = swag._OwnedNpyMapping._close_mapping
+    original_payload_close = swag._OwnedNpyMapping._close_payload
+    original_root_close = ArtifactRoot.close
+
+    def release(owner):
+        events.append("view")
+        original_release(owner)
+
+    def close_mapping(owner):
+        events.append("mmap")
+        original_mapping_close(owner)
+
+    def close_payload(owner):
+        events.append("payload")
+        original_payload_close(owner)
+
+    def close_root(root):
+        events.append("root")
+        original_root_close(root)
+
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_release_view", release)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_mapping", close_mapping)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_payload", close_payload)
+    monkeypatch.setattr(ArtifactRoot, "close", close_root)
+    bundle = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider((VALID_ROW,))),
+        tiny_base_model(),
+        tmp_path / "swag",
+    )
+    events.clear()
+    owner_count = len(bundle._mappings)
+    bundle.close()
+    bundle.close()
+
+    assert events == [
+        *(["view"] * owner_count),
+        *(["mmap"] * owner_count),
+        *(["payload"] * owner_count),
+        "root",
+    ]
+    with pytest.raises(SMLDataError, match="closed"):
+        _ = bundle.buckets
+
+
+def _one_example_bundle(tmp_path: Path):
+    from sml.data.swag import prepare_swag_bundle
+
+    return prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider((VALID_ROW,))),
+        tiny_base_model(),
+        tmp_path / "swag",
+    )
+
+
+def _one_example_loader() -> SimpleNamespace:
+    return SimpleNamespace(prefetch_depth=1, microbatch_size=1, epoch_seed=7)
+
+
+def test_swag_stream_closes_owned_bundle_on_exhaustion(tmp_path):
+    from sml.data.swag import SwagBatchStream, SwagCursor
+
+    bundle = _one_example_bundle(tmp_path)
+    stream = SwagBatchStream(bundle, _one_example_loader(), cursor=SwagCursor.initial())
+    envelopes = list(stream)
+    for envelope in envelopes:
+        envelope.release()
+
+    assert bundle._closed
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+def test_swag_stream_closes_owned_bundle_on_early_return_and_double_close(tmp_path):
+    from sml.data.swag import SwagBatchStream, SwagCursor
+
+    bundle = _one_example_bundle(tmp_path)
+    stream = SwagBatchStream(bundle, _one_example_loader(), cursor=SwagCursor.initial())
+    with stream:
+        envelope = next(stream)
+        envelope.release()
+    stream.close()
+
+    assert bundle._closed
+
+
+def test_swag_stream_construction_failure_closes_owned_bundle(tmp_path, monkeypatch):
+    from sml.data.swag import SwagBatchStream, SwagCursor
+
+    bundle = _one_example_bundle(tmp_path)
+
+    def fail_start(_thread):
+        raise RuntimeError("thread start failed")
+
+    monkeypatch.setattr("threading.Thread.start", fail_start)
+    with pytest.raises(RuntimeError, match="thread start failed"):
+        SwagBatchStream(bundle, _one_example_loader(), cursor=SwagCursor.initial())
+
+    assert bundle._closed
+
+
+def test_swag_stream_rejects_an_already_closed_bundle(tmp_path):
+    from sml.data.swag import SwagBatchStream, SwagCursor
+
+    bundle = _one_example_bundle(tmp_path)
+    bundle.close()
+
+    with pytest.raises(SMLDataError, match="closed"):
+        SwagBatchStream(bundle, _one_example_loader(), cursor=SwagCursor.initial())
+
+
+def test_swag_stream_public_constructor_does_not_expose_borrowed_ownership():
+    from sml.data.swag import SwagBatchStream
+
+    assert tuple(inspect.signature(SwagBatchStream).parameters) == (
+        "bundle",
+        "loader",
+        "cursor",
+    )
+
+
+def test_swag_bundle_construction_failure_closes_partial_mapping_then_root(
+    tmp_path, monkeypatch
+):
+    from sml.artifacts.manifest import ArtifactRoot
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle
+
+    prepared = _one_example_bundle(tmp_path)
+    path = prepared.path
+    prepared.close()
+    events: list[str] = []
+    opened: list[object] = []
+    original_open = swag._OwnedNpyMapping.open.__func__
+    original_close = swag._OwnedNpyMapping.close
+    original_root_close = ArtifactRoot.close
+
+    def fail_second(cls, artifact, reference):
+        if opened:
+            raise RuntimeError("second mapping failed")
+        owner = original_open(cls, artifact, reference)
+        opened.append(owner)
+        return owner
+
+    def close_mapping(owner):
+        events.append("mapping")
+        original_close(owner)
+
+    def close_root(root):
+        events.append("root")
+        original_root_close(root)
+
+    monkeypatch.setattr(swag._OwnedNpyMapping, "open", classmethod(fail_second))
+    monkeypatch.setattr(swag._OwnedNpyMapping, "close", close_mapping)
+    monkeypatch.setattr(ArtifactRoot, "close", close_root)
+    with pytest.raises(RuntimeError, match="second mapping failed"):
+        load_swag_bundle(path, VerificationLevel.FULL)
+
+    assert events == ["mapping", "root"]
+    assert opened[0]._closed
+
+
+def test_swag_bundle_final_construction_failure_closes_all_resources(
+    tmp_path, monkeypatch
+):
+    from sml.artifacts.manifest import ArtifactRoot
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle
+
+    prepared = _one_example_bundle(tmp_path)
+    path = prepared.path
+    prepared.close()
+    events: list[str] = []
+    original_release = swag._OwnedNpyMapping._release_view
+    original_mapping_close = swag._OwnedNpyMapping._close_mapping
+    original_payload_close = swag._OwnedNpyMapping._close_payload
+    original_root_close = ArtifactRoot.close
+
+    def release(owner):
+        events.append("view")
+        original_release(owner)
+
+    def close_mapping(owner):
+        events.append("mmap")
+        original_mapping_close(owner)
+
+    def close_payload(owner):
+        events.append("payload")
+        original_payload_close(owner)
+
+    def close_root(root):
+        events.append("root")
+        original_root_close(root)
+
+    def fail_bundle_construction(*_args, **_kwargs):
+        raise RuntimeError("bundle construction failed")
+
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_release_view", release)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_mapping", close_mapping)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_payload", close_payload)
+    monkeypatch.setattr(ArtifactRoot, "close", close_root)
+    monkeypatch.setattr(swag, "SwagDataBundle", fail_bundle_construction)
+
+    with pytest.raises(RuntimeError, match="bundle construction failed"):
+        load_swag_bundle(path, VerificationLevel.FULL)
+
+    assert events == [
+        *("view" for _ in range(4)),
+        *("mmap" for _ in range(4)),
+        *("payload" for _ in range(4)),
+        "root",
+    ]
+
+
+def test_swag_bundle_root_detach_failure_closes_all_resources(tmp_path, monkeypatch):
+    from sml.artifacts.manifest import ArtifactRoot, OpenedArtifact
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle
+
+    prepared = _one_example_bundle(tmp_path)
+    path = prepared.path
+    prepared.close()
+    events: list[str] = []
+    original_release = swag._OwnedNpyMapping._release_view
+    original_mapping_close = swag._OwnedNpyMapping._close_mapping
+    original_payload_close = swag._OwnedNpyMapping._close_payload
+    original_root_close = ArtifactRoot.close
+
+    def release(owner):
+        events.append("view")
+        original_release(owner)
+
+    def close_mapping(owner):
+        events.append("mmap")
+        original_mapping_close(owner)
+
+    def close_payload(owner):
+        events.append("payload")
+        original_payload_close(owner)
+
+    def close_root(root):
+        events.append("root")
+        original_root_close(root)
+
+    def fail_detach(_artifact):
+        raise RuntimeError("root detach failed")
+
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_release_view", release)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_mapping", close_mapping)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_payload", close_payload)
+    monkeypatch.setattr(ArtifactRoot, "close", close_root)
+    monkeypatch.setattr(OpenedArtifact, "detach_root", fail_detach)
+
+    with pytest.raises(RuntimeError, match="root detach failed"):
+        load_swag_bundle(path, VerificationLevel.FULL)
+
+    assert events == [
+        *("view" for _ in range(4)),
+        *("mmap" for _ in range(4)),
+        *("payload" for _ in range(4)),
+        "root",
+    ]
+
+
+def test_owned_npy_mapping_close_attempts_every_phase_and_preserves_primary(
+    monkeypatch,
+):
+    from sml.data import swag
+
+    events: list[str] = []
+
+    class FailingMapping:
+        def close(self):
+            events.append("mmap")
+            raise RuntimeError("mmap close failed")
+
+    class FailingPayload:
+        def close(self):
+            events.append("payload")
+            raise RuntimeError("payload close failed")
+
+    owner = swag._OwnedNpyMapping(
+        "array.npy",
+        FailingPayload(),
+        FailingMapping(),
+        np.zeros((1,), dtype="<i4"),
+    )
+
+    def fail_release(_owner):
+        events.append("view")
+        raise RuntimeError("view release failed")
+
+    monkeypatch.setattr(swag._OwnedNpyMapping, "_release_view", fail_release)
+    with pytest.raises(RuntimeError, match="view release failed"):
+        owner.close()
+
+    assert events == ["view", "mmap", "payload"]
+    assert owner._closed
+
+
+def test_owned_npy_mapping_open_failure_releases_view_mapping_and_payload(
+    monkeypatch,
+):
+    from sml.data import swag
+
+    payload_bytes = _npy_bytes(np.array([7], dtype="<i4"))
+    events: list[str] = []
+
+    class FakeArray:
+        dtype = np.dtype("<i4")
+
+        def setflags(self, *, write):
+            assert write is False
+
+    class FakeMapping:
+        def close(self):
+            events.append("mmap")
+            raise RuntimeError("mmap cleanup failed")
+
+    class FakeStream(io.BytesIO):
+        def fileno(self):
+            return 42
+
+    class FakePayload:
+        stream = FakeStream(payload_bytes)
+        opened_stat = SimpleNamespace(st_size=len(payload_bytes))
+
+        def close(self):
+            events.append("payload")
+            raise RuntimeError("payload cleanup failed")
+
+    class FakeArtifact:
+        def open_payload(self, _reference):
+            return FakePayload()
+
+    reference = ArrayPayloadRef(
+        payload=PayloadRef("array.npy", IDENTITY_A, len(payload_bytes)),
+        arrays=(ArraySpec(name="array", shape=(1,), dtype="int32"),),
+    )
+
+    def release_view(*_args, **_kwargs):
+        events.append("view")
+        raise RuntimeError("view cleanup failed")
+
+    def fail_construction(*_args, **_kwargs):
+        raise RuntimeError("owner construction failed")
+
+    monkeypatch.setattr(swag.mmap, "mmap", lambda *_args, **_kwargs: FakeMapping())
+    monkeypatch.setattr(swag.np, "ndarray", lambda *_args, **_kwargs: FakeArray())
+    monkeypatch.setattr(swag.np, "empty", release_view)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "__init__", fail_construction)
+
+    with pytest.raises(RuntimeError, match="owner construction failed") as caught:
+        swag._OwnedNpyMapping.open(FakeArtifact(), reference)
+
+    assert events == ["view", "mmap", "payload"]
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "view cleanup failed"
+
+
 def test_huggingface_provider_pins_main_revision_to_commit_sha(monkeypatch):
     from sml.data import swag
     from sml.data.swag import HuggingFaceDatasetsSwagProvider, SwagSourceConfig
@@ -721,11 +1316,13 @@ def test_load_swag_bundle_rejects_unsupported_policy_before_opening_arrays(
 
     provider = FakeSwagProvider((VALID_ROW,))
     output = tmp_path / "swag"
-    prepare_swag_bundle(
-        change_identity_field(tiny_swag_config(provider), "join_policy"),
-        tiny_base_model(),
-        output,
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
     )
+    preprocessing = dict(prepared.manifest.preprocessing)
+    prepared.close()
+    preprocessing["join_policy"] = "other-join-v1"
+    _rewrite_swag_manifest(output, preprocessing=preprocessing)
 
     def fail_open(*args, **kwargs):
         del args, kwargs
@@ -744,13 +1341,13 @@ def test_load_swag_bundle_rejects_unsupported_schema_before_opening_arrays(
 
     provider = FakeSwagProvider((VALID_ROW,))
     output = tmp_path / "swag"
-    prepare_swag_bundle(
-        change_identity_field(
-            tiny_swag_config(provider), "preprocessing_schema_version"
-        ),
-        tiny_base_model(),
-        output,
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(provider), tiny_base_model(), output
     )
+    preprocessing = dict(prepared.manifest.preprocessing)
+    prepared.close()
+    preprocessing["schema_version"] = 2
+    _rewrite_swag_manifest(output, preprocessing=preprocessing)
 
     def fail_open(*args, **kwargs):
         del args, kwargs
@@ -759,6 +1356,24 @@ def test_load_swag_bundle_rejects_unsupported_schema_before_opening_arrays(
     monkeypatch.setattr(swag, "_open_buckets", fail_open)
     with pytest.raises(SMLArtifactError, match="schema"):
         load_swag_bundle(output, VerificationLevel.FULL)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    (("join_policy", "join"), ("preprocessing_schema_version", "schema")),
+)
+def test_prepare_swag_bundle_validates_newly_published_projections(
+    tmp_path, field, message
+):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    with pytest.raises(SMLArtifactError, match=message):
+        prepare_swag_bundle(
+            change_identity_field(tiny_swag_config(provider), field),
+            tiny_base_model(),
+            tmp_path / field,
+        )
 
 
 def test_load_swag_bundle_rejects_bucket_policy_that_misses_maximum_length(
@@ -914,8 +1529,10 @@ def test_parse_errors_are_not_wrapped_as_provider_failures(tmp_path):
     assert "sha256:" not in message
 
 
-def test_different_maximum_examples_at_existing_path_is_a_collision(tmp_path):
-    from sml.data.swag import prepare_swag_bundle
+def test_different_maximum_examples_at_existing_path_is_a_collision(
+    tmp_path, monkeypatch
+):
+    from sml.data.swag import SwagDataBundle, prepare_swag_bundle
 
     provider = FakeSwagProvider((VALID_ROW, replace_row(label=0)))
     base = tiny_base_model()
@@ -926,12 +1543,26 @@ def test_different_maximum_examples_at_existing_path_is_a_collision(tmp_path):
         output,
     )
     assert first.manifest.preprocessing["maximum_examples"] == 2
-    with pytest.raises(SMLArtifactError, match="collision"):
-        prepare_swag_bundle(
-            tiny_swag_config(provider, maximum_examples=1),
-            base,
-            output,
-        )
+    closed: list[SwagDataBundle] = []
+    original_close = SwagDataBundle.close
+
+    def record_close(bundle):
+        closed.append(bundle)
+        original_close(bundle)
+
+    monkeypatch.setattr(SwagDataBundle, "close", record_close)
+    try:
+        with pytest.raises(SMLArtifactError, match="collision"):
+            prepare_swag_bundle(
+                tiny_swag_config(provider, maximum_examples=1),
+                base,
+                output,
+            )
+        assert len(closed) == 1
+        assert closed[0] is not first
+        assert closed[0]._closed
+    finally:
+        first.close()
 
 
 def test_none_versus_integer_maximum_examples_is_a_collision(tmp_path):

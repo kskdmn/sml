@@ -5,27 +5,28 @@ from __future__ import annotations
 import hashlib
 import json
 import mmap
-import os
 import queue
 import threading
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import BinaryIO, Self
+from typing import Self
 
 import numpy as np
 
 from sml.artifacts.checkpoint import publish_immutable_bundle
 from sml.artifacts.manifest import (
     ArtifactRoot,
+    OpenedArtifact,
     PayloadRef,
     PretrainingDataManifest,
     TokenizerManifest,
     VerificationLevel,
+    VerifiedPayload,
     canonical_json_bytes,
     file_identity,
-    read_manifest,
+    open_artifact,
     row_content_identity,
 )
 from sml.data.corpus import CorpusConfig, discover_corpus_files, iter_filtered_texts
@@ -385,34 +386,23 @@ def _parse_canonical_tokenizer_manifest(payload: bytes) -> TokenizerManifest:
         raise SMLArtifactError(f"invalid copied tokenizer manifest: {error}") from error
 
 
-def _verify_open_payload(payload: BinaryIO, reference: PayloadRef) -> None:
-    payload_stat = os.fstat(payload.fileno())
-    if payload_stat.st_size != reference.byte_size:
-        raise SMLArtifactError(f"payload byte size mismatch: {reference.logical_path}")
-    payload.seek(0)
-    if file_identity(payload) != reference.identity:
-        raise SMLArtifactError(f"payload identity mismatch: {reference.logical_path}")
-    payload.seek(0)
-
-
 def _map_npy_payload(
-    payload: BinaryIO,
+    payload: VerifiedPayload,
     reference: PayloadRef,
     *,
     declared_rows: int,
     row_width: int,
 ) -> tuple[mmap.mmap, np.ndarray]:
+    stream = payload.stream
     try:
-        version = np.lib.format.read_magic(payload)
+        version = np.lib.format.read_magic(stream)
         if version == (1, 0):
-            shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(payload)
-        elif version in {(2, 0), (3, 0)}:
-            shape, fortran_order, dtype = np.lib.format._read_array_header(
-                payload, version
-            )
+            shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(stream)
+        elif version == (2, 0):
+            shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(stream)
         else:
             raise ValueError(f"unsupported NPY version: {version}")
-        data_offset = payload.tell()
+        data_offset = stream.tell()
     except (EOFError, OSError, TypeError, ValueError) as error:
         raise SMLArtifactError(
             f"invalid prepared shard NPY header: {reference.logical_path}"
@@ -433,7 +423,7 @@ def _map_npy_payload(
             f"prepared shard dtype must be <i4: {reference.logical_path}"
         )
     expected_size = data_offset + declared_rows * row_width * _INT32.itemsize
-    actual_size = os.fstat(payload.fileno()).st_size
+    actual_size = payload.opened_stat.st_size
     if actual_size != expected_size:
         raise SMLArtifactError(
             f"prepared shard payload size mismatch: {reference.logical_path}"
@@ -441,7 +431,7 @@ def _map_npy_payload(
 
     mapping: mmap.mmap | None = None
     try:
-        mapping = mmap.mmap(payload.fileno(), length=0, access=mmap.ACCESS_READ)
+        mapping = mmap.mmap(stream.fileno(), length=0, access=mmap.ACCESS_READ)
         array = np.ndarray(
             expected_shape,
             dtype=_INT32,
@@ -492,67 +482,79 @@ def _validate_prepared_tokenizer_binding(
 
 def _close_prepared_resources(
     root: ArtifactRoot | None,
-    shard_files: list[BinaryIO],
+    shard_files: list[VerifiedPayload],
     mappings: list[mmap.mmap],
     shard_arrays: list[np.ndarray],
 ) -> None:
     shard_arrays.clear()
+    errors: list[BaseException] = []
     while mappings:
-        mappings.pop().close()
+        try:
+            mappings.pop().close()
+        except BaseException as error:  # noqa: BLE001 - cleanup must continue
+            errors.append(error)
     while shard_files:
-        shard_files.pop().close()
+        try:
+            shard_files.pop().close()
+        except BaseException as error:  # noqa: BLE001 - cleanup must continue
+            errors.append(error)
     if root is not None:
-        root.close()
+        try:
+            root.close()
+        except BaseException as error:  # noqa: BLE001 - cleanup must complete
+            errors.append(error)
+    if errors:
+        raise errors[0]
 
 
 def _open_validated_prepared_resources(
     bundle: PreparedDataBundle,
 ) -> tuple[
     ArtifactRoot,
-    list[BinaryIO],
+    list[VerifiedPayload],
     list[mmap.mmap],
     list[np.ndarray],
     PretrainingDataManifest,
 ]:
-    verified = read_manifest(
-        bundle.path,
-        PretrainingDataManifest,
-        VerificationLevel.FULL,
+    artifact: OpenedArtifact[PretrainingDataManifest] = open_artifact(
+        bundle.path, (PretrainingDataManifest,), bundle.verification
     )
-    if verified.manifest != bundle.manifest:
-        raise SMLArtifactError(
+    if artifact.manifest != bundle.manifest:
+        error = SMLArtifactError(
             "supplied prepared bundle manifest does not match the verified manifest"
         )
-    manifest = verified.manifest
-    root: ArtifactRoot | None = None
-    shard_files: list[BinaryIO] = []
+        try:
+            artifact.close()
+        except BaseException as cleanup_error:
+            raise error from cleanup_error
+        raise error
+    manifest = artifact.manifest
+    shard_files: list[VerifiedPayload] = []
     mappings: list[mmap.mmap] = []
     shard_arrays: list[np.ndarray] = []
     try:
-        root = ArtifactRoot.open(bundle.path, writable=False)
-        with root.open_payload("manifest.json") as manifest_file:
+        with artifact.root.open_payload("manifest.json") as manifest_file:
             manifest_bytes = manifest_file.read()
         if manifest_bytes != canonical_json_bytes(manifest):
             raise SMLArtifactError("prepared bundle manifest is not canonical")
 
-        with root.open_payload("tokenizer/manifest.json") as tokenizer_file:
+        with artifact.root.open_payload("tokenizer/manifest.json") as tokenizer_file:
             tokenizer_manifest = _parse_canonical_tokenizer_manifest(
                 tokenizer_file.read()
             )
         _validate_prepared_tokenizer_binding(manifest, tokenizer_manifest)
 
         for reference in (manifest.tokenizer_model, manifest.tokenizer_vocab):
-            with root.open_payload(reference.logical_path) as payload:
-                _verify_open_payload(payload, reference)
+            with artifact.open_payload(reference):
+                pass
 
         for reference, row_count in zip(
             manifest.shards,
             manifest.shard_row_counts,
             strict=True,
         ):
-            payload = root.open_payload(reference.logical_path)
+            payload = artifact.open_payload(reference)
             shard_files.append(payload)
-            _verify_open_payload(payload, reference)
             mapping, array = _map_npy_payload(
                 payload,
                 reference,
@@ -571,9 +573,20 @@ def _open_validated_prepared_resources(
                 "prepared bundle token IDs must be in "
                 f"[0, {tokenizer_manifest.vocab_size})"
             )
+        root = artifact.detach_root()
         return root, shard_files, mappings, shard_arrays, manifest
-    except BaseException:
-        _close_prepared_resources(root, shard_files, mappings, shard_arrays)
+    except BaseException as error:
+        cleanup_errors: list[BaseException] = []
+        try:
+            _close_prepared_resources(None, shard_files, mappings, shard_arrays)
+        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
+            cleanup_errors.append(cleanup_error)
+        try:
+            artifact.close()
+        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup completes
+            cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            raise error from cleanup_errors[0]
         raise
 
 
@@ -589,7 +602,7 @@ def preflight_pretraining_bundle(
     if bundle.verification is not VerificationLevel.FULL:
         raise SMLArtifactError("prepared bundle must have FULL verification")
     root = None
-    shard_files: list[BinaryIO] = []
+    shard_files: list[VerifiedPayload] = []
     mappings: list[mmap.mmap] = []
     shard_arrays: list[np.ndarray] = []
     try:
@@ -638,7 +651,7 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         self._seed = seed
         self._prefetch_depth = prefetch_depth
         self._artifact_root: ArtifactRoot | None = None
-        self._shard_files: list[BinaryIO] = []
+        self._shard_files: list[VerifiedPayload] = []
         self._mappings: list[mmap.mmap] = []
         self._shard_arrays: list[np.ndarray] = []
         self._manifest = bundle.manifest
@@ -687,8 +700,11 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
                 daemon=True,
             )
             self._producer.start()
-        except BaseException:
-            self._close_open_resources()
+        except BaseException as error:
+            try:
+                self._close_open_resources()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
             raise
 
     @property
@@ -942,19 +958,15 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
             }
 
     def _close_open_resources(self) -> None:
-        self._shard_arrays.clear()
+        shard_arrays = self._shard_arrays
+        self._shard_arrays = []
         mappings = self._mappings
         self._mappings = []
-        for mapping in mappings:
-            mapping.close()
         files = self._shard_files
         self._shard_files = []
-        for payload in files:
-            payload.close()
         root = self._artifact_root
         self._artifact_root = None
-        if root is not None:
-            root.close()
+        _close_prepared_resources(root, files, mappings, shard_arrays)
 
     def _drain_consumer_items(self) -> None:
         pending = self._pending_envelope

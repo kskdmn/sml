@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import mmap
 import queue
 import tempfile
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from math import prod
 from pathlib import Path
 from typing import Literal, Protocol, Self
 
@@ -18,11 +20,14 @@ from sml.artifacts.checkpoint import publish_immutable_bundle
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
+    ArtifactRoot,
+    OpenedArtifact,
     PayloadRef,
     SwagDataManifest,
     VerificationLevel,
+    VerifiedPayload,
     canonical_json_bytes,
-    read_manifest,
+    open_artifact,
     structured_identity,
 )
 from sml.errors import SMLArtifactError, SMLDataError
@@ -181,12 +186,243 @@ class SwagBucket:
     labels: np.ndarray
 
 
+class _OwnedNpyMapping:
+    """One read-only NPY view backed by its proven payload descriptor."""
+
+    __slots__ = ("_closed", "array", "logical_path", "mapping", "payload")
+
+    def __init__(
+        self,
+        logical_path: str,
+        payload: VerifiedPayload,
+        mapping: mmap.mmap,
+        array: np.ndarray,
+    ) -> None:
+        self.logical_path = logical_path
+        self.payload = payload
+        self.mapping = mapping
+        self.array = array
+        self._closed = False
+
+    @classmethod
+    def open(
+        cls,
+        artifact: OpenedArtifact[SwagDataManifest],
+        reference: ArrayPayloadRef,
+    ) -> _OwnedNpyMapping:
+        if len(reference.arrays) != 1:
+            raise SMLArtifactError(
+                f"SWAG NPY payload must declare one array: {reference.payload.logical_path}"
+            )
+        spec = reference.arrays[0]
+        expected_dtypes = {"int32": _INT32, "bool": _BOOL}
+        try:
+            expected_dtype = expected_dtypes[spec.dtype]
+        except KeyError as error:
+            raise SMLArtifactError(
+                f"unsupported SWAG array dtype: {reference.payload.logical_path}"
+            ) from error
+        expected_shape = tuple(spec.shape)
+
+        payload = artifact.open_payload(reference.payload)
+        mapping: mmap.mmap | None = None
+        array: np.ndarray | None = None
+        try:
+            stream = payload.stream
+            try:
+                version = np.lib.format.read_magic(stream)
+                if version == (1, 0):
+                    shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(
+                        stream
+                    )
+                elif version == (2, 0):
+                    shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(
+                        stream
+                    )
+                else:
+                    raise SMLArtifactError(f"unsupported SWAG NPY version: {version}")
+                data_offset = stream.tell()
+            except SMLArtifactError:
+                raise
+            except (EOFError, OSError, TypeError, ValueError) as error:
+                raise SMLArtifactError(
+                    f"invalid SWAG array NPY header: {reference.payload.logical_path}"
+                ) from error
+
+            parsed_dtype = np.dtype(dtype)
+            if fortran_order:
+                raise SMLArtifactError(
+                    f"SWAG array must use C order: {reference.payload.logical_path}"
+                )
+            if parsed_dtype.hasobject or parsed_dtype != expected_dtype:
+                raise SMLArtifactError(
+                    f"SWAG array dtype mismatch: {reference.payload.logical_path}"
+                )
+            if tuple(shape) != expected_shape:
+                raise SMLArtifactError(
+                    f"SWAG array shape mismatch: {reference.payload.logical_path}"
+                )
+            element_count = prod(expected_shape)
+            expected_size = data_offset + element_count * parsed_dtype.itemsize
+            if expected_size != payload.opened_stat.st_size:
+                raise SMLArtifactError(
+                    f"SWAG array payload size mismatch: {reference.payload.logical_path}"
+                )
+
+            mapping = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ)
+            array = np.ndarray(
+                expected_shape,
+                dtype=parsed_dtype,
+                buffer=mapping,
+                offset=data_offset,
+                order="C",
+            )
+            array.setflags(write=False)
+            return cls(reference.payload.logical_path, payload, mapping, array)
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
+            try:
+                if array is not None:
+                    array = np.empty((0,), dtype=array.dtype)
+                    array.setflags(write=False)
+            except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
+                cleanup_errors.append(cleanup_error)
+            try:
+                if mapping is not None:
+                    mapping.close()
+            except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
+                cleanup_errors.append(cleanup_error)
+            try:
+                payload.close()
+            except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
+                cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise error from cleanup_errors[0]
+            raise
+
+    def _release_view(self) -> None:
+        self.array = np.empty((0,), dtype=self.array.dtype)
+        self.array.setflags(write=False)
+
+    def _close_mapping(self) -> None:
+        self.mapping.close()
+
+    def _close_payload(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self.payload.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        errors: list[BaseException] = []
+        try:
+            self._release_view()
+        except BaseException as error:  # noqa: BLE001 - cleanup must continue
+            errors.append(error)
+        try:
+            self._close_mapping()
+        except BaseException as error:  # noqa: BLE001 - cleanup must continue
+            errors.append(error)
+        try:
+            self._close_payload()
+        except BaseException as error:  # noqa: BLE001 - cleanup must continue
+            errors.append(error)
+        if errors:
+            raise errors[0]
+
+    def __enter__(self) -> Self:
+        if self._closed:
+            raise SMLArtifactError("SWAG NPY mapping is closed")
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        try:
+            self.close()
+        except BaseException as close_error:
+            if isinstance(exception, BaseException):
+                raise exception from close_error
+            raise
+
+
+def _close_swag_resources(
+    mappings: Sequence[_OwnedNpyMapping],
+    root: ArtifactRoot | None,
+) -> None:
+    errors: list[BaseException] = []
+    for owner in reversed(mappings):
+        try:
+            owner._release_view()
+        except BaseException as error:  # noqa: BLE001 - cleanup continues
+            errors.append(error)
+    for owner in reversed(mappings):
+        try:
+            owner._close_mapping()
+        except BaseException as error:  # noqa: BLE001 - cleanup continues
+            errors.append(error)
+    for owner in reversed(mappings):
+        try:
+            owner._close_payload()
+        except BaseException as error:  # noqa: BLE001 - cleanup continues
+            errors.append(error)
+    if root is not None:
+        try:
+            root.close()
+        except BaseException as error:  # noqa: BLE001 - cleanup completes
+            errors.append(error)
+    if errors:
+        raise errors[0]
+
+
 @dataclass(frozen=True, slots=True)
 class SwagDataBundle:
     path: Path
     manifest: SwagDataManifest
     verification: VerificationLevel
-    buckets: tuple[SwagBucket, ...]
+    _buckets: tuple[SwagBucket, ...]
+    _root: ArtifactRoot = field(repr=False, compare=False)
+    _mappings: tuple[_OwnedNpyMapping, ...] = field(repr=False, compare=False)
+    _closed: bool = field(default=False, init=False, repr=False, compare=False)
+
+    @property
+    def buckets(self) -> tuple[SwagBucket, ...]:
+        if self._closed:
+            raise SMLDataError("SWAG data bundle is closed")
+        return self._buckets
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        object.__setattr__(self, "_closed", True)
+        mappings = self._mappings
+        root = self._root
+        object.__setattr__(self, "_buckets", ())
+        object.__setattr__(self, "_mappings", ())
+        _close_swag_resources(mappings, root)
+
+    def __enter__(self) -> Self:
+        if self._closed:
+            raise SMLDataError("SWAG data bundle is closed")
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        try:
+            self.close()
+        except BaseException as close_error:
+            if isinstance(exception, BaseException):
+                raise exception from close_error
+            raise
 
 
 class HuggingFaceDatasetsSwagProvider:
@@ -632,15 +868,6 @@ def _write_npy(path: Path, array: np.ndarray, logical_path: str) -> ArrayPayload
     )
 
 
-def _load_npy(path: Path, *, dtype: np.dtype, shape: tuple[int, ...]) -> np.ndarray:
-    array = np.load(path, mmap_mode="r", allow_pickle=False)
-    if tuple(array.shape) != shape:
-        raise SMLArtifactError(f"SWAG array shape mismatch: {path.name}")
-    if np.dtype(array.dtype) != dtype:
-        raise SMLArtifactError(f"SWAG array dtype mismatch: {path.name}")
-    return array
-
-
 def _logical_array_path(length: int, name: str) -> str:
     return f"buckets/length-{length:04d}/{name}.npy"
 
@@ -734,83 +961,122 @@ def _validate_bucket_arrays(
         )
 
 
-def _open_buckets(path: Path, manifest: SwagDataManifest) -> tuple[SwagBucket, ...]:
+def _open_buckets(
+    artifact: OpenedArtifact[SwagDataManifest],
+    manifest: SwagDataManifest,
+) -> tuple[tuple[SwagBucket, ...], tuple[_OwnedNpyMapping, ...]]:
     buckets: list[SwagBucket] = []
+    mappings: list[_OwnedNpyMapping] = []
     total_examples = 0
-    for length, arrays in _group_manifest_buckets(manifest):
-        input_ids = _load_npy(
-            path / arrays["input_ids"].payload.logical_path,
-            dtype=_INT32,
-            shape=tuple(arrays["input_ids"].arrays[0].shape),
-        )
-        valid_token_mask = _load_npy(
-            path / arrays["valid_token_mask"].payload.logical_path,
-            dtype=_BOOL,
-            shape=tuple(arrays["valid_token_mask"].arrays[0].shape),
-        )
-        score_mask = _load_npy(
-            path / arrays["score_mask"].payload.logical_path,
-            dtype=_BOOL,
-            shape=tuple(arrays["score_mask"].arrays[0].shape),
-        )
-        labels = _load_npy(
-            path / arrays["labels"].payload.logical_path,
-            dtype=_INT32,
-            shape=tuple(arrays["labels"].arrays[0].shape),
-        )
-        example_count = int(input_ids.shape[0])
-        expected = (example_count, 4, length)
-        if (
-            input_ids.shape != expected
-            or valid_token_mask.shape != expected
-            or score_mask.shape != expected
-            or labels.shape != (example_count,)
-        ):
-            raise SMLArtifactError("SWAG bucket arrays have incompatible shapes")
-        if bool(np.any(score_mask[:, :, 0])):
-            raise SMLArtifactError("SWAG score mask must be false at position zero")
-        if example_count and (int(labels.min()) < 0 or int(labels.max()) >= 4):
-            raise SMLArtifactError("SWAG labels must be in 0..3")
-        _validate_bucket_arrays(
-            input_ids=input_ids,
-            valid_token_mask=valid_token_mask,
-            score_mask=score_mask,
-            vocab_size=manifest.vocab_size,
-            pad_token_id=manifest.pad_token_id,
-            eos_token_id=manifest.eos_token_id,
-            bos_token_id=manifest.bos_token_id,
-            maximum_length=manifest.preprocessing["maximum_length"],
-            bucket_length=length,
-            bucket_boundaries=manifest.preprocessing["bucket_boundaries"],
-        )
-        buckets.append(
-            SwagBucket(
-                length=length,
+    try:
+        for length, arrays in _group_manifest_buckets(manifest):
+            owners: dict[str, _OwnedNpyMapping] = {}
+            for name in _ARRAY_NAMES:
+                owner = _OwnedNpyMapping.open(artifact, arrays[name])
+                owners[name] = owner
+                mappings.append(owner)
+            input_ids = owners["input_ids"].array
+            valid_token_mask = owners["valid_token_mask"].array
+            score_mask = owners["score_mask"].array
+            labels = owners["labels"].array
+            example_count = int(input_ids.shape[0])
+            expected = (example_count, 4, length)
+            if (
+                input_ids.shape != expected
+                or valid_token_mask.shape != expected
+                or score_mask.shape != expected
+                or labels.shape != (example_count,)
+            ):
+                raise SMLArtifactError("SWAG bucket arrays have incompatible shapes")
+            if bool(np.any(score_mask[:, :, 0])):
+                raise SMLArtifactError("SWAG score mask must be false at position zero")
+            if example_count and (int(labels.min()) < 0 or int(labels.max()) >= 4):
+                raise SMLArtifactError("SWAG labels must be in 0..3")
+            _validate_bucket_arrays(
                 input_ids=input_ids,
                 valid_token_mask=valid_token_mask,
                 score_mask=score_mask,
-                labels=labels,
+                vocab_size=manifest.vocab_size,
+                pad_token_id=manifest.pad_token_id,
+                eos_token_id=manifest.eos_token_id,
+                bos_token_id=manifest.bos_token_id,
+                maximum_length=manifest.preprocessing["maximum_length"],
+                bucket_length=length,
+                bucket_boundaries=manifest.preprocessing["bucket_boundaries"],
             )
-        )
-        total_examples += example_count
-    if total_examples != manifest.example_count:
-        raise SMLArtifactError("SWAG example_count does not match bucket rows")
-    return tuple(buckets)
+            buckets.append(
+                SwagBucket(
+                    length=length,
+                    input_ids=input_ids,
+                    valid_token_mask=valid_token_mask,
+                    score_mask=score_mask,
+                    labels=labels,
+                )
+            )
+            total_examples += example_count
+        if total_examples != manifest.example_count:
+            raise SMLArtifactError("SWAG example_count does not match bucket rows")
+        return tuple(buckets), tuple(mappings)
+    except BaseException as error:
+        buckets.clear()
+        cleanup_error: BaseException | None = None
+        while mappings:
+            try:
+                mappings.pop().close()
+            except BaseException as caught:  # noqa: BLE001 - cleanup continues
+                if cleanup_error is None:
+                    cleanup_error = caught
+        if cleanup_error is not None:
+            raise error from cleanup_error
+        raise
 
 
-def load_swag_bundle(path: Path, verification: VerificationLevel) -> SwagDataBundle:
+def _load_swag_bundle(
+    path: Path,
+    verification: VerificationLevel,
+    *,
+    validate_projections: bool,
+) -> SwagDataBundle:
     if not isinstance(path, Path):
         raise TypeError("path must be a Path")
     if not isinstance(verification, VerificationLevel):
         raise TypeError("verification must be a VerificationLevel")
-    verified = read_manifest(path, SwagDataManifest, verification)
-    _validate_recorded_projections(verified.manifest)
-    return SwagDataBundle(
-        path=path,
-        manifest=verified.manifest,
-        verification=verified.verification,
-        buckets=_open_buckets(path, verified.manifest),
-    )
+    artifact = open_artifact(path, (SwagDataManifest,), verification)
+    mappings: tuple[_OwnedNpyMapping, ...] = ()
+    detached_root: ArtifactRoot | None = None
+    try:
+        if validate_projections:
+            _validate_recorded_projections(artifact.manifest)
+        buckets, mappings = _open_buckets(artifact, artifact.manifest)
+        detached_root = artifact.detach_root()
+        bundle = SwagDataBundle(
+            path,
+            artifact.manifest,
+            artifact.verification,
+            buckets,
+            detached_root,
+            mappings,
+        )
+        mappings = ()
+        detached_root = None
+        return bundle
+    except BaseException as error:
+        cleanup_errors: list[BaseException] = []
+        try:
+            _close_swag_resources(mappings, detached_root)
+        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
+            cleanup_errors.append(cleanup_error)
+        try:
+            artifact.close()
+        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup completes
+            cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            raise error from cleanup_errors[0]
+        raise
+
+
+def load_swag_bundle(path: Path, verification: VerificationLevel) -> SwagDataBundle:
+    return _load_swag_bundle(path, verification, validate_projections=True)
 
 
 def _provider_failure_message(
@@ -1071,9 +1337,14 @@ def prepare_swag_bundle(
         if canonical_json_bytes(
             _manifest_projections(existing.manifest)
         ) != canonical_json_bytes(_requested_projections(config, base)):
-            raise SMLArtifactError(
+            error = SMLArtifactError(
                 f"existing target has a different identity collision: {output}"
             )
+            try:
+                existing.close()
+            except BaseException as close_error:
+                raise error from close_error
+            raise error
         return existing
 
     try:
@@ -1109,11 +1380,10 @@ def prepare_swag_bundle(
         return replace(manifest, identity=manifest.recompute_identity())
 
     published = publish_immutable_bundle(output, build)
-    return SwagDataBundle(
-        path=published.path,
-        manifest=published.manifest,
-        verification=published.verification,
-        buckets=_open_buckets(published.path, published.manifest),
+    return _load_swag_bundle(
+        published.path,
+        published.verification,
+        validate_projections=True,
     )
 
 
@@ -1536,12 +1806,25 @@ class SwagBatchStream:
         *,
         cursor: SwagCursor,
     ) -> None:
+        self._initialize(bundle, loader, cursor=cursor, owns_bundle=True)
+
+    def _initialize(
+        self,
+        bundle: SwagDataBundle,
+        loader: SwagLoaderPolicy,
+        *,
+        cursor: SwagCursor,
+        owns_bundle: bool,
+    ) -> None:
         if not isinstance(bundle, SwagDataBundle):
             raise TypeError("bundle must be a SwagDataBundle")
         loader = _require_swag_loader_policy(loader)
         if not isinstance(cursor, SwagCursor):
             raise TypeError("cursor must be a SwagCursor")
+        if bundle._closed:
+            raise SMLDataError("SWAG data bundle is closed")
         self._bundle = bundle
+        self._owns_bundle = owns_bundle
         self._loader = loader
         self._stop = threading.Event()
         self._queue: queue.Queue[SwagBatchEnvelope | _ProducerFailure | object] = (
@@ -1558,7 +1841,30 @@ class SwagBatchStream:
             name="sml-swag-prefetch",
             daemon=True,
         )
-        self._producer.start()
+        try:
+            self._producer.start()
+        except BaseException as error:
+            self._producer = None
+            self._stop.set()
+            self._closed = True
+            if self._owns_bundle:
+                try:
+                    self._bundle.close()
+                except BaseException as close_error:
+                    raise error from close_error
+            raise
+
+    @classmethod
+    def _borrowing_bundle(
+        cls,
+        bundle: SwagDataBundle,
+        loader: SwagLoaderPolicy,
+        *,
+        cursor: SwagCursor,
+    ) -> SwagBatchStream:
+        stream = cls.__new__(cls)
+        stream._initialize(bundle, loader, cursor=cursor, owns_bundle=False)
+        return stream
 
     @property
     def committed_cursor(self) -> SwagCursor:
@@ -1667,8 +1973,13 @@ class SwagBatchStream:
     def __next__(self) -> SwagBatchEnvelope:
         with self._consumer_lock:
             if self._epoch_complete:
+                self.close()
                 raise StopIteration
-            envelope = self._pull()
+            try:
+                envelope = self._pull()
+            except StopIteration:
+                self.close()
+                raise
             if envelope._source_epoch > self._initial_epoch:
                 envelope.release()
                 self._epoch_complete = True
@@ -1684,11 +1995,13 @@ class SwagBatchStream:
             self._committed_cursor = cursor_after
 
     def close(self) -> None:
+        if self._closed:
+            return
         self._stop.set()
         self._closed = True
         producer = self._producer
         if producer is not None and producer is not threading.current_thread():
-            producer.join(timeout=1.0)
+            producer.join()
         while True:
             try:
                 item = self._queue.get_nowait()
@@ -1696,6 +2009,8 @@ class SwagBatchStream:
                 break
             if isinstance(item, SwagBatchEnvelope):
                 item.release()
+        if self._owns_bundle:
+            self._bundle.close()
 
     def __enter__(self) -> Self:
         return self

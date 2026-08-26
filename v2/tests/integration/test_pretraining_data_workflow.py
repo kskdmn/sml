@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import queue
+import shutil
 import threading
 import time
 from dataclasses import replace
@@ -12,6 +14,7 @@ import pytest
 import sml.data.pretraining as pretraining_module
 import zstandard as zstd
 from sml.artifacts.manifest import (
+    OpenedArtifact,
     PayloadRef,
     PretrainingDataManifest,
     TokenizerManifest,
@@ -172,6 +175,17 @@ def _replace_shard_payload(
     path = bundle.path / reference.logical_path
     with path.open("wb") as payload:
         np.save(payload, array, allow_pickle=False)
+    references = list(bundle.manifest.shards)
+    references[index] = _payload_ref(path, reference.logical_path)
+    return _replace_manifest(bundle, shards=tuple(references))
+
+
+def _replace_shard_bytes(
+    bundle: PreparedDataBundle, index: int, payload_bytes: bytes
+) -> PreparedDataBundle:
+    reference = bundle.manifest.shards[index]
+    path = bundle.path / reference.logical_path
+    path.write_bytes(payload_bytes)
     references = list(bundle.manifest.shards)
     references[index] = _payload_ref(path, reference.logical_path)
     return _replace_manifest(bundle, shards=tuple(references))
@@ -1034,6 +1048,186 @@ def test_stream_maps_open_descriptors_without_numpy_path_reload(
             envelope.release()
 
 
+def test_stream_uses_retained_root_after_path_replacement(prepared_bundle, monkeypatch):
+    original_open = pretraining_module.open_artifact
+    expected = _load_rows(prepared_bundle.path)
+
+    def replace_after_open(path, manifest_types, verification):
+        artifact = original_open(path, manifest_types, verification)
+        retained = path.with_name(path.name + "-retained")
+        path.rename(retained)
+        shutil.copytree(retained, path)
+        shard = artifact.manifest.shards[0]
+        replacement = np.full(
+            (artifact.manifest.shard_row_counts[0], artifact.manifest.row_width),
+            99,
+            dtype="<i4",
+        )
+        with path.joinpath(shard.logical_path).open("wb") as payload:
+            np.save(payload, replacement, allow_pickle=False)
+        return artifact
+
+    monkeypatch.setattr(
+        pretraining_module,
+        "open_artifact",
+        replace_after_open,
+        raising=False,
+    )
+    with (
+        PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=1,
+            seed=5,
+            prefetch_depth=1,
+            cursor=PretrainingCursor.initial(),
+        ) as stream,
+        next(stream) as envelope,
+    ):
+        assert any(np.array_equal(envelope.rows[0], row) for row in expected)
+
+
+def test_stream_uses_proven_shard_after_payload_path_replacement(
+    prepared_bundle, monkeypatch
+):
+    reference = prepared_bundle.manifest.shards[0]
+    expected_rows = _load_rows(prepared_bundle.path)
+    original_shard = np.load(
+        prepared_bundle.path / reference.logical_path,
+        allow_pickle=False,
+    )
+    original_open_payload = OpenedArtifact.open_payload
+
+    def replace_after_proof(artifact, payload_reference):
+        payload = original_open_payload(artifact, payload_reference)
+        if payload_reference.logical_path == reference.logical_path:
+            source = prepared_bundle.path / reference.logical_path
+            retained = source.with_suffix(".proven.npy")
+            source.rename(retained)
+            with source.open("wb") as replacement:
+                np.save(
+                    replacement, np.full_like(original_shard, 99), allow_pickle=False
+                )
+        return payload
+
+    monkeypatch.setattr(OpenedArtifact, "open_payload", replace_after_proof)
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=1,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    try:
+        with next(stream) as envelope:
+            assert any(np.array_equal(envelope.rows[0], row) for row in expected_rows)
+            assert not bool(np.all(envelope.rows[0] == 99))
+    finally:
+        with pytest.raises(SMLArtifactError, match="changed during use"):
+            stream.close()
+
+
+def test_stream_close_detects_in_place_shard_mutation(prepared_bundle):
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=1,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    payload_path = (
+        prepared_bundle.path / prepared_bundle.manifest.shards[0].logical_path
+    )
+    with payload_path.open("r+b") as payload:
+        payload.seek(-1, 2)
+        final_byte = payload.read(1)
+        payload.seek(-1, 2)
+        payload.write(bytes([final_byte[0] ^ 1]))
+        payload.flush()
+
+    with pytest.raises(SMLArtifactError, match="changed during use"):
+        stream.close()
+    stream.close()
+
+
+def test_prepared_resource_cleanup_releases_views_mappings_payloads_then_root():
+    events: list[str] = []
+    arrays = [np.zeros((1, 1), dtype="<i4")]
+
+    class Mapping:
+        def close(self):
+            assert arrays == []
+            events.append("mmap")
+
+    class Payload:
+        def close(self):
+            assert events == ["mmap"]
+            events.append("payload")
+
+    class Root:
+        def close(self):
+            assert events == ["mmap", "payload"]
+            events.append("root")
+
+    mappings = [Mapping()]
+    payloads = [Payload()]
+    pretraining_module._close_prepared_resources(Root(), payloads, mappings, arrays)
+
+    assert events == ["mmap", "payload", "root"]
+    assert arrays == mappings == payloads == []
+
+
+def test_prepared_resource_cleanup_continues_after_mapping_failure():
+    events: list[str] = []
+    arrays = [np.zeros((1, 1), dtype="<i4")]
+
+    class Mapping:
+        def close(self):
+            events.append("mmap")
+            raise RuntimeError("mmap close failed")
+
+    class Payload:
+        def close(self):
+            events.append("payload")
+
+    class Root:
+        def close(self):
+            events.append("root")
+
+    with pytest.raises(RuntimeError, match="mmap close failed"):
+        pretraining_module._close_prepared_resources(
+            Root(), [Payload()], [Mapping()], arrays
+        )
+
+    assert events == ["mmap", "payload", "root"]
+    assert arrays == []
+
+
+def test_prepared_open_failure_preserves_semantic_error_when_cleanup_fails(
+    prepared_bundle, monkeypatch
+):
+    from sml.artifacts.manifest import ArtifactRoot
+
+    mismatched = replace(
+        prepared_bundle,
+        manifest=replace(
+            prepared_bundle.manifest,
+            diagnostic_source_locator="mismatched-source",
+        ),
+    )
+    original_close = ArtifactRoot.close
+
+    def fail_after_close(root):
+        original_close(root)
+        raise RuntimeError("root cleanup failed")
+
+    monkeypatch.setattr(ArtifactRoot, "close", fail_after_close)
+    with pytest.raises(SMLArtifactError, match="supplied prepared bundle") as caught:
+        pretraining_module._open_validated_prepared_resources(mismatched)
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "root cleanup failed"
+
+
 @pytest.mark.parametrize(
     ("argument", "value", "error"),
     [
@@ -1200,6 +1394,57 @@ def test_stream_rejects_invalid_npy_header_before_thread_start(
             cursor=PretrainingCursor.initial(),
         ),
     )
+
+
+@pytest.mark.parametrize("corruption", ["version", "trailing", "short"])
+def test_stream_rejects_unsupported_or_inexact_npy_payload_before_thread_start(
+    prepared_bundle, monkeypatch, corruption
+):
+    reference = prepared_bundle.manifest.shards[0]
+    source = np.load(prepared_bundle.path / reference.logical_path, allow_pickle=False)
+    payload = io.BytesIO()
+    np.lib.format.write_array(
+        payload,
+        source,
+        version=(3, 0) if corruption == "version" else (1, 0),
+        allow_pickle=False,
+    )
+    payload_bytes = payload.getvalue()
+    if corruption == "trailing":
+        payload_bytes += b"trailing"
+    elif corruption == "short":
+        payload_bytes = payload_bytes[:-1]
+    prepared_bundle = _replace_shard_bytes(prepared_bundle, 0, payload_bytes)
+
+    _assert_constructor_fails_before_thread_start(
+        monkeypatch,
+        SMLArtifactError,
+        "NPY|header|size|shard",
+        lambda: PretrainingBatchStream(
+            prepared_bundle,
+            batch_size=3,
+            seed=5,
+            prefetch_depth=2,
+            cursor=PretrainingCursor.initial(),
+        ),
+    )
+
+
+def test_stream_retains_nonwriteable_descriptor_mapped_shards(prepared_bundle):
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    try:
+        assert stream._shard_arrays
+        assert all(not array.flags.writeable for array in stream._shard_arrays)
+        with pytest.raises(ValueError, match="read-only"):
+            stream._shard_arrays[0][0, 0] = 7
+    finally:
+        stream.close()
 
 
 @pytest.mark.parametrize("invalid_token", [-1, 300])
