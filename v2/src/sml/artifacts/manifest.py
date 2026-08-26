@@ -455,11 +455,14 @@ class ArtifactRoot:
             os.close(descriptor)
             raise
 
-    def open_payload(self, logical_path: str) -> BinaryIO:
+    def _open_payload_with_stat(
+        self, logical_path: str
+    ) -> tuple[BinaryIO, os.stat_result]:
         components = parse_logical_path(logical_path)
 
         current_descriptor = -1
         final_descriptor = -1
+        stream: BinaryIO | None = None
         try:
             current_descriptor = self._open_directory_descriptor(
                 components[:-1],
@@ -472,7 +475,9 @@ class ArtifactRoot:
                 _PAYLOAD_OPEN_FLAGS,
                 dir_fd=current_descriptor,
             )
-            payload_stat = os.fstat(final_descriptor)
+            stream = cast(BinaryIO, os.fdopen(final_descriptor, "rb"))
+            final_descriptor = -1
+            payload_stat = os.fstat(stream.fileno())
             if not stat.S_ISREG(payload_stat.st_mode):
                 raise SMLArtifactError(f"payload is not a regular file: {logical_path}")
             if payload_stat.st_nlink != 1:
@@ -489,9 +494,9 @@ class ArtifactRoot:
                 )
             self._inode_paths[inode] = components
 
-            stream = cast(BinaryIO, os.fdopen(final_descriptor, "rb"))
-            final_descriptor = -1
-            return stream
+            result = stream
+            stream = None
+            return result, payload_stat
         except SMLArtifactError:
             raise
         except OSError as error:
@@ -499,10 +504,20 @@ class ArtifactRoot:
                 f"no-follow traversal failed for payload: {logical_path}"
             ) from error
         finally:
-            if final_descriptor >= 0:
-                os.close(final_descriptor)
-            if current_descriptor >= 0:
-                os.close(current_descriptor)
+            try:
+                if stream is not None:
+                    stream.close()
+            finally:
+                try:
+                    if final_descriptor >= 0:
+                        os.close(final_descriptor)
+                finally:
+                    if current_descriptor >= 0:
+                        os.close(current_descriptor)
+
+    def open_payload(self, logical_path: str) -> BinaryIO:
+        stream, _opened_stat = self._open_payload_with_stat(logical_path)
+        return stream
 
     def verify_payloads(self, references: Sequence[PayloadRef], *, full: bool) -> None:
         if not isinstance(full, bool):
@@ -570,31 +585,39 @@ class VerifiedPayload:
     def close(self) -> None:
         if self.closed:
             return
-        self.closed = True
         postcheck_error: BaseException | None = None
+        close_error: BaseException | None = None
         try:
-            current_stat = os.fstat(self.stream.fileno())
-            if _stable_stat_fields(current_stat) != _stable_stat_fields(
-                self.opened_stat
-            ):
+            try:
+                current_stat = os.fstat(self.stream.fileno())
+                if _stable_stat_fields(current_stat) != _stable_stat_fields(
+                    self.opened_stat
+                ):
+                    postcheck_error = SMLArtifactError(
+                        f"payload changed during use: {self.reference.logical_path}"
+                    )
+            except OSError as error:
                 postcheck_error = SMLArtifactError(
-                    f"payload changed during use: {self.reference.logical_path}"
+                    "could not perform payload stability postcheck: "
+                    f"{self.reference.logical_path}"
                 )
-        except OSError as error:
-            postcheck_error = SMLArtifactError(
-                "could not perform payload stability postcheck: "
-                f"{self.reference.logical_path}"
-            )
-            postcheck_error.__cause__ = error
+                postcheck_error.__cause__ = error
+            except BaseException as error:  # noqa: BLE001 - cleanup must still run
+                postcheck_error = error
+        finally:
+            try:
+                self.stream.close()
+            except BaseException as error:  # noqa: BLE001 - retain close failure
+                close_error = error
+            finally:
+                self.closed = True
 
-        try:
-            self.stream.close()
-        except BaseException as close_error:
-            if postcheck_error is not None:
-                raise postcheck_error from close_error
-            raise
         if postcheck_error is not None:
+            if close_error is not None:
+                raise postcheck_error from close_error
             raise postcheck_error
+        if close_error is not None:
+            raise close_error
 
     def __enter__(self) -> Self:
         if self.closed:
@@ -625,10 +648,9 @@ def _open_verified_payload(
     if not isinstance(verification, VerificationLevel):
         raise TypeError("verification must be a VerificationLevel")
 
-    stream = root.open_payload(reference.logical_path)
+    stream, opened_stat = root._open_payload_with_stat(reference.logical_path)
     payload: VerifiedPayload | None = None
     try:
-        opened_stat = os.fstat(stream.fileno())
         payload = VerifiedPayload(
             reference=reference,
             verification=verification,
@@ -1502,8 +1524,8 @@ def _read_manifest_from_root[M: _Manifest](
     filename = next(iter(filenames))
     manifest_path = path / filename
     try:
-        with root.open_payload(filename) as manifest_file:
-            opened_stat = os.fstat(manifest_file.fileno())
+        manifest_file, opened_stat = root._open_payload_with_stat(filename)
+        with manifest_file:
             encoded = manifest_file.read()
             consumed_stat = os.fstat(manifest_file.fileno())
             if _stable_stat_fields(opened_stat) != _stable_stat_fields(consumed_stat):

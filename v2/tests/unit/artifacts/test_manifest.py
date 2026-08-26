@@ -793,6 +793,83 @@ def test_opened_artifact_rejects_distinct_paths_to_one_inode(tmp_path, monkeypat
             artifact.open_payload(artifact.manifest.vocab)
 
 
+def test_payload_acquisition_rejects_hard_link_created_by_fdopen_hook(
+    tmp_path, monkeypatch
+):
+    """Using a later baseline would accept a hard link introduced after validation."""
+    _write_tokenizer_artifact(tmp_path)
+    payload_path = tmp_path / "tokenizer.model"
+    payload_inode = payload_path.stat().st_ino
+    real_fdopen = os.fdopen
+    real_fstat = os.fstat
+    payload_descriptors: list[int] = []
+
+    def linking_fdopen(descriptor, *args, **kwargs):
+        stream = real_fdopen(descriptor, *args, **kwargs)
+        if real_fstat(descriptor).st_ino == payload_inode:
+            payload_descriptors.append(descriptor)
+            os.link(payload_path, tmp_path / "late-alias.bin")
+        return stream
+
+    with manifest_module.open_artifact(
+        tmp_path, (TokenizerManifest,), VerificationLevel.FULL
+    ) as artifact:
+        monkeypatch.setattr(manifest_module.os, "fdopen", linking_fdopen)
+        payload = None
+        try:
+            payload = artifact.open_payload(artifact.manifest.model)
+        except SMLArtifactError as error:
+            assert "link count" in str(error)
+        else:
+            payload.close()
+            pytest.fail("payload acquisition accepted a late hard link")
+
+    assert len(payload_descriptors) == 1
+    with pytest.raises(OSError):
+        real_fstat(payload_descriptors[0])
+
+
+@pytest.mark.parametrize("semantic_failure", [False, True])
+def test_non_oserror_postcheck_always_closes_and_preserves_exception_precedence(
+    tmp_path, monkeypatch, semantic_failure
+):
+    """A non-OSError postcheck failure must not leak or replace a reader failure."""
+    _write_tokenizer_artifact(tmp_path)
+    real_fstat = os.fstat
+
+    with manifest_module.open_artifact(
+        tmp_path, (TokenizerManifest,), VerificationLevel.FULL
+    ) as artifact:
+        payload = artifact.open_payload(artifact.manifest.model)
+        descriptor = payload.stream.fileno()
+
+        def failing_postcheck(candidate):
+            if candidate == descriptor:
+                raise RuntimeError("injected postcheck failure")
+            return real_fstat(candidate)
+
+        monkeypatch.setattr(manifest_module.os, "fstat", failing_postcheck)
+        try:
+            if semantic_failure:
+                with (
+                    pytest.raises(ValueError, match="semantic failure") as caught,
+                    payload,
+                ):
+                    raise ValueError("semantic failure")
+                assert isinstance(caught.value.__cause__, RuntimeError)
+                assert "injected postcheck failure" in str(caught.value.__cause__)
+            else:
+                with pytest.raises(RuntimeError, match="injected postcheck failure"):
+                    payload.close()
+
+            assert payload.closed is True
+            payload.close()
+            with pytest.raises(OSError):
+                real_fstat(descriptor)
+        finally:
+            payload.stream.close()
+
+
 @pytest.mark.parametrize("mutation", ["unknown", "missing", "nested-unknown"])
 def test_strict_manifest_parser_rejects_schema_field_mutations(tmp_path, mutation):
     """Ignoring an unknown or missing field would silently reinterpret another schema."""
