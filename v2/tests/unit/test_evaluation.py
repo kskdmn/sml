@@ -1036,6 +1036,25 @@ class _DuplicateMetricMapping(Mapping[str, object]):
         return (("acc,none", 0.5), ("acc,none", 0.75))
 
 
+class _DuplicateIterationMapping(Mapping[str, object]):
+    """A hostile Mapping whose sole key iteration contains duplicates."""
+
+    def __init__(self, entries: tuple[tuple[str, object], ...]) -> None:
+        self._entries = entries
+
+    def __getitem__(self, key: str) -> object:
+        for candidate, value in self._entries:
+            if candidate == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _value in self._entries)
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+
 def test_task_provenance_rejects_ambiguous_duplicate_metric_keys(fake_provider) -> None:
     with pytest.raises(SMLRuntimeError, match="duplicate|ambiguous"):
         _task_record(
@@ -1338,6 +1357,85 @@ def test_evaluate_fails_before_publish_when_provider_result_is_incomplete(
     with pytest.raises(SMLRuntimeError, match="results"):
         evaluate(config)
 
+    assert not config.output.exists()
+
+
+def test_evaluate_rejects_duplicate_top_level_provider_keys_before_publish(
+    tiny_pretraining_run: Path,
+    fake_lm_eval,
+    tmp_path: Path,
+) -> None:
+    """Breaks if copying a provider Mapping collapses duplicate iteration keys."""
+    fake_lm_eval.result = _DuplicateIterationMapping(
+        (
+            ("results", {"hellaswag": {"acc,none": 0.5}}),
+            ("configs", {"hellaswag": {}}),
+            ("results", {"hellaswag": {"acc,none": 0.75}}),
+        )
+    )
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+
+    with pytest.raises(SMLRuntimeError, match="duplicate"):
+        evaluate(config)
+
+    assert not config.output.exists()
+
+
+def test_evaluate_rejects_duplicate_nested_config_keys_before_serialization(
+    tiny_pretraining_run: Path,
+    fake_provider,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Breaks if recursive config copying serializes before duplicate rejection."""
+    from sml import evaluation
+
+    serialization_calls: list[object] = []
+
+    class TrackingTaskManager(fake_provider.task_manager_type):
+        def load(self, task_list):
+            loaded = super().load(task_list)
+
+            def serialize_function(value: object) -> str:
+                serialization_calls.append(value)
+                return "serialized"
+
+            loaded["tasks"]["hellaswag"].config.serialize_function = serialize_function
+            return loaded
+
+    def nested_callable() -> None:
+        raise AssertionError("provider callables must only be serialized")
+
+    def simple_evaluate(**kwargs: object) -> dict[str, object]:
+        raw_result = fake_provider.simple_evaluate(**kwargs)
+        raw_result["results"] = {"hellaswag": {"acc,none": 0.5}}
+        configs = raw_result["configs"]
+        assert isinstance(configs, dict)
+        task_config = configs["hellaswag"]
+        assert isinstance(task_config, dict)
+        task_config["fewshot_config"] = _DuplicateIterationMapping(
+            (
+                ("process_docs", nested_callable),
+                ("process_docs", nested_callable),
+            )
+        )
+        return raw_result
+
+    monkeypatch.setattr(
+        evaluation,
+        "_import_lm_eval",
+        lambda: replace(
+            fake_provider,
+            simple_evaluate=simple_evaluate,
+            task_manager_type=TrackingTaskManager,
+        ),
+    )
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+
+    with pytest.raises(SMLRuntimeError, match="duplicate"):
+        evaluate(config)
+
+    assert serialization_calls == []
     assert not config.output.exists()
 
 

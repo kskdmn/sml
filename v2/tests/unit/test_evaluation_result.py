@@ -658,6 +658,71 @@ def test_collision_validation_normalizes_destination_os_errors(
     assert str(error.value) == f"evaluation output collision: {path}"
 
 
+def test_collision_reader_preserves_artifact_error_when_descriptor_close_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Breaks if collision descriptor cleanup replaces its primary artifact error."""
+    path = tmp_path / "evaluation.json"
+    path.write_bytes(b"not an evaluation result")
+    parent = os.open(tmp_path, evaluation_result_module._DIRECTORY_OPEN_FLAGS)
+    real_close = os.close
+    real_fstat = os.fstat
+    collision_closes: list[int] = []
+
+    def fail_collision_close(descriptor: int) -> None:
+        if stat.S_ISREG(real_fstat(descriptor).st_mode):
+            collision_closes.append(descriptor)
+            real_close(descriptor)
+            raise OSError("injected collision descriptor close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(evaluation_result_module.os, "close", fail_collision_close)
+    try:
+        with pytest.raises(
+            SMLArtifactError, match="invalid evaluation result"
+        ) as error:
+            evaluation_result_module._read_existing_result(parent, path.name)
+    finally:
+        real_close(parent)
+
+    evidence = [
+        repr(error.value.__cause__),
+        repr(error.value.__context__),
+        *getattr(error.value, "__notes__", ()),
+    ]
+    assert any(
+        "injected collision descriptor close failure" in item for item in evidence
+    )
+    assert len(collision_closes) == 1
+
+
+def test_collision_descriptor_close_only_error_normalizes_public_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Breaks if a sole collision descriptor close failure escapes as raw OSError."""
+    path = tmp_path / "evaluation.json"
+    publish_evaluation_result(path, identified_result())
+    real_close = os.close
+    real_fstat = os.fstat
+    collision_closes: list[int] = []
+
+    def fail_collision_close(descriptor: int) -> None:
+        if stat.S_ISREG(real_fstat(descriptor).st_mode):
+            collision_closes.append(descriptor)
+            real_close(descriptor)
+            raise OSError("injected collision descriptor close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(evaluation_result_module.os, "close", fail_collision_close)
+    with pytest.raises(SMLRuntimeError) as error:
+        publish_evaluation_result(
+            path, identified_result(metric_payload={"acc,none": 0.75})
+        )
+
+    assert str(error.value) == f"evaluation output collision: {path}"
+    assert len(collision_closes) == 1
+
+
 @pytest.mark.parametrize("already_published", (False, True))
 def test_publication_unlinks_temporary_entry_before_parent_fsync(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, already_published: bool
@@ -796,19 +861,38 @@ def test_collision_preserves_primary_error_and_notes_cleanup_failure(
 def test_publication_recovers_when_another_writer_creates_missing_parent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Breaks if a missing-parent mkdir race is reported as a collision."""
+    """Breaks if a raced mkdir descends before fsyncing its exact predecessor."""
     path = tmp_path / "racing-parent" / "evaluation.json"
     real_mkdir = os.mkdir
+    real_fsync = os.fsync
+    predecessor = (tmp_path.stat().st_dev, tmp_path.stat().st_ino)
+    events: list[tuple[str, int, int]] = []
 
     def create_then_report_race(
         name: str, mode: int = 0o777, *, dir_fd: int | None = None
     ) -> None:
+        assert dir_fd is not None
+        metadata = os.fstat(dir_fd)
+        events.append(("mkdir-race", metadata.st_dev, metadata.st_ino))
         real_mkdir(name, mode, dir_fd=dir_fd)
         raise FileExistsError(name)
 
+    def record_fsync(descriptor: int) -> None:
+        metadata = os.fstat(descriptor)
+        events.append(("fsync", metadata.st_dev, metadata.st_ino))
+        real_fsync(descriptor)
+
     monkeypatch.setattr(evaluation_result_module.os, "mkdir", create_then_report_race)
+    monkeypatch.setattr(evaluation_result_module.os, "fsync", record_fsync)
     result = identified_result()
     publish_evaluation_result(path, result)
+
+    race = ("mkdir-race", *predecessor)
+    race_index = events.index(race)
+    assert events[race_index : race_index + 2] == [
+        race,
+        ("fsync", *predecessor),
+    ]
     assert read_evaluation_result(path) == result
 
 

@@ -346,6 +346,22 @@ def _metadata_version(config: Mapping[str, object]) -> str:
     return text
 
 
+def _snapshot_provider_mapping(
+    value: object,
+    *,
+    context: str,
+) -> tuple[tuple[str, object], ...]:
+    if not isinstance(value, Mapping):
+        raise SMLRuntimeError(f"{context} is not a mapping")
+    items = tuple(value.items())
+    keys = tuple(key for key, _item in items)
+    if any(not isinstance(key, str) for key in keys):
+        raise SMLRuntimeError(f"{context} key is malformed")
+    if len(keys) != len(set(keys)):
+        raise SMLRuntimeError(f"{context} contains duplicate keys")
+    return items
+
+
 def _serialize_provider_value(config: object, value: object) -> object:
     if callable(value):
         serializer = getattr(config, "serialize_function", None)
@@ -356,12 +372,8 @@ def _serialize_provider_value(config: object, value: object) -> object:
             raise SMLRuntimeError("lm-eval task callable serialization is malformed")
         return _serialize_provider_value(config, serialized)
     if isinstance(value, Mapping):
-        serialized_mapping: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise SMLRuntimeError("lm-eval task config key is malformed")
-            serialized_mapping[key] = _serialize_provider_value(config, item)
-        return serialized_mapping
+        items = _snapshot_provider_mapping(value, context="lm-eval task config")
+        return {key: _serialize_provider_value(config, item) for key, item in items}
     if isinstance(value, (list, tuple)):
         return tuple(_serialize_provider_value(config, item) for item in value)
     return value
@@ -793,28 +805,26 @@ def _exact_task_mapping(
     *,
     context: str,
 ) -> Mapping[str, object]:
-    if not isinstance(value, Mapping):
-        raise SMLRuntimeError(f"lm-eval provider {context} is not a mapping")
-    task_names = tuple(value)
-    if (
-        any(not isinstance(task_name, str) or not task_name for task_name in task_names)
-        or len(task_names) != len(set(task_names))
-        or set(task_names) != set(requested_tasks)
+    items = _snapshot_provider_mapping(value, context=f"lm-eval provider {context}")
+    task_names = tuple(task_name for task_name, _item in items)
+    if any(not task_name for task_name in task_names) or set(task_names) != set(
+        requested_tasks
     ):
         raise SMLRuntimeError(
             f"lm-eval provider {context} must contain exactly the requested task keys"
         )
-    return value
+    return dict(items)
 
 
 def _validate_provider_result(
     raw_result: object,
     requested_tasks: tuple[str, ...],
 ) -> Mapping[str, object]:
-    if not isinstance(raw_result, Mapping):
-        raise SMLRuntimeError("lm-eval provider result is not a mapping")
+    provider_result = dict(
+        _snapshot_provider_mapping(raw_result, context="lm-eval provider result")
+    )
     results = _exact_task_mapping(
-        raw_result.get("results"), requested_tasks, context="results"
+        provider_result.get("results"), requested_tasks, context="results"
     )
     for task_name in requested_tasks:
         metrics = results.get(task_name)
@@ -822,7 +832,8 @@ def _validate_provider_result(
             raise SMLRuntimeError(
                 f"lm-eval metric result is malformed for task: {task_name}"
             )
-    return raw_result
+    provider_result["results"] = results
+    return provider_result
 
 
 def _serialize_provider_configs(
@@ -830,10 +841,12 @@ def _serialize_provider_configs(
     requested_tasks: tuple[str, ...],
     loaded_tasks: tuple[object, ...],
 ) -> Mapping[str, object]:
-    configs = _exact_task_mapping(
-        raw_result.get("configs"), requested_tasks, context="configs"
+    serialized = dict(
+        _snapshot_provider_mapping(raw_result, context="lm-eval provider result")
     )
-    serialized = dict(raw_result)
+    configs = _exact_task_mapping(
+        serialized.get("configs"), requested_tasks, context="configs"
+    )
     serialized["configs"] = {
         task_name: _serialize_provider_value(
             getattr(task, "config", None), configs[task_name]

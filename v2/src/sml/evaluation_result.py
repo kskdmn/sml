@@ -638,8 +638,7 @@ def _open_publication_parent(path: Path) -> int:
                     os.mkdir(component, dir_fd=descriptor)
                 except FileExistsError:
                     pass
-                else:
-                    os.fsync(descriptor)
+                os.fsync(descriptor)
                 child = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
             previous = descriptor
             descriptor = child
@@ -670,6 +669,7 @@ def _open_temporary_output(parent: int, destination: str) -> tuple[int, str]:
 
 def _read_existing_result(parent: int, destination: str) -> EvaluationResult:
     descriptor: int | None = None
+    primary_error: SMLArtifactError | None = None
     try:
         entry = os.stat(destination, dir_fd=parent, follow_symlinks=False)
         if not stat.S_ISREG(entry.st_mode):
@@ -691,11 +691,25 @@ def _read_existing_result(parent: int, destination: str) -> EvaluationResult:
         if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
             raise SMLArtifactError("evaluation output changed during collision check")
         return _result_from_bytes(b"".join(chunks))
+    except SMLArtifactError as error:
+        primary_error = error
+        raise
     except OSError as error:
-        raise SMLArtifactError("invalid existing evaluation result") from error
+        primary_error = SMLArtifactError("invalid existing evaluation result")
+        raise primary_error from error
     finally:
         if descriptor is not None:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                if primary_error is None:
+                    raise SMLArtifactError(
+                        "invalid existing evaluation result"
+                    ) from close_error
+                primary_error.add_note(
+                    "evaluation output collision descriptor close failed: "
+                    f"{close_error!r}"
+                )
 
 
 def _cleanup_temporary_output(parent: int, temporary: str) -> None:
