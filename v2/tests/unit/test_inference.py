@@ -316,6 +316,99 @@ def test_generation_compile_cache_keys_both_length_domains(
     ) in tiny_session._compiled
 
 
+def test_prefill_uses_prompt_bucket_while_lease_uses_capacity_bucket(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt = "alpha"
+    request = GenerationRequest(max_new_tokens=16)
+    bucket = tiny_session._bucketize(((prompt, request),))[0]
+    assert bucket.prefill_length_bucket < bucket.cache_capacity_bucket
+
+    captured: dict[str, int] = {}
+    leased_storage: list[mx.array] = []
+    prefill_rows: list[list[int]] = []
+    storage_rows: list[list[int]] = []
+    real_lease = tiny_session.buffer_pool.lease
+    real_compiled = tiny_session._compiled_kernels
+
+    def lease_spy(*, batch_size, capacity, config):
+        captured["lease_batch"] = batch_size
+        captured["leased_capacity"] = capacity
+        lease = real_lease(batch_size=batch_size, capacity=capacity, config=config)
+        captured["token_storage_capacity"] = int(lease.token_storage.shape[1])
+        leased_storage.append(lease.token_storage)
+        return lease
+
+    def compiled_spy(
+        prefill_length_bucket,
+        cache_capacity_bucket,
+        batch_size_bucket,
+        kernel_key,
+    ):
+        captured["compiled_prefill_length"] = prefill_length_bucket
+        captured["compiled_cache_capacity"] = cache_capacity_bucket
+        prefill, decode = real_compiled(
+            prefill_length_bucket,
+            cache_capacity_bucket,
+            batch_size_bucket,
+            kernel_key,
+        )
+
+        def prefill_shape_spy(
+            parameters,
+            input_ids,
+            attention_mask,
+            positions,
+            cache_state,
+        ):
+            captured["prefill_tokens"] = int(input_ids.shape[1])
+            captured["prefill_mask"] = int(attention_mask.shape[1])
+            captured["prefill_positions"] = int(positions.shape[1])
+            captured["cache_capacity"] = int(cache_state[0][0].shape[2])
+            prefill_rows.extend(input_ids.tolist())
+            storage_rows.extend(
+                leased_storage[0][:, : bucket.prefill_length_bucket].tolist()
+            )
+            return prefill(
+                parameters,
+                input_ids,
+                attention_mask,
+                positions,
+                cache_state,
+            )
+
+        return prefill_shape_spy, decode
+
+    monkeypatch.setattr(tiny_session.buffer_pool, "lease", lease_spy)
+    monkeypatch.setattr(tiny_session, "_compiled_kernels", compiled_spy)
+    tiny_session.generate(prompt, request)
+
+    assert captured == {
+        "lease_batch": bucket.batch_size_bucket,
+        "leased_capacity": bucket.cache_capacity_bucket,
+        "token_storage_capacity": bucket.cache_capacity_bucket,
+        "compiled_prefill_length": bucket.prefill_length_bucket,
+        "compiled_cache_capacity": bucket.cache_capacity_bucket,
+        "prefill_tokens": bucket.prefill_length_bucket,
+        "prefill_mask": bucket.prefill_length_bucket,
+        "prefill_positions": bucket.prefill_length_bucket,
+        "cache_capacity": bucket.cache_capacity_bucket,
+    }
+    expected_rows = [
+        [
+            *prompt_ids,
+            *(
+                [tiny_session.resolved_model.model_config.pad_token_id]
+                * (bucket.prefill_length_bucket - len(prompt_ids))
+            ),
+        ]
+        for prompt_ids in bucket.prompt_ids
+    ]
+    assert prefill_rows == expected_rows
+    assert storage_rows == expected_rows
+
+
 def test_prompt_shape_change_with_same_capacity_uses_distinct_compile_keys(
     tiny_session: InferenceSession,
 ) -> None:
@@ -465,6 +558,64 @@ def test_session_reuses_pooled_token_storage_for_same_bucket(
     assert len(leased) == 2
     assert len(released) == 2
     assert leased[1] is released[0]
+
+
+def test_reused_token_storage_tail_does_not_affect_generation(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt = "alpha"
+    request = GenerationRequest(
+        max_new_tokens=16,
+        config=GenerationConfig(
+            temperature=0.8,
+            top_p=0.9,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=2,
+            seed=71,
+        ),
+    )
+    bucket = tiny_session._bucketize(((prompt, request),))[0]
+    assert bucket.prefill_length_bucket < bucket.cache_capacity_bucket
+    expected = tiny_session.generate(prompt, request)
+
+    pool = tiny_session.buffer_pool
+    primed = pool.lease(
+        batch_size=bucket.batch_size_bucket,
+        capacity=bucket.cache_capacity_bucket,
+        config=tiny_session.resolved_model.model_config,
+    )
+    sentinel = tiny_session._encode_prompt(prompt)[-1]
+    primed.token_storage[:, :] = mx.full(
+        primed.token_storage.shape,
+        sentinel,
+        dtype=mx.int32,
+    )
+    mx.eval(primed.token_storage)
+    primed_storage = primed.token_storage
+    pool.release(primed)
+
+    reused: list[mx.array] = []
+    reused_tails: list[list[list[int]]] = []
+    real_lease = pool.lease
+
+    def lease_spy(**kwargs):
+        lease = real_lease(**kwargs)
+        reused.append(lease.token_storage)
+        reused_tails.append(
+            lease.token_storage[:, bucket.prefill_length_bucket :].tolist()
+        )
+        return lease
+
+    monkeypatch.setattr(pool, "lease", lease_spy)
+    actual = tiny_session.generate(prompt, request)
+
+    assert len(reused) == 1
+    assert reused[0] is primed_storage
+    assert reused_tails == [
+        [[sentinel] * (bucket.cache_capacity_bucket - bucket.prefill_length_bucket)]
+    ]
+    assert actual.token_ids == expected.token_ids
 
 
 def _kv_arrays(cache_state: object) -> tuple[object, ...]:

@@ -32,7 +32,7 @@ from sml.inference import (
     InferenceSession,
     resolve_model_artifact,
 )
-from sml.model.config import ModelConfig
+from sml.model.config import GenerationConfig, ModelConfig
 from sml.training.common import (
     CheckpointPolicy,
     LoaderConfig,
@@ -343,6 +343,39 @@ def test_session_generate_batch_restores_caller_order(
     assert tuple(result.token_ids for result in batched) == tuple(
         result.token_ids for result in serial
     )
+    assert tiny_session.buffer_pool.active_leases == 0
+
+
+def test_short_prompt_long_generation_seeded_batch_matches_serial(
+    tiny_session: InferenceSession,
+) -> None:
+    items = [
+        (
+            "alpha",
+            GenerationRequest(
+                max_new_tokens=16,
+                config=GenerationConfig(temperature=0.8, top_p=0.9, seed=101),
+            ),
+        ),
+        (
+            "alpha",
+            GenerationRequest(
+                max_new_tokens=16,
+                config=GenerationConfig(temperature=0.8, top_p=0.9, seed=103),
+            ),
+        ),
+    ]
+    buckets = tiny_session._bucketize(items)
+    assert len(buckets) == 1
+    assert buckets[0].prefill_length_bucket < buckets[0].cache_capacity_bucket
+
+    serial = tuple(tiny_session.generate(text, request) for text, request in items)
+    batched = tiny_session.generate_batch(items)
+
+    assert tuple(result.token_ids for result in batched) == tuple(
+        result.token_ids for result in serial
+    )
+    assert tuple(result.seed for result in batched) == (101, 103)
     assert tiny_session.buffer_pool.active_leases == 0
 
 

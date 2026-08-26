@@ -1097,15 +1097,16 @@ class InferenceSession:
             bucket.kernel_key,
         )
         pad_id = self._resolved.model_config.pad_token_id
-        capacity = bucket.cache_capacity_bucket
+        prefill_length = bucket.prefill_length_bucket
         batch_size = bucket.batch_size_bucket
         rows = []
         for prompt in bucket.prompt_ids:
-            row = [pad_id] * capacity
+            row = [pad_id] * prefill_length
             row[: len(prompt)] = list(prompt)
             rows.append(row)
-        lease.token_storage[:, :] = mx.array(rows, dtype=mx.int32)
-        token_range = mx.arange(capacity, dtype=mx.int32)[None, :]
+        lease.token_storage[:, :prefill_length] = mx.array(rows, dtype=mx.int32)
+        prefill_tokens = lease.token_storage[:, :prefill_length]
+        token_range = mx.arange(prefill_length, dtype=mx.int32)[None, :]
         real_mask = (
             token_range < bucket.prompt_lengths[:, None]
         ) & bucket.request_mask[:, None]
@@ -1113,17 +1114,17 @@ class InferenceSession:
         attention_mask = real_mask | synthetic_mask
         positions = mx.where(
             attention_mask,
-            mx.broadcast_to(token_range, (batch_size, capacity)),
-            mx.zeros((batch_size, capacity), dtype=mx.int32),
+            mx.broadcast_to(token_range, attention_mask.shape),
+            mx.zeros(attention_mask.shape, dtype=mx.int32),
         )
         logits, cache_state = prefill(
             self._parameters,
-            lease.token_storage,
+            prefill_tokens,
             attention_mask,
             positions,
             lease.cache_state,
         )
-        last_index = mx.clip(bucket.prompt_lengths - 1, 0, capacity - 1)
+        last_index = mx.clip(bucket.prompt_lengths - 1, 0, prefill_length - 1)
         gather_index = mx.broadcast_to(
             last_index[:, None, None],
             (batch_size, 1, logits.shape[-1]),
