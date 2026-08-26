@@ -12,11 +12,23 @@ if str(_UNIT_DIR) not in sys.path:
     sys.path.insert(0, str(_UNIT_DIR))
 
 import pytest
-from sml.artifacts.manifest import ExportManifest, VerificationLevel, read_manifest
+from sml.artifacts.manifest import (
+    ExportManifest,
+    VerificationLevel,
+    read_checkpoint_manifest,
+    read_manifest,
+    read_run_manifest,
+    structured_identity,
+)
 from sml.data.swag import SwagPreparationConfig, SwagSourceConfig, prepare_swag_bundle
 from sml.evaluation import evaluate, read_evaluation_result
 from sml.evaluation_result import normalize_json_value
-from sml.inference import GenerationRequest, InferenceSession, resolve_model_artifact
+from sml.inference import (
+    GenerationRequest,
+    InferenceSession,
+    ModelIdentity,
+    resolve_model_artifact,
+)
 from sml.model.config import ModelConfig
 from sml.training.common import ResumeOverrides
 from sml.training.swag import export_merged, finetune, resume_finetune
@@ -104,11 +116,38 @@ def assert_complete_evaluation(
     artifact_kind: str,
     step: int,
     run_identity: bool,
+    checkpoint: Path,
 ) -> None:
     result = read_evaluation_result(path)
     assert result.kind == "evaluation-result"
     assert result.version == 1
     assert result.identity.startswith("sha256:")
+    if run_identity:
+        run = read_run_manifest(checkpoint, VerificationLevel.MANIFEST_TRUSTED).manifest
+        checkpoint_manifest = read_checkpoint_manifest(
+            checkpoint / "checkpoints" / f"step-{result.model.step:09d}",
+            VerificationLevel.MANIFEST_TRUSTED,
+        ).manifest
+        assert result.model == ModelIdentity(
+            artifact_kind=run.kind,
+            run_identity=run.identity,
+            step=checkpoint_manifest.step,
+            checkpoint_identity=checkpoint_manifest.identity,
+            run_step_identity=structured_identity(
+                "sml-run-step-v1",
+                {
+                    "run_identity": run.identity,
+                    "checkpoint_identity": checkpoint_manifest.identity,
+                },
+            ),
+            tokenizer_identity=run.tokenizer_identity,
+            verification=VerificationLevel.MANIFEST_TRUSTED,
+        )
+    else:
+        assert (
+            result.model
+            == resolve_model_artifact(checkpoint, full_verify=False).identity()
+        )
     assert result.model.artifact_kind == artifact_kind
     assert result.model.step == step
     if run_identity:
@@ -324,11 +363,13 @@ def test_encoded_swag_to_exported_evaluation(
         artifact_kind="lora-run",
         step=2,
         run_identity=True,
+        checkpoint=resumed.run,
     )
     assert_complete_evaluation(
         tmp_path / "evaluation.json",
         artifact_kind="export",
         step=2,
         run_identity=False,
+        checkpoint=exported.path,
     )
     assert read_export_manifest(exported.path).model_config.rope_scaling_factor == 1.0

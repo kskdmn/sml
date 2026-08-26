@@ -343,9 +343,9 @@ def _dataset_identity(
     evaluation_split = test_split if test_split is not None else validation_split
     if not isinstance(evaluation_split, str) or not evaluation_split:
         raise SMLRuntimeError("lm-eval task has no selected evaluation split")
-    evaluation_docs = getattr(task, "eval_docs", None)
+    evaluation_docs = getattr(task, "task_docs", None)
     if evaluation_docs is None:
-        raise SMLRuntimeError("lm-eval task effective evaluation docs are unavailable")
+        raise SMLRuntimeError("lm-eval task retained evaluation docs are unavailable")
     selected_datasets: list[tuple[str, object]] = [(evaluation_split, evaluation_docs)]
     num_fewshot = config.get("num_fewshot")
     if isinstance(num_fewshot, bool) or not isinstance(num_fewshot, int):
@@ -355,17 +355,22 @@ def _dataset_identity(
         nested_split = (
             fewshot_config.get("split") if isinstance(fewshot_config, Mapping) else None
         )
-        fewshot_split = (
-            nested_split if nested_split is not None else config.get("fewshot_split")
-        )
+        fewshot_split = nested_split
+        if fewshot_split is None:
+            fewshot_split = config.get("fewshot_split")
+        if fewshot_split is None:
+            for fallback_name in ("training_split", "validation_split", "test_split"):
+                candidate = config.get(fallback_name)
+                if candidate is not None:
+                    fewshot_split = candidate
+                    break
         if not isinstance(fewshot_split, str) or not fewshot_split:
             raise SMLRuntimeError("lm-eval task few-shot split is missing")
-        fewshot_docs = getattr(task, "fewshot_docs", None)
-        if not callable(fewshot_docs):
-            raise SMLRuntimeError(
-                "lm-eval task effective few-shot docs are unavailable"
-            )
-        selected_datasets.append((fewshot_split, fewshot_docs()))
+        sampler = getattr(task, "sampler", None)
+        fewshot_docs = getattr(sampler, "df", None)
+        if fewshot_docs is None:
+            raise SMLRuntimeError("lm-eval task retained few-shot docs are unavailable")
+        selected_datasets.append((fewshot_split, fewshot_docs))
 
     fingerprints: list[tuple[str, str]] = []
     versions: list[str] = []
@@ -426,22 +431,30 @@ def _lm_eval_source_commit() -> str | None:
         raise SMLRuntimeError(
             "lm-eval distribution metadata cannot be resolved"
         ) from error
-    distribution_path = getattr(distribution, "_path", None)
-    if not isinstance(distribution_path, Path):
-        raise SMLRuntimeError("lm-eval distribution metadata path is malformed")
-    direct_url_path = distribution_path / "direct_url.json"
-    if not direct_url_path.is_file():
-        return None
     try:
-        direct_url = json.loads(direct_url_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        direct_url_text = distribution.read_text("direct_url.json")
+    except OSError as error:
+        raise SMLRuntimeError("lm-eval direct_url metadata is malformed") from error
+    if direct_url_text is None:
+        return None
+    if not isinstance(direct_url_text, str):
+        raise SMLRuntimeError("lm-eval direct_url metadata is malformed")
+    try:
+        direct_url = json.loads(direct_url_text)
+    except json.JSONDecodeError as error:
         raise SMLRuntimeError("lm-eval direct_url metadata is malformed") from error
     if not isinstance(direct_url, Mapping):
+        raise SMLRuntimeError("lm-eval direct_url metadata is malformed")
+    url = direct_url.get("url")
+    if not isinstance(url, str) or not url:
         raise SMLRuntimeError("lm-eval direct_url metadata is malformed")
     if "vcs_info" not in direct_url:
         return None
     vcs_info = direct_url["vcs_info"]
     if not isinstance(vcs_info, Mapping):
+        raise SMLRuntimeError("lm-eval direct_url VCS metadata is malformed")
+    vcs = vcs_info.get("vcs")
+    if not isinstance(vcs, str) or not vcs:
         raise SMLRuntimeError("lm-eval direct_url VCS metadata is malformed")
     commit_id = vcs_info.get("commit_id")
     if not isinstance(commit_id, str) or not commit_id:

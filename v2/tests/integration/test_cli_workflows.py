@@ -14,6 +14,7 @@ import zstandard as zstd
 from sml.artifacts.manifest import VerificationLevel
 from sml.evaluation import read_evaluation_result
 from sml.evaluation_result import normalize_json_value
+from sml.inference import ModelIdentity, resolve_model_artifact
 
 V2_ROOT = Path(__file__).resolve().parents[2]
 PROVIDER_STUBS = V2_ROOT / "tests" / "fixtures" / "provider_stubs"
@@ -107,11 +108,13 @@ def _assert_complete_evaluation(
     verification: VerificationLevel,
     step: int,
     run_identity: bool,
+    expected_model: ModelIdentity,
 ) -> None:
     result = read_evaluation_result(path)
     assert result.kind == "evaluation-result"
     assert result.version == 1
     assert result.identity.startswith("sha256:")
+    assert result.model == expected_model
     assert result.model.artifact_kind == artifact_kind
     if run_identity:
         assert result.model.run_identity is not None
@@ -228,6 +231,7 @@ class CLIWorkspace:
     export_evaluation: Path
     configs: dict[str, Path]
     results: dict[str, subprocess.CompletedProcess[str]] = field(default_factory=dict)
+    evaluation_models: dict[str, ModelIdentity] = field(default_factory=dict)
 
     def run(
         self,
@@ -461,6 +465,9 @@ def completed_cli_workspace(cli_workspace: CLIWorkspace) -> CLIWorkspace:
         "--output",
         workspace.base_evaluation,
     )
+    workspace.evaluation_models["base"] = resolve_model_artifact(
+        workspace.base_run, full_verify=False
+    ).identity()
     workspace.results["prepare_swag"] = workspace.run(
         "prepare", "swag", "--config", workspace.configs["prepare_swag"]
     )
@@ -476,6 +483,9 @@ def completed_cli_workspace(cli_workspace: CLIWorkspace) -> CLIWorkspace:
         "--output",
         workspace.lora_evaluation,
     )
+    workspace.evaluation_models["lora"] = resolve_model_artifact(
+        workspace.lora_run, full_verify=False
+    ).identity()
     workspace.results["export"] = workspace.run(
         "export",
         "--checkpoint",
@@ -501,6 +511,9 @@ def completed_cli_workspace(cli_workspace: CLIWorkspace) -> CLIWorkspace:
         "--output",
         workspace.export_evaluation,
     )
+    workspace.evaluation_models["export"] = resolve_model_artifact(
+        workspace.export, full_verify=True
+    ).identity()
     workspace.results["verify"] = workspace.run("verify", "--full", workspace.export)
     workspace.results["train_resume"] = workspace.run(
         "train",
@@ -547,6 +560,7 @@ def test_every_cli_workflow_runs_offline_in_subprocesses(
         verification=VerificationLevel.MANIFEST_TRUSTED,
         step=1,
         run_identity=True,
+        expected_model=workspace.evaluation_models["base"],
     )
     assert (
         str(workspace.base_evaluation.parent).encode()
@@ -560,6 +574,7 @@ def test_every_cli_workflow_runs_offline_in_subprocesses(
         verification=VerificationLevel.MANIFEST_TRUSTED,
         step=1,
         run_identity=True,
+        expected_model=workspace.evaluation_models["lora"],
     )
     assert (
         str(workspace.lora_evaluation.parent).encode()
@@ -573,6 +588,7 @@ def test_every_cli_workflow_runs_offline_in_subprocesses(
         verification=VerificationLevel.FULL,
         step=1,
         run_identity=False,
+        expected_model=workspace.evaluation_models["export"],
     )
     assert (
         str(workspace.export_evaluation.parent).encode()

@@ -50,6 +50,11 @@ class _Split:
     info: _Info
 
 
+@dataclass(frozen=True, slots=True)
+class _Sampler:
+    df: _Split
+
+
 class _Config:
     def __init__(self, values: dict[str, object]) -> None:
         self._values = values
@@ -86,13 +91,16 @@ class _Task:
             "train": _Split("train-fingerprint", _Info("1.0.0")),
             "fewshot-config": _Split("fewshot-config-fingerprint", _Info("1.0.0")),
         }
-        # 0.4.12 fingerprints the objects it actually iterates: test_docs()
-        # applies process_docs and fewshot_docs() applies the few-shot processor.
-        # Keep these identities distinct from the unprocessed dataset mapping so
-        # tests reject provenance collected from task.dataset directly.
-        self.eval_docs = _Split("processed-test-fingerprint", _Info("1.0.0"))
+        # 0.4.12 retains task_docs and its sampler input after construction.
+        # The accessor objects model later processing results and deliberately
+        # differ, so provenance tests reject repeat processing after evaluation.
+        self.task_docs = _Split("retained-test-fingerprint", _Info("1.0.0"))
+        self.eval_docs = _Split("reprocessed-test-fingerprint", _Info("1.0.0"))
         self._fewshot_docs = _Split(
-            "processed-fewshot-config-fingerprint", _Info("1.0.0")
+            "reprocessed-fewshot-config-fingerprint", _Info("1.0.0")
+        )
+        self.sampler = _Sampler(
+            _Split("retained-fewshot-config-fingerprint", _Info("1.0.0"))
         )
 
     def fewshot_docs(self) -> _Split:

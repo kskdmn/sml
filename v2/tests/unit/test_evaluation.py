@@ -276,8 +276,8 @@ def test_task_provenance_prefers_effective_fewshot_config_split(fake_provider) -
     assert record.dataset_fingerprint == structured_identity(
         "sml-evaluation-dataset-v1",
         (
-            ("test", "processed-test-fingerprint"),
-            ("fewshot-config", "processed-fewshot-config-fingerprint"),
+            ("test", "retained-test-fingerprint"),
+            ("fewshot-config", "retained-fewshot-config-fingerprint"),
         ),
     )
 
@@ -512,8 +512,8 @@ def test_task_provenance_records_processed_eval_and_fewshot_dataset_objects(
     assert record.dataset_fingerprint == structured_identity(
         "sml-evaluation-dataset-v1",
         (
-            ("test", "processed-test-fingerprint"),
-            ("fewshot-config", "processed-fewshot-config-fingerprint"),
+            ("test", "retained-test-fingerprint"),
+            ("fewshot-config", "retained-fewshot-config-fingerprint"),
         ),
     )
     assert record.dataset_revision == "version:1.0.0"
@@ -592,27 +592,37 @@ def test_provider_versions_require_all_five_evaluation_packages() -> None:
     )
 
 
-def test_lm_eval_source_commit_uses_only_pep_610_vcs_metadata(
+def test_lm_eval_source_commit_uses_public_pep_610_distribution_metadata(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
-    """Catches provenance populated from a provider result git_hash instead of PEP 610."""
+    """Catches private distribution-path access instead of the public metadata API."""
     from importlib import metadata
 
     from sml import evaluation
 
-    dist_info = tmp_path / "lm_eval-0.4.12.dist-info"
-    dist_info.mkdir()
+    class PublicDistribution:
+        def __init__(self, direct_url: str | None) -> None:
+            self._direct_url = direct_url
+
+        def read_text(self, filename: str) -> str | None:
+            assert filename == "direct_url.json"
+            return self._direct_url
+
+    distribution = PublicDistribution(None)
     monkeypatch.setattr(
         metadata,
         "distribution",
-        lambda name: SimpleNamespace(_path=dist_info),
+        lambda name: distribution,
     )
 
     assert evaluation._lm_eval_source_commit() is None
-    (dist_info / "direct_url.json").write_text(
-        '{"vcs_info":{"vcs":"git","commit_id":"0123456789abcdef"}}',
-        encoding="utf-8",
+    distribution._direct_url = (
+        '{"url":"https://example.invalid/lm-eval.whl","archive_info":{}}'
+    )
+    assert evaluation._lm_eval_source_commit() is None
+    distribution._direct_url = (
+        '{"url":"https://github.com/EleutherAI/lm-evaluation-harness",'
+        '"vcs_info":{"vcs":"git","commit_id":"0123456789abcdef"}}'
     )
     assert evaluation._lm_eval_source_commit() == "0123456789abcdef"
 
@@ -621,14 +631,19 @@ def test_lm_eval_source_commit_uses_only_pep_610_vcs_metadata(
     "payload",
     (
         "not-json",
-        '{"vcs_info": "not-a-mapping"}',
-        '{"vcs_info": {"vcs": "git"}}',
-        '{"vcs_info": {"vcs": "git", "commit_id": ""}}',
+        "[]",
+        '{"vcs_info":{"vcs":"git","commit_id":"abc"}}',
+        '{"url":"","vcs_info":{"vcs":"git","commit_id":"abc"}}',
+        '{"url":3,"vcs_info":{"vcs":"git","commit_id":"abc"}}',
+        '{"url":"https://example.invalid","vcs_info":"not-a-mapping"}',
+        '{"url":"https://example.invalid","vcs_info":{"commit_id":"abc"}}',
+        '{"url":"https://example.invalid","vcs_info":{"vcs":"","commit_id":"abc"}}',
+        '{"url":"https://example.invalid","vcs_info":{"vcs":"git"}}',
+        '{"url":"https://example.invalid","vcs_info":{"vcs":"git","commit_id":""}}',
     ),
 )
 def test_lm_eval_source_commit_fails_closed_for_malformed_pep_610_metadata(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
     payload: str,
 ) -> None:
     """Catches acceptance of malformed direct_url metadata as trustworthy provenance."""
@@ -636,17 +651,150 @@ def test_lm_eval_source_commit_fails_closed_for_malformed_pep_610_metadata(
 
     from sml import evaluation
 
-    dist_info = tmp_path / "lm_eval-0.4.12.dist-info"
-    dist_info.mkdir()
-    (dist_info / "direct_url.json").write_text(payload, encoding="utf-8")
+    class PublicDistribution:
+        def read_text(self, filename: str) -> str | None:
+            assert filename == "direct_url.json"
+            return payload
+
     monkeypatch.setattr(
         metadata,
         "distribution",
-        lambda name: SimpleNamespace(_path=dist_info),
+        lambda name: PublicDistribution(),
     )
 
     with pytest.raises(SMLRuntimeError, match="direct_url|PEP 610|source commit"):
         evaluation._lm_eval_source_commit()
+
+
+def test_dataset_provenance_avoids_reprocessing_accessors() -> None:
+    """Catches post-evaluation accessors rerunning mutable provider processing."""
+    from sml import evaluation
+    from sml.artifacts.manifest import structured_identity
+
+    retained_eval = SimpleNamespace(
+        _fingerprint="retained-eval", info=SimpleNamespace(version="1.0.0")
+    )
+    retained_fewshot = SimpleNamespace(
+        _fingerprint="retained-fewshot", info=SimpleNamespace(version="1.0.0")
+    )
+    calls = {"eval": 0, "fewshot": 0}
+
+    class Task:
+        task_docs = retained_eval
+        sampler = SimpleNamespace(df=retained_fewshot)
+
+        @property
+        def eval_docs(self):
+            calls["eval"] += 1
+            return SimpleNamespace(
+                _fingerprint=f"mutable-eval-{calls['eval']}",
+                info=SimpleNamespace(version="1.0.0"),
+            )
+
+        def fewshot_docs(self):
+            calls["fewshot"] += 1
+            return SimpleNamespace(
+                _fingerprint=f"mutable-fewshot-{calls['fewshot']}",
+                info=SimpleNamespace(version="1.0.0"),
+            )
+
+    revision, fingerprint = evaluation._dataset_identity(
+        Task(),
+        {
+            "test_split": "test",
+            "num_fewshot": 1,
+            "fewshot_config": {"split": "train"},
+            "dataset_kwargs": {},
+        },
+    )
+
+    assert calls == {"eval": 0, "fewshot": 0}
+    assert revision == "version:1.0.0"
+    assert fingerprint == structured_identity(
+        "sml-evaluation-dataset-v1",
+        (("test", "retained-eval"), ("train", "retained-fewshot")),
+    )
+
+
+@pytest.mark.parametrize(
+    ("available", "expected_split"),
+    (
+        ({"training_split": "train"}, "train"),
+        ({"validation_split": "validation"}, "validation"),
+        ({"test_split": "test"}, "test"),
+    ),
+)
+def test_dataset_provenance_mirrors_provider_fewshot_fallback_order(
+    available: dict[str, str],
+    expected_split: str,
+) -> None:
+    """Catches rejection of 0.4.12's training/validation/test few-shot fallback."""
+    from sml import evaluation
+    from sml.artifacts.manifest import structured_identity
+
+    task = SimpleNamespace(
+        task_docs=SimpleNamespace(
+            _fingerprint="retained-eval", info=SimpleNamespace(version="1.0.0")
+        ),
+        sampler=SimpleNamespace(
+            df=SimpleNamespace(
+                _fingerprint=f"retained-{expected_split}",
+                info=SimpleNamespace(version="1.0.0"),
+            )
+        ),
+    )
+    config = {
+        "test_split": "test",
+        "num_fewshot": 1,
+        "fewshot_config": {},
+        "fewshot_split": None,
+        "dataset_kwargs": {},
+        **available,
+    }
+
+    _, fingerprint = evaluation._dataset_identity(task, config)
+
+    assert fingerprint == structured_identity(
+        "sml-evaluation-dataset-v1",
+        (("test", "retained-eval"), (expected_split, f"retained-{expected_split}")),
+    )
+
+
+@pytest.mark.parametrize(
+    ("package", "failure"),
+    tuple(
+        (package, failure)
+        for package in ("datasets", "lm-eval", "mlx", "numpy", "sentencepiece")
+        for failure in ("missing", "empty")
+    ),
+)
+def test_evaluation_fails_before_publication_for_each_invalid_provider_version(
+    package: str,
+    failure: str,
+    tiny_pretraining_run: Path,
+    fake_lm_eval,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Catches publication after any required provider version is missing or empty."""
+    from importlib import metadata
+
+    original_version = metadata.version
+
+    def invalid_version(name: str) -> str:
+        if name == package:
+            if failure == "missing":
+                raise metadata.PackageNotFoundError(name)
+            return ""
+        return original_version(name)
+
+    monkeypatch.setattr(metadata, "version", invalid_version)
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+
+    with pytest.raises(SMLRuntimeError, match="required evaluation provider package"):
+        evaluate(config)
+
+    assert not config.output.exists()
 
 
 def test_task_provenance_rejects_missing_index_yaml_path(fake_provider) -> None:
@@ -750,9 +898,9 @@ def test_task_provenance_rejects_unsafe_include_closure(
 @pytest.mark.parametrize(
     ("dataset_object", "attribute", "value", "message"),
     [
-        ("eval_docs", "_fingerprint", "", "fingerprint"),
-        ("eval_docs", "info", SimpleNamespace(version=""), "version"),
-        ("fewshot_docs", "_fingerprint", "", "fingerprint"),
+        ("task_docs", "_fingerprint", "", "fingerprint"),
+        ("task_docs", "info", SimpleNamespace(version=""), "version"),
+        ("sampler_docs", "_fingerprint", "", "fingerprint"),
     ],
 )
 def test_task_provenance_requires_selected_dataset_identities(
@@ -767,7 +915,7 @@ def test_task_provenance_requires_selected_dataset_identities(
     manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
-    dataset = task.eval_docs if dataset_object == "eval_docs" else task.fewshot_docs()
+    dataset = task.task_docs if dataset_object == "task_docs" else task.sampler.df
     object.__setattr__(dataset, attribute, value)
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
@@ -796,7 +944,7 @@ def test_task_provenance_selects_test_when_validation_is_not_declared(
     task = loaded["tasks"]["hellaswag"]
     task.config._values["validation_split"] = None
     task.config._values["num_fewshot"] = 0
-    object.__setattr__(task.eval_docs, "info", SimpleNamespace(version="3.0.0"))
+    object.__setattr__(task.task_docs, "info", SimpleNamespace(version="3.0.0"))
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     record = evaluation._resolve_task_record(
