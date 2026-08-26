@@ -51,7 +51,7 @@ def load_safetensors_payload(
             return {name: arrays[name] for name in names}
     except SMLArtifactError:
         raise
-    except (OSError, TypeError, ValueError, RuntimeError) as error:
+    except (AttributeError, OSError, TypeError, ValueError, RuntimeError) as error:
         raise SMLArtifactError(
             f"invalid safetensors payload: {logical_path}"
         ) from error

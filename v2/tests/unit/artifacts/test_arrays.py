@@ -340,3 +340,52 @@ def test_loader_failures_close_payload_but_leave_root_owned_by_caller(
 
     with pytest.raises(OSError):
         os.fstat(root_descriptor)
+
+
+def test_malformed_array_metadata_is_normalized_and_closes_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed lazy metadata object must not escape as a public AttributeError."""
+    root = tmp_path / "bundle"
+    reference = _write_array_artifact(
+        root,
+        {"weight": mx.array([1.0], dtype=mx.float32)},
+        (ArraySpec("weight", (1,), "float32"),),
+    )
+    artifact = _open_array_artifact(root)
+    root_descriptor = artifact.root._fd
+    opened_payloads = []
+    real_open_payload = artifact.open_payload
+
+    class MissingShape:
+        dtype = mx.float32
+
+        @property
+        def shape(self):
+            raise AttributeError("injected missing shape")
+
+    def recording_open_payload(payload_reference):
+        payload = real_open_payload(payload_reference)
+        opened_payloads.append(payload)
+        return payload
+
+    monkeypatch.setattr(artifact, "open_payload", recording_open_payload)
+    monkeypatch.setattr(
+        arrays_module.mx,
+        "load",
+        lambda *_args, **_kwargs: {"weight": MissingShape()},
+    )
+
+    with artifact:
+        with pytest.raises(SMLArtifactError) as raised:
+            load_safetensors_payload(artifact, reference)
+        assert isinstance(raised.value.__cause__, AttributeError)
+        assert "injected missing shape" in str(raised.value.__cause__)
+        assert len(opened_payloads) == 1
+        assert opened_payloads[0].closed is True
+        assert opened_payloads[0].stream.closed is True
+        os.fstat(root_descriptor)
+
+    with pytest.raises(OSError):
+        os.fstat(root_descriptor)

@@ -1880,7 +1880,24 @@ def _load_checkpoint_array_payload(
                 raise SMLArtifactError(
                     f"checkpoint array payload must be a mapping: {logical_path}"
                 )
-            mx.eval(*arrays.values())
+            expected = {spec.name: spec for spec in reference.arrays}
+            if set(arrays) != set(expected):
+                raise SMLArtifactError(
+                    f"checkpoint array keys mismatch: {logical_path}"
+                )
+            names = sorted(expected)
+            for name in names:
+                array = arrays[name]
+                spec = expected[name]
+                if (
+                    tuple(array.shape) != spec.shape
+                    or _checkpoint_dtype_name(array) != spec.dtype
+                ):
+                    raise SMLArtifactError(
+                        f"checkpoint array metadata mismatch: {logical_path}:{name}"
+                    )
+            result = {name: arrays[name] for name in names}
+            mx.eval(*result.values())
             if full:
                 payload.seek(0)
                 if file_identity(payload) != reference.payload.identity:
@@ -1894,20 +1911,7 @@ def _load_checkpoint_array_payload(
         raise SMLArtifactError(
             f"invalid checkpoint safetensors payload: {logical_path}"
         ) from error
-
-    expected = {spec.name: spec for spec in reference.arrays}
-    if set(arrays) != set(expected):
-        raise SMLArtifactError(f"checkpoint array keys mismatch: {logical_path}")
-    for name, array in arrays.items():
-        spec = expected[name]
-        if (
-            tuple(array.shape) != spec.shape
-            or _checkpoint_dtype_name(array) != spec.dtype
-        ):
-            raise SMLArtifactError(
-                f"checkpoint array metadata mismatch: {logical_path}:{name}"
-            )
-    return dict(sorted(arrays.items()))
+    return result
 
 
 def _plain_nonnegative(value: object, name: str) -> int:

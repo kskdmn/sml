@@ -16,6 +16,7 @@ from sml.artifacts.checkpoint import (
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
+    ArtifactRoot,
     PayloadRef,
     PretrainingCheckpointManifest,
     PretrainingRunManifest,
@@ -136,55 +137,144 @@ def _write_valid_checkpoint_run(tmp_path: Path) -> Path:
     return run
 
 
-def test_checkpoint_full_hash_load_and_eval_share_each_open_payload(
+def test_checkpoint_array_validation_uses_one_open_payload_through_posthash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reopening after hash or evaluating after close would use a different lifetime."""
-    run = _write_valid_checkpoint_run(tmp_path)
+    """Descriptor reuse must not hide metadata access after payload close."""
+    payload_path = tmp_path / "arrays.safetensors"
+    payload_path.write_bytes(b"descriptor-owned checkpoint payload")
+    reference = ArrayPayloadRef(
+        payload=_payload_ref(payload_path, "arrays.safetensors"),
+        arrays=(
+            ArraySpec("z", (1,), "float32"),
+            ArraySpec("a", (1,), "float32"),
+        ),
+    )
     real_file_identity = checkpoint_module.file_identity
-    events: list[tuple[str, int]] = []
-    active_descriptor = -1
+    payload_stream = None
+    events: list[tuple[str, int, tuple[int, int] | None, bool, tuple[str, ...]]] = []
+
+    def record(phase: str, stream, names: tuple[str, ...] = ()) -> None:
+        is_open = not stream.closed
+        inode = None
+        if is_open:
+            opened = os.fstat(stream.fileno())
+            inode = (opened.st_dev, opened.st_ino)
+        events.append((phase, id(stream), inode, is_open, names))
 
     def recording_file_identity(stream):
-        descriptor = stream.fileno()
-        events.append(("hash", descriptor))
+        record("hash", stream)
         return real_file_identity(stream)
+
+    class MetadataSpy:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        @property
+        def shape(self):
+            assert payload_stream is not None
+            record("shape", payload_stream, (self.name,))
+            return (1,)
+
+        @property
+        def dtype(self):
+            assert payload_stream is not None
+            record("dtype", payload_stream, (self.name,))
+            return mx.float32
 
     class RecordingMlx:
         def __getattr__(self, name: str):
             return getattr(mx, name)
 
         def load(self, stream, *, format):
-            nonlocal active_descriptor
-            active_descriptor = stream.fileno()
-            events.append(("load", active_descriptor))
-            return mx.load(stream, format=format)
+            nonlocal payload_stream
+            assert format == "safetensors"
+            payload_stream = stream
+            record("load", stream)
+            return {"z": MetadataSpy("z"), "a": MetadataSpy("a")}
 
         def eval(self, *values):
-            os.fstat(active_descriptor)
-            events.append(("eval", active_descriptor))
-            return mx.eval(*values)
+            assert payload_stream is not None
+            record("eval", payload_stream, tuple(value.name for value in values))
 
     monkeypatch.setattr(checkpoint_module, "file_identity", recording_file_identity)
     monkeypatch.setattr(checkpoint_module, "_mlx_core", lambda: RecordingMlx())
 
-    with open_checkpoint_reader(run, step=0) as reader:
-        contents = reader.read_contents()
-        assert sorted(contents.array_groups) == [
-            "master.safetensors",
-            "model.safetensors",
-            "optimizer.safetensors",
-            "trainer.safetensors",
-        ]
+    with ArtifactRoot.open(tmp_path, writable=False) as root:
+        loaded = checkpoint_module._load_checkpoint_array_payload(
+            root,
+            reference,
+            full=True,
+        )
 
-    load_indices = [index for index, event in enumerate(events) if event[0] == "load"]
-    assert len(load_indices) == 4
-    for index in load_indices:
-        assert events[index - 1][0] == "hash"
-        assert events[index + 1][0] == "eval"
-        assert events[index + 2][0] == "hash"
-        assert len({events[offset][1] for offset in range(index - 1, index + 3)}) == 1
+    assert list(loaded) == ["a", "z"]
+    assert [event[0] for event in events] == [
+        "hash",
+        "load",
+        "shape",
+        "dtype",
+        "shape",
+        "dtype",
+        "eval",
+        "hash",
+    ]
+    assert [event[4] for event in events if event[0] in {"shape", "dtype"}] == [
+        ("a",),
+        ("a",),
+        ("z",),
+        ("z",),
+    ]
+    assert events[-2][4] == ("a", "z")
+    assert len({event[1] for event in events}) == 1
+    assert len({event[2] for event in events}) == 1
+    assert events[0][2] is not None
+    assert all(event[3] for event in events)
+    assert payload_stream is not None and payload_stream.closed
+
+
+def test_checkpoint_initial_step_name_swap_fails_opened_entry_revalidation(
+    tmp_path: Path,
+) -> None:
+    """The first name-to-opened-inode check must reject a just-opened step swap."""
+    run = _write_valid_checkpoint_run(tmp_path)
+    checkpoints = run / "checkpoints"
+    step_name = "step-000000000"
+    step = checkpoints / step_name
+    moved_step = checkpoints / "retained-before-revalidation"
+
+    class SwapBeforeNamedStat(checkpoint_module._OSFilesystemOps):
+        def __init__(self) -> None:
+            self.opened_descriptor = -1
+            self.swapped = False
+
+        def open(self, path, flags, mode=0o777, *, dir_fd=None):
+            descriptor = super().open(path, flags, mode, dir_fd=dir_fd)
+            if path == step_name:
+                self.opened_descriptor = descriptor
+            return descriptor
+
+        def stat(self, path, *, dir_fd=None, follow_symlinks=False):
+            if path == step_name and self.opened_descriptor >= 0 and not self.swapped:
+                step.rename(moved_step)
+                shutil.copytree(moved_step, step)
+                self.swapped = True
+            return super().stat(
+                path,
+                dir_fd=dir_fd,
+                follow_symlinks=follow_symlinks,
+            )
+
+    faulting_fs = SwapBeforeNamedStat()
+    with (
+        pytest.raises(SMLArtifactError, match="entry swap"),
+        open_checkpoint_reader(run, step=0, fs=faulting_fs),
+    ):
+        pytest.fail("initial checkpoint step swap was accepted")
+
+    assert faulting_fs.swapped is True
+    with pytest.raises(OSError):
+        os.fstat(faulting_fs.opened_descriptor)
 
 
 def test_checkpoint_step_swap_after_payload_hash_fails_final_named_inode_check(
