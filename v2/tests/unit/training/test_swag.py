@@ -19,6 +19,7 @@ from sml.data.swag import (
     SwagCursor,
     prepare_swag_bundle,
 )
+from sml.errors import SMLConfigurationError
 from sml.inference import ResolvedModel
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
@@ -167,7 +168,7 @@ def assert_close(actual: mx.array, expected: mx.array, *, atol: float, rtol: flo
     assert bool(mx.allclose(actual, expected, atol=atol, rtol=rtol).item())
 
 
-def assert_tree_close(actual: dict, expected: dict, *, atol: float, rtol: float):
+def assert_tree_close(actual: object, expected: object, *, atol: float, rtol: float):
     actual_leaves = dict(tree_flatten(actual))
     expected_leaves = dict(tree_flatten(expected))
     assert set(actual_leaves) == set(expected_leaves)
@@ -268,8 +269,6 @@ def split_adapter_parameters(parameters: object) -> tuple[object, object]:
                     adapters[key] = nested_adapters
                 if nested_frozen:
                     frozen[key] = nested_frozen
-            elif key == "scale":
-                frozen[key] = value.astype(mx.bfloat16)
             else:
                 frozen[key] = value
         return adapters, frozen
@@ -604,10 +603,23 @@ def test_two_compiled_swag_updates_keep_base_bf16_and_all_optimizer_state_fp32(
     assert_tree_close(compiled.adapters, eager.adapters, atol=1e-5, rtol=1e-5)
 
 
+def test_swag_kernels_require_a_nonempty_static_lora_policy(tiny_swag_runtime):
+    unadapted = SMLLanguageModel(tiny_model_config(), key=mx.random.key(17))
+
+    with pytest.raises(SMLConfigurationError, match="nonempty LoRA forward policy"):
+        build_swag_kernels(unadapted, tiny_swag_runtime.config, {})
+
+
 def test_compiled_swag_cores_accept_only_builtin_array_trees(tiny_swag_runtime):
     kernels = tiny_swag_runtime.kernels(compiled=True)
     core_inputs = tiny_swag_runtime.core_inputs()
     assert_builtin_array_tree(core_inputs)
+    adapter_paths = [path for path, _leaf in tree_flatten(core_inputs[0])]
+    frozen_paths = [path for path, _leaf in tree_flatten(core_inputs[1])]
+    assert all(
+        path.rsplit(".", 1)[-1] in {"lora_a", "lora_b"} for path in adapter_paths
+    )
+    assert all(path.rsplit(".", 1)[-1] != "scale" for path in frozen_paths)
     core_outputs = kernels.compiled_ranking_microstep_core(*core_inputs)
     mx.eval(core_outputs)
     assert_builtin_array_tree(core_outputs)
@@ -619,6 +631,9 @@ def test_compiled_swag_cores_accept_only_builtin_array_trees(tiny_swag_runtime):
             "mx.compile(lambda config",
         ],
     )
+    builder_source = inspect.getsource(swag_module.build_swag_kernels)
+    assert "mx.random" not in builder_source
+    assert "random." not in builder_source
 
 
 def test_swag_value_and_grad_targets_adapters_only():
@@ -1056,9 +1071,24 @@ def test_epoch_boundary_commits_with_update(tiny_swag_runtime):
 def test_second_compiled_step_sees_returned_adapter_optimizer_and_key_state(
     tiny_swag_runtime,
 ):
-    model = tiny_language_model(hidden_dropout=0.1)
+    model = SMLLanguageModel(
+        tiny_model_config(hidden_dropout=0.1), key=mx.random.key(3)
+    )
+    apply_lora(
+        model,
+        LoRAConfig(
+            rank=2,
+            alpha=1.0,
+            scaling_mode="lora",
+            dropout=0.5,
+            target_modules=("q_proj", "v_proj", "down_proj"),
+            initializer=LoRAInitializerConfig(lora_a=0.05, lora_b=0.05),
+        ),
+        key=mx.random.key(5),
+    )
     adapters, frozen_base = split_adapter_parameters(model.parameters())
     mx.eval(adapters, frozen_base)
+    before_base = clone_tree(frozen_base)
     runtime = TinySwagRuntime(
         bundle=tiny_swag_runtime.bundle,
         model=model,
@@ -1104,18 +1134,30 @@ def test_second_compiled_step_sees_returned_adapter_optimizer_and_key_state(
 
     compiled_adapters, compiled_optimizer, compiled_keys = run_two_steps(compiled=True)
     eager_adapters, eager_optimizer, eager_keys = run_two_steps(compiled=False)
+    mx.eval(
+        compiled_adapters,
+        compiled_optimizer.to_tree(),
+        eager_adapters,
+        eager_optimizer.to_tree(),
+        frozen_base,
+        before_base,
+        *compiled_keys,
+        *eager_keys,
+    )
     assert int(np.array(compiled_optimizer.step)) == 2
     assert int(np.array(eager_optimizer.step)) == 2
+    assert bool(mx.array_equal(compiled_keys[0], eager_keys[0]).item())
+    assert not bool(mx.array_equal(eager_keys[1], eager_keys[0]).item())
+    assert not bool(mx.array_equal(eager_keys[2], eager_keys[1]).item())
     assert not bool(mx.array_equal(compiled_keys[1], compiled_keys[0]).item())
     assert not bool(mx.array_equal(compiled_keys[2], compiled_keys[1]).item())
     assert bool(mx.array_equal(compiled_keys[1], eager_keys[1]).item())
     assert bool(mx.array_equal(compiled_keys[2], eager_keys[2]).item())
+    assert_tree_dtypes(frozen_base, mx.bfloat16)
+    assert_tree_equal(frozen_base, before_base)
     assert_tree_close(compiled_adapters, eager_adapters, atol=1e-5, rtol=1e-5)
     assert_tree_close(
-        compiled_optimizer.first_moments,
-        eager_optimizer.first_moments,
-        atol=1e-5,
-        rtol=1e-5,
+        compiled_optimizer.to_tree(), eager_optimizer.to_tree(), atol=1e-5, rtol=1e-5
     )
 
 

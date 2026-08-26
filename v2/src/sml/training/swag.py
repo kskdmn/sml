@@ -53,6 +53,7 @@ from sml.data.swag import (
 from sml.errors import SMLArtifactError, SMLConfigurationError
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
+from sml.model.layers import LoRAForwardPolicy
 from sml.training.common import (
     AdamState,
     CheckpointPolicy,
@@ -366,6 +367,15 @@ def build_swag_kernels(
     weight_decay_tree: dict,
 ) -> SwagKernels:
     """Build host wrappers around eager or compiled ranking and optimizer cores."""
+
+    lora_forward_policy = model.lora_forward_policy
+    if (
+        type(lora_forward_policy) is not LoRAForwardPolicy
+        or not lora_forward_policy.adapters
+    ):
+        raise SMLConfigurationError(
+            "SWAG kernels require a nonempty LoRA forward policy"
+        )
 
     kernel_config = SwagKernelConfig(
         accumulation_steps=config.loader.gradient_accumulation_steps,
