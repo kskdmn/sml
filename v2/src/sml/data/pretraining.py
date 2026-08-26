@@ -11,6 +11,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from traceback import clear_frames
 from typing import Self
 
 import numpy as np
@@ -430,6 +431,7 @@ def _map_npy_payload(
         )
 
     mapping: mmap.mmap | None = None
+    array: np.ndarray | None = None
     try:
         mapping = mmap.mmap(stream.fileno(), length=0, access=mmap.ACCESS_READ)
         array = np.ndarray(
@@ -441,12 +443,27 @@ def _map_npy_payload(
         )
         array.setflags(write=False)
         return mapping, array
-    except (BufferError, OSError, TypeError, ValueError) as error:
+    except BaseException as error:
+        if error.__traceback__ is not None:
+            clear_frames(error.__traceback__)
+        array = None
+        cleanup_error: BaseException | None = None
         if mapping is not None:
-            mapping.close()
-        raise SMLArtifactError(
-            f"could not memory-map prepared shard: {reference.logical_path}"
-        ) from error
+            try:
+                mapping.close()
+            except BaseException as caught:  # noqa: BLE001 - cleanup must complete
+                cleanup_error = caught
+        if isinstance(error, (BufferError, OSError, TypeError, ValueError)):
+            primary: BaseException = SMLArtifactError(
+                f"could not memory-map prepared shard: {reference.logical_path}"
+            )
+        else:
+            primary = error
+        if cleanup_error is not None:
+            raise primary from cleanup_error
+        if primary is not error:
+            raise primary from error
+        raise
 
 
 def _validate_prepared_tokenizer_binding(
@@ -532,6 +549,9 @@ def _open_validated_prepared_resources(
     shard_files: list[VerifiedPayload] = []
     mappings: list[mmap.mmap] = []
     shard_arrays: list[np.ndarray] = []
+    payload: VerifiedPayload | None = None
+    mapping: mmap.mmap | None = None
+    array: np.ndarray | None = None
     try:
         with artifact.root.open_payload("manifest.json") as manifest_file:
             manifest_bytes = manifest_file.read()
@@ -554,15 +574,35 @@ def _open_validated_prepared_resources(
             strict=True,
         ):
             payload = artifact.open_payload(reference)
-            shard_files.append(payload)
+            try:
+                shard_files.append(payload)
+            except BaseException as error:
+                try:
+                    payload.close()
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+                raise
             mapping, array = _map_npy_payload(
                 payload,
                 reference,
                 declared_rows=row_count,
                 row_width=manifest.row_width,
             )
-            mappings.append(mapping)
+            try:
+                mappings.append(mapping)
+            except BaseException as error:
+                if error.__traceback__ is not None:
+                    clear_frames(error.__traceback__)
+                array = None
+                try:
+                    mapping.close()
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+                raise
             shard_arrays.append(array)
+            payload = None
+            mapping = None
+            array = None
 
         if not shard_arrays:
             raise SMLDataError("prepared bundle contains no shards")
@@ -576,6 +616,11 @@ def _open_validated_prepared_resources(
         root = artifact.detach_root()
         return root, shard_files, mappings, shard_arrays, manifest
     except BaseException as error:
+        if error.__traceback__ is not None:
+            clear_frames(error.__traceback__)
+        payload = None
+        mapping = None
+        array = None
         cleanup_errors: list[BaseException] = []
         try:
             _close_prepared_resources(None, shard_files, mappings, shard_arrays)
@@ -614,9 +659,16 @@ def preflight_pretraining_bundle(
             raise SMLDataError(
                 "prepared bundle does not contain one full runtime batch"
             )
-        return PreparedDataPreflight(bundle, row_count, batch_size)
-    finally:
+        result = PreparedDataPreflight(bundle, row_count, batch_size)
+    except BaseException as error:
+        try:
+            _close_prepared_resources(root, shard_files, mappings, shard_arrays)
+        except BaseException as cleanup_error:
+            raise error from cleanup_error
+        raise
+    else:
         _close_prepared_resources(root, shard_files, mappings, shard_arrays)
+        return result
 
 
 class PretrainingBatchStream(Iterator[BatchEnvelope]):
@@ -901,7 +953,10 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
             if isinstance(item, BatchEnvelope):
                 self._record_delivery(item)
                 return item
-        self.close()
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            raise item.error from cleanup_error
         raise item.error
 
     def iter_epoch(self, epoch: int) -> Iterator[BatchEnvelope]:
@@ -920,7 +975,10 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
                         )
                     self._record_delivery(item)
             if isinstance(item, _ProducerFailure):
-                self.close()
+                try:
+                    self.close()
+                except BaseException as cleanup_error:
+                    raise item.error from cleanup_error
                 raise item.error
             yield item
 
@@ -1031,7 +1089,12 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         exception: object,
         traceback: object,
     ) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if isinstance(exception, BaseException):
+                raise exception from cleanup_error
+            raise
 
 
 def _validated_token_array(

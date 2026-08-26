@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from math import prod
 from pathlib import Path
+from traceback import clear_frames
 from typing import Literal, Protocol, Self
 
 import numpy as np
@@ -280,13 +281,10 @@ class _OwnedNpyMapping:
             array.setflags(write=False)
             return cls(reference.payload.logical_path, payload, mapping, array)
         except BaseException as error:
+            if error.__traceback__ is not None:
+                clear_frames(error.__traceback__)
+            array = None
             cleanup_errors: list[BaseException] = []
-            try:
-                if array is not None:
-                    array = np.empty((0,), dtype=array.dtype)
-                    array.setflags(write=False)
-            except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
-                cleanup_errors.append(cleanup_error)
             try:
                 if mapping is not None:
                     mapping.close()
@@ -967,10 +965,16 @@ def _open_buckets(
 ) -> tuple[tuple[SwagBucket, ...], tuple[_OwnedNpyMapping, ...]]:
     buckets: list[SwagBucket] = []
     mappings: list[_OwnedNpyMapping] = []
+    owners: dict[str, _OwnedNpyMapping] = {}
+    owner: _OwnedNpyMapping | None = None
+    input_ids: np.ndarray | None = None
+    valid_token_mask: np.ndarray | None = None
+    score_mask: np.ndarray | None = None
+    labels: np.ndarray | None = None
     total_examples = 0
     try:
         for length, arrays in _group_manifest_buckets(manifest):
-            owners: dict[str, _OwnedNpyMapping] = {}
+            owners = {}
             for name in _ARRAY_NAMES:
                 owner = _OwnedNpyMapping.open(artifact, arrays[name])
                 owners[name] = owner
@@ -1018,15 +1022,18 @@ def _open_buckets(
             raise SMLArtifactError("SWAG example_count does not match bucket rows")
         return tuple(buckets), tuple(mappings)
     except BaseException as error:
+        if error.__traceback__ is not None:
+            clear_frames(error.__traceback__)
         buckets.clear()
-        cleanup_error: BaseException | None = None
-        while mappings:
-            try:
-                mappings.pop().close()
-            except BaseException as caught:  # noqa: BLE001 - cleanup continues
-                if cleanup_error is None:
-                    cleanup_error = caught
-        if cleanup_error is not None:
+        owners.clear()
+        owner = None
+        input_ids = None
+        valid_token_mask = None
+        score_mask = None
+        labels = None
+        try:
+            _close_swag_resources(mappings, None)
+        except BaseException as cleanup_error:
             raise error from cleanup_error
         raise
 
@@ -1042,6 +1049,7 @@ def _load_swag_bundle(
     if not isinstance(verification, VerificationLevel):
         raise TypeError("verification must be a VerificationLevel")
     artifact = open_artifact(path, (SwagDataManifest,), verification)
+    buckets: tuple[SwagBucket, ...] = ()
     mappings: tuple[_OwnedNpyMapping, ...] = ()
     detached_root: ArtifactRoot | None = None
     try:
@@ -1061,6 +1069,9 @@ def _load_swag_bundle(
         detached_root = None
         return bundle
     except BaseException as error:
+        if error.__traceback__ is not None:
+            clear_frames(error.__traceback__)
+        buckets = ()
         cleanup_errors: list[BaseException] = []
         try:
             _close_swag_resources(mappings, detached_root)
@@ -1836,12 +1847,13 @@ class SwagBatchStream:
         self._initial_epoch = cursor.epoch
         self._epoch_complete = False
         self._closed = False
-        self._producer = threading.Thread(
-            target=self._produce,
-            name="sml-swag-prefetch",
-            daemon=True,
-        )
+        self._producer: threading.Thread | None = None
         try:
+            self._producer = threading.Thread(
+                target=self._produce,
+                name="sml-swag-prefetch",
+                daemon=True,
+            )
             self._producer.start()
         except BaseException as error:
             self._producer = None
@@ -1962,7 +1974,10 @@ class SwagBatchStream:
             if isinstance(item, SwagBatchEnvelope):
                 return item
             if isinstance(item, _ProducerFailure):
-                self.close()
+                try:
+                    self.close()
+                except BaseException as cleanup_error:
+                    raise item.error from cleanup_error
                 raise item.error
             if item is _QUEUE_STOP:
                 raise StopIteration
@@ -1983,6 +1998,7 @@ class SwagBatchStream:
             if envelope._source_epoch > self._initial_epoch:
                 envelope.release()
                 self._epoch_complete = True
+                self.close()
                 raise StopIteration
             if envelope.cursor_after.epoch > self._initial_epoch:
                 self._epoch_complete = True
@@ -2021,7 +2037,12 @@ class SwagBatchStream:
         exception: object,
         traceback: object,
     ) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if isinstance(exception, BaseException):
+                raise exception from cleanup_error
+            raise
 
 
 __all__ = [

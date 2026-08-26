@@ -6,6 +6,7 @@ import queue
 import shutil
 import threading
 import time
+import weakref
 from dataclasses import replace
 from pathlib import Path
 
@@ -1026,6 +1027,100 @@ def test_stream_producer_exception_propagates_as_focused_data_error(
         stream.close()
 
 
+def test_preflight_preserves_semantic_error_when_cleanup_fails(
+    prepared_bundle, monkeypatch
+):
+    semantic_error = SMLDataError(
+        "prepared bundle does not contain one full runtime batch"
+    )
+    cleanup_error = RuntimeError("injected preflight postcheck failure")
+    original_close = pretraining_module._close_prepared_resources
+
+    def fail_after_close(*args, **kwargs):
+        original_close(*args, **kwargs)
+        raise cleanup_error
+
+    monkeypatch.setattr(
+        pretraining_module, "_close_prepared_resources", fail_after_close
+    )
+
+    with pytest.raises(SMLDataError) as raised:
+        pretraining_module.preflight_pretraining_bundle(
+            prepared_bundle,
+            batch_size=sum(prepared_bundle.manifest.shard_row_counts) + 1,
+        )
+
+    assert str(raised.value) == str(semantic_error)
+    assert raised.value.__cause__ is cleanup_error
+
+
+@pytest.mark.parametrize("consumer_api", ["next", "iter_epoch"])
+def test_stream_preserves_producer_failure_when_close_fails(
+    prepared_bundle, monkeypatch, consumer_api
+):
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    producer_error = SMLDataError("injected producer failure")
+    cleanup_error = RuntimeError("injected stream cleanup failure")
+    original_close = stream.close
+
+    def fail_after_close():
+        original_close()
+        raise cleanup_error
+
+    monkeypatch.setattr(
+        stream,
+        "_pull_envelope",
+        lambda: pretraining_module._ProducerFailure(producer_error),
+    )
+    monkeypatch.setattr(stream, "close", fail_after_close)
+    try:
+        with pytest.raises(SMLDataError) as raised:
+            if consumer_api == "next":
+                next(stream)
+            else:
+                next(stream.iter_epoch(0))
+
+        assert raised.value is producer_error
+        assert raised.value.__cause__ is cleanup_error
+    finally:
+        original_close()
+
+
+def test_stream_exit_preserves_body_error_when_close_fails(
+    prepared_bundle, monkeypatch
+):
+    stream = PretrainingBatchStream(
+        prepared_bundle,
+        batch_size=3,
+        seed=5,
+        prefetch_depth=1,
+        cursor=PretrainingCursor.initial(),
+    )
+    body_error = ValueError("injected stream body failure")
+    cleanup_error = RuntimeError("injected stream cleanup failure")
+    original_close = stream.close
+
+    def fail_after_close():
+        original_close()
+        raise cleanup_error
+
+    monkeypatch.setattr(stream, "close", fail_after_close)
+    try:
+        with pytest.raises(ValueError) as raised, stream:
+            raise body_error
+
+        assert raised.value is body_error
+        assert raised.value.__cause__ is cleanup_error
+    finally:
+        original_close()
+
+
 def test_stream_maps_open_descriptors_without_numpy_path_reload(
     prepared_bundle, monkeypatch
 ):
@@ -1147,6 +1242,154 @@ def test_stream_close_detects_in_place_shard_mutation(prepared_bundle):
     with pytest.raises(SMLArtifactError, match="changed during use"):
         stream.close()
     stream.close()
+
+
+def _instrument_real_prepared_cleanup(
+    monkeypatch,
+    *,
+    fail_ndarray_index: int | None = None,
+    fail_shard_open_index: int | None = None,
+):
+    from sml.artifacts.manifest import ArtifactRoot, VerifiedPayload
+
+    events: list[tuple[str, int | str | None]] = []
+    mappings: list[object] = []
+    payloads: list[VerifiedPayload] = []
+    roots: list[ArtifactRoot] = []
+    array_refs: dict[int, weakref.ReferenceType[np.ndarray]] = {}
+    original_mmap = pretraining_module.mmap.mmap
+    original_ndarray = pretraining_module.np.ndarray
+    original_open_payload = OpenedArtifact.open_payload
+    original_payload_close = VerifiedPayload.close
+    original_root_close = ArtifactRoot.close
+
+    class ObservedMmap(original_mmap):
+        def __new__(cls, *args, **kwargs):
+            mapping = super().__new__(cls, *args, **kwargs)
+            mappings.append(mapping)
+            return mapping
+
+        def close(self):
+            index = mappings.index(self)
+            events.append(("mmap", index))
+            array_ref = array_refs.get(id(self))
+            assert array_ref is None or array_ref() is None, (
+                f"live prepared ndarray still exports mapping {index}"
+            )
+            return super().close()
+
+    def open_payload(artifact, reference):
+        if (
+            reference.logical_path.startswith("shards/")
+            and fail_shard_open_index is not None
+            and len(payloads) == fail_shard_open_index
+        ):
+            raise RuntimeError("injected next-shard open failure")
+        payload = original_open_payload(artifact, reference)
+        if reference.logical_path.startswith("shards/"):
+            payloads.append(payload)
+        return payload
+
+    def close_payload(payload):
+        if payload in payloads:
+            events.append(("payload", payloads.index(payload)))
+        return original_payload_close(payload)
+
+    def close_root(root):
+        roots.append(root)
+        events.append(("root", None))
+        return original_root_close(root)
+
+    def construct_array(*args, **kwargs):
+        array = original_ndarray(*args, **kwargs)
+        buffer = kwargs.get("buffer")
+        if isinstance(buffer, ObservedMmap):
+            array_refs[id(buffer)] = weakref.ref(array)
+            if (
+                fail_ndarray_index is not None
+                and mappings.index(buffer) == fail_ndarray_index
+            ):
+                raise RuntimeError("injected ndarray construction failure")
+        return array
+
+    monkeypatch.setattr(pretraining_module.mmap, "mmap", ObservedMmap)
+    monkeypatch.setattr(pretraining_module.np, "ndarray", construct_array)
+    monkeypatch.setattr(OpenedArtifact, "open_payload", open_payload)
+    monkeypatch.setattr(VerifiedPayload, "close", close_payload)
+    monkeypatch.setattr(ArtifactRoot, "close", close_root)
+    return events, mappings, payloads, roots
+
+
+def _assert_real_prepared_cleanup(events, mappings, payloads, roots):
+    assert events == [
+        *(("mmap", index) for index in reversed(range(len(mappings)))),
+        *(("payload", index) for index in reversed(range(len(payloads)))),
+        ("root", None),
+    ]
+    assert mappings
+    assert all(mapping.closed for mapping in mappings)
+    assert all(payload.closed for payload in payloads)
+    assert len(roots) == 1
+    assert roots[0]._fd == -1
+
+
+def test_prepared_ndarray_failure_closes_real_mapping_payload_and_root(
+    prepared_bundle, monkeypatch
+):
+    events, mappings, payloads, roots = _instrument_real_prepared_cleanup(
+        monkeypatch,
+        fail_ndarray_index=0,
+    )
+
+    with pytest.raises(RuntimeError, match="injected ndarray construction failure"):
+        pretraining_module._open_validated_prepared_resources(prepared_bundle)
+
+    _assert_real_prepared_cleanup(events, mappings, payloads, roots)
+
+
+def test_prepared_next_shard_failure_closes_real_mapping_payload_and_root(
+    prepared_bundle, monkeypatch
+):
+    events, mappings, payloads, roots = _instrument_real_prepared_cleanup(
+        monkeypatch,
+        fail_shard_open_index=1,
+    )
+
+    with pytest.raises(RuntimeError, match="injected next-shard open failure"):
+        pretraining_module._open_validated_prepared_resources(prepared_bundle)
+
+    _assert_real_prepared_cleanup(events, mappings, payloads, roots)
+
+
+def test_prepared_semantic_failure_closes_real_mappings_payloads_and_root(
+    prepared_bundle, monkeypatch
+):
+    width = prepared_bundle.manifest.row_width
+    prepared_bundle = _replace_shards(
+        prepared_bundle,
+        (_rows(width, 0, 1), _rows(width, 10, 11), _rows(width, 20, 300)),
+    )
+    events, mappings, payloads, roots = _instrument_real_prepared_cleanup(monkeypatch)
+
+    with pytest.raises(SMLArtifactError, match="token IDs"):
+        pretraining_module._open_validated_prepared_resources(prepared_bundle)
+
+    _assert_real_prepared_cleanup(events, mappings, payloads, roots)
+
+
+def test_prepared_detach_failure_closes_real_mappings_payloads_and_root(
+    prepared_bundle, monkeypatch
+):
+    events, mappings, payloads, roots = _instrument_real_prepared_cleanup(monkeypatch)
+
+    def fail_detach(_artifact):
+        raise RuntimeError("injected prepared detach failure")
+
+    monkeypatch.setattr(OpenedArtifact, "detach_root", fail_detach)
+    with pytest.raises(RuntimeError, match="injected prepared detach failure"):
+        pretraining_module._open_validated_prepared_resources(prepared_bundle)
+
+    _assert_real_prepared_cleanup(events, mappings, payloads, roots)
 
 
 def test_prepared_resource_cleanup_releases_views_mappings_payloads_then_root():

@@ -527,6 +527,8 @@ def test_resume_rejects_mismatches_before_allocation(
         resolve_model_artifact(tiny_base_run, full_verify=True),
         tmp_path / "other-swag",
     )
+    other_bundle_path = other_bundle.path
+    other_bundle.close()
     allocated: list[str] = []
 
     def forbidden(name: str):
@@ -549,7 +551,7 @@ def test_resume_rejects_mismatches_before_allocation(
     with pytest.raises((SMLArtifactError, SMLConfigurationError)):
         resume_finetune(
             trained.run,
-            data=other_bundle.path,
+            data=other_bundle_path,
             overrides=ResumeOverrides(maximum_steps=2),
         )
     assert allocated == []
