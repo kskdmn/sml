@@ -1222,6 +1222,110 @@ def test_swag_bundle_construction_failure_closes_partial_mapping_then_root(
     _assert_real_swag_cleanup(events, owners, roots)
 
 
+def test_swag_registration_failure_closes_pending_real_mapping_phase_wide(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle
+
+    prepared = _one_example_bundle(tmp_path)
+    path = prepared.path
+    reference = next(
+        reference
+        for reference in prepared.manifest.buckets
+        if reference.payload.logical_path.endswith("/input_ids.npy")
+    )
+    length = reference.arrays[0].shape[-1]
+    prepared.close()
+    events, owners, roots = _instrument_real_swag_cleanup(monkeypatch)
+    semantic_error = RuntimeError("injected owner registration failure")
+    cleanup_error = RuntimeError("injected payload postcheck failure")
+    instrumented_payload_close = swag._OwnedNpyMapping._close_payload
+
+    class FailingRegistrationKey(str):
+        def __hash__(self):
+            raise semantic_error
+
+    class SingleReferenceLookup:
+        def __getitem__(self, _name):
+            return reference
+
+    def fail_after_payload_close(owner):
+        instrumented_payload_close(owner)
+        raise cleanup_error
+
+    monkeypatch.setattr(
+        swag,
+        "_ARRAY_NAMES",
+        (FailingRegistrationKey("input_ids"),),
+    )
+    monkeypatch.setattr(
+        swag,
+        "_group_manifest_buckets",
+        lambda _manifest: ((length, SingleReferenceLookup()),),
+    )
+    monkeypatch.setattr(
+        swag._OwnedNpyMapping,
+        "_close_payload",
+        fail_after_payload_close,
+    )
+
+    with pytest.raises(RuntimeError, match="owner registration") as caught:
+        load_swag_bundle(path, VerificationLevel.FULL)
+
+    assert caught.value is semantic_error
+    assert caught.value.__cause__ is cleanup_error
+    _assert_real_swag_cleanup(events, owners, roots)
+
+
+def test_swag_pre_registration_failure_closes_pending_real_mapping_phase_wide(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle
+
+    prepared = _one_example_bundle(tmp_path)
+    path = prepared.path
+    prepared.close()
+    events, owners, roots = _instrument_real_swag_cleanup(monkeypatch)
+    semantic_error = RuntimeError("injected pre-registration failure")
+    instrumented_open = swag._OwnedNpyMapping.open.__func__
+    registration_pending = False
+    previous_trace = sys.gettrace()
+
+    def open_then_arm_registration_failure(cls, artifact, reference):
+        nonlocal registration_pending
+        owner = instrumented_open(cls, artifact, reference)
+        registration_pending = True
+        return owner
+
+    def fail_before_registration(frame, event, _argument):
+        nonlocal registration_pending
+        if event == "line" and frame.f_code is swag._open_buckets.__code__:
+            if not registration_pending:
+                return fail_before_registration
+            registration_pending = False
+            sys.settrace(previous_trace)
+            raise semantic_error
+        return fail_before_registration
+
+    monkeypatch.setattr(
+        swag._OwnedNpyMapping,
+        "open",
+        classmethod(open_then_arm_registration_failure),
+    )
+    sys.settrace(fail_before_registration)
+    try:
+        with pytest.raises(RuntimeError, match="pre-registration") as caught:
+            load_swag_bundle(path, VerificationLevel.FULL)
+    finally:
+        sys.settrace(previous_trace)
+
+    assert caught.value is semantic_error
+    assert caught.value.__cause__ is None
+    _assert_real_swag_cleanup(events, owners, roots)
+
+
 def test_swag_semantic_failure_closes_real_mmaps_phase_wide(tmp_path, monkeypatch):
     from sml.data.swag import load_swag_bundle
 

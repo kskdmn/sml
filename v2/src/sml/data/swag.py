@@ -352,16 +352,33 @@ class _OwnedNpyMapping:
 def _close_swag_resources(
     mappings: Sequence[_OwnedNpyMapping],
     root: ArtifactRoot | None,
+    *,
+    pending_mapping: _OwnedNpyMapping | None = None,
 ) -> None:
     errors: list[BaseException] = []
+    if pending_mapping is not None:
+        try:
+            pending_mapping._release_view()
+        except BaseException as error:  # noqa: BLE001 - cleanup continues
+            errors.append(error)
     for owner in reversed(mappings):
         try:
             owner._release_view()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
+    if pending_mapping is not None:
+        try:
+            pending_mapping._close_mapping()
+        except BaseException as error:  # noqa: BLE001 - cleanup continues
+            errors.append(error)
     for owner in reversed(mappings):
         try:
             owner._close_mapping()
+        except BaseException as error:  # noqa: BLE001 - cleanup continues
+            errors.append(error)
+    if pending_mapping is not None:
+        try:
+            pending_mapping._close_payload()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     for owner in reversed(mappings):
@@ -967,6 +984,7 @@ def _open_buckets(
     mappings: list[_OwnedNpyMapping] = []
     owners: dict[str, _OwnedNpyMapping] = {}
     owner: _OwnedNpyMapping | None = None
+    pending_owner: _OwnedNpyMapping | None = None
     input_ids: np.ndarray | None = None
     valid_token_mask: np.ndarray | None = None
     score_mask: np.ndarray | None = None
@@ -976,9 +994,12 @@ def _open_buckets(
         for length, arrays in _group_manifest_buckets(manifest):
             owners = {}
             for name in _ARRAY_NAMES:
-                owner = _OwnedNpyMapping.open(artifact, arrays[name])
+                pending_owner = _OwnedNpyMapping.open(artifact, arrays[name])
+                mappings.append(pending_owner)
+                owner = pending_owner
+                pending_owner = None
                 owners[name] = owner
-                mappings.append(owner)
+                owner = None
             input_ids = owners["input_ids"].array
             valid_token_mask = owners["valid_token_mask"].array
             score_mask = owners["score_mask"].array
@@ -1032,7 +1053,11 @@ def _open_buckets(
         score_mask = None
         labels = None
         try:
-            _close_swag_resources(mappings, None)
+            _close_swag_resources(
+                mappings,
+                None,
+                pending_mapping=pending_owner,
+            )
         except BaseException as cleanup_error:
             raise error from cleanup_error
         raise
