@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import inspect
 import math
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten
 from sml.errors import SMLConfigurationError
 from sml.model import LoRAAdapterSpec, LoRAForwardPolicy
+from sml.model import layers as layers_module
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
-from sml.model.layers import _Linear
-from sml.training import lora as lora_module
+from sml.model.layers import _Linear, _linear, keyed_dropout
 from sml.training.common import PrecisionConfig
 from sml.training.lora import (
     LoRAConfig,
@@ -196,6 +196,61 @@ def test_lora_dtype_boundaries_and_live_formula(tiny_model):
     assert layer.lora_a.dtype == mx.float32
     assert layer.lora_b.dtype == mx.float32
     assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+def test_shared_linear_formula_matches_live_wrapper_and_manual_dropout_oracle():
+    module_path = "layers.0.self_attn.q_proj"
+    spec = LoRAAdapterSpec(module_path=module_path, scale=1.0 / 3.0, dropout=0.5)
+    linear = _Linear(4, 3)
+    linear.weight = mx.array(
+        [[1.0, -2.0, 0.5, 3.0], [0.25, 1.5, -1.0, 2.0], [2.0, 0.0, 1.0, -0.5]],
+        dtype=mx.bfloat16,
+    )
+    layer = LoRALinear(
+        linear,
+        tiny_lora_config(rank=2),
+        module_path=module_path,
+        spec=spec,
+        key=mx.random.key(7),
+    )
+    layer.lora_a = mx.array(
+        [[0.5, -1.0, 2.0, 0.25], [1.5, 0.75, -0.5, 1.0]],
+        dtype=mx.float32,
+    )
+    layer.lora_b = mx.array(
+        [[1.0, -0.5], [0.25, 2.0], [-1.5, 0.75]],
+        dtype=mx.float32,
+    )
+    x = mx.array(
+        [[[1.0, -0.5, 2.0, 0.25], [0.75, 1.5, -1.0, 2.0]]],
+        dtype=mx.bfloat16,
+    )
+    key = mx.random.key(19)
+    adapter_input, expected_key = keyed_dropout(x.astype(mx.float32), spec.dropout, key)
+    expected_adapter = mx.array(1.0 / 3.0, dtype=mx.float32) * (
+        (adapter_input @ layer.lora_a.T) @ layer.lora_b.T
+    )
+    expected = (x @ linear.weight.T + expected_adapter.astype(mx.bfloat16)).astype(
+        mx.bfloat16
+    )
+    policy = LoRAForwardPolicy((spec,))
+
+    pure, pure_key = _linear(
+        x,
+        layer.parameters(),
+        module_path=module_path,
+        lora_policy=policy,
+        training=True,
+        key=key,
+    )
+    live, live_key = layer(x, training=True, key=key)
+
+    mx.eval(expected, pure, live, expected_key, pure_key, live_key)
+    assert pure.dtype == live.dtype == mx.bfloat16
+    assert bool(mx.array_equal(pure, expected).item())
+    assert bool(mx.array_equal(live, expected).item())
+    assert bool(mx.array_equal(pure_key, expected_key).item())
+    assert bool(mx.array_equal(live_key, expected_key).item())
 
 
 def test_merged_weight_matches_exact_array_formula_without_mutation(tiny_adapted_model):
@@ -424,6 +479,151 @@ def test_lora_dropout_replays_from_the_same_explicit_key(tiny_model, tiny_lora_c
     assert not bool(mx.allclose(first, idle, atol=0.0, rtol=0.0).item())
 
 
+def test_pure_array_lora_dropout_replays_and_advances_key(
+    tiny_model,
+    tiny_lora_config,
+) -> None:
+    adapted = apply_lora(
+        tiny_model,
+        tiny_lora_config(
+            dropout=0.5,
+            initializer=LoRAInitializerConfig(lora_a=0.05, lora_b=0.05),
+        ),
+        key=mx.random.key(4),
+    )
+    input_ids = mx.array([[1, 2, 3, 4]], dtype=mx.int32)
+    key = mx.random.key(19)
+    first, first_cache, first_key = adapted.forward_arrays(
+        adapted.parameters(),
+        input_ids,
+        attention_mask=None,
+        positions=None,
+        cache_state=None,
+        training=True,
+        key=key,
+    )
+    replay, replay_cache, replay_key = adapted.forward_arrays(
+        adapted.parameters(),
+        input_ids,
+        attention_mask=None,
+        positions=None,
+        cache_state=None,
+        training=True,
+        key=key,
+    )
+    mx.eval(first, replay, first_key, replay_key)
+    assert first_cache is replay_cache is None
+    assert bool(mx.array_equal(first, replay).item())
+    assert bool(mx.array_equal(first_key, replay_key).item())
+    assert not bool(mx.array_equal(first_key, key).item())
+
+
+def test_inference_and_zero_dropout_consume_no_adapter_key(
+    tiny_model,
+    tiny_lora_config,
+) -> None:
+    adapted = apply_lora(
+        tiny_model,
+        tiny_lora_config(dropout=0.0),
+        key=mx.random.key(4),
+    )
+    key = mx.random.key(23)
+    input_ids = mx.array([[1, 2]], dtype=mx.int32)
+    _, _, returned = adapted.forward_arrays(
+        adapted.parameters(),
+        input_ids,
+        attention_mask=None,
+        positions=None,
+        cache_state=None,
+        training=True,
+        key=key,
+    )
+    _, _, inference_returned = adapted.forward_arrays(
+        adapted.parameters(),
+        input_ids,
+        attention_mask=None,
+        positions=None,
+        cache_state=None,
+        training=False,
+        key=key,
+    )
+    mx.eval(returned, inference_returned, key)
+    assert bool(mx.array_equal(returned, key).item())
+    assert bool(mx.array_equal(inference_returned, key).item())
+
+
+def test_pure_array_lora_and_hidden_dropout_use_canonical_key_order(
+    monkeypatch,
+    tiny_lora_config,
+) -> None:
+    config = replace(tiny_model_config(), hidden_dropout=0.18)
+    model = SMLLanguageModel(config, key=mx.random.key(3))
+    adapted = apply_lora(
+        model,
+        tiny_lora_config(
+            dropout=0.1,
+            target_modules=(
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ),
+            initializer=LoRAInitializerConfig(lora_a=0.05, lora_b=0.05),
+        ),
+        key=mx.random.key(4),
+    )
+    dropout_by_module = {
+        "q_proj": 0.11,
+        "k_proj": 0.12,
+        "v_proj": 0.13,
+        "o_proj": 0.14,
+        "gate_proj": 0.15,
+        "up_proj": 0.16,
+        "down_proj": 0.17,
+    }
+    original_policy = adapted.lora_forward_policy
+    assert original_policy is not None
+    adapted.lora_forward_policy = LoRAForwardPolicy(
+        tuple(
+            LoRAAdapterSpec(
+                module_path=spec.module_path,
+                scale=spec.scale,
+                dropout=dropout_by_module[spec.module_path.rsplit(".", 1)[-1]],
+            )
+            for spec in original_policy.adapters
+        )
+    )
+    observed_probabilities: list[float] = []
+    real_keyed_dropout = layers_module.keyed_dropout
+
+    def record_keyed_dropout(x, probability, key):
+        observed_probabilities.append(probability)
+        return real_keyed_dropout(x, probability, key)
+
+    monkeypatch.setattr(layers_module, "keyed_dropout", record_keyed_dropout)
+    key = mx.random.key(29)
+    _logits, _cache, returned_key = adapted.forward_arrays(
+        adapted.parameters(),
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        attention_mask=None,
+        positions=None,
+        cache_state=None,
+        training=True,
+        key=key,
+    )
+
+    per_layer = [0.11, 0.12, 0.13, 0.14, 0.15, 0.16, 0.17, 0.18]
+    assert observed_probabilities == per_layer * config.num_layers
+    expected_key = key
+    for _dropout_site in observed_probabilities:
+        expected_key = mx.random.split(expected_key)[0]
+    mx.eval(returned_key, expected_key)
+    assert bool(mx.array_equal(returned_key, expected_key).item())
+
+
 def test_live_and_merged_outputs_match_within_pinned_bf16_tolerance(tiny_adapted_model):
     layer = tiny_adapted_model.layers[0].self_attn.q_proj
     x = mx.ones((2, 3, layer.base.weight.shape[1]), dtype=mx.bfloat16)
@@ -478,7 +678,7 @@ def test_lora_state_dict_round_trip_preserves_adapter_arrays(tiny_model_config):
 
 
 def test_lora_uses_keyed_dropout_rather_than_nn_dropout():
-    source = inspect.getsource(lora_module)
+    source = inspect.getsource(layers_module)
 
     assert "keyed_dropout" in source
     assert "nn.Dropout" not in source

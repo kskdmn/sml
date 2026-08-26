@@ -95,14 +95,40 @@ def keyed_dropout(
     return mx.where(mask, x / keep_probability, 0.0).astype(x.dtype), next_key
 
 
-def _linear(x: mx.array, parameters: dict[str, object]) -> mx.array:
+def _linear(
+    x: mx.array,
+    parameters: dict[str, object],
+    *,
+    module_path: str,
+    lora_policy: LoRAForwardPolicy | None,
+    training: bool,
+    key: mx.array | None,
+) -> tuple[mx.array, mx.array | None]:
+    spec = None if lora_policy is None else lora_policy.for_module(module_path)
     if "weight" in parameters:
-        return x @ parameters["weight"].T
-    base_output = x @ parameters["base"]["weight"].T
-    adapter = parameters["scale"].astype(mx.float32) * (
-        (x.astype(mx.float32) @ parameters["lora_a"].T) @ parameters["lora_b"].T
+        if spec is not None:
+            raise ValueError(
+                f"LoRA policy applies to plain linear parameters: {module_path}"
+            )
+        return (x @ parameters["weight"].T).astype(mx.bfloat16), key
+    if spec is None:
+        raise ValueError(
+            f"adapted parameters require matching LoRA adapter spec: {module_path}"
+        )
+
+    adapter_input = x.astype(mx.float32)
+    if training and spec.dropout > 0.0:
+        if key is None:
+            raise ValueError("training with LoRA dropout requires an explicit key")
+        adapter_input, key = keyed_dropout(adapter_input, spec.dropout, key)
+    scale = mx.array(spec.scale, dtype=mx.float32)
+    adapter = scale * (
+        (adapter_input @ parameters["lora_a"].T) @ parameters["lora_b"].T
     )
-    return (base_output + adapter.astype(mx.bfloat16)).astype(mx.bfloat16)
+    output = (x @ parameters["base"]["weight"].T + adapter.astype(mx.bfloat16)).astype(
+        mx.bfloat16
+    )
+    return output, key
 
 
 def _apply_rotary_batched(
@@ -158,11 +184,36 @@ class GroupedQueryAttention(nn.Module):
         attention_mask: mx.array,
         positions: mx.array,
         cache_state: KVArrayState | None,
-    ) -> tuple[mx.array, KVArrayState | None]:
+        lora_policy: LoRAForwardPolicy | None,
+        training: bool,
+        key: mx.array | None,
+    ) -> tuple[mx.array, KVArrayState | None, mx.array | None]:
         batch_size, query_length, _hidden_size = x.shape
-        q = _linear(x, parameters["q_proj"])
-        k = _linear(x, parameters["k_proj"])
-        v = _linear(x, parameters["v_proj"])
+        module_prefix = f"layers.{self.layer_index}.self_attn"
+        q, key = _linear(
+            x,
+            parameters["q_proj"],
+            module_path=f"{module_prefix}.q_proj",
+            lora_policy=lora_policy,
+            training=training,
+            key=key,
+        )
+        k, key = _linear(
+            x,
+            parameters["k_proj"],
+            module_path=f"{module_prefix}.k_proj",
+            lora_policy=lora_policy,
+            training=training,
+            key=key,
+        )
+        v, key = _linear(
+            x,
+            parameters["v_proj"],
+            module_path=f"{module_prefix}.v_proj",
+            lora_policy=lora_policy,
+            training=training,
+            key=key,
+        )
         q = q.reshape(
             (batch_size, query_length, self.config.num_q_heads, self.config.head_dim)
         ).swapaxes(1, 2)
@@ -210,9 +261,16 @@ class GroupedQueryAttention(nn.Module):
         output = output.swapaxes(1, 2).reshape(
             (batch_size, query_length, self.config.hidden_size)
         )
-        output = _linear(output, parameters["o_proj"]).astype(mx.bfloat16)
+        output, key = _linear(
+            output,
+            parameters["o_proj"],
+            module_path=f"{module_prefix}.o_proj",
+            lora_policy=lora_policy,
+            training=training,
+            key=key,
+        )
         output = mx.where(attention_mask[:, :, None], output, 0.0).astype(mx.bfloat16)
-        return output, updated_cache_state
+        return output, updated_cache_state, key
 
     def __call__(
         self,
@@ -229,12 +287,15 @@ class GroupedQueryAttention(nn.Module):
                 mx.arange(query_length, dtype=mx.int32)[None, :],
                 (batch_size, query_length),
             )
-        output, _cache_state = self.forward_arrays(
+        output, _cache_state, _key = self.forward_arrays(
             self.parameters(),
             x,
             attention_mask=attention_mask,
             positions=positions,
             cache_state=None,
+            lora_policy=None,
+            training=False,
+            key=None,
         )
         return output
 
@@ -252,13 +313,36 @@ class SwiGLUFeedForward(nn.Module):
         parameters: dict[str, dict[str, mx.array]],
         x: mx.array,
         *,
+        module_prefix: str,
+        lora_policy: LoRAForwardPolicy | None,
         training: bool,
         key: mx.array | None,
     ) -> tuple[mx.array, mx.array | None]:
-        hidden = nn.silu(_linear(x, parameters["gate_proj"])) * _linear(
-            x, parameters["up_proj"]
+        gate, key = _linear(
+            x,
+            parameters["gate_proj"],
+            module_path=f"{module_prefix}.gate_proj",
+            lora_policy=lora_policy,
+            training=training,
+            key=key,
         )
-        output = _linear(hidden, parameters["down_proj"]).astype(mx.bfloat16)
+        up, key = _linear(
+            x,
+            parameters["up_proj"],
+            module_path=f"{module_prefix}.up_proj",
+            lora_policy=lora_policy,
+            training=training,
+            key=key,
+        )
+        hidden = nn.silu(gate) * up
+        output, key = _linear(
+            hidden,
+            parameters["down_proj"],
+            module_path=f"{module_prefix}.down_proj",
+            lora_policy=lora_policy,
+            training=training,
+            key=key,
+        )
         if training and self.dropout_probability > 0.0:
             if key is None:
                 raise ValueError("training with dropout requires an explicit key")
@@ -275,6 +359,8 @@ class SwiGLUFeedForward(nn.Module):
         return self.forward_arrays(
             self.parameters(),
             x,
+            module_prefix="mlp",
+            lora_policy=None,
             training=training,
             key=key,
         )
@@ -296,6 +382,7 @@ class TransformerBlock(nn.Module):
         attention_mask: mx.array,
         positions: mx.array,
         cache_state: KVArrayState | None,
+        lora_policy: LoRAForwardPolicy | None = None,
         training: bool,
         key: mx.array | None,
     ) -> tuple[mx.array, KVArrayState | None, mx.array | None]:
@@ -304,12 +391,15 @@ class TransformerBlock(nn.Module):
             x,
             self.input_norm.epsilon,
         )
-        attention_output, cache_state = self.self_attn.forward_arrays(
+        attention_output, cache_state, key = self.self_attn.forward_arrays(
             parameters["self_attn"],
             attention_input,
             attention_mask=attention_mask,
             positions=positions,
             cache_state=cache_state,
+            lora_policy=lora_policy,
+            training=training,
+            key=key,
         )
         hidden = (x + attention_output).astype(mx.bfloat16)
         mlp_input = RMSNorm.forward_arrays(
@@ -320,6 +410,8 @@ class TransformerBlock(nn.Module):
         mlp_output, key = self.mlp.forward_arrays(
             parameters["mlp"],
             mlp_input,
+            module_prefix=f"layers.{self.self_attn.layer_index}.mlp",
+            lora_policy=lora_policy,
             training=training,
             key=key,
         )
@@ -342,6 +434,7 @@ class TransformerBlock(nn.Module):
             attention_mask=attention_mask,
             positions=positions,
             cache_state=cache_state,
+            lora_policy=None,
             training=training,
             key=key,
         )

@@ -6,11 +6,13 @@ from dataclasses import fields, replace
 from pathlib import Path
 
 import mlx.core as mx
+import pytest
 from mlx import nn
 from mlx.utils import tree_flatten, tree_map
 from sml.model.cache import KVCache
 from sml.model.config import ModelConfig
 from sml.model.language_model import ForwardOutput, SMLLanguageModel, causal_lm_loss
+from sml.model.layers import LoRAAdapterSpec, LoRAForwardPolicy
 
 
 def _tiny_model_config(**overrides) -> ModelConfig:
@@ -136,6 +138,24 @@ def test_forward_arrays_uses_explicit_parameters_without_installing_them():
         registered_after[name] is registered_before[name] for name in registered_before
     )
     _assert_close(logits, mx.zeros_like(logits))
+
+
+def test_forward_arrays_rejects_lora_policy_entry_for_plain_projection():
+    model = SMLLanguageModel(_tiny_model_config(), key=mx.random.key(17))
+    model.lora_forward_policy = LoRAForwardPolicy(
+        (LoRAAdapterSpec("layers.0.self_attn.q_proj", 1.0, 0.0),)
+    )
+
+    with pytest.raises(ValueError, match="plain linear parameters"):
+        model.forward_arrays(
+            model.parameters(),
+            mx.array([[1, 4, 5]], dtype=mx.int32),
+            attention_mask=None,
+            positions=None,
+            cache_state=None,
+            training=False,
+            key=None,
+        )
 
 
 def test_attention_mask_and_positions_make_padding_inert(

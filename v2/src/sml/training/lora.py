@@ -10,7 +10,7 @@ from mlx import nn
 from mlx.utils import tree_flatten
 
 from sml.errors import SMLConfigurationError
-from sml.model.layers import LoRAAdapterSpec, LoRAForwardPolicy, _Linear, keyed_dropout
+from sml.model.layers import LoRAAdapterSpec, LoRAForwardPolicy, _Linear, _linear
 
 _ALLOWED_TARGET_MODULES = (
     "q_proj",
@@ -213,19 +213,14 @@ class LoRALinear(nn.Module):
         key: mx.array | None = None,
         training: bool = False,
     ) -> tuple[mx.array, mx.array | None]:
-        base_output = self.base(x)
-        adapter_input = x.astype(mx.float32)
-        if training and self.spec.dropout > 0.0:
-            if key is None:
-                raise SMLConfigurationError(
-                    "training with dropout requires an explicit key"
-                )
-            adapter_input, key = keyed_dropout(adapter_input, self.spec.dropout, key)
-        adapter = mx.array(self.spec.scale, dtype=mx.float32) * (
-            (adapter_input @ self.lora_a.T) @ self.lora_b.T
+        return _linear(
+            x,
+            self.parameters(),
+            module_path=self.module_path,
+            lora_policy=LoRAForwardPolicy((self.spec,)),
+            training=training,
+            key=key,
         )
-        output = (base_output + adapter.astype(mx.bfloat16)).astype(mx.bfloat16)
-        return output, key
 
 
 def _get_submodule(module, path: str):

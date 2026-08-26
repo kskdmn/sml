@@ -3,7 +3,15 @@ from __future__ import annotations
 import inspect
 
 import mlx.core as mx
-from sml.model.layers import GroupedQueryAttention, RMSNorm, _linear, keyed_dropout
+import pytest
+from sml.model.layers import (
+    GroupedQueryAttention,
+    LoRAAdapterSpec,
+    LoRAForwardPolicy,
+    RMSNorm,
+    _linear,
+    keyed_dropout,
+)
 
 
 def _assert_close(
@@ -69,24 +77,117 @@ def test_grouped_query_attention_uses_fused_gqa_without_tiling_kv_heads():
     assert "mx.repeat" not in source
 
 
-def test_linear_applies_live_lora_formula_when_projection_is_wrapped():
+def test_linear_plain_weight_returns_bfloat16_and_consumes_no_key():
     x = mx.ones((1, 2, 4), dtype=mx.bfloat16)
-    base_weight = mx.arange(12, dtype=mx.bfloat16).reshape((3, 4))
-    lora_a = mx.arange(8, dtype=mx.float32).reshape((2, 4))
-    lora_b = mx.arange(6, dtype=mx.float32).reshape((3, 2))
-    scale = mx.array(0.5, dtype=mx.float32)
+    weight = mx.arange(12, dtype=mx.bfloat16).reshape((3, 4))
+    key = mx.random.key(5)
 
-    actual = _linear(
+    actual, returned_key = _linear(
         x,
-        {
-            "base": {"weight": base_weight},
-            "lora_a": lora_a,
-            "lora_b": lora_b,
-            "scale": scale,
-        },
+        {"weight": weight},
+        module_path="layers.0.self_attn.q_proj",
+        lora_policy=None,
+        training=True,
+        key=key,
     )
-    adapter = scale.astype(mx.float32) * ((x.astype(mx.float32) @ lora_a.T) @ lora_b.T)
-    expected = ((x @ base_weight.T) + adapter.astype(mx.bfloat16)).astype(mx.bfloat16)
+    expected = (x @ weight.T).astype(mx.bfloat16)
 
     assert actual.dtype == mx.bfloat16
     _assert_close(actual, expected)
+    _assert_close(returned_key, key)
+
+
+def test_linear_requires_an_exact_policy_match_for_adapted_parameters():
+    x = mx.ones((1, 2, 4), dtype=mx.bfloat16)
+    parameters = {
+        "base": {"weight": mx.ones((3, 4), dtype=mx.bfloat16)},
+        "lora_a": mx.ones((2, 4), dtype=mx.float32),
+        "lora_b": mx.ones((3, 2), dtype=mx.float32),
+    }
+    mismatched_policy = LoRAForwardPolicy(
+        (LoRAAdapterSpec("layers.0.self_attn.k_proj", 1.0, 0.0),)
+    )
+
+    with pytest.raises(ValueError, match="matching LoRA adapter spec"):
+        _linear(
+            x,
+            parameters,
+            module_path="layers.0.self_attn.q_proj",
+            lora_policy=None,
+            training=False,
+            key=None,
+        )
+    with pytest.raises(ValueError, match="matching LoRA adapter spec"):
+        _linear(
+            x,
+            parameters,
+            module_path="layers.0.self_attn.q_proj",
+            lora_policy=mismatched_policy,
+            training=False,
+            key=None,
+        )
+
+
+def test_linear_rejects_policy_entry_applied_to_plain_weights():
+    policy = LoRAForwardPolicy(
+        (LoRAAdapterSpec("layers.0.self_attn.q_proj", 1.0, 0.0),)
+    )
+
+    with pytest.raises(ValueError, match="plain linear parameters"):
+        _linear(
+            mx.ones((1, 2, 4), dtype=mx.bfloat16),
+            {"weight": mx.ones((3, 4), dtype=mx.bfloat16)},
+            module_path="layers.0.self_attn.q_proj",
+            lora_policy=policy,
+            training=False,
+            key=None,
+        )
+
+
+def test_linear_requires_key_only_for_enabled_training_adapter_dropout():
+    x = mx.ones((1, 2, 4), dtype=mx.bfloat16)
+    parameters = {
+        "base": {"weight": mx.ones((3, 4), dtype=mx.bfloat16)},
+        "lora_a": mx.ones((2, 4), dtype=mx.float32),
+        "lora_b": mx.ones((3, 2), dtype=mx.float32),
+    }
+    active = LoRAForwardPolicy(
+        (LoRAAdapterSpec("layers.0.self_attn.q_proj", 1.0, 0.5),)
+    )
+    disabled = LoRAForwardPolicy(
+        (LoRAAdapterSpec("layers.0.self_attn.q_proj", 1.0, 0.0),)
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="training with LoRA dropout requires an explicit key",
+    ):
+        _linear(
+            x,
+            parameters,
+            module_path="layers.0.self_attn.q_proj",
+            lora_policy=active,
+            training=True,
+            key=None,
+        )
+
+    inference, inference_key = _linear(
+        x,
+        parameters,
+        module_path="layers.0.self_attn.q_proj",
+        lora_policy=active,
+        training=False,
+        key=None,
+    )
+    zero_dropout, zero_dropout_key = _linear(
+        x,
+        parameters,
+        module_path="layers.0.self_attn.q_proj",
+        lora_policy=disabled,
+        training=True,
+        key=None,
+    )
+
+    mx.eval(inference, zero_dropout)
+    assert inference_key is None
+    assert zero_dropout_key is None

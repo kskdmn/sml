@@ -187,6 +187,7 @@ class SMLLanguageModel(nn.Module):
                 attention_mask=attention_mask,
                 positions=positions,
                 cache_state=cache_state,
+                lora_policy=self.lora_forward_policy,
                 training=training,
                 key=key,
             )
