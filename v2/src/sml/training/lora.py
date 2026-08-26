@@ -69,6 +69,7 @@ class LoRAConfig:
         dropout = _require_finite(self.dropout, "dropout")
         if not 0.0 <= dropout < 1.0:
             raise SMLConfigurationError("dropout must be in [0, 1)")
+        object.__setattr__(self, "dropout", dropout)
         if not isinstance(self.initializer, LoRAInitializerConfig):
             raise SMLConfigurationError("initializer must be a LoRAInitializerConfig")
 
@@ -321,14 +322,15 @@ def merged_model_weights(model) -> dict[str, mx.array]:
     }
     merged: dict[str, mx.array] = {}
     for name, value in tree_flatten(model.parameters()):
-        if name.endswith((".lora_a", ".lora_b", ".scale")):
+        if name.endswith((".lora_a", ".lora_b")):
             continue
         if name.endswith(".base.weight"):
             prefix = name[: -len(".base.weight")]
             module = lora_modules[prefix]
+            scale = mx.array(module.spec.scale, dtype=mx.float32)
             merged[f"{prefix}.weight"] = (
                 module.base.weight.astype(mx.float32)
-                + module.scale.astype(mx.float32) * (module.lora_b @ module.lora_a)
+                + scale * (module.lora_b @ module.lora_a)
             ).astype(mx.bfloat16)
             continue
         merged[name] = value

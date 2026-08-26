@@ -21,6 +21,7 @@ from sml.training.lora import (
     LoRAPrecisionConfig,
     apply_lora,
     load_lora_state_dict,
+    lora_config_from_mapping,
     lora_state_dict,
     merged_model_weights,
     split_adapter_parameters,
@@ -98,6 +99,8 @@ def tiny_adapted_model(
     adapted = apply_lora(
         tiny_model,
         tiny_lora_config(
+            rank=3,
+            alpha=1.0,
             dropout=0.0,
             initializer=LoRAInitializerConfig(lora_a=0.01, lora_b=0.05),
         ),
@@ -154,6 +157,29 @@ def test_lora_config_rejects_invalid_rank_alpha_dropout_scaling_and_targets():
         LoRAInitializerConfig(lora_a=-0.1)
     with pytest.raises(SMLConfigurationError, match="lora_b"):
         LoRAInitializerConfig(lora_b=math.inf)
+
+
+def test_lora_config_reconstructs_canonical_zero_dropout_for_static_policy(
+    tiny_model,
+):
+    config = lora_config_from_mapping(
+        {
+            "rank": 2,
+            "alpha": 4.0,
+            "scaling_mode": "lora",
+            "dropout": 0,
+            "target_modules": ["q_proj"],
+            "initializer": {"lora_a": 0.01, "lora_b": 0},
+        }
+    )
+
+    adapted = apply_lora(tiny_model, config, key=mx.random.key(4))
+
+    assert adapted.lora_forward_policy is not None
+    assert all(
+        type(spec.dropout) is float and spec.dropout == 0.0
+        for spec in adapted.lora_forward_policy.adapters
+    )
 
 
 def test_lora_linear_uses_configured_static_scaling_modes():
@@ -254,15 +280,29 @@ def test_shared_linear_formula_matches_live_wrapper_and_manual_dropout_oracle():
 
 
 def test_merged_weight_matches_exact_array_formula_without_mutation(tiny_adapted_model):
+    module = tiny_adapted_model.layers[0].self_attn.q_proj
+    module.base.weight = mx.zeros_like(module.base.weight)
+    module.lora_a = mx.zeros_like(module.lora_a).at[0, 0].add(3.0087)
+    module.lora_b = mx.zeros_like(module.lora_b).at[0, 0].add(1.0)
     before = lora_state_dict(tiny_adapted_model)
     merged = merged_model_weights(tiny_adapted_model)
-    module = tiny_adapted_model.layers[0].self_attn.q_proj
+    spec = module.spec
+    scale = mx.array(spec.scale, dtype=mx.float32)
     expected = (
-        module.base.weight.astype(mx.float32)
-        + mx.array(module.spec.scale, dtype=mx.float32)
-        * (module.lora_b @ module.lora_a)
+        module.base.weight.astype(mx.float32) + scale * (module.lora_b @ module.lora_a)
     ).astype(mx.bfloat16)
-    assert mx.array_equal(merged["layers.0.self_attn.q_proj.weight"], expected).item()
+    bf16_scale_result = (
+        module.base.weight.astype(mx.float32)
+        + scale.astype(mx.bfloat16).astype(mx.float32) * (module.lora_b @ module.lora_a)
+    ).astype(mx.bfloat16)
+    mx.eval(expected, bf16_scale_result)
+    assert not bool(mx.array_equal(expected, bf16_scale_result).item())
+    assert bool(
+        mx.array_equal(
+            merged["layers.0.self_attn.q_proj.weight"],
+            expected,
+        ).item()
+    )
     assert_lora_state_equal(lora_state_dict(tiny_adapted_model), before)
 
 

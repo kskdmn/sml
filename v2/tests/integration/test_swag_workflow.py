@@ -452,12 +452,22 @@ def test_lora_checkpoint_omits_frozen_base(tiny_lora_run):
 def test_uninterrupted_and_interrupted_adapter_state_match(
     tiny_base_run, tiny_swag_bundle, tmp_path
 ):
+    lora = LoRAConfig(
+        rank=3,
+        alpha=1.0,
+        scaling_mode="lora",
+        dropout=0.5,
+        target_modules=("q_proj", "v_proj"),
+        initializer=LoRAInitializerConfig(lora_a=0.05, lora_b=0.05),
+    )
     uninterrupted = finetune(
         tiny_swag_training_config(
             tiny_base_run,
             tiny_swag_bundle,
             tmp_path / "uninterrupted",
+            lora=lora,
             maximum_steps=2,
+            compile=True,
         )
     )
     first = finetune(
@@ -465,7 +475,9 @@ def test_uninterrupted_and_interrupted_adapter_state_match(
             tiny_base_run,
             tiny_swag_bundle,
             tmp_path / "interrupted",
+            lora=lora,
             maximum_steps=1,
+            compile=True,
         )
     )
     resumed = resume_finetune(
@@ -478,6 +490,8 @@ def test_uninterrupted_and_interrupted_adapter_state_match(
     assert left["step"] == right["step"] == 2
     assert left["scalar"]["cursor"] == right["scalar"]["cursor"]
     assert left["scalar"]["step"] == right["scalar"]["step"]
+    assert "step" in left["optimizer"]
+    assert "next_key" in left["trainer"]
     _assert_array_maps_equal(left["adapters"], right["adapters"])
     _assert_array_maps_equal(left["optimizer"], right["optimizer"])
     _assert_array_maps_equal(left["trainer"], right["trainer"])
