@@ -610,6 +610,22 @@ def test_swag_kernels_require_a_nonempty_static_lora_policy(tiny_swag_runtime):
         build_swag_kernels(unadapted, tiny_swag_runtime.config, {})
 
 
+@pytest.mark.parametrize("compiled", (False, True))
+def test_swag_kernels_reject_lora_policy_reassignment_before_execution(
+    tiny_swag_runtime,
+    compiled: bool,
+):
+    kernels = tiny_swag_runtime.kernels(compiled=compiled)
+    policy = tiny_swag_runtime.model.lora_forward_policy
+    assert policy is not None
+    tiny_swag_runtime.model.lora_forward_policy = type(policy)(policy.adapters)
+
+    with pytest.raises(
+        SMLConfigurationError, match="policy changed after kernel build"
+    ):
+        kernels.compiled_ranking_microstep_core(*tiny_swag_runtime.core_inputs())
+
+
 def test_compiled_swag_cores_accept_only_builtin_array_trees(tiny_swag_runtime):
     kernels = tiny_swag_runtime.kernels(compiled=True)
     core_inputs = tiny_swag_runtime.core_inputs()
@@ -1129,16 +1145,22 @@ def test_second_compiled_step_sees_returned_adapter_optimizer_and_key_state(
                     trainer,
                 )
                 stream.commit(batch.cursor_after)
-        mx.eval(adapters, optimizer.to_tree(), *keys)
-        return adapters, optimizer, keys
+        mx.eval(adapters, optimizer.to_tree(), trainer.to_tree(), *keys)
+        return adapters, optimizer, trainer, keys
 
-    compiled_adapters, compiled_optimizer, compiled_keys = run_two_steps(compiled=True)
-    eager_adapters, eager_optimizer, eager_keys = run_two_steps(compiled=False)
+    compiled_adapters, compiled_optimizer, compiled_trainer, compiled_keys = (
+        run_two_steps(compiled=True)
+    )
+    eager_adapters, eager_optimizer, eager_trainer, eager_keys = run_two_steps(
+        compiled=False
+    )
     mx.eval(
         compiled_adapters,
         compiled_optimizer.to_tree(),
+        compiled_trainer.to_tree(),
         eager_adapters,
         eager_optimizer.to_tree(),
+        eager_trainer.to_tree(),
         frozen_base,
         before_base,
         *compiled_keys,
@@ -1159,6 +1181,17 @@ def test_second_compiled_step_sees_returned_adapter_optimizer_and_key_state(
     assert_tree_close(
         compiled_optimizer.to_tree(), eager_optimizer.to_tree(), atol=1e-5, rtol=1e-5
     )
+    assert_tree_close(
+        compiled_trainer.to_tree(), eager_trainer.to_tree(), atol=1e-5, rtol=1e-5
+    )
+    compiled_trainer_tree = compiled_trainer.to_tree()
+    eager_trainer_tree = eager_trainer.to_tree()
+    for index in (1, 2, 4):
+        assert bool(
+            mx.array_equal(
+                compiled_trainer_tree[index], eager_trainer_tree[index]
+            ).item()
+        )
 
 
 def test_kernel_config_is_frozen_from_loader_optimizer_and_compile(tiny_swag_runtime):

@@ -479,12 +479,19 @@ def build_swag_kernels(
         )
         return next_adapters, next_adam_tree, next_trainer
 
+    ranking_microstep_core_impl = (
+        mx.compile(ranking_microstep_core) if config.compile else ranking_microstep_core
+    )
+
+    def guarded_ranking_microstep_core(*args):
+        if model.lora_forward_policy is not lora_forward_policy:
+            raise SMLConfigurationError(
+                "LoRA forward policy changed after kernel build"
+            )
+        return ranking_microstep_core_impl(*args)
+
     return SwagKernels(
-        compiled_ranking_microstep_core=(
-            mx.compile(ranking_microstep_core)
-            if config.compile
-            else ranking_microstep_core
-        ),
+        compiled_ranking_microstep_core=guarded_ranking_microstep_core,
         compiled_optimizer_step_core=(
             mx.compile(swag_optimizer_step_core)
             if config.compile
