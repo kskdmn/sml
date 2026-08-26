@@ -279,6 +279,45 @@ def _logical_path_collision_key(logical_path: str) -> tuple[str, ...]:
     return tuple(component.casefold() for component in parse_logical_path(logical_path))
 
 
+def _stable_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _validated_payload_references(
+    references: Sequence[PayloadRef],
+) -> tuple[PayloadRef, ...]:
+    parsed_references: list[PayloadRef] = []
+    collision_paths: dict[tuple[str, ...], tuple[str, tuple[str, ...]]] = {}
+    for reference in references:
+        if not isinstance(reference, PayloadRef):
+            raise TypeError("references must contain PayloadRef values")
+        components = parse_logical_path(reference.logical_path)
+        collision_key = tuple(component.casefold() for component in components)
+        previous = collision_paths.get(collision_key)
+        if previous is not None:
+            if previous[0] == reference.logical_path:
+                raise SMLArtifactError(
+                    f"duplicate logical payload path: {reference.logical_path!r}"
+                )
+            category = (
+                "normalized path collision"
+                if previous[1] == components
+                else "case-folded path collision"
+            )
+            raise SMLArtifactError(
+                f"{category}: {previous[0]!r} and {reference.logical_path!r}"
+            )
+        collision_paths[collision_key] = (reference.logical_path, components)
+        parsed_references.append(reference)
+    return tuple(parsed_references)
+
+
 def _require_unique_payload_paths(
     references: Sequence[PayloadRef | ArrayPayloadRef],
     name: str,
@@ -359,34 +398,74 @@ class ArtifactRoot:
     ) -> None:
         self.close()
 
-    def open_payload(self, logical_path: str) -> BinaryIO:
-        components = parse_logical_path(logical_path)
+    def _open_directory_descriptor(
+        self,
+        components: tuple[str, ...],
+        *,
+        logical_path: str,
+        context: str,
+    ) -> int:
         if self._fd < 0:
             raise SMLArtifactError("artifact root is closed")
-
-        current_descriptor = -1
-        final_descriptor = -1
+        descriptor = -1
         try:
-            current_descriptor = os.dup(self._fd)
-            for component in components[:-1]:
+            descriptor = os.dup(self._fd)
+            for component in components:
                 next_descriptor = os.open(
                     component,
                     _DIRECTORY_OPEN_FLAGS,
-                    dir_fd=current_descriptor,
+                    dir_fd=descriptor,
                 )
                 try:
                     component_stat = os.fstat(next_descriptor)
                     if not stat.S_ISDIR(component_stat.st_mode):
                         raise SMLArtifactError(
                             "no-follow traversal found a non-directory component "
-                            f"in payload: {logical_path}"
+                            f"in {context}: {logical_path}"
                         )
                 except BaseException:
                     os.close(next_descriptor)
                     raise
-                previous_descriptor = current_descriptor
-                current_descriptor = next_descriptor
+                previous_descriptor = descriptor
+                descriptor = next_descriptor
                 os.close(previous_descriptor)
+            result = descriptor
+            descriptor = -1
+            return result
+        except SMLArtifactError:
+            raise
+        except OSError as error:
+            raise SMLArtifactError(
+                f"no-follow traversal failed for {context}: {logical_path}"
+            ) from error
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def open_child(self, logical_path: str) -> ArtifactRoot:
+        components = parse_logical_path(logical_path)
+        descriptor = self._open_directory_descriptor(
+            components,
+            logical_path=logical_path,
+            context="child root",
+        )
+        try:
+            return ArtifactRoot(descriptor, local_apfs=self._local_apfs)
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    def open_payload(self, logical_path: str) -> BinaryIO:
+        components = parse_logical_path(logical_path)
+
+        current_descriptor = -1
+        final_descriptor = -1
+        try:
+            current_descriptor = self._open_directory_descriptor(
+                components[:-1],
+                logical_path=logical_path,
+                context="payload",
+            )
 
             final_descriptor = os.open(
                 components[-1],
@@ -428,41 +507,12 @@ class ArtifactRoot:
     def verify_payloads(self, references: Sequence[PayloadRef], *, full: bool) -> None:
         if not isinstance(full, bool):
             raise TypeError("full must be a bool")
-        parsed_references: list[tuple[PayloadRef, tuple[str, ...]]] = []
-        collision_paths: dict[tuple[str, ...], tuple[str, tuple[str, ...]]] = {}
-        for reference in references:
-            if not isinstance(reference, PayloadRef):
-                raise TypeError("references must contain PayloadRef values")
-            components = parse_logical_path(reference.logical_path)
-            collision_key = tuple(component.casefold() for component in components)
-            previous = collision_paths.get(collision_key)
-            if previous is not None:
-                if previous[0] == reference.logical_path:
-                    raise SMLArtifactError(
-                        f"duplicate logical payload path: {reference.logical_path!r}"
-                    )
-                category = (
-                    "normalized path collision"
-                    if previous[1] == components
-                    else "case-folded path collision"
-                )
-                raise SMLArtifactError(
-                    f"{category}: {previous[0]!r} and {reference.logical_path!r}"
-                )
-            collision_paths[collision_key] = (reference.logical_path, components)
-            parsed_references.append((reference, components))
-
-        for reference, _components in parsed_references:
-            with self.open_payload(reference.logical_path) as payload:
-                payload_stat = os.fstat(payload.fileno())
-                if payload_stat.st_size != reference.byte_size:
-                    raise SMLArtifactError(
-                        f"payload byte size mismatch: {reference.logical_path}"
-                    )
-                if full and file_identity(payload) != reference.identity:
-                    raise SMLArtifactError(
-                        f"payload identity mismatch: {reference.logical_path}"
-                    )
+        verification = (
+            VerificationLevel.FULL if full else VerificationLevel.MANIFEST_TRUSTED
+        )
+        for reference in _validated_payload_references(references):
+            with _open_verified_payload(self, reference, verification):
+                pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,6 +548,115 @@ class ArrayPayloadRef:
 class VerificationLevel(Enum):
     MANIFEST_TRUSTED = "manifest-trusted"
     FULL = "full"
+
+
+class VerifiedPayload:
+    """One proven payload descriptor retained through semantic consumption."""
+
+    def __init__(
+        self,
+        *,
+        reference: PayloadRef,
+        verification: VerificationLevel,
+        stream: BinaryIO,
+        opened_stat: os.stat_result,
+    ) -> None:
+        self.reference = reference
+        self.verification = verification
+        self.stream = stream
+        self.opened_stat = opened_stat
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        postcheck_error: BaseException | None = None
+        try:
+            current_stat = os.fstat(self.stream.fileno())
+            if _stable_stat_fields(current_stat) != _stable_stat_fields(
+                self.opened_stat
+            ):
+                postcheck_error = SMLArtifactError(
+                    f"payload changed during use: {self.reference.logical_path}"
+                )
+        except OSError as error:
+            postcheck_error = SMLArtifactError(
+                "could not perform payload stability postcheck: "
+                f"{self.reference.logical_path}"
+            )
+            postcheck_error.__cause__ = error
+
+        try:
+            self.stream.close()
+        except BaseException as close_error:
+            if postcheck_error is not None:
+                raise postcheck_error from close_error
+            raise
+        if postcheck_error is not None:
+            raise postcheck_error
+
+    def __enter__(self) -> Self:
+        if self.closed:
+            raise SMLArtifactError("verified payload is closed")
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        try:
+            self.close()
+        except BaseException as close_error:
+            if isinstance(exception, BaseException):
+                raise exception from close_error
+            raise
+
+
+def _open_verified_payload(
+    root: ArtifactRoot,
+    reference: PayloadRef,
+    verification: VerificationLevel,
+) -> VerifiedPayload:
+    if not isinstance(reference, PayloadRef):
+        raise TypeError("reference must be a PayloadRef")
+    if not isinstance(verification, VerificationLevel):
+        raise TypeError("verification must be a VerificationLevel")
+
+    stream = root.open_payload(reference.logical_path)
+    payload: VerifiedPayload | None = None
+    try:
+        opened_stat = os.fstat(stream.fileno())
+        payload = VerifiedPayload(
+            reference=reference,
+            verification=verification,
+            stream=stream,
+            opened_stat=opened_stat,
+        )
+        if opened_stat.st_size != reference.byte_size:
+            raise SMLArtifactError(
+                f"payload byte size mismatch: {reference.logical_path}"
+            )
+        if (
+            verification is VerificationLevel.FULL
+            and file_identity(stream) != reference.identity
+        ):
+            raise SMLArtifactError(
+                f"payload identity mismatch: {reference.logical_path}"
+            )
+        stream.seek(0)
+        return payload
+    except BaseException as error:
+        if payload is None:
+            stream.close()
+        else:
+            try:
+                payload.close()
+            except BaseException as close_error:
+                raise error from close_error
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -977,6 +1136,79 @@ CHECKPOINT_MANIFEST_TYPES = (
 )
 
 
+class OpenedArtifact[M: _Manifest]:
+    """A strict manifest and the retained root descriptor that owns it."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        root: ArtifactRoot,
+        manifest: M,
+        verification: VerificationLevel,
+    ) -> None:
+        self.path = path
+        self.root = root
+        self.manifest = manifest
+        self.verification = verification
+        self.closed = False
+        self._owns_root = True
+
+    def open_payload(self, reference: PayloadRef) -> VerifiedPayload:
+        if self.closed or not self._owns_root:
+            raise SMLArtifactError("opened artifact is closed")
+        return _open_verified_payload(self.root, reference, self.verification)
+
+    def open_child[ChildManifest: _Manifest](
+        self,
+        logical_path: str,
+        manifest_types: tuple[type[ChildManifest], ...],
+    ) -> OpenedArtifact[ChildManifest]:
+        if self.closed or not self._owns_root:
+            raise SMLArtifactError("opened artifact is closed")
+        components = parse_logical_path(logical_path)
+        child_root = self.root.open_child(logical_path)
+        child_path = self.path.joinpath(*components)
+        try:
+            return _open_artifact_from_root(
+                child_path,
+                child_root,
+                manifest_types,
+                self.verification,
+            )
+        except BaseException:
+            child_root.close()
+            raise
+
+    def detach_root(self) -> ArtifactRoot:
+        if self.closed or not self._owns_root:
+            raise SMLArtifactError("artifact root ownership was already transferred")
+        self._owns_root = False
+        self.closed = True
+        return self.root
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self._owns_root:
+            self._owns_root = False
+            self.root.close()
+
+    def __enter__(self) -> Self:
+        if self.closed or not self._owns_root:
+            raise SMLArtifactError("opened artifact is closed")
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        self.close()
+
+
 def _strict_keys(raw: Mapping[str, object], expected: set[str], context: str) -> None:
     actual = set(raw)
     unknown = sorted(actual - expected)
@@ -1242,15 +1474,11 @@ def _manifest_type_for_raw[M: _Manifest](
         ) from error
 
 
-def _read_manifest_types[M: _Manifest](
-    root: Path,
+def _validated_manifest_types[M: _Manifest](
     manifest_types: tuple[type[M], ...],
-    verification: VerificationLevel,
-) -> Verified[M]:
-    if not isinstance(root, Path):
-        raise TypeError("root must be a Path")
-    if not isinstance(verification, VerificationLevel):
-        raise TypeError("verification must be a VerificationLevel")
+) -> tuple[type[M], ...]:
+    if not isinstance(manifest_types, tuple):
+        raise TypeError("manifest_types must be a tuple")
     if not manifest_types or any(
         manifest_type not in _MANIFEST_TYPES for manifest_type in manifest_types
     ):
@@ -1258,43 +1486,107 @@ def _read_manifest_types[M: _Manifest](
     filenames = {manifest_type.MANIFEST_FILENAME for manifest_type in manifest_types}
     if len(filenames) != 1:
         raise SMLArtifactError("discriminated manifest types must share one filename")
-    filename = next(iter(filenames))
-    manifest_path = root / filename
-    with ArtifactRoot.open(root, writable=False) as artifact_root:
-        try:
-            with artifact_root.open_payload(filename) as manifest_file:
-                text = manifest_file.read().decode("utf-8")
-            raw = json.loads(
-                text,
-                parse_constant=_reject_json_constant,
-                object_pairs_hook=_json_object_no_duplicates,
-            )
-            manifest_type = _manifest_type_for_raw(raw, manifest_types)
-            manifest = _parse_manifest(raw, manifest_type)
-        except SMLArtifactError:
-            raise
-        except (
-            OSError,
-            UnicodeError,
-            json.JSONDecodeError,
-            TypeError,
-            ValueError,
-        ) as error:
-            raise SMLArtifactError(
-                f"invalid manifest at {manifest_path}: {error}"
-            ) from error
+    kinds = [manifest_type.EXPECTED_KIND for manifest_type in manifest_types]
+    if len(kinds) != len(set(kinds)):
+        raise SMLArtifactError("manifest_types must contain unique kinds")
+    return manifest_types
 
-        recomputed = manifest.recompute_identity()
-        if recomputed != manifest.identity:
-            raise SMLArtifactError(
-                "manifest identity mismatch: "
-                f"stored {manifest.identity}, recomputed {recomputed}"
-            )
-        artifact_root.verify_payloads(
-            tuple(_payload_refs(manifest)),
-            full=verification is VerificationLevel.FULL,
+
+def _read_manifest_from_root[M: _Manifest](
+    root: ArtifactRoot,
+    path: Path,
+    manifest_types: tuple[type[M], ...],
+) -> M:
+    manifest_types = _validated_manifest_types(manifest_types)
+    filenames = {manifest_type.MANIFEST_FILENAME for manifest_type in manifest_types}
+    filename = next(iter(filenames))
+    manifest_path = path / filename
+    try:
+        with root.open_payload(filename) as manifest_file:
+            opened_stat = os.fstat(manifest_file.fileno())
+            encoded = manifest_file.read()
+            consumed_stat = os.fstat(manifest_file.fileno())
+            if _stable_stat_fields(opened_stat) != _stable_stat_fields(consumed_stat):
+                raise SMLArtifactError(
+                    f"manifest changed during parsing: {manifest_path}"
+                )
+        text = encoded.decode("utf-8")
+        raw = json.loads(
+            text,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_json_object_no_duplicates,
         )
-        return Verified(manifest=manifest, verification=verification)
+        manifest_type = _manifest_type_for_raw(raw, manifest_types)
+        manifest = _parse_manifest(raw, manifest_type)
+    except SMLArtifactError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise SMLArtifactError(
+            f"invalid manifest at {manifest_path}: {error}"
+        ) from error
+
+    recomputed = manifest.recompute_identity()
+    if recomputed != manifest.identity:
+        raise SMLArtifactError(
+            "manifest identity mismatch: "
+            f"stored {manifest.identity}, recomputed {recomputed}"
+        )
+    return manifest
+
+
+def _open_artifact_from_root[M: _Manifest](
+    path: Path,
+    root: ArtifactRoot,
+    manifest_types: tuple[type[M], ...],
+    verification: VerificationLevel,
+) -> OpenedArtifact[M]:
+    try:
+        manifest = _read_manifest_from_root(root, path, manifest_types)
+        return OpenedArtifact(
+            path=path,
+            root=root,
+            manifest=manifest,
+            verification=verification,
+        )
+    except BaseException:
+        root.close()
+        raise
+
+
+def open_artifact[M: _Manifest](
+    path: Path,
+    manifest_types: tuple[type[M], ...],
+    verification: VerificationLevel,
+) -> OpenedArtifact[M]:
+    """Open one strict artifact while retaining its root descriptor."""
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
+    _validated_manifest_types(manifest_types)
+    if not isinstance(verification, VerificationLevel):
+        raise TypeError("verification must be a VerificationLevel")
+    root = ArtifactRoot.open(path, writable=False)
+    return _open_artifact_from_root(path, root, manifest_types, verification)
+
+
+def _read_manifest_types[M: _Manifest](
+    root: Path,
+    manifest_types: tuple[type[M], ...],
+    verification: VerificationLevel,
+) -> Verified[M]:
+    with open_artifact(root, manifest_types, verification) as artifact:
+        references = _validated_payload_references(
+            tuple(_payload_refs(artifact.manifest))
+        )
+        for reference in references:
+            with artifact.open_payload(reference):
+                pass
+        return Verified(manifest=artifact.manifest, verification=verification)
 
 
 def read_manifest[M: _Manifest](
@@ -1330,6 +1622,7 @@ __all__ = [
     "LatestIndex",
     "LoRACheckpointManifest",
     "LoRARunManifest",
+    "OpenedArtifact",
     "PayloadRef",
     "PretrainingCheckpointManifest",
     "PretrainingDataManifest",
@@ -1339,8 +1632,10 @@ __all__ = [
     "TokenizerManifest",
     "VerificationLevel",
     "Verified",
+    "VerifiedPayload",
     "canonical_json_bytes",
     "file_identity",
+    "open_artifact",
     "parse_logical_path",
     "read_checkpoint_manifest",
     "read_manifest",

@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 import math
+import os
+import stat
 from dataclasses import fields, replace
 from enum import Enum
 from pathlib import Path
@@ -231,6 +233,28 @@ def _materialize_payloads(root: Path, value: object) -> object:
     if isinstance(value, tuple):
         return tuple(_materialize_payloads(root, item) for item in value)
     return value
+
+
+def _write_tokenizer_artifact(
+    root: Path,
+    *,
+    model_data: bytes = b"model-bytes",
+    vocab_data: bytes = b"vocab-bytes",
+    diagnostic_source_locator: str = "/original",
+) -> TokenizerManifest:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "tokenizer.model").write_bytes(model_data)
+    (root / "tokenizer.vocab").write_bytes(vocab_data)
+    manifest = tokenizer_manifest_fixture(
+        model=PayloadRef(
+            "tokenizer.model", file_identity(io.BytesIO(model_data)), len(model_data)
+        ),
+        vocab=PayloadRef(
+            "tokenizer.vocab", file_identity(io.BytesIO(vocab_data)), len(vocab_data)
+        ),
+        diagnostic_source_locator=diagnostic_source_locator,
+    )
+    return _write_manifest(root, manifest, "manifest.json")
 
 
 def test_sml_json_v1_identity_vectors_are_stable():
@@ -547,6 +571,226 @@ def test_strict_manifest_parser_round_trips_every_schema(tmp_path):
 
         assert verified.manifest == expected
         assert verified.verification is VerificationLevel.MANIFEST_TRUSTED
+
+
+def test_open_artifact_does_not_preopen_declared_payloads(tmp_path):
+    """Proof-only eager payload opens would separate later semantic use from proof."""
+    expected = _write_manifest(tmp_path, tokenizer_manifest_fixture(), "manifest.json")
+
+    with manifest_module.open_artifact(
+        tmp_path, (TokenizerManifest,), VerificationLevel.FULL
+    ) as artifact:
+        assert artifact.manifest == expected
+        assert artifact.verification is VerificationLevel.FULL
+
+
+def test_opened_artifact_child_uses_retained_root_after_path_replacement(tmp_path):
+    """Constructing a child Path would parse a replacement instead of the retained root."""
+    bundle = tmp_path / "bundle"
+    _write_tokenizer_artifact(bundle, diagnostic_source_locator="/outer-original")
+    _write_tokenizer_artifact(
+        bundle / "tokenizer", diagnostic_source_locator="/child-original"
+    )
+
+    artifact = manifest_module.open_artifact(
+        bundle, (TokenizerManifest,), VerificationLevel.MANIFEST_TRUSTED
+    )
+    retained = tmp_path / "retained-bundle"
+    bundle.rename(retained)
+    _write_tokenizer_artifact(
+        bundle / "tokenizer", diagnostic_source_locator="/child-replacement"
+    )
+
+    try:
+        child = artifact.open_child("tokenizer", (TokenizerManifest,))
+        artifact.close()
+        with child:
+            assert child.manifest.diagnostic_source_locator == "/child-original"
+            with child.open_payload(child.manifest.model) as payload:
+                assert payload.stream.read() == b"model-bytes"
+    finally:
+        artifact.close()
+
+
+def test_full_payload_proof_and_reader_share_one_final_descriptor_after_swap(
+    tmp_path, monkeypatch
+):
+    """Hashing one inode and reopening its name for use would accept swapped bytes."""
+    expected_data = b"proven-model"
+    _write_tokenizer_artifact(tmp_path, model_data=expected_data)
+    artifact = manifest_module.open_artifact(
+        tmp_path, (TokenizerManifest,), VerificationLevel.FULL
+    )
+    real_open = os.open
+    real_fstat = os.fstat
+    real_file_identity = manifest_module.file_identity
+    payload_descriptors: list[int] = []
+    fstat_descriptors: list[int] = []
+    identity_descriptors: list[int] = []
+
+    def recording_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "tokenizer.model":
+            payload_descriptors.append(descriptor)
+        return descriptor
+
+    def recording_fstat(descriptor):
+        if descriptor in payload_descriptors:
+            fstat_descriptors.append(descriptor)
+        return real_fstat(descriptor)
+
+    def recording_file_identity(stream):
+        identity_descriptors.append(stream.fileno())
+        return real_file_identity(stream)
+
+    monkeypatch.setattr(manifest_module.os, "open", recording_open)
+    monkeypatch.setattr(manifest_module.os, "fstat", recording_fstat)
+    monkeypatch.setattr(manifest_module, "file_identity", recording_file_identity)
+
+    try:
+        payload = artifact.open_payload(artifact.manifest.model)
+        descriptor = payload.stream.fileno()
+        (tmp_path / "tokenizer.model").rename(tmp_path / "proven.model")
+        (tmp_path / "tokenizer.model").write_bytes(b"replacement!")
+
+        assert payload.stream.read() == expected_data
+        assert payload_descriptors == [descriptor]
+        assert identity_descriptors == [descriptor]
+        assert fstat_descriptors and set(fstat_descriptors) == {descriptor}
+        with pytest.raises(SMLArtifactError, match="changed during use"):
+            payload.close()
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+    finally:
+        artifact.close()
+
+
+@pytest.mark.parametrize("mutation", ["size", "mtime", "ctime"])
+def test_verified_payload_close_rejects_every_tracked_in_place_mutation(
+    tmp_path, mutation
+):
+    """Omitting any pinned stat field would allow an open payload to change during use."""
+    _write_tokenizer_artifact(tmp_path)
+    payload_path = tmp_path / "tokenizer.model"
+
+    with manifest_module.open_artifact(
+        tmp_path, (TokenizerManifest,), VerificationLevel.FULL
+    ) as artifact:
+        payload = artifact.open_payload(artifact.manifest.model)
+        descriptor = payload.stream.fileno()
+        before = payload_path.stat()
+        if mutation == "size":
+            payload_path.write_bytes(b"changed-size")
+        elif mutation == "mtime":
+            os.utime(
+                payload_path,
+                ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+            )
+        else:
+            payload_path.chmod(stat.S_IMODE(before.st_mode) | stat.S_IXUSR)
+
+        with pytest.raises(SMLArtifactError, match="changed during use"):
+            payload.close()
+        assert payload.closed is True
+        payload.close()
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_semantic_error_stays_primary_when_mutation_postcheck_also_fails(tmp_path):
+    """Replacing the reader error with cleanup failure would hide the semantic cause."""
+    _write_tokenizer_artifact(tmp_path)
+
+    with manifest_module.open_artifact(
+        tmp_path, (TokenizerManifest,), VerificationLevel.FULL
+    ) as artifact:
+        payload = artifact.open_payload(artifact.manifest.model)
+        descriptor = payload.stream.fileno()
+        with (
+            pytest.raises(RuntimeError, match="semantic reader failed") as caught,
+            payload,
+        ):
+            (tmp_path / "tokenizer.model").write_bytes(b"mutated")
+            raise RuntimeError("semantic reader failed")
+
+        assert isinstance(caught.value.__cause__, SMLArtifactError)
+        assert "changed during use" in str(caught.value.__cause__)
+        assert payload.closed is True
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.parametrize(
+    ("link_kind", "message"),
+    [
+        ("symlink", "symlink|no-follow"),
+        ("internal-hard-link", "link count"),
+        ("external-hard-link", "link count"),
+    ],
+)
+def test_opened_artifact_rejects_linked_payloads(tmp_path, link_kind, message):
+    """Accepting links would let payload ownership escape or alias the artifact root."""
+    root = tmp_path / "artifact"
+    root.mkdir()
+    data = b"linked"
+    if link_kind == "symlink":
+        source = tmp_path / "external.bin"
+        source.write_bytes(data)
+        (root / "tokenizer.model").symlink_to(source)
+    elif link_kind == "internal-hard-link":
+        source = root / "source.bin"
+        source.write_bytes(data)
+        os.link(source, root / "tokenizer.model")
+    else:
+        source = tmp_path / "external.bin"
+        source.write_bytes(data)
+        os.link(source, root / "tokenizer.model")
+    (root / "tokenizer.vocab").write_bytes(b"vocab")
+    manifest = tokenizer_manifest_fixture(
+        model=PayloadRef("tokenizer.model", file_identity(io.BytesIO(data)), len(data)),
+        vocab=PayloadRef("tokenizer.vocab", file_identity(io.BytesIO(b"vocab")), 5),
+    )
+    _write_manifest(root, manifest, "manifest.json")
+
+    with (
+        manifest_module.open_artifact(
+            root, (TokenizerManifest,), VerificationLevel.FULL
+        ) as artifact,
+        pytest.raises(SMLArtifactError, match=message),
+    ):
+        artifact.open_payload(artifact.manifest.model)
+
+
+def test_opened_artifact_rejects_distinct_paths_to_one_inode(tmp_path, monkeypatch):
+    """Dropping retained-root inode tracking would accept duplicate payload aliases."""
+    first = tmp_path / "tokenizer.model"
+    second = tmp_path / "tokenizer.vocab"
+    first.write_bytes(b"shared")
+    os.link(first, second)
+    aliased_inode = first.stat().st_ino
+    manifest = tokenizer_manifest_fixture(
+        model=PayloadRef("tokenizer.model", file_identity(io.BytesIO(b"shared")), 6),
+        vocab=PayloadRef("tokenizer.vocab", file_identity(io.BytesIO(b"shared")), 6),
+    )
+    _write_manifest(tmp_path, manifest, "manifest.json")
+    real_fstat = os.fstat
+
+    def single_link_fstat(descriptor):
+        result = real_fstat(descriptor)
+        if result.st_ino != aliased_inode:
+            return result
+        values = list(result)
+        values[3] = 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(manifest_module.os, "fstat", single_link_fstat)
+    with manifest_module.open_artifact(
+        tmp_path, (TokenizerManifest,), VerificationLevel.MANIFEST_TRUSTED
+    ) as artifact:
+        with artifact.open_payload(artifact.manifest.model):
+            pass
+        with pytest.raises(SMLArtifactError, match="inode alias"):
+            artifact.open_payload(artifact.manifest.vocab)
 
 
 @pytest.mark.parametrize("mutation", ["unknown", "missing", "nested-unknown"])

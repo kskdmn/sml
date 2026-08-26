@@ -188,6 +188,58 @@ def test_root_descriptor_lives_until_context_exit(tmp_path):
         os.fstat(descriptor)
 
 
+def test_child_root_uses_retained_parent_after_path_replacement(tmp_path):
+    """Reopening a child by pathname would consume an attacker replacement root."""
+    bundle = tmp_path / "bundle"
+    child = bundle / "tokenizer"
+    child.mkdir(parents=True)
+    (child / "payload.bin").write_bytes(b"retained")
+
+    with artifacts.ArtifactRoot.open(bundle, writable=False) as root:
+        retained = tmp_path / "retained-bundle"
+        bundle.rename(retained)
+        replacement = bundle / "tokenizer"
+        replacement.mkdir(parents=True)
+        (replacement / "payload.bin").write_bytes(b"replacement")
+
+        with root.open_child("tokenizer") as child_root:
+            assert child_root.local_apfs is root.local_apfs
+            with child_root.open_payload("payload.bin") as payload:
+                assert payload.read() == b"retained"
+
+
+def test_child_root_owns_descriptor_independently_of_parent(tmp_path):
+    """Sharing the parent descriptor would invalidate a live child on parent close."""
+    child_path = tmp_path / "nested" / "child"
+    child_path.mkdir(parents=True)
+    (child_path / "payload.bin").write_bytes(b"payload")
+    root = artifacts.ArtifactRoot.open(tmp_path, writable=False)
+    child_root = root.open_child("nested/child")
+    root.close()
+
+    try:
+        with child_root.open_payload("payload.bin") as payload:
+            assert payload.read() == b"payload"
+    finally:
+        child_root.close()
+
+
+def test_open_child_rejects_symlink_and_closed_parent(tmp_path):
+    """Following child symlinks or traversing a closed root would escape ownership."""
+    external = tmp_path / "external"
+    external.mkdir()
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "child").symlink_to(external, target_is_directory=True)
+
+    root = artifacts.ArtifactRoot.open(bundle, writable=False)
+    with pytest.raises(SMLArtifactError, match="no-follow"):
+        root.open_child("child")
+    root.close()
+    with pytest.raises(SMLArtifactError, match="closed"):
+        root.open_child("child")
+
+
 def test_probe_failure_closes_root_descriptor(tmp_path, monkeypatch):
     """Letting an unexpected probe failure escape must not leak the opened root."""
     probed_descriptors: list[int] = []
