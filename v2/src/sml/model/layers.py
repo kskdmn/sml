@@ -18,11 +18,19 @@ class LoRAAdapterSpec:
     dropout: float
 
     def __post_init__(self) -> None:
-        if not self.module_path:
+        if type(self.module_path) is not str or not self.module_path:
             raise ValueError("LoRA module_path must be nonempty")
-        if not math.isfinite(self.scale) or self.scale <= 0.0:
+        if (
+            type(self.scale) is not float
+            or not math.isfinite(self.scale)
+            or self.scale <= 0.0
+        ):
             raise ValueError("LoRA scale must be finite and positive")
-        if not math.isfinite(self.dropout) or not 0.0 <= self.dropout < 1.0:
+        if (
+            type(self.dropout) is not float
+            or not math.isfinite(self.dropout)
+            or not 0.0 <= self.dropout < 1.0
+        ):
             raise ValueError("LoRA dropout must be in [0, 1)")
 
 
@@ -31,11 +39,17 @@ class LoRAForwardPolicy:
     adapters: tuple
 
     def __post_init__(self) -> None:
+        if type(self.adapters) is not tuple or not self.adapters:
+            raise ValueError("LoRA policy adapters must be a nonempty tuple")
+        if any(type(spec) is not LoRAAdapterSpec for spec in self.adapters):
+            raise ValueError("LoRA policy adapters must be LoRAAdapterSpec records")
         paths = tuple(spec.module_path for spec in self.adapters)
-        if not paths or len(paths) != len(set(paths)):
+        if len(paths) != len(set(paths)):
             raise ValueError("LoRA policy paths must be nonempty and unique")
 
     def for_module(self, module_path: str) -> LoRAAdapterSpec | None:
+        if type(module_path) is not str or not module_path:
+            raise ValueError("LoRA module_path must be nonempty")
         return next(
             (spec for spec in self.adapters if spec.module_path == module_path),
             None,

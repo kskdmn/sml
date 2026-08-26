@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from dataclasses import FrozenInstanceError
 
 import mlx.core as mx
 import pytest
@@ -62,6 +63,14 @@ def assert_lora_state_equal(actual: dict[str, mx.array], expected: dict[str, mx.
     mx.eval(*actual.values(), *expected.values())
     for name, value in actual.items():
         assert bool(mx.array_equal(value, expected[name]).item()), name
+
+
+class _StringSubclass(str):
+    pass
+
+
+class _LoRAAdapterLookalike:
+    module_path = "layers.0.self_attn.q_proj"
 
 
 @pytest.fixture(name="tiny_model_config")
@@ -260,6 +269,88 @@ def test_lora_policy_is_canonical_static_and_scale_is_not_a_parameter(
     scale_bf16_round_trip = scale_fp32.astype(mx.bfloat16).astype(mx.float32)
     mx.eval(scale_fp32, scale_bf16_round_trip)
     assert not bool(mx.array_equal(scale_fp32, scale_bf16_round_trip).item())
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("module_path", ""),
+        ("module_path", 1),
+        ("module_path", b"layers.0.self_attn.q_proj"),
+        ("module_path", _StringSubclass("layers.0.self_attn.q_proj")),
+        ("scale", True),
+        ("scale", 1),
+        ("scale", "1.0"),
+        ("scale", math.inf),
+        ("scale", 0.0),
+        ("dropout", False),
+        ("dropout", 0),
+        ("dropout", "0.0"),
+        ("dropout", math.inf),
+        ("dropout", 1.0),
+    ),
+)
+def test_lora_adapter_spec_rejects_noncanonical_static_fields(
+    field_name: str,
+    value: object,
+) -> None:
+    """Catches coercing non-float policy values into static adapter behavior."""
+    fields: dict[str, object] = {
+        "module_path": "layers.0.self_attn.q_proj",
+        "scale": 1.0,
+        "dropout": 0.0,
+    }
+    fields[field_name] = value
+
+    with pytest.raises(ValueError, match=field_name):
+        LoRAAdapterSpec(**fields)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "adapters",
+    (
+        [],
+        (),
+        (
+            LoRAAdapterSpec("layers.0.self_attn.q_proj", 1.0, 0.0),
+            LoRAAdapterSpec("layers.0.self_attn.q_proj", 2.0, 0.0),
+        ),
+        (_LoRAAdapterLookalike(),),
+    ),
+)
+def test_lora_forward_policy_rejects_noncanonical_adapter_collections(
+    adapters: object,
+) -> None:
+    """Catches mutable, empty, duplicate, or duck-typed policy adapters."""
+    with pytest.raises(ValueError, match="LoRA policy"):
+        LoRAForwardPolicy(adapters)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("module_path", ("", 1, b"layers.0.self_attn.q_proj"))
+def test_lora_forward_policy_rejects_noncanonical_lookup_paths(
+    module_path: object,
+) -> None:
+    """Catches invalid lookup paths being silently treated as missing adapters."""
+    policy = LoRAForwardPolicy(
+        (LoRAAdapterSpec("layers.0.self_attn.q_proj", 1.0, 0.0),)
+    )
+
+    with pytest.raises(ValueError, match="module_path"):
+        policy.for_module(module_path)  # type: ignore[arg-type]
+
+
+def test_lora_forward_policy_is_recursively_immutable() -> None:
+    """Catches mutable policy adapters changing static forward behavior after setup."""
+    policy = LoRAForwardPolicy(
+        (LoRAAdapterSpec("layers.0.self_attn.q_proj", 1.0, 0.0),)
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        policy.adapters[0].scale = 2.0  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        policy.adapters[0] = LoRAAdapterSpec(  # type: ignore[index]
+            "layers.0.self_attn.v_proj", 2.0, 0.0
+        )
 
 
 def test_split_adapter_parameters_contains_only_fp32_adapters_and_bf16_base(
