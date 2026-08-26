@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import inspect
 import math
-from dataclasses import replace
 
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten
 from sml.errors import SMLConfigurationError
+from sml.model import LoRAAdapterSpec, LoRAForwardPolicy
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
 from sml.model.layers import _Linear
@@ -22,6 +22,7 @@ from sml.training.lora import (
     load_lora_state_dict,
     lora_state_dict,
     merged_model_weights,
+    split_adapter_parameters,
 )
 
 
@@ -146,33 +147,28 @@ def test_lora_config_rejects_invalid_rank_alpha_dropout_scaling_and_targets():
         LoRAInitializerConfig(lora_b=math.inf)
 
 
-def test_lora_linear_uses_configured_scaling_modes():
+def test_lora_linear_uses_configured_static_scaling_modes():
     linear = _Linear(8, 4)
     linear.weight = mx.ones((4, 8), dtype=mx.bfloat16)
     lora = LoRALinear(
         linear,
-        replace(tiny_lora_config(), rank=4, alpha=8.0, scaling_mode="lora"),
+        tiny_lora_config(rank=4),
+        module_path="test.lora",
+        spec=LoRAAdapterSpec(module_path="test.lora", scale=2.0, dropout=0.0),
         key=mx.random.key(1),
     )
     rslora = LoRALinear(
         _Linear(8, 4),
-        replace(tiny_lora_config(), rank=4, alpha=8.0, scaling_mode="rslora"),
+        tiny_lora_config(rank=4),
+        module_path="test.rslora",
+        spec=LoRAAdapterSpec(module_path="test.rslora", scale=4.0, dropout=0.0),
         key=mx.random.key(2),
     )
 
-    mx.eval(lora.scale, rslora.scale)
-    assert_close(
-        lora.scale.astype(mx.float32),
-        mx.array(2.0, dtype=mx.float32),
-        atol=0.0,
-        rtol=0.0,
-    )
-    assert_close(
-        rslora.scale.astype(mx.float32),
-        mx.array(4.0, dtype=mx.float32),
-        atol=0.0,
-        rtol=0.0,
-    )
+    assert lora.spec.scale == 2.0
+    assert rslora.spec.scale == 4.0
+    assert lora.module_path == "test.lora"
+    assert rslora.module_path == "test.rslora"
 
 
 def test_lora_dtype_boundaries_and_live_formula(tiny_model):
@@ -182,7 +178,7 @@ def test_lora_dtype_boundaries_and_live_formula(tiny_model):
     layer = adapted.layers[0].self_attn.q_proj
     x = mx.ones((1, 2, layer.base.weight.shape[1]), dtype=mx.bfloat16)
     actual, _next_key = layer(x, key=mx.random.key(8), training=False)
-    expected_adapter = layer.scale.astype(mx.float32) * (
+    expected_adapter = mx.array(layer.spec.scale, dtype=mx.float32) * (
         (x.astype(mx.float32) @ layer.lora_a.T) @ layer.lora_b.T
     )
     expected = layer.base(x) + expected_adapter.astype(mx.bfloat16)
@@ -199,7 +195,8 @@ def test_merged_weight_matches_exact_array_formula_without_mutation(tiny_adapted
     module = tiny_adapted_model.layers[0].self_attn.q_proj
     expected = (
         module.base.weight.astype(mx.float32)
-        + module.scale.astype(mx.float32) * (module.lora_b @ module.lora_a)
+        + mx.array(module.spec.scale, dtype=mx.float32)
+        * (module.lora_b @ module.lora_a)
     ).astype(mx.bfloat16)
     assert mx.array_equal(merged["layers.0.self_attn.q_proj.weight"], expected).item()
     assert_lora_state_equal(lora_state_dict(tiny_adapted_model), before)
@@ -230,22 +227,69 @@ def test_apply_lora_wraps_only_configured_linear_targets(tiny_model, tiny_lora_c
     assert isinstance(adapted.layers[0].self_attn.k_proj, _Linear)
 
 
+def test_lora_policy_is_canonical_static_and_scale_is_not_a_parameter(
+    tiny_model,
+) -> None:
+    """Catches retaining LoRA scale as an MLX parameter instead of static policy."""
+    config = tiny_lora_config(
+        rank=3,
+        alpha=1.0,
+        scaling_mode="lora",
+        dropout=0.25,
+        target_modules=("q_proj", "v_proj", "down_proj"),
+    )
+    adapted = apply_lora(tiny_model, config, key=mx.random.key(4))
+    policy = adapted.lora_forward_policy
+    assert isinstance(policy, LoRAForwardPolicy)
+    assert tuple(spec.module_path for spec in policy.adapters) == (
+        "layers.1.mlp.down_proj",
+        "layers.1.self_attn.v_proj",
+        "layers.1.self_attn.q_proj",
+        "layers.0.mlp.down_proj",
+        "layers.0.self_attn.v_proj",
+        "layers.0.self_attn.q_proj",
+    )
+    assert all(spec.dropout == 0.25 for spec in policy.adapters)
+    parameters = dict(tree_flatten(adapted.parameters()))
+    trainable = dict(tree_flatten(adapted.trainable_parameters()))
+    assert not any(name.endswith(".scale") for name in parameters)
+    assert set(trainable) == {
+        name for name in parameters if name.endswith((".lora_a", ".lora_b"))
+    }
+    scale_fp32 = mx.array(policy.adapters[0].scale, dtype=mx.float32)
+    scale_bf16_round_trip = scale_fp32.astype(mx.bfloat16).astype(mx.float32)
+    mx.eval(scale_fp32, scale_bf16_round_trip)
+    assert not bool(mx.array_equal(scale_fp32, scale_bf16_round_trip).item())
+
+
+def test_split_adapter_parameters_contains_only_fp32_adapters_and_bf16_base(
+    tiny_model,
+) -> None:
+    """Catches scale leaking into adapter or frozen parameter trees."""
+    adapted = apply_lora(tiny_model, tiny_lora_config(), key=mx.random.key(5))
+    adapters, frozen = split_adapter_parameters(adapted.parameters())
+    adapter_leaves = dict(tree_flatten(adapters))
+    frozen_leaves = dict(tree_flatten(frozen))
+    assert adapter_leaves
+    assert frozen_leaves
+    assert all(array.dtype == mx.float32 for array in adapter_leaves.values())
+    assert all(array.dtype == mx.bfloat16 for array in frozen_leaves.values())
+    assert not any(name.endswith("scale") for name in (*adapter_leaves, *frozen_leaves))
+
+
 def test_apply_lora_leaves_only_adapter_arrays_trainable(tiny_adapted_model):
     trainable = dict(tree_flatten(tiny_adapted_model.trainable_parameters()))
     parameters = dict(tree_flatten(tiny_adapted_model.parameters()))
-    scale_names = {name for name in parameters if name.endswith(".scale")}
 
-    assert scale_names
+    assert not any(name.endswith(".scale") for name in parameters)
     assert set(trainable) == {
         name for name in parameters if name.endswith((".lora_a", ".lora_b"))
     }
     assert all(value.dtype == mx.float32 for value in trainable.values())
-    assert all(parameters[name].dtype == mx.float32 for name in scale_names)
-    assert all(name not in trainable for name in scale_names)
     assert all(
         value.dtype == mx.bfloat16
         for name, value in parameters.items()
-        if not name.endswith((".lora_a", ".lora_b", ".scale"))
+        if not name.endswith((".lora_a", ".lora_b"))
     )
 
 

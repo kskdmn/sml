@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import mlx.core as mx
 from mlx import nn
@@ -8,6 +9,37 @@ from mlx import nn
 from sml.model.cache import KVArrayState, append_kv_state
 from sml.model.config import ModelConfig
 from sml.model.rope import RotaryEmbedding, rotate_half
+
+
+@dataclass(frozen=True, slots=True)
+class LoRAAdapterSpec:
+    module_path: str
+    scale: float
+    dropout: float
+
+    def __post_init__(self) -> None:
+        if not self.module_path:
+            raise ValueError("LoRA module_path must be nonempty")
+        if not math.isfinite(self.scale) or self.scale <= 0.0:
+            raise ValueError("LoRA scale must be finite and positive")
+        if not math.isfinite(self.dropout) or not 0.0 <= self.dropout < 1.0:
+            raise ValueError("LoRA dropout must be in [0, 1)")
+
+
+@dataclass(frozen=True, slots=True)
+class LoRAForwardPolicy:
+    adapters: tuple
+
+    def __post_init__(self) -> None:
+        paths = tuple(spec.module_path for spec in self.adapters)
+        if not paths or len(paths) != len(set(paths)):
+            raise ValueError("LoRA policy paths must be nonempty and unique")
+
+    def for_module(self, module_path: str) -> LoRAAdapterSpec | None:
+        return next(
+            (spec for spec in self.adapters if spec.module_path == module_path),
+            None,
+        )
 
 
 class _Linear(nn.Module):

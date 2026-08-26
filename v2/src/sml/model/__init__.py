@@ -11,6 +11,8 @@ from sml.model.config import GenerationConfig, InitializerConfig, ModelConfig
 from sml.model.language_model import ForwardOutput, SMLLanguageModel, causal_lm_loss
 from sml.model.layers import (
     GroupedQueryAttention,
+    LoRAAdapterSpec,
+    LoRAForwardPolicy,
     RMSNorm,
     SwiGLUFeedForward,
     TransformerBlock,
@@ -33,6 +35,8 @@ __all__ = (
     "KVArrayState",
     "KVCache",
     "KVView",
+    "LoRAAdapterSpec",
+    "LoRAForwardPolicy",
     "ModelConfig",
     "RMSNorm",
     "RotaryEmbedding",

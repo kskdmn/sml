@@ -8,7 +8,7 @@ from mlx import nn
 
 from sml.model.cache import KVArrayState, KVCache
 from sml.model.config import InitializerConfig, ModelConfig
-from sml.model.layers import RMSNorm, TransformerBlock
+from sml.model.layers import LoRAForwardPolicy, RMSNorm, TransformerBlock
 
 
 class _Embedding(nn.Module):
@@ -52,6 +52,7 @@ class SMLLanguageModel(nn.Module):
     def __init__(self, config: ModelConfig, *, key: mx.array) -> None:
         super().__init__()
         self.config = config
+        self.lora_forward_policy: LoRAForwardPolicy | None = None
         self.embed_tokens = _Embedding(config.vocab_size, config.hidden_size)
         self.layers = [
             TransformerBlock(config, layer_index)

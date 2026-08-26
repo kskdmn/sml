@@ -10,7 +10,7 @@ from mlx import nn
 from mlx.utils import tree_flatten
 
 from sml.errors import SMLConfigurationError
-from sml.model.layers import _Linear, keyed_dropout
+from sml.model.layers import LoRAAdapterSpec, LoRAForwardPolicy, _Linear, keyed_dropout
 
 _ALLOWED_TARGET_MODULES = (
     "q_proj",
@@ -138,8 +138,6 @@ def split_adapter_parameters(parameters: object) -> tuple[object, object]:
                     adapters[key] = nested_adapters
                 if nested_frozen:
                     frozen[key] = nested_frozen
-            elif key == "scale":
-                frozen[key] = value.astype(mx.bfloat16)
             else:
                 frozen[key] = value
         return adapters, frozen
@@ -161,27 +159,36 @@ def split_adapter_parameters(parameters: object) -> tuple[object, object]:
     return {}, parameters
 
 
-def _lora_scale(config: LoRAConfig) -> mx.array:
-    alpha = mx.array(float(config.alpha), dtype=mx.float32)
-    rank = mx.array(float(config.rank), dtype=mx.float32)
+def _lora_scale(config: LoRAConfig) -> float:
+    alpha = float(config.alpha)
+    rank = float(config.rank)
     if config.scaling_mode == "lora":
         return alpha / rank
-    return alpha / mx.sqrt(rank)
+    return alpha / math.sqrt(rank)
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, linear: _Linear, config: LoRAConfig, *, key: mx.array) -> None:
+    def __init__(
+        self,
+        linear: _Linear,
+        config: LoRAConfig,
+        *,
+        module_path: str,
+        spec: LoRAAdapterSpec,
+        key: mx.array,
+    ) -> None:
         super().__init__()
         if not isinstance(linear, _Linear):
             raise SMLConfigurationError("LoRA wraps package linear modules")
+        if spec.module_path != module_path:
+            raise SMLConfigurationError("LoRA adapter spec path must match module path")
 
         input_dims = int(linear.weight.shape[1])
         output_dims = int(linear.weight.shape[0])
         self.base = linear
         self.base.freeze()
-        self.dropout = config.dropout
-        self.scale = _lora_scale(config)
-        self.freeze(keys=["scale"], recurse=False)
+        self.module_path = module_path
+        self.spec = spec
 
         key, adapter_a_key = mx.random.split(key)
         _, adapter_b_key = mx.random.split(key)
@@ -208,13 +215,13 @@ class LoRALinear(nn.Module):
     ) -> tuple[mx.array, mx.array | None]:
         base_output = self.base(x)
         adapter_input = x.astype(mx.float32)
-        if training and self.dropout > 0.0:
+        if training and self.spec.dropout > 0.0:
             if key is None:
                 raise SMLConfigurationError(
                     "training with dropout requires an explicit key"
                 )
-            adapter_input, key = keyed_dropout(adapter_input, self.dropout, key)
-        adapter = self.scale.astype(mx.float32) * (
+            adapter_input, key = keyed_dropout(adapter_input, self.spec.dropout, key)
+        adapter = mx.array(self.spec.scale, dtype=mx.float32) * (
             (adapter_input @ self.lora_a.T) @ self.lora_b.T
         )
         output = (base_output + adapter.astype(mx.bfloat16)).astype(mx.bfloat16)
@@ -250,11 +257,32 @@ def apply_lora(model, config: LoRAConfig, *, key: mx.array):
             continue
         targets.append((name, module))
 
+    scale = _lora_scale(config)
+    policy = LoRAForwardPolicy(
+        tuple(
+            LoRAAdapterSpec(
+                module_path=name,
+                scale=scale,
+                dropout=config.dropout,
+            )
+            for name, _module in targets
+        )
+    )
+    model.lora_forward_policy = policy
     model.freeze()
     for name, module in targets:
         key, module_key = mx.random.split(key)
         parent, child_name = _split_parent(model, name)
-        wrapper = LoRALinear(module, config, key=module_key)
+        spec = policy.for_module(name)
+        if spec is None:
+            raise RuntimeError(f"missing LoRA policy spec for {name}")
+        wrapper = LoRALinear(
+            module,
+            config,
+            module_path=name,
+            spec=spec,
+            key=module_key,
+        )
         setattr(parent, child_name, wrapper)
         wrapper.unfreeze(keys=["lora_a", "lora_b"], recurse=False)
     return model
