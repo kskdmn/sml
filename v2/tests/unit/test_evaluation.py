@@ -240,6 +240,7 @@ def test_installed_task_config_keeps_numeric_metadata_and_nested_callables(
     values = config.to_dict()
     assert values["metadata"]["version"] == 1.0
     assert any(callable(value) for value in values["fewshot_config"].values())
+    assert "filter_list" not in values
 
 
 def test_task_provenance_serializes_nested_provider_callables(fake_provider) -> None:
@@ -275,8 +276,8 @@ def test_task_provenance_prefers_effective_fewshot_config_split(fake_provider) -
     assert record.dataset_fingerprint == structured_identity(
         "sml-evaluation-dataset-v1",
         (
-            ("validation", "validation-fingerprint"),
-            ("fewshot-config", "fewshot-config-fingerprint"),
+            ("test", "processed-test-fingerprint"),
+            ("fewshot-config", "processed-fewshot-config-fingerprint"),
         ),
     )
 
@@ -428,7 +429,12 @@ def test_task_provenance_hashes_yaml_include_config_and_dataset(fake_provider) -
     assert record.metric_normalization_config == {
         "bootstrap_iters": 100000,
         "doc_to_decontamination_query": None,
-        "filter_list": ({"filter": "none"},),
+        "filter_list": (
+            {
+                "filter": ({"function": "take_first"},),
+                "name": "none",
+            },
+        ),
         "log_samples": True,
         "metric_list": ({"metric": "acc"},),
         "predict_only": False,
@@ -458,6 +464,189 @@ def test_recording_manager_rejects_malformed_load_result() -> None:
     manager = evaluation._RecordingTaskManager(MalformedTaskManager())
     with pytest.raises(SMLRuntimeError, match="malformed"):
         manager.load(["hellaswag"])
+
+
+@pytest.mark.parametrize("first_outcome", ("delegate-error", "missing", "malformed"))
+def test_recording_manager_rejects_second_load_after_every_failed_first_attempt(
+    first_outcome: str,
+) -> None:
+    """Catches a manager that records only successful loads and permits retries."""
+    from sml import evaluation
+
+    if first_outcome == "delegate-error":
+
+        class Inner:
+            def load(self, _task_list: object) -> object:
+                raise ValueError("provider failed")
+
+        message = "provider failed"
+    elif first_outcome == "missing":
+
+        class Inner:
+            pass
+
+        message = "no load"
+    else:
+
+        class Inner:
+            def load(self, _task_list: object) -> object:
+                return {"groups": {}, "group_map": {}}
+
+        message = "malformed"
+
+    manager = evaluation._RecordingTaskManager(Inner())
+    with pytest.raises((SMLRuntimeError, ValueError), match=message):
+        manager.load(["hellaswag"])
+    with pytest.raises(SMLRuntimeError, match="second|once"):
+        manager.load(["hellaswag"])
+
+
+def test_task_provenance_records_processed_eval_and_fewshot_dataset_objects(
+    fake_provider,
+) -> None:
+    """Catches provenance that reads raw task.dataset splits instead of iterated docs."""
+    from sml.artifacts.manifest import structured_identity
+
+    record = _task_record(fake_provider)
+
+    assert record.dataset_fingerprint == structured_identity(
+        "sml-evaluation-dataset-v1",
+        (
+            ("test", "processed-test-fingerprint"),
+            ("fewshot-config", "processed-fewshot-config-fingerprint"),
+        ),
+    )
+    assert record.dataset_revision == "version:1.0.0"
+
+
+def test_task_provenance_serializes_effective_default_filter_pipeline(
+    fake_provider,
+) -> None:
+    """Catches omission of 0.4.12's default none/take_first filter pipeline."""
+    record = _task_record(fake_provider)
+
+    assert record.metric_normalization_config["filter_list"] == (
+        {
+            "filter": ({"function": "take_first"},),
+            "name": "none",
+        },
+    )
+
+
+def test_task_provenance_preserves_explicit_provider_filter_pipeline(
+    fake_provider,
+) -> None:
+    """Catches replacement of an explicit provider-owned filter pipeline with defaults."""
+    from sml import evaluation
+
+    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    loaded = manager.load(["hellaswag"])
+    task = loaded["tasks"]["hellaswag"]
+    task.config._values["filter_list"] = [
+        {
+            "name": "exact-match",
+            "filter": [
+                {"function": "regex", "regex_pattern": "^A$"},
+                {"function": "take_first"},
+            ],
+        }
+    ]
+    recorder = evaluation._EvaluationRequestRecorder()
+    recorder.record("loglikelihood", task.instances)
+
+    record = evaluation._resolve_task_record(
+        task_name="hellaswag",
+        task=task,
+        provider=fake_provider,
+        manager=manager,
+        recorder=recorder,
+        provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
+        limit=None,
+        padding="right",
+        seeds=evaluation._evaluation_seeds(),
+        provider_versions=evaluation._provider_versions(),
+    )
+
+    assert record.metric_normalization_config["filter_list"] == (
+        {
+            "filter": (
+                {"function": "regex", "regex_pattern": "^A$"},
+                {"function": "take_first"},
+            ),
+            "name": "exact-match",
+        },
+    )
+
+
+def test_provider_versions_require_all_five_evaluation_packages() -> None:
+    """Catches provider provenance that silently drops datasets or another required package."""
+    from importlib import metadata
+
+    from sml import evaluation
+
+    assert evaluation._provider_versions() == tuple(
+        sorted(
+            (name, metadata.version(name))
+            for name in ("datasets", "lm-eval", "mlx", "numpy", "sentencepiece")
+        )
+    )
+
+
+def test_lm_eval_source_commit_uses_only_pep_610_vcs_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Catches provenance populated from a provider result git_hash instead of PEP 610."""
+    from importlib import metadata
+
+    from sml import evaluation
+
+    dist_info = tmp_path / "lm_eval-0.4.12.dist-info"
+    dist_info.mkdir()
+    monkeypatch.setattr(
+        metadata,
+        "distribution",
+        lambda name: SimpleNamespace(_path=dist_info),
+    )
+
+    assert evaluation._lm_eval_source_commit() is None
+    (dist_info / "direct_url.json").write_text(
+        '{"vcs_info":{"vcs":"git","commit_id":"0123456789abcdef"}}',
+        encoding="utf-8",
+    )
+    assert evaluation._lm_eval_source_commit() == "0123456789abcdef"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        "not-json",
+        '{"vcs_info": "not-a-mapping"}',
+        '{"vcs_info": {"vcs": "git"}}',
+        '{"vcs_info": {"vcs": "git", "commit_id": ""}}',
+    ),
+)
+def test_lm_eval_source_commit_fails_closed_for_malformed_pep_610_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    payload: str,
+) -> None:
+    """Catches acceptance of malformed direct_url metadata as trustworthy provenance."""
+    from importlib import metadata
+
+    from sml import evaluation
+
+    dist_info = tmp_path / "lm_eval-0.4.12.dist-info"
+    dist_info.mkdir()
+    (dist_info / "direct_url.json").write_text(payload, encoding="utf-8")
+    monkeypatch.setattr(
+        metadata,
+        "distribution",
+        lambda name: SimpleNamespace(_path=dist_info),
+    )
+
+    with pytest.raises(SMLRuntimeError, match="direct_url|PEP 610|source commit"):
+        evaluation._lm_eval_source_commit()
 
 
 def test_task_provenance_rejects_missing_index_yaml_path(fake_provider) -> None:
@@ -559,16 +748,16 @@ def test_task_provenance_rejects_unsafe_include_closure(
 
 
 @pytest.mark.parametrize(
-    ("split", "attribute", "value", "message"),
+    ("dataset_object", "attribute", "value", "message"),
     [
-        ("validation", "_fingerprint", "", "fingerprint"),
-        ("validation", "info", SimpleNamespace(version=""), "version"),
-        ("fewshot-config", "_fingerprint", "", "fingerprint"),
+        ("eval_docs", "_fingerprint", "", "fingerprint"),
+        ("eval_docs", "info", SimpleNamespace(version=""), "version"),
+        ("fewshot_docs", "_fingerprint", "", "fingerprint"),
     ],
 )
 def test_task_provenance_requires_selected_dataset_identities(
     fake_provider,
-    split: str,
+    dataset_object: str,
     attribute: str,
     value: object,
     message: str,
@@ -578,7 +767,8 @@ def test_task_provenance_requires_selected_dataset_identities(
     manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
-    object.__setattr__(task.dataset[split], attribute, value)
+    dataset = task.eval_docs if dataset_object == "eval_docs" else task.fewshot_docs()
+    object.__setattr__(dataset, attribute, value)
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     with pytest.raises(SMLRuntimeError, match=message):
@@ -606,9 +796,7 @@ def test_task_provenance_selects_test_when_validation_is_not_declared(
     task = loaded["tasks"]["hellaswag"]
     task.config._values["validation_split"] = None
     task.config._values["num_fewshot"] = 0
-    task.dataset["test"] = replace(
-        task.dataset["test"], info=SimpleNamespace(version="3.0.0")
-    )
+    object.__setattr__(task.eval_docs, "info", SimpleNamespace(version="3.0.0"))
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     record = evaluation._resolve_task_record(

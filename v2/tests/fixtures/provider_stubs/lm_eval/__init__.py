@@ -86,6 +86,17 @@ class _Task:
             "train": _Split("train-fingerprint", _Info("1.0.0")),
             "fewshot-config": _Split("fewshot-config-fingerprint", _Info("1.0.0")),
         }
+        # 0.4.12 fingerprints the objects it actually iterates: test_docs()
+        # applies process_docs and fewshot_docs() applies the few-shot processor.
+        # Keep these identities distinct from the unprocessed dataset mapping so
+        # tests reject provenance collected from task.dataset directly.
+        self.eval_docs = _Split("processed-test-fingerprint", _Info("1.0.0"))
+        self._fewshot_docs = _Split(
+            "processed-fewshot-config-fingerprint", _Info("1.0.0")
+        )
+
+    def fewshot_docs(self) -> _Split:
+        return self._fewshot_docs
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +142,6 @@ def _task_config(task_name: str) -> dict[str, object]:
         },
         "generation_kwargs": {"temperature": 0.0},
         "metric_list": [{"metric": "acc"}],
-        "filter_list": [{"filter": "none"}],
         "repeats": 1,
         "should_decontaminate": False,
         "doc_to_decontamination_query": None,

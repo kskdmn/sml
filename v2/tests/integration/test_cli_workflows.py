@@ -45,7 +45,6 @@ def _expected_provider_config(task_name: str) -> dict[str, object]:
         },
         "generation_kwargs": {"temperature": 0.0},
         "metric_list": [{"metric": "acc"}],
-        "filter_list": [{"filter": "none"}],
         "repeats": 1,
         "should_decontaminate": False,
         "doc_to_decontamination_query": None,
@@ -87,8 +86,7 @@ def _expected_provider_versions() -> tuple[tuple[str, str], ...]:
     return tuple(
         sorted(
             (name, metadata.version(name))
-            for name in ("lm-eval", "mlx", "numpy", "sentencepiece")
-            if _installed(name)
+            for name in ("datasets", "lm-eval", "mlx", "numpy", "sentencepiece")
         )
     )
 
@@ -173,7 +171,7 @@ def _assert_complete_evaluation(
     assert task.metric_normalization_config == {
         "bootstrap_iters": 100000,
         "doc_to_decontamination_query": None,
-        "filter_list": ({"filter": "none"},),
+        "filter_list": ({"filter": ({"function": "take_first"},), "name": "none"},),
         "log_samples": True,
         "metric_list": ({"metric": "acc"},),
         "predict_only": False,
@@ -189,7 +187,7 @@ def _assert_complete_evaluation(
     assert task.limit is None
     assert task.ordered_request_identity.startswith("sha256:")
     assert task.lm_eval_package_version == "0.4.12"
-    assert task.lm_eval_source_commit == "offline-lm-eval-commit"
+    assert task.lm_eval_source_commit is None
     assert task.dataset_revision == "version:1.0.0"
     assert task.dataset_fingerprint.startswith("sha256:")
     assert tuple((item.name, item.version) for item in task.provider_versions) == (
@@ -225,6 +223,7 @@ class CLIWorkspace:
     base_evaluation: Path
     swag_data: Path
     lora_run: Path
+    lora_evaluation: Path
     export: Path
     export_evaluation: Path
     configs: dict[str, Path]
@@ -296,6 +295,7 @@ def cli_workspace(tmp_path_factory: pytest.TempPathFactory) -> CLIWorkspace:
     base_evaluation = root / "base-evaluation.json"
     swag_data = root / "swag-data"
     lora_run = root / "lora-run"
+    lora_evaluation = root / "lora-evaluation.json"
     export = root / "export"
     export_evaluation = root / "export-evaluation.json"
 
@@ -405,6 +405,7 @@ def cli_workspace(tmp_path_factory: pytest.TempPathFactory) -> CLIWorkspace:
         base_evaluation=base_evaluation,
         swag_data=swag_data,
         lora_run=lora_run,
+        lora_evaluation=lora_evaluation,
         export=export,
         export_evaluation=export_evaluation,
         configs=configs,
@@ -465,6 +466,15 @@ def completed_cli_workspace(cli_workspace: CLIWorkspace) -> CLIWorkspace:
     )
     workspace.results["finetune"] = workspace.run(
         "finetune", "--config", workspace.configs["finetune"]
+    )
+    workspace.results["lora_evaluate"] = workspace.run(
+        "evaluate",
+        "--checkpoint",
+        workspace.lora_run,
+        "--task",
+        "hellaswag",
+        "--output",
+        workspace.lora_evaluation,
     )
     workspace.results["export"] = workspace.run(
         "export",
@@ -541,6 +551,19 @@ def test_every_cli_workflow_runs_offline_in_subprocesses(
     assert (
         str(workspace.base_evaluation.parent).encode()
         not in workspace.base_evaluation.read_bytes()
+    )
+
+    _assert_complete_evaluation(
+        workspace.lora_evaluation,
+        task_name="hellaswag",
+        artifact_kind="lora-run",
+        verification=VerificationLevel.MANIFEST_TRUSTED,
+        step=1,
+        run_identity=True,
+    )
+    assert (
+        str(workspace.lora_evaluation.parent).encode()
+        not in workspace.lora_evaluation.read_bytes()
     )
 
     _assert_complete_evaluation(

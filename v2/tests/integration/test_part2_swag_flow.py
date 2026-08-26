@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,8 +65,7 @@ def _expected_provider_versions() -> tuple[tuple[str, str], ...]:
     return tuple(
         sorted(
             (name, metadata.version(name))
-            for name in ("lm-eval", "mlx", "numpy", "sentencepiece")
-            if _installed(name)
+            for name in ("datasets", "lm-eval", "mlx", "numpy", "sentencepiece")
         )
     )
 
@@ -98,16 +98,30 @@ def _expected_provider_samples(task_name: str) -> dict[str, object]:
     }
 
 
-def assert_complete_export_evaluation(path: Path) -> None:
+def assert_complete_evaluation(
+    path: Path,
+    *,
+    artifact_kind: str,
+    step: int,
+    run_identity: bool,
+) -> None:
     result = read_evaluation_result(path)
     assert result.kind == "evaluation-result"
     assert result.version == 1
     assert result.identity.startswith("sha256:")
-    assert result.model.artifact_kind == "export"
-    assert result.model.run_identity is None
-    assert result.model.step == 2
-    assert result.model.checkpoint_identity is None
-    assert result.model.run_step_identity is None
+    assert result.model.artifact_kind == artifact_kind
+    assert result.model.step == step
+    if run_identity:
+        assert result.model.run_identity is not None
+        assert result.model.run_identity.startswith("sha256:")
+        assert result.model.checkpoint_identity is not None
+        assert result.model.checkpoint_identity.startswith("sha256:")
+        assert result.model.run_step_identity is not None
+        assert result.model.run_step_identity.startswith("sha256:")
+    else:
+        assert result.model.run_identity is None
+        assert result.model.checkpoint_identity is None
+        assert result.model.run_step_identity is None
     assert result.model.tokenizer_identity.startswith("sha256:")
     assert result.model.verification is VerificationLevel.MANIFEST_TRUSTED
     assert len(result.tasks) == 1
@@ -157,7 +171,7 @@ def assert_complete_export_evaluation(path: Path) -> None:
     assert task.metric_normalization_config == {
         "bootstrap_iters": 100000,
         "doc_to_decontamination_query": None,
-        "filter_list": ({"filter": "none"},),
+        "filter_list": ({"filter": ({"function": "take_first"},), "name": "none"},),
         "log_samples": True,
         "metric_list": ({"metric": "acc"},),
         "predict_only": False,
@@ -173,7 +187,7 @@ def assert_complete_export_evaluation(path: Path) -> None:
     assert task.limit is None
     assert task.ordered_request_identity.startswith("sha256:")
     assert task.lm_eval_package_version == "0.4.12"
-    assert task.lm_eval_source_commit == "offline-lm-eval-commit"
+    assert task.lm_eval_source_commit is None
     assert task.dataset_revision == "version:1.0.0"
     assert task.dataset_fingerprint.startswith("sha256:")
     assert tuple((item.name, item.version) for item in task.provider_versions) == (
@@ -212,7 +226,6 @@ def assert_complete_export_evaluation(path: Path) -> None:
         "fewshot_config",
         "generation_kwargs",
         "metric_list",
-        "filter_list",
         "repeats",
         "should_decontaminate",
         "doc_to_decontamination_query",
@@ -244,10 +257,6 @@ def assert_complete_export_evaluation(path: Path) -> None:
     assert (
         provider_config["metric_list"]
         == task.metric_normalization_config["metric_list"]
-    )
-    assert (
-        provider_config["filter_list"]
-        == task.metric_normalization_config["filter_list"]
     )
     assert provider_config["repeats"] == task.metric_normalization_config["repeats"]
     assert provider_config["should_decontaminate"] is False
@@ -292,6 +301,13 @@ def test_encoded_swag_to_exported_evaluation(
     resumed = resume_finetune(
         tuned.run, data=data.path, overrides=ResumeOverrides(maximum_steps=2)
     )
+    lora_path = tmp_path / "lora-evaluation.json"
+    lora_evaluation = evaluate(
+        replace(
+            tiny_evaluation_config(resumed.run, tmp_path, tasks=("hellaswag",)),
+            output=lora_path,
+        )
+    )
     exported = export_merged(resumed.run, tmp_path / "export")
     inference_result = InferenceSession.from_checkpoint(
         exported.path, full_verify=True
@@ -302,5 +318,17 @@ def test_encoded_swag_to_exported_evaluation(
     assert inference_result.model.verification is VerificationLevel.FULL
     assert evaluation_result.model.artifact_kind == "export"
     assert evaluation_result.model.verification is VerificationLevel.MANIFEST_TRUSTED
-    assert_complete_export_evaluation(tmp_path / "evaluation.json")
+    assert lora_evaluation.model.artifact_kind == "lora-run"
+    assert_complete_evaluation(
+        lora_path,
+        artifact_kind="lora-run",
+        step=2,
+        run_identity=True,
+    )
+    assert_complete_evaluation(
+        tmp_path / "evaluation.json",
+        artifact_kind="export",
+        step=2,
+        run_identity=False,
+    )
     assert read_export_manifest(exported.path).model_config.rope_scaling_factor == 1.0

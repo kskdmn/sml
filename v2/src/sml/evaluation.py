@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.metadata
+import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -30,7 +31,7 @@ from sml.inference import (
 )
 
 _ALLOWED_TASKS = frozenset({"hellaswag", "winogrande"})
-_PROVIDER_PACKAGES = ("lm-eval", "mlx", "numpy", "sentencepiece")
+_PROVIDER_PACKAGES = ("datasets", "lm-eval", "mlx", "numpy", "sentencepiece")
 _EVALUATION_SEEDS = {
     "random_seed": 0,
     "numpy_random_seed": 1234,
@@ -128,6 +129,7 @@ class _RecordingTaskManager:
     def __init__(self, inner: object) -> None:
         self._inner = inner
         self._loaded: Mapping[str, object] | None = None
+        self._attempted = False
 
     @property
     def loaded(self) -> Mapping[str, object]:
@@ -136,8 +138,9 @@ class _RecordingTaskManager:
         return self._loaded
 
     def load(self, task_list: object) -> Mapping[str, object]:
-        if self._loaded is not None:
+        if self._attempted:
             raise SMLRuntimeError("lm-eval task manager may load tasks only once")
+        self._attempted = True
         loader = getattr(self._inner, "load", None)
         if not callable(loader):
             raise SMLRuntimeError("lm-eval task manager has no load method")
@@ -335,13 +338,15 @@ def _dataset_identity(
     task: object,
     config: Mapping[str, object],
 ) -> tuple[str, str]:
-    dataset = getattr(task, "dataset", None)
-    if not isinstance(dataset, Mapping):
-        raise SMLRuntimeError("lm-eval task dataset is unavailable")
-    evaluation_split = config.get("validation_split") or config.get("test_split")
+    test_split = config.get("test_split")
+    validation_split = config.get("validation_split")
+    evaluation_split = test_split if test_split is not None else validation_split
     if not isinstance(evaluation_split, str) or not evaluation_split:
         raise SMLRuntimeError("lm-eval task has no selected evaluation split")
-    selected_splits = [evaluation_split]
+    evaluation_docs = getattr(task, "eval_docs", None)
+    if evaluation_docs is None:
+        raise SMLRuntimeError("lm-eval task effective evaluation docs are unavailable")
+    selected_datasets: list[tuple[str, object]] = [(evaluation_split, evaluation_docs)]
     num_fewshot = config.get("num_fewshot")
     if isinstance(num_fewshot, bool) or not isinstance(num_fewshot, int):
         raise SMLRuntimeError("lm-eval task num_fewshot is malformed")
@@ -355,20 +360,18 @@ def _dataset_identity(
         )
         if not isinstance(fewshot_split, str) or not fewshot_split:
             raise SMLRuntimeError("lm-eval task few-shot split is missing")
-        if fewshot_split not in selected_splits:
-            selected_splits.append(fewshot_split)
+        fewshot_docs = getattr(task, "fewshot_docs", None)
+        if not callable(fewshot_docs):
+            raise SMLRuntimeError(
+                "lm-eval task effective few-shot docs are unavailable"
+            )
+        selected_datasets.append((fewshot_split, fewshot_docs()))
 
     fingerprints: list[tuple[str, str]] = []
     versions: list[str] = []
-    for split_name in selected_splits:
-        try:
-            split = dataset[split_name]
-        except (KeyError, TypeError) as error:
-            raise SMLRuntimeError(
-                f"lm-eval task selected dataset split is missing: {split_name}"
-            ) from error
-        fingerprint = getattr(split, "_fingerprint", None)
-        version = getattr(getattr(split, "info", None), "version", None)
+    for split_name, effective_dataset in selected_datasets:
+        fingerprint = getattr(effective_dataset, "_fingerprint", None)
+        version = getattr(getattr(effective_dataset, "info", None), "version", None)
         if not isinstance(fingerprint, str) or not fingerprint:
             raise SMLRuntimeError(
                 f"lm-eval task dataset split fingerprint is missing: {split_name}"
@@ -399,6 +402,51 @@ def _dataset_identity(
         dataset_revision,
         structured_identity("sml-evaluation-dataset-v1", tuple(fingerprints)),
     )
+
+
+def _effective_filter_pipeline(
+    config: Mapping[str, object],
+    config_object: object,
+) -> object:
+    filter_list = config.get("filter_list")
+    if filter_list is None:
+        return (
+            {
+                "name": "none",
+                "filter": ({"function": "take_first"},),
+            },
+        )
+    return _serialize_provider_value(config_object, filter_list)
+
+
+def _lm_eval_source_commit() -> str | None:
+    try:
+        distribution = importlib.metadata.distribution("lm-eval")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise SMLRuntimeError(
+            "lm-eval distribution metadata cannot be resolved"
+        ) from error
+    distribution_path = getattr(distribution, "_path", None)
+    if not isinstance(distribution_path, Path):
+        raise SMLRuntimeError("lm-eval distribution metadata path is malformed")
+    direct_url_path = distribution_path / "direct_url.json"
+    if not direct_url_path.is_file():
+        return None
+    try:
+        direct_url = json.loads(direct_url_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SMLRuntimeError("lm-eval direct_url metadata is malformed") from error
+    if not isinstance(direct_url, Mapping):
+        raise SMLRuntimeError("lm-eval direct_url metadata is malformed")
+    if "vcs_info" not in direct_url:
+        return None
+    vcs_info = direct_url["vcs_info"]
+    if not isinstance(vcs_info, Mapping):
+        raise SMLRuntimeError("lm-eval direct_url VCS metadata is malformed")
+    commit_id = vcs_info.get("commit_id")
+    if not isinstance(commit_id, str) or not commit_id:
+        raise SMLRuntimeError("lm-eval direct_url source commit is malformed")
+    return commit_id
 
 
 def _metric_payload(
@@ -437,6 +485,7 @@ def _resolve_task_record(
     padding: Literal["left", "right"],
     seeds: Mapping[str, object],
     provider_versions: tuple[tuple[str, str], ...],
+    lm_eval_source_commit: str | None = None,
 ) -> EvaluationTaskRecord:
     if not isinstance(task_name, str) or not task_name:
         raise SMLRuntimeError("lm-eval task name is invalid")
@@ -452,11 +501,6 @@ def _resolve_task_record(
     dataset_revision, dataset_fingerprint = _dataset_identity(task, config)
     if not isinstance(provider_result, Mapping):
         raise SMLRuntimeError("lm-eval provider result is malformed")
-    source_commit = provider_result.get("git_hash")
-    if source_commit is not None and (
-        not isinstance(source_commit, str) or not source_commit
-    ):
-        raise SMLRuntimeError("lm-eval provider source commit is malformed")
     provider_records = tuple(
         EvaluationProviderVersion(name=name, version=version)
         for name, version in provider_versions
@@ -489,7 +533,7 @@ def _resolve_task_record(
     }
     metric_normalization_config = {
         "metric_list": config.get("metric_list"),
-        "filter_list": config.get("filter_list"),
+        "filter_list": _effective_filter_pipeline(config, config_object),
         "repeats": config.get("repeats"),
         "should_decontaminate": config.get("should_decontaminate"),
         "doc_to_decontamination_query": config.get("doc_to_decontamination_query"),
@@ -511,7 +555,7 @@ def _resolve_task_record(
         limit=limit,
         ordered_request_identity=recorder.identity_for(task_name),
         lm_eval_package_version=provider.package_version,
-        lm_eval_source_commit=source_commit,
+        lm_eval_source_commit=lm_eval_source_commit,
         dataset_revision=dataset_revision,
         dataset_fingerprint=dataset_fingerprint,
         provider_versions=provider_records,
@@ -674,9 +718,16 @@ def _provider_versions() -> tuple[tuple[str, str], ...]:
     found: list[tuple[str, str]] = []
     for name in _PROVIDER_PACKAGES:
         try:
-            found.append((name, importlib.metadata.version(name)))
-        except importlib.metadata.PackageNotFoundError:
-            continue
+            version = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError as error:
+            raise SMLRuntimeError(
+                f"required evaluation provider package is missing: {name}"
+            ) from error
+        if not isinstance(version, str) or not version:
+            raise SMLRuntimeError(
+                f"required evaluation provider package version is missing: {name}"
+            )
+        found.append((name, version))
     return tuple(sorted(found, key=lambda item: item[0]))
 
 
@@ -810,6 +861,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
     )
     _validate_recorded_task_names(recorder, config.tasks)
     provider_versions = _provider_versions()
+    lm_eval_source_commit = _lm_eval_source_commit()
     task_records = tuple(
         _resolve_task_record(
             task_name=task_name,
@@ -822,6 +874,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
             padding=config.padding,
             seeds=_evaluation_seeds(),
             provider_versions=provider_versions,
+            lm_eval_source_commit=lm_eval_source_commit,
         )
         for task_name, task in zip(config.tasks, loaded_tasks, strict=True)
     )
