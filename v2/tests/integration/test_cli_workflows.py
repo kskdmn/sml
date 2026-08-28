@@ -12,9 +12,12 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 import zstandard as zstd
+from sml import cli as cli_module
+from sml.artifacts.checkpoint import CheckpointReader
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
+    ArtifactRoot,
     BaseSnapshotManifest,
     ExportManifest,
     LatestIndex,
@@ -904,6 +907,74 @@ def test_recursive_lora_child_dispatch_rejects_every_invalid_candidate_root(
 
     with pytest.raises(SMLArtifactError, match=message):
         verify_artifact(run, full=full)
+
+
+@pytest.mark.parametrize(
+    ("run_attribute", "logical_path"),
+    (("base_run", "tokenizer"), ("lora_run", "base")),
+)
+def test_cli_verify_child_transfer_failure_closes_real_reader_and_child_fds(
+    completed_cli_workspace: CLIWorkspace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    run_attribute: str,
+    logical_path: str,
+) -> None:
+    """The CLI domain-error path closes real run, step, temporary, and child FDs."""
+    run = getattr(completed_cli_workspace, run_attribute)
+    transfer_error = SMLArtifactError("injected temporary-root transfer failure")
+    reader_fds: tuple[int, ...] = ()
+    temporary_fd = -1
+    child_fd = -1
+    close_counts: dict[int, int] = {}
+    original_reader_open = CheckpointReader.open_run_child_root
+    original_open_child = ArtifactRoot.open_child
+    original_close = ArtifactRoot.close
+
+    def recording_reader_open(
+        reader: CheckpointReader,
+        requested: str,
+    ) -> ArtifactRoot:
+        nonlocal reader_fds
+        reader_fds = (
+            reader._run_descriptor,
+            reader._checkpoints_descriptor,
+            reader._owned_step.descriptor,
+        )
+        return original_reader_open(reader, requested)
+
+    def recording_open_child(owner: ArtifactRoot, requested: str) -> ArtifactRoot:
+        nonlocal child_fd, temporary_fd
+        child = original_open_child(owner, requested)
+        if requested == logical_path:
+            temporary_fd = owner.fileno()
+            child_fd = child.fileno()
+        return child
+
+    def close_with_transfer_failure(owner: ArtifactRoot) -> None:
+        descriptor = owner.fileno()
+        original_close(owner)
+        if descriptor in {temporary_fd, child_fd}:
+            close_counts[descriptor] = close_counts.get(descriptor, 0) + 1
+        if descriptor == temporary_fd:
+            raise transfer_error
+
+    monkeypatch.setattr(CheckpointReader, "open_run_child_root", recording_reader_open)
+    monkeypatch.setattr(ArtifactRoot, "open_child", recording_open_child)
+    monkeypatch.setattr(ArtifactRoot, "close", close_with_transfer_failure)
+
+    exit_code = cli_module.main(["verify", "--full", str(run)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 3
+    assert captured.out == ""
+    assert captured.err == (
+        "SMLArtifactError: injected temporary-root transfer failure\n"
+    )
+    assert close_counts == {temporary_fd: 1, child_fd: 1}
+    for descriptor in (*reader_fds, temporary_fd, child_fd):
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_full_pretraining_run_rejects_resigned_run_checkpoint_disagreement(

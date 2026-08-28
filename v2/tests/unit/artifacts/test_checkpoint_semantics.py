@@ -353,6 +353,171 @@ def test_checkpoint_reader_retains_only_explicitly_requested_raw_bytes(
         assert set(reader.read_contents().payload_bytes) == {"model.safetensors"}
 
 
+@pytest.mark.parametrize("logical_path", ("tokenizer", "base"))
+def test_open_run_child_root_preserves_acquisition_error_over_root_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    logical_path: str,
+) -> None:
+    """Child acquisition remains primary when the temporary run root also fails."""
+    run = _write_valid_checkpoint_run(tmp_path)
+    (run / logical_path).mkdir()
+    acquisition_error = SMLArtifactError("injected child acquisition failure")
+    root_cleanup_error = RuntimeError("injected temporary-root cleanup failure")
+    temporary_fd = -1
+    reader_fds: tuple[int, ...] = ()
+    close_count = 0
+    original_close = ArtifactRoot.close
+
+    def failing_open_child(owner: ArtifactRoot, requested: str) -> ArtifactRoot:
+        nonlocal temporary_fd
+        assert requested == logical_path
+        temporary_fd = owner.fileno()
+        raise acquisition_error
+
+    def close_then_fail(owner: ArtifactRoot) -> None:
+        nonlocal close_count
+        descriptor = owner.fileno()
+        original_close(owner)
+        if descriptor == temporary_fd:
+            close_count += 1
+            raise root_cleanup_error
+
+    monkeypatch.setattr(ArtifactRoot, "open_child", failing_open_child)
+    monkeypatch.setattr(ArtifactRoot, "close", close_then_fail)
+
+    with open_checkpoint_reader(run, step=0) as reader:
+        reader_fds = (
+            reader._run_descriptor,
+            reader._checkpoints_descriptor,
+            reader._owned_step.descriptor,
+        )
+        with pytest.raises(BaseException) as raised:
+            reader.open_run_child_root(logical_path)
+
+        assert raised.value is acquisition_error
+        assert raised.value.__cause__ is root_cleanup_error
+        assert close_count == 1
+        with pytest.raises(OSError):
+            os.fstat(temporary_fd)
+        for descriptor in reader_fds:
+            os.fstat(descriptor)
+
+    for descriptor in reader_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.parametrize("logical_path", ("tokenizer", "base"))
+@pytest.mark.parametrize("child_close_fails", (False, True))
+def test_open_run_child_root_rolls_back_child_when_root_transfer_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    logical_path: str,
+    child_close_fails: bool,
+) -> None:
+    """A failed temporary-root close rolls back the acquired real child FD once."""
+    run = _write_valid_checkpoint_run(tmp_path)
+    (run / logical_path).mkdir()
+    root_cleanup_error = RuntimeError("injected temporary-root cleanup failure")
+    child_cleanup_error = RuntimeError("injected child-root cleanup failure")
+    temporary_fd = -1
+    child_fd = -1
+    reader_fds: tuple[int, ...] = ()
+    close_counts: dict[int, int] = {}
+    original_open_child = ArtifactRoot.open_child
+    original_close = ArtifactRoot.close
+
+    def recording_open_child(owner: ArtifactRoot, requested: str) -> ArtifactRoot:
+        nonlocal child_fd, temporary_fd
+        assert requested == logical_path
+        temporary_fd = owner.fileno()
+        child = original_open_child(owner, requested)
+        child_fd = child.fileno()
+        return child
+
+    def closing_with_failures(owner: ArtifactRoot) -> None:
+        descriptor = owner.fileno()
+        original_close(owner)
+        if descriptor in {temporary_fd, child_fd}:
+            close_counts[descriptor] = close_counts.get(descriptor, 0) + 1
+        if descriptor == temporary_fd:
+            raise root_cleanup_error
+        if descriptor == child_fd and child_close_fails:
+            raise child_cleanup_error
+
+    monkeypatch.setattr(ArtifactRoot, "open_child", recording_open_child)
+    monkeypatch.setattr(ArtifactRoot, "close", closing_with_failures)
+
+    with open_checkpoint_reader(run, step=0) as reader:
+        reader_fds = (
+            reader._run_descriptor,
+            reader._checkpoints_descriptor,
+            reader._owned_step.descriptor,
+        )
+        with pytest.raises(BaseException) as raised:
+            reader.open_run_child_root(logical_path)
+
+        assert raised.value is root_cleanup_error
+        expected_cause = child_cleanup_error if child_close_fails else None
+        assert raised.value.__cause__ is expected_cause
+        assert close_counts == {temporary_fd: 1, child_fd: 1}
+        for descriptor in (temporary_fd, child_fd):
+            with pytest.raises(OSError):
+                os.fstat(descriptor)
+        for descriptor in reader_fds:
+            os.fstat(descriptor)
+
+    for descriptor in reader_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.parametrize("logical_path", ("tokenizer", "base"))
+def test_open_run_child_root_returns_sole_live_child_owner_on_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    logical_path: str,
+) -> None:
+    """Successful transfer closes only the temporary duplicate until child close."""
+    run = _write_valid_checkpoint_run(tmp_path)
+    (run / logical_path).mkdir()
+    temporary_fd = -1
+    child_fd = -1
+    reader_fds: tuple[int, ...] = ()
+    original_open_child = ArtifactRoot.open_child
+
+    def recording_open_child(owner: ArtifactRoot, requested: str) -> ArtifactRoot:
+        nonlocal child_fd, temporary_fd
+        assert requested == logical_path
+        temporary_fd = owner.fileno()
+        child = original_open_child(owner, requested)
+        child_fd = child.fileno()
+        return child
+
+    monkeypatch.setattr(ArtifactRoot, "open_child", recording_open_child)
+
+    with open_checkpoint_reader(run, step=0) as reader:
+        reader_fds = (
+            reader._run_descriptor,
+            reader._checkpoints_descriptor,
+            reader._owned_step.descriptor,
+        )
+        child = reader.open_run_child_root(logical_path)
+        with pytest.raises(OSError):
+            os.fstat(temporary_fd)
+        os.fstat(child_fd)
+        for descriptor in reader_fds:
+            os.fstat(descriptor)
+        child.close()
+        with pytest.raises(OSError):
+            os.fstat(child_fd)
+
+    for descriptor in reader_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_trusted_reader_materializes_requested_bytes_without_array_selection(
     tmp_path: Path,
 ) -> None:

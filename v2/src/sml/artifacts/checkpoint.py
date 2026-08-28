@@ -1825,8 +1825,20 @@ class CheckpointReader:
         )
         try:
             child_root = root.open_child(logical_path)
-        finally:
+        except BaseException as error:
+            try:
+                root.close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+        try:
             root.close()
+        except BaseException as error:
+            try:
+                child_root.close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
         return child_root
 
     def read_contents(self) -> VerifiedCheckpointContents:
