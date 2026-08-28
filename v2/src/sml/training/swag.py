@@ -1224,6 +1224,7 @@ def _select_pretraining_base(run: Path) -> _SelectedPretrainingBase:
         run,
         verification=VerificationLevel.FULL,
         load_array_groups=frozenset({"model.safetensors", "master.safetensors"}),
+        materialize_byte_groups=frozenset({"model.safetensors"}),
     ) as reader:
         recovered = reader.resolved
         if not isinstance(recovered.run, PretrainingRunManifest):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -433,14 +434,22 @@ def test_loader_closes_its_retained_owner_when_processor_construction_fails(
     )
     output = tmp_path / "bundle"
     train_tokenizer_bundle(_config(tmp_path), output)
-    closed: list[OpenedArtifact] = []
-    original_close = OpenedArtifact.close
+    descriptors: list[int] = []
+    real_open_artifact = open_artifact
+    real_open_payload = OpenedArtifact.open_payload
 
-    def record_close(artifact):
-        closed.append(artifact)
-        original_close(artifact)
+    def record_artifact(*args):
+        artifact = real_open_artifact(*args)
+        descriptors.append(artifact.root.fileno())
+        return artifact
 
-    monkeypatch.setattr(OpenedArtifact, "close", record_close)
+    def record_payload(artifact, reference):
+        payload = real_open_payload(artifact, reference)
+        descriptors.append(payload.stream.fileno())
+        return payload
+
+    monkeypatch.setattr("sml.data.tokenizer.open_artifact", record_artifact)
+    monkeypatch.setattr(OpenedArtifact, "open_payload", record_payload)
     monkeypatch.setitem(
         sys.modules,
         "sentencepiece",
@@ -453,8 +462,10 @@ def test_loader_closes_its_retained_owner_when_processor_construction_fails(
 
     with pytest.raises(SMLArtifactError, match="tokenizer model"):
         load_tokenizer_bundle(output, VerificationLevel.FULL)
-    assert len(closed) == 1
-    assert closed[0].closed
+    assert len(descriptors) == 3
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_loader_consumes_open_root_after_outer_name_replacement(tmp_path, monkeypatch):

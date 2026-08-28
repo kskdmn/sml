@@ -19,6 +19,7 @@ from sml.artifacts.manifest import (
     LatestIndex,
     LoRACheckpointManifest,
     LoRARunManifest,
+    OpenedArtifact,
     PayloadRef,
     VerificationLevel,
     canonical_json_bytes,
@@ -942,6 +943,75 @@ def test_merged_inference_fails_closed_on_child_or_payload_replacement(
     assert len(descriptors) == 1
     with pytest.raises(OSError):
         os.fstat(descriptors[0])
+
+
+@pytest.mark.parametrize("target", ["tokenizer", "model.safetensors"])
+def test_merged_inference_consumes_post_open_export_owner_after_name_replacement(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch, target: str
+):
+    """Child/payload replacement after FULL proof cannot redirect export inference."""
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / f"post-open-{target}-source",
+            maximum_steps=1,
+        )
+    )
+    exported = export_merged(trained.run, tmp_path / f"post-open-{target}-export")
+    descriptors: list[int] = []
+    moved = tmp_path / f"retained-{target}"
+    real_duplicate = ArtifactRoot.duplicate
+    real_child = OpenedArtifact.open_child
+    real_payload = OpenedArtifact.open_payload
+
+    def capture_outer(root):
+        duplicated = real_duplicate(root)
+        descriptors.append(duplicated.fileno())
+        return duplicated
+
+    def replace_child(artifact, logical_path, manifest_types):
+        child = real_child(artifact, logical_path, manifest_types)
+        if target == "tokenizer" and artifact.path == exported.path:
+            descriptors.append(child.root.fileno())
+            source = exported.path / "tokenizer"
+            source.rename(moved)
+            source.mkdir()
+        return child
+
+    def replace_payload(artifact, reference):
+        payload = real_payload(artifact, reference)
+        if target == "tokenizer" and artifact.path == exported.path / "tokenizer":
+            descriptors.append(payload.stream.fileno())
+        if target == "model.safetensors" and artifact.path == exported.path:
+            descriptors.append(payload.stream.fileno())
+            source = exported.path / "model.safetensors"
+            source.rename(moved)
+            source.write_bytes(b"replacement")
+        return payload
+
+    monkeypatch.setattr(ArtifactRoot, "duplicate", capture_outer)
+    monkeypatch.setattr(OpenedArtifact, "open_child", replace_child)
+    monkeypatch.setattr(OpenedArtifact, "open_payload", replace_payload)
+    try:
+        if target == "model.safetensors":
+            with pytest.raises(SMLArtifactError, match="payload changed during use"):
+                resolve_model_artifact(exported.path, full_verify=True)
+            resolved = None
+        else:
+            resolved = resolve_model_artifact(exported.path, full_verify=True)
+    finally:
+        source = exported.path / target
+        if target == "tokenizer":
+            source.rmdir()
+        else:
+            source.unlink()
+        moved.rename(source)
+    if resolved is not None:
+        assert resolved.artifact_kind == "export"
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 @pytest.mark.parametrize("child", ["base", "tokenizer"])

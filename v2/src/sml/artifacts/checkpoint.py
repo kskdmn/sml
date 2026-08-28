@@ -1932,12 +1932,13 @@ def _load_checkpoint_array_payload(
                     )
             result = {name: arrays[name] for name in names}
             mx.eval(*result.values())
-            payload.seek(0)
-            raw_bytes = payload.read()
-            if len(raw_bytes) != reference.payload.byte_size:
-                raise SMLArtifactError(
-                    f"checkpoint payload byte size mismatch: {logical_path}"
-                )
+            if payload_bytes is not None:
+                payload.seek(0)
+                raw_bytes = payload.read()
+                if len(raw_bytes) != reference.payload.byte_size:
+                    raise SMLArtifactError(
+                        f"checkpoint payload byte size mismatch: {logical_path}"
+                    )
             if full:
                 payload.seek(0)
                 if file_identity(payload) != reference.payload.identity:
@@ -2235,6 +2236,7 @@ def _verify_checkpoint_semantics(
     verification: VerificationLevel,
     *,
     load_array_groups: frozenset[str] | None = None,
+    materialize_byte_groups: frozenset[str] | None = None,
 ) -> VerifiedCheckpointContents:
     mx = _mlx_core()
     local_apfs = _descriptor_is_local_apfs(descriptor)
@@ -2251,12 +2253,26 @@ def _verify_checkpoint_semantics(
                 + ", ".join(sorted(unknown))
             )
         selected = set(load_array_groups)
+    byte_groups = (
+        set() if materialize_byte_groups is None else set(materialize_byte_groups)
+    )
+    if not byte_groups <= available:
+        raise SMLArtifactError("unknown checkpoint byte groups requested")
+    if not byte_groups <= selected:
+        raise SMLArtifactError("checkpoint byte groups must also be loaded")
     with ArtifactRoot(os.dup(descriptor), local_apfs=local_apfs) as root:
         scalar = _read_checkpoint_scalar_payload(root, manifest, full=full)
         payload_bytes: dict[str, bytes] = {}
         groups = {
             reference.payload.logical_path: _load_checkpoint_array_payload(
-                root, reference, full=full, payload_bytes=payload_bytes
+                root,
+                reference,
+                full=full,
+                payload_bytes=(
+                    payload_bytes
+                    if reference.payload.logical_path in byte_groups
+                    else None
+                ),
             )
             for reference in references
             if reference.payload.logical_path in selected
@@ -2426,6 +2442,7 @@ def _open_verified_step_from_descriptor(
     verification: VerificationLevel,
     fs: FilesystemOps,
     load_array_groups: frozenset[str] | None = None,
+    materialize_byte_groups: frozenset[str] | None = None,
 ) -> _OwnedStep:
     name = _step_name(step)
     descriptor = -1
@@ -2465,6 +2482,7 @@ def _open_verified_step_from_descriptor(
                 manifest,
                 verification,
                 load_array_groups=load_array_groups,
+                materialize_byte_groups=materialize_byte_groups,
             )
             if materialize
             else None
@@ -2534,6 +2552,7 @@ def open_checkpoint_reader(
     expected_checkpoint_identity: str | None = None,
     verification: VerificationLevel = VerificationLevel.FULL,
     load_array_groups: frozenset[str] | None = None,
+    materialize_byte_groups: frozenset[str] | None = None,
     hold_lock: bool = True,
     fs: FilesystemOps = OS_FILESYSTEM,
 ) -> Iterator[CheckpointReader]:
@@ -2552,6 +2571,13 @@ def open_checkpoint_reader(
         or not all(isinstance(name, str) for name in load_array_groups)
     ):
         raise TypeError("load_array_groups must be a frozenset of strings or None")
+    if materialize_byte_groups is not None and (
+        not isinstance(materialize_byte_groups, frozenset)
+        or not all(isinstance(name, str) for name in materialize_byte_groups)
+    ):
+        raise TypeError(
+            "materialize_byte_groups must be a frozenset of strings or None"
+        )
     if not isinstance(hold_lock, bool):
         raise TypeError("hold_lock must be a bool")
     if not isinstance(fs, FilesystemOps):
@@ -2598,6 +2624,7 @@ def open_checkpoint_reader(
                 verification=verification,
                 fs=fs,
                 load_array_groups=load_array_groups,
+                materialize_byte_groups=materialize_byte_groups,
             )
             if (
                 expected_checkpoint_identity is not None
@@ -2632,6 +2659,7 @@ def open_latest_checkpoint_reader(
     *,
     verification: VerificationLevel = VerificationLevel.FULL,
     load_array_groups: frozenset[str] | None = None,
+    materialize_byte_groups: frozenset[str] | None = None,
     run_descriptor: int | None = None,
     fs: FilesystemOps = OS_FILESYSTEM,
 ) -> Iterator[CheckpointReader]:
@@ -2645,6 +2673,13 @@ def open_latest_checkpoint_reader(
         or not all(isinstance(name, str) for name in load_array_groups)
     ):
         raise TypeError("load_array_groups must be a frozenset of strings or None")
+    if materialize_byte_groups is not None and (
+        not isinstance(materialize_byte_groups, frozenset)
+        or not all(isinstance(name, str) for name in materialize_byte_groups)
+    ):
+        raise TypeError(
+            "materialize_byte_groups must be a frozenset of strings or None"
+        )
     if run_descriptor is not None and (
         isinstance(run_descriptor, bool) or not isinstance(run_descriptor, int)
     ):
@@ -2691,6 +2726,7 @@ def open_latest_checkpoint_reader(
                 verification=verification,
                 fs=fs,
                 load_array_groups=load_array_groups,
+                materialize_byte_groups=materialize_byte_groups,
             )
             if owned.resolved.checkpoint.identity != recovered.checkpoint.identity:
                 raise SMLArtifactError("resolved latest changed before state loading")

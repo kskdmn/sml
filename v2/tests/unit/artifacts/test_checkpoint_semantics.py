@@ -319,6 +319,7 @@ def test_reader_returns_materialized_payload_bytes_after_logical_name_replacemen
         run,
         step=0,
         load_array_groups=frozenset({"model.safetensors"}),
+        materialize_byte_groups=frozenset({"model.safetensors"}),
     ) as reader:
         descriptors.extend(
             [
@@ -334,6 +335,22 @@ def test_reader_returns_materialized_payload_bytes_after_logical_name_replacemen
     for descriptor in descriptors:
         with pytest.raises(OSError):
             os.fstat(descriptor)
+
+
+def test_checkpoint_reader_retains_only_explicitly_requested_raw_bytes(
+    tmp_path: Path,
+) -> None:
+    """Normal checkpoint consumers keep arrays, not duplicate safetensors bytes."""
+    run = _write_valid_checkpoint_run(tmp_path)
+    with open_checkpoint_reader(run, step=0) as reader:
+        assert reader.read_contents().payload_bytes == {}
+    with open_checkpoint_reader(
+        run,
+        step=0,
+        load_array_groups=frozenset({"model.safetensors"}),
+        materialize_byte_groups=frozenset({"model.safetensors"}),
+    ) as reader:
+        assert set(reader.read_contents().payload_bytes) == {"model.safetensors"}
 
 
 def test_checkpoint_initial_step_name_swap_fails_opened_entry_revalidation(
