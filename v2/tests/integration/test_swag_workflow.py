@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -818,6 +819,45 @@ def test_export_uses_recovered_latest_and_rejects_direct_step_paths(
         export_merged(latest.step_directory, tmp_path / "export-from-step")
     with pytest.raises(SMLArtifactError):
         InferenceSession.from_checkpoint(latest.step_directory, full_verify=True)
+
+
+def test_export_consumes_run_descriptor_after_outer_name_replacement(
+    tiny_base_run,
+    tiny_swag_bundle,
+    tmp_path,
+    monkeypatch,
+):
+    """Catches export reopening the run pathname after proving its latest step."""
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "descriptor-export-run",
+            maximum_steps=1,
+        )
+    )
+    run = trained.run
+    displaced = tmp_path / "displaced-run"
+    real_open_latest = swag_module.open_latest_checkpoint_reader
+
+    @contextmanager
+    def replace_outer_name(*args, **kwargs):
+        with real_open_latest(*args, **kwargs) as reader:
+            run.rename(displaced)
+            run.mkdir()
+            try:
+                yield reader
+            finally:
+                run.rmdir()
+                displaced.rename(run)
+
+    monkeypatch.setattr(
+        swag_module, "open_latest_checkpoint_reader", replace_outer_name
+    )
+
+    exported = export_merged(run, tmp_path / "descriptor-export")
+
+    assert exported.path.is_dir()
 
 
 def test_resolve_rejects_export_that_changes_copied_base_rope(
