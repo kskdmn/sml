@@ -149,27 +149,34 @@ def test_prepare_swag_bundle_writes_mmap_npy_layout(tmp_path):
     provider = FakeSwagProvider((VALID_ROW,))
     output = tmp_path / "swag"
     bundle = prepare_swag_bundle(tiny_swag_config(provider), tiny_base_model(), output)
-
-    bucket_length = bundle.buckets[0].input_ids.shape[-1]
-    bucket_dir = output / "buckets" / f"length-{bucket_length:04d}"
-    for name in (
-        "input_ids.npy",
-        "valid_token_mask.npy",
-        "score_mask.npy",
-        "labels.npy",
-    ):
-        path = bucket_dir / name
-        assert path.is_file()
-        loaded = np.load(path, mmap_mode="r", allow_pickle=False)
-        assert loaded.ndim >= 1
-
     reloaded = load_swag_bundle(output, VerificationLevel.FULL)
-    assert reloaded.manifest.identity == bundle.manifest.identity
-    assert reloaded.path == output
-    np.testing.assert_array_equal(
-        reloaded.buckets[0].input_ids, bundle.buckets[0].input_ids
-    )
-    np.testing.assert_array_equal(reloaded.buckets[0].labels, bundle.buckets[0].labels)
+    try:
+        with (
+            bundle.borrow_buckets() as buckets,
+            reloaded.borrow_buckets() as reloaded_buckets,
+        ):
+            bucket_length = buckets[0].input_ids.shape[-1]
+            bucket_dir = output / "buckets" / f"length-{bucket_length:04d}"
+            for name in (
+                "input_ids.npy",
+                "valid_token_mask.npy",
+                "score_mask.npy",
+                "labels.npy",
+            ):
+                path = bucket_dir / name
+                assert path.is_file()
+                loaded = np.load(path, mmap_mode="r", allow_pickle=False)
+                assert loaded.ndim >= 1
+
+            assert reloaded.manifest.identity == bundle.manifest.identity
+            assert reloaded.path == output
+            np.testing.assert_array_equal(
+                reloaded_buckets[0].input_ids, buckets[0].input_ids
+            )
+            np.testing.assert_array_equal(reloaded_buckets[0].labels, buckets[0].labels)
+    finally:
+        reloaded.close()
+        bundle.close()
 
 
 def test_reopening_valid_bundle_does_not_call_provider(tmp_path):
@@ -184,11 +191,15 @@ def test_reopening_valid_bundle_does_not_call_provider(tmp_path):
 
     second = prepare_swag_bundle(tiny_swag_config(provider), tiny_base_model(), output)
     loaded = load_swag_bundle(output, VerificationLevel.FULL)
-
-    assert provider.resolve_calls == 0
-    assert provider.iter_calls == 0
-    assert second.manifest.identity == first.manifest.identity
-    assert loaded.manifest.identity == first.manifest.identity
+    try:
+        assert provider.resolve_calls == 0
+        assert provider.iter_calls == 0
+        assert second.manifest.identity == first.manifest.identity
+        assert loaded.manifest.identity == first.manifest.identity
+    finally:
+        loaded.close()
+        second.close()
+        first.close()
 
 
 def test_identity_mismatch_at_existing_target_is_a_collision(tmp_path):

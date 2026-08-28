@@ -841,7 +841,7 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
             self._committed_cursor = normalized_cursor
             self._producer_cursor = normalized_cursor
             self._pool = _StagingPool(
-                prefetch_depth,
+                prefetch_depth + 1,
                 (batch_size, self._manifest.row_width),
             )
             self._producer = threading.Thread(
@@ -954,20 +954,16 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         else:
             cursor_after = PretrainingCursor(cursor.epoch, position, offset)
 
-        if len(segments) == 1:
-            rows = segments[0]
-            pool_lease = None
-        else:
-            pool = self._pool
-            if pool is None:
-                raise _ProducerStopped
-            rows, pool_index, generation = pool.lease()
-            destination = 0
-            for segment in segments:
-                next_destination = destination + segment.shape[0]
-                rows[destination:next_destination] = segment
-                destination = next_destination
-            pool_lease = (pool_index, generation)
+        pool = self._pool
+        if pool is None:
+            raise _ProducerStopped
+        rows, pool_index, generation = pool.lease()
+        destination = 0
+        for segment in segments:
+            next_destination = destination + segment.shape[0]
+            rows[destination:next_destination] = segment
+            destination = next_destination
+        pool_lease = (pool_index, generation)
 
         return (
             self._make_envelope(

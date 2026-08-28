@@ -327,12 +327,10 @@ def test_loader_failures_close_payload_but_leave_root_owned_by_caller(
     monkeypatch.setattr(arrays_module.mx, "eval", fake_eval)
 
     with artifact:
-        with pytest.raises((InjectedFailure, SMLArtifactError)) as raised:
+        with pytest.raises(SMLArtifactError) as raised:
             load_safetensors_payload(artifact, reference)
-        assert "injected" in str(raised.value) or (
-            raised.value.__cause__ is not None
-            and "injected" in str(raised.value.__cause__)
-        )
+        assert isinstance(raised.value.__cause__, InjectedFailure)
+        assert "injected" in str(raised.value.__cause__)
         assert len(opened_payloads) == 1
         assert opened_payloads[0].closed is True
         assert opened_payloads[0].stream.closed is True

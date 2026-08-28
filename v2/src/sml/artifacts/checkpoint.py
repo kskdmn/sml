@@ -48,6 +48,7 @@ from sml.artifacts.manifest import (
     _json_object_no_duplicates,
     _manifest_type_for_raw,
     _open_artifact_from_root,
+    _open_stable_payload,
     _parse_manifest,
     _reject_json_constant,
     canonical_json_bytes,
@@ -1725,19 +1726,19 @@ def _read_manifest_from_descriptor[M](
         filename = next(iter(filenames))
         local_apfs = _descriptor_is_local_apfs(descriptor)
         with ArtifactRoot(os.dup(descriptor), local_apfs=local_apfs) as artifact_root:
-            with artifact_root.open_payload(filename) as manifest_file:
-                manifest_bytes = manifest_file.read()
-            raw = json.loads(
-                manifest_bytes.decode("utf-8"),
-                parse_constant=_reject_json_constant,
-                object_pairs_hook=_json_object_no_duplicates,
-            )
-            resolved_type = _manifest_type_for_raw(raw, manifest_types)
-            manifest = _parse_manifest(raw, resolved_type)
-            if manifest.recompute_identity() != manifest.identity:
-                raise SMLArtifactError(f"manifest identity mismatch in {context}")
-            if manifest_bytes != canonical_json_bytes(manifest):
-                raise SMLArtifactError(f"noncanonical manifest bytes in {context}")
+            with _open_stable_payload(artifact_root, filename) as manifest_payload:
+                manifest_bytes = manifest_payload.read()
+                raw = json.loads(
+                    manifest_bytes.decode("utf-8"),
+                    parse_constant=_reject_json_constant,
+                    object_pairs_hook=_json_object_no_duplicates,
+                )
+                resolved_type = _manifest_type_for_raw(raw, manifest_types)
+                manifest = _parse_manifest(raw, resolved_type)
+                if manifest.recompute_identity() != manifest.identity:
+                    raise SMLArtifactError(f"manifest identity mismatch in {context}")
+                if manifest_bytes != canonical_json_bytes(manifest):
+                    raise SMLArtifactError(f"noncanonical manifest bytes in {context}")
             artifact_root.verify_payloads(
                 tuple(_payload_references(manifest)),
                 full=verification is VerificationLevel.FULL,
@@ -2042,24 +2043,78 @@ def _read_checkpoint_scalar_payload(
 ) -> dict[str, object]:
     reference = manifest.scalar_state
     try:
-        with root.open_payload(reference.logical_path) as payload:
-            opened = os.fstat(payload.fileno())
+        with _open_stable_payload(root, reference.logical_path) as payload:
             raw_bytes = payload.read()
-        if (
-            opened.st_size != reference.byte_size
-            or len(raw_bytes) != reference.byte_size
-        ):
-            raise SMLArtifactError("checkpoint scalar state byte size mismatch")
-        if (
-            full
-            and f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}" != reference.identity
-        ):
-            raise SMLArtifactError("checkpoint scalar state identity mismatch")
-        raw = json.loads(
-            raw_bytes.decode("utf-8"),
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=_json_object_no_duplicates,
-        )
+            if (
+                payload.opened_stat.st_size != reference.byte_size
+                or len(raw_bytes) != reference.byte_size
+            ):
+                raise SMLArtifactError("checkpoint scalar state byte size mismatch")
+            if (
+                full
+                and f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+                != reference.identity
+            ):
+                raise SMLArtifactError("checkpoint scalar state identity mismatch")
+            raw = json.loads(
+                raw_bytes.decode("utf-8"),
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_json_object_no_duplicates,
+            )
+            if not isinstance(raw, dict) or canonical_json_bytes(raw) != raw_bytes:
+                raise SMLArtifactError(
+                    "checkpoint scalar state must be a canonical JSON object"
+                )
+
+            if isinstance(manifest, PretrainingCheckpointManifest):
+                expected_fields = {
+                    "kind",
+                    "version",
+                    "owning_run_identity",
+                    "step",
+                    "rows",
+                    "microsteps",
+                    "cursor",
+                }
+                expected_kind = "pretraining-state"
+                cursor_fields = {"epoch", "shard_order_position", "row_offset"}
+                progress_fields = ("rows", "microsteps")
+            else:
+                expected_fields = {
+                    "kind",
+                    "version",
+                    "owning_run_identity",
+                    "step",
+                    "examples",
+                    "microsteps",
+                    "cursor",
+                }
+                expected_kind = "lora-state"
+                cursor_fields = {"epoch", "bucket_order_position", "row_offset"}
+                progress_fields = ("examples", "microsteps")
+            if set(raw) != expected_fields:
+                raise SMLArtifactError("checkpoint scalar state has invalid fields")
+            if raw["kind"] != expected_kind or raw["version"] != 1:
+                raise SMLArtifactError(
+                    "checkpoint scalar state has invalid owner-kind schema"
+                )
+            if raw["owning_run_identity"] != manifest.owning_run_identity:
+                raise SMLArtifactError("checkpoint scalar state belongs to another run")
+            if (
+                _plain_nonnegative(raw["step"], "checkpoint scalar step")
+                != manifest.step
+            ):
+                raise SMLArtifactError(
+                    "checkpoint scalar step does not match checkpoint"
+                )
+            for name in progress_fields:
+                _plain_nonnegative(raw[name], f"checkpoint scalar {name}")
+            cursor = raw["cursor"]
+            if not isinstance(cursor, dict) or set(cursor) != cursor_fields:
+                raise SMLArtifactError("checkpoint scalar cursor has invalid fields")
+            for name in cursor_fields:
+                _plain_nonnegative(cursor[name], f"checkpoint cursor {name}")
+            return raw
     except SMLArtifactError:
         raise
     except (
@@ -2068,55 +2123,9 @@ def _read_checkpoint_scalar_payload(
         json.JSONDecodeError,
         TypeError,
         ValueError,
+        RuntimeError,
     ) as error:
         raise SMLArtifactError("invalid checkpoint scalar state") from error
-    if not isinstance(raw, dict) or canonical_json_bytes(raw) != raw_bytes:
-        raise SMLArtifactError(
-            "checkpoint scalar state must be a canonical JSON object"
-        )
-
-    if isinstance(manifest, PretrainingCheckpointManifest):
-        expected_fields = {
-            "kind",
-            "version",
-            "owning_run_identity",
-            "step",
-            "rows",
-            "microsteps",
-            "cursor",
-        }
-        expected_kind = "pretraining-state"
-        cursor_fields = {"epoch", "shard_order_position", "row_offset"}
-        progress_fields = ("rows", "microsteps")
-    else:
-        expected_fields = {
-            "kind",
-            "version",
-            "owning_run_identity",
-            "step",
-            "examples",
-            "microsteps",
-            "cursor",
-        }
-        expected_kind = "lora-state"
-        cursor_fields = {"epoch", "bucket_order_position", "row_offset"}
-        progress_fields = ("examples", "microsteps")
-    if set(raw) != expected_fields:
-        raise SMLArtifactError("checkpoint scalar state has invalid fields")
-    if raw["kind"] != expected_kind or raw["version"] != 1:
-        raise SMLArtifactError("checkpoint scalar state has invalid owner-kind schema")
-    if raw["owning_run_identity"] != manifest.owning_run_identity:
-        raise SMLArtifactError("checkpoint scalar state belongs to another run")
-    if _plain_nonnegative(raw["step"], "checkpoint scalar step") != manifest.step:
-        raise SMLArtifactError("checkpoint scalar step does not match checkpoint")
-    for name in progress_fields:
-        _plain_nonnegative(raw[name], f"checkpoint scalar {name}")
-    cursor = raw["cursor"]
-    if not isinstance(cursor, dict) or set(cursor) != cursor_fields:
-        raise SMLArtifactError("checkpoint scalar cursor has invalid fields")
-    for name in cursor_fields:
-        _plain_nonnegative(cursor[name], f"checkpoint cursor {name}")
-    return raw
 
 
 def _require_array_contract(

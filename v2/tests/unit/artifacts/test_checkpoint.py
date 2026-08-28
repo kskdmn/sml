@@ -650,6 +650,101 @@ def _resolve_latest_owned(run: Path, *, writable: bool) -> checkpoint.ResolvedSt
         )
 
 
+@pytest.mark.parametrize("semantic_failure", [False, True])
+def test_checkpoint_manifest_descriptor_is_stable_through_schema_validation(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    semantic_failure: bool,
+) -> None:
+    """Manifest parsing and its cleanup must share one stable descriptor lifetime."""
+    step = valid_run / "checkpoints" / "step-000000001"
+    manifest_path = step / "checkpoint.json"
+    descriptor = os.open(step, os.O_RDONLY | os.O_DIRECTORY)
+    real_parse = checkpoint._parse_manifest
+    primary = SMLArtifactError("injected checkpoint manifest semantic failure")
+
+    def mutating_parse(raw, manifest_type):
+        before = manifest_path.stat()
+        os.utime(
+            manifest_path,
+            ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+        )
+        if semantic_failure:
+            raise primary
+        return real_parse(raw, manifest_type)
+
+    monkeypatch.setattr(checkpoint, "_parse_manifest", mutating_parse)
+    try:
+        with pytest.raises(SMLArtifactError) as caught:
+            checkpoint._read_manifest_from_descriptor(
+                descriptor,
+                PretrainingCheckpointManifest,
+                VerificationLevel.MANIFEST_TRUSTED,
+                context="injected checkpoint",
+            )
+    finally:
+        os.close(descriptor)
+
+    if semantic_failure:
+        assert caught.value is primary
+        assert isinstance(caught.value.__cause__, SMLArtifactError)
+        assert "changed during use" in str(caught.value.__cause__)
+    else:
+        assert "changed during use" in str(caught.value)
+
+
+@pytest.mark.parametrize("semantic_failure", [False, True])
+def test_checkpoint_scalar_descriptor_is_stable_through_schema_validation(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    semantic_failure: bool,
+) -> None:
+    """Scalar schema checks must finish before postcheck and deterministic close."""
+    step = valid_run / "checkpoints" / "step-000000001"
+    descriptor = os.open(step, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        manifest = checkpoint._read_manifest_from_descriptor(
+            descriptor,
+            PretrainingCheckpointManifest,
+            VerificationLevel.MANIFEST_TRUSTED,
+            context="checkpoint scalar fixture",
+        )
+    finally:
+        os.close(descriptor)
+
+    state_path = step / "state.json"
+    real_plain_nonnegative = checkpoint._plain_nonnegative
+    mutated = False
+    primary = SMLArtifactError("injected checkpoint scalar semantic failure")
+
+    def mutating_validation(value, name):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            before = state_path.stat()
+            os.utime(
+                state_path,
+                ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+            )
+            if semantic_failure:
+                raise primary
+        return real_plain_nonnegative(value, name)
+
+    monkeypatch.setattr(checkpoint, "_plain_nonnegative", mutating_validation)
+    with (
+        checkpoint.ArtifactRoot.open(step, writable=False) as root,
+        pytest.raises(SMLArtifactError) as caught,
+    ):
+        checkpoint._read_checkpoint_scalar_payload(root, manifest, full=False)
+
+    if semantic_failure:
+        assert caught.value is primary
+        assert isinstance(caught.value.__cause__, SMLArtifactError)
+        assert "changed during use" in str(caught.value.__cause__)
+    else:
+        assert "changed during use" in str(caught.value)
+
+
 @pytest.mark.parametrize("latest", [False, True])
 def test_reader_cleanup_keeps_semantic_failure_primary_and_closes_all_fds(
     valid_run: Path, monkeypatch: pytest.MonkeyPatch, latest: bool

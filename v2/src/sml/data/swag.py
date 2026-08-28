@@ -16,6 +16,7 @@ from traceback import clear_frames
 from typing import Literal, Protocol, Self
 
 import numpy as np
+from numpy.lib.mixins import NDArrayOperatorsMixin
 
 from sml.artifacts.checkpoint import publish_immutable_bundle
 from sml.artifacts.manifest import (
@@ -202,6 +203,176 @@ class SwagBucket:
     valid_token_mask: np.ndarray
     score_mask: np.ndarray
     labels: np.ndarray
+
+
+class _ScopedNumpyArray(NDArrayOperatorsMixin):
+    """Copying array proxy that never exports descriptor-backed storage."""
+
+    __slots__ = ("_array", "_lease")
+
+    def __init__(self, array: np.ndarray, lease: SwagBucketLease) -> None:
+        self._array = array
+        self._lease = lease
+
+    def _require_active(self) -> np.ndarray:
+        if self._lease.closed:
+            raise SMLDataError("SWAG bucket lease is closed")
+        return self._array
+
+    @staticmethod
+    def _copied(value: object) -> object:
+        if isinstance(value, np.ndarray):
+            copied = np.array(value, copy=True)
+            copied.setflags(write=False)
+            return copied
+        return value
+
+    @staticmethod
+    def _index_value(value: object) -> object:
+        if isinstance(value, _ScopedNumpyArray):
+            return np.asarray(value)
+        if isinstance(value, tuple):
+            return tuple(_ScopedNumpyArray._index_value(item) for item in value)
+        return value
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(self._require_active().shape)
+
+    @property
+    def dtype(self) -> np.dtype:
+        return self._require_active().dtype
+
+    @property
+    def ndim(self) -> int:
+        return self._require_active().ndim
+
+    @property
+    def size(self) -> int:
+        return self._require_active().size
+
+    @property
+    def flags(self):
+        return self._require_active().flags
+
+    def __len__(self) -> int:
+        return len(self._require_active())
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+    def __getitem__(self, key: object) -> object:
+        return self._copied(self._require_active()[self._index_value(key)])
+
+    def __setitem__(self, key: object, value: object) -> None:
+        del key, value
+        raise ValueError("SWAG borrowed arrays are read-only")
+
+    def __array__(
+        self,
+        dtype: np.dtype | None = None,
+        copy: bool | None = None,
+    ) -> np.ndarray:
+        if copy is False:
+            raise ValueError("SWAG borrowed arrays cannot export zero-copy storage")
+        return np.array(self._require_active(), dtype=dtype, copy=True)
+
+    def __array_ufunc__(
+        self,
+        ufunc: object,
+        method: str,
+        *inputs: object,
+        **kwargs: object,
+    ) -> object:
+        if kwargs.get("out") is not None:
+            raise ValueError("SWAG borrowed arrays are read-only")
+        copied_inputs = tuple(
+            np.asarray(value) if isinstance(value, _ScopedNumpyArray) else value
+            for value in inputs
+        )
+        return getattr(ufunc, method)(*copied_inputs, **kwargs)
+
+    def astype(self, dtype: np.dtype, *args: object, **kwargs: object) -> np.ndarray:
+        return self._require_active().astype(dtype, *args, **kwargs).copy()
+
+    def min(self, *args: object, **kwargs: object) -> object:
+        return self._copied(self._require_active().min(*args, **kwargs))
+
+    def max(self, *args: object, **kwargs: object) -> object:
+        return self._copied(self._require_active().max(*args, **kwargs))
+
+    def sum(self, *args: object, **kwargs: object) -> object:
+        return self._copied(self._require_active().sum(*args, **kwargs))
+
+    def any(self, *args: object, **kwargs: object) -> object:
+        return self._copied(self._require_active().any(*args, **kwargs))
+
+    def all(self, *args: object, **kwargs: object) -> object:
+        return self._copied(self._require_active().all(*args, **kwargs))
+
+    def copy(self) -> np.ndarray:
+        return np.array(self._require_active(), copy=True)
+
+    def tolist(self) -> list[object]:
+        return self._require_active().tolist()
+
+
+@dataclass(frozen=True, slots=True)
+class BorrowedSwagBucket:
+    length: int
+    input_ids: _ScopedNumpyArray
+    valid_token_mask: _ScopedNumpyArray
+    score_mask: _ScopedNumpyArray
+    labels: _ScopedNumpyArray
+
+
+class SwagBucketLease:
+    """One explicit, scoped public borrow of safe SWAG array proxies."""
+
+    __slots__ = ("_buckets", "_bundle", "closed")
+
+    def __init__(
+        self,
+        bundle: SwagDataBundle,
+        buckets: tuple[SwagBucket, ...],
+    ) -> None:
+        self._bundle = bundle
+        self.closed = False
+        self._buckets = tuple(
+            BorrowedSwagBucket(
+                bucket.length,
+                _ScopedNumpyArray(bucket.input_ids, self),
+                _ScopedNumpyArray(bucket.valid_token_mask, self),
+                _ScopedNumpyArray(bucket.score_mask, self),
+                _ScopedNumpyArray(bucket.labels, self),
+            )
+            for bucket in buckets
+        )
+
+    @property
+    def buckets(self) -> tuple[BorrowedSwagBucket, ...]:
+        if self.closed:
+            raise SMLDataError("SWAG bucket lease is closed")
+        return self._buckets
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self._buckets = ()
+        self._bundle._release_bucket_lease()
+
+    def __enter__(self) -> tuple[BorrowedSwagBucket, ...]:
+        return self.buckets
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        self.close()
 
 
 class _OwnedNpyMapping:
@@ -424,9 +595,28 @@ class SwagDataBundle:
     _root: ArtifactRoot = field(repr=False, compare=False)
     _mappings: tuple[_OwnedNpyMapping, ...] = field(repr=False, compare=False)
     _closed: bool = field(default=False, init=False, repr=False, compare=False)
+    _bucket_leases: int = field(default=0, init=False, repr=False, compare=False)
 
     @property
     def buckets(self) -> tuple[SwagBucket, ...]:
+        raise SMLDataError("public SWAG bucket access requires borrow_buckets()")
+
+    def borrow_buckets(self) -> SwagBucketLease:
+        if self._closed:
+            raise SMLDataError("SWAG data bundle is closed")
+        object.__setattr__(self, "_bucket_leases", self._bucket_leases + 1)
+        try:
+            return SwagBucketLease(self, self._buckets)
+        except BaseException:
+            self._release_bucket_lease()
+            raise
+
+    def _release_bucket_lease(self) -> None:
+        if self._bucket_leases <= 0:
+            raise SMLDataError("SWAG bucket lease accounting underflow")
+        object.__setattr__(self, "_bucket_leases", self._bucket_leases - 1)
+
+    def _owned_buckets(self) -> tuple[SwagBucket, ...]:
         if self._closed:
             raise SMLDataError("SWAG data bundle is closed")
         return self._buckets
@@ -434,6 +624,8 @@ class SwagDataBundle:
     def close(self) -> None:
         if self._closed:
             return
+        if self._bucket_leases:
+            raise SMLDataError("cannot close SWAG bundle with active bucket leases")
         object.__setattr__(self, "_closed", True)
         mappings = self._mappings
         root = self._root
@@ -2007,7 +2199,7 @@ class SwagBatchStream:
         self, cursor: SwagCursor
     ) -> tuple[SwagBatchEnvelope, SwagCursor]:
         plan = _epoch_bucket_plan(
-            self._bundle.buckets,
+            self._bundle._owned_buckets(),
             epoch_seed=self._loader.epoch_seed,
             epoch=cursor.epoch,
         )
@@ -2027,7 +2219,7 @@ class SwagBatchStream:
         remaining = row_permutation[cursor.row_offset :]
         take = min(self._loader.microbatch_size, len(remaining))
         selected = remaining[:take]
-        bucket = self._bundle.buckets[plan[cursor.bucket_order_position][0]]
+        bucket = self._bundle._owned_buckets()[plan[cursor.bucket_order_position][0]]
         arrays = _assemble_batch_arrays(
             bucket,
             selected,

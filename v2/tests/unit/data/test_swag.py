@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import io
 import shutil
+import subprocess
 import sys
 import weakref
 from collections.abc import Iterator, Mapping, Sequence
@@ -291,17 +292,18 @@ def test_context_and_endings_are_encoded_separately_and_eos_is_scored(tmp_path):
     try:
         assert recording_tokenizer.calls[0] == VALID_ROW["context"]
         assert tuple(recording_tokenizer.calls[1:5]) == tuple(VALID_ROW["endings"])
-        bucket = bundle.buckets[0]
-        assert not bucket.score_mask[:, :, 0].any()
-        assert bucket.score_mask[bucket.valid_token_mask].any()
-        assert (~bucket.score_mask & bucket.valid_token_mask).any()
-        assert_eos_positions_are_scored(bucket, eos_token_id=2)
-        assert bucket.input_ids.dtype == np.dtype("<i4")
-        assert bucket.labels.dtype == np.dtype("<i4")
-        assert bucket.valid_token_mask.dtype == np.dtype("bool")
-        assert bucket.score_mask.dtype == np.dtype("bool")
-        assert bucket.input_ids.shape == bucket.valid_token_mask.shape
-        assert bucket.input_ids.shape[1:] == (4, bucket.input_ids.shape[-1])
+        with bundle.borrow_buckets() as buckets:
+            bucket = buckets[0]
+            assert not bucket.score_mask[:, :, 0].any()
+            assert bucket.score_mask[bucket.valid_token_mask].any()
+            assert (~bucket.score_mask & bucket.valid_token_mask).any()
+            assert_eos_positions_are_scored(bucket, eos_token_id=2)
+            assert bucket.input_ids.dtype == np.dtype("<i4")
+            assert bucket.labels.dtype == np.dtype("<i4")
+            assert bucket.valid_token_mask.dtype == np.dtype("bool")
+            assert bucket.score_mask.dtype == np.dtype("bool")
+            assert bucket.input_ids.shape == bucket.valid_token_mask.shape
+            assert bucket.input_ids.shape[1:] == (4, bucket.input_ids.shape[-1])
     finally:
         bundle.close()
 
@@ -414,9 +416,10 @@ def test_overlength_candidate_drops_complete_row(tmp_path):
     try:
         assert bundle.manifest.dropped_overlength_rows == 1
         assert bundle.manifest.example_count == 1
-        assert all(
-            0 <= int(label) < 4 for bucket in bundle.buckets for label in bucket.labels
-        )
+        with bundle.borrow_buckets() as buckets:
+            assert all(
+                0 <= int(label) < 4 for bucket in buckets for label in bucket.labels
+            )
     finally:
         bundle.close()
 
@@ -617,7 +620,13 @@ def test_load_swag_bundle_reopens_without_provider(tmp_path):
     loaded = load_swag_bundle(output, VerificationLevel.FULL)
     try:
         assert loaded.manifest.identity == prepared.manifest.identity
-        assert loaded.buckets[0].input_ids.shape == prepared.buckets[0].input_ids.shape
+        with (
+            loaded.borrow_buckets() as loaded_buckets,
+            prepared.borrow_buckets() as prepared_buckets,
+        ):
+            assert (
+                loaded_buckets[0].input_ids.shape == prepared_buckets[0].input_ids.shape
+            )
     finally:
         loaded.close()
         prepared.close()
@@ -793,7 +802,8 @@ def test_load_swag_bundle_rejects_invalid_descriptor_bound_npy(
     )
     manifest = prepared.manifest
     logical_path = _array_logical_path(manifest, "input_ids")
-    original = np.array(prepared.buckets[0].input_ids)
+    with prepared.borrow_buckets() as buckets:
+        original = np.array(buckets[0].input_ids)
     prepared.close()
     _replace_array_bytes(
         output,
@@ -818,7 +828,8 @@ def test_load_swag_bundle_uses_retained_root_after_path_replacement(
         tiny_base_model(),
         output,
     )
-    expected = np.array(prepared.buckets[0].input_ids)
+    with prepared.borrow_buckets() as buckets:
+        expected = np.array(buckets[0].input_ids)
     prepared.close()
     original_open = swag.open_artifact
 
@@ -837,7 +848,8 @@ def test_load_swag_bundle_uses_retained_root_after_path_replacement(
     monkeypatch.setattr(swag, "open_artifact", replace_after_open, raising=False)
     loaded = load_swag_bundle(output, VerificationLevel.FULL)
     try:
-        assert np.array_equal(loaded.buckets[0].input_ids, expected)
+        with loaded.borrow_buckets() as buckets:
+            assert np.array_equal(buckets[0].input_ids, expected)
     finally:
         loaded.close()
 
@@ -857,7 +869,8 @@ def test_load_swag_bundle_uses_proven_payload_after_path_replacement(
         output,
     )
     manifest = prepared.manifest
-    expected = np.array(getattr(prepared.buckets[0], array_name))
+    with prepared.borrow_buckets() as buckets:
+        expected = np.array(getattr(buckets[0], array_name))
     prepared.close()
     logical_path = _array_logical_path(manifest, array_name)
     original_open_payload = OpenedArtifact.open_payload
@@ -874,7 +887,8 @@ def test_load_swag_bundle_uses_proven_payload_after_path_replacement(
 
     monkeypatch.setattr(OpenedArtifact, "open_payload", replace_after_proof)
     loaded = load_swag_bundle(output, VerificationLevel.FULL)
-    assert np.array_equal(getattr(loaded.buckets[0], array_name), expected)
+    with loaded.borrow_buckets() as buckets:
+        assert np.array_equal(getattr(buckets[0], array_name), expected)
     with pytest.raises(SMLArtifactError, match="changed during use"):
         loaded.close()
 
@@ -891,8 +905,11 @@ def test_swag_mapping_is_read_only_and_close_detects_in_place_mutation(tmp_path)
     manifest = prepared.manifest
     prepared.close()
     loaded = load_swag_bundle(output, VerificationLevel.FULL)
-    with pytest.raises(ValueError, match="read-only"):
-        loaded.buckets[0].input_ids[0, 0, 0] = 7
+    with (
+        loaded.borrow_buckets() as buckets,
+        pytest.raises(ValueError, match="read-only"),
+    ):
+        buckets[0].input_ids[0, 0, 0] = 7
 
     logical_path = _array_logical_path(manifest, "input_ids")
     payload_path = output / logical_path
@@ -905,7 +922,59 @@ def test_swag_mapping_is_read_only_and_close_detects_in_place_mutation(tmp_path)
     with pytest.raises(SMLArtifactError, match="changed during use"):
         loaded.close()
     with pytest.raises(SMLDataError, match="closed"):
-        _ = loaded.buckets
+        loaded.borrow_buckets()
+
+
+def test_public_swag_array_remains_safe_after_bundle_close_in_subprocess(tmp_path):
+    """Retaining a public bucket array must never leave a dangling mmap view."""
+    from sml.data.swag import prepare_swag_bundle
+
+    output = tmp_path / "swag-public-borrower"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider((VALID_ROW,))),
+        tiny_base_model(),
+        output,
+    )
+    with prepared.borrow_buckets() as buckets:
+        expected = int(buckets[0].input_ids[0, 0, 0])
+    prepared.close()
+
+    program = """
+import sys
+from pathlib import Path
+
+from sml.artifacts.manifest import VerificationLevel
+from sml.data.swag import load_swag_bundle
+from sml.errors import SMLDataError
+
+bundle = load_swag_bundle(Path(sys.argv[1]), VerificationLevel.FULL)
+lease = bundle.borrow_buckets()
+retained = lease.buckets[0].input_ids
+try:
+    bundle.close()
+except SMLDataError:
+    pass
+else:
+    raise AssertionError("bundle close accepted a live public bucket lease")
+print(int(retained[0, 0, 0]))
+lease.close()
+try:
+    retained[0, 0, 0]
+except SMLDataError:
+    pass
+else:
+    raise AssertionError("closed bucket lease remained addressable")
+bundle.close()
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(output)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == str(expected)
 
 
 def test_swag_bundle_close_releases_views_mappings_payloads_then_root_once(
@@ -958,7 +1027,7 @@ def test_swag_bundle_close_releases_views_mappings_payloads_then_root_once(
         "root",
     ]
     with pytest.raises(SMLDataError, match="closed"):
-        _ = bundle.buckets
+        bundle.borrow_buckets()
 
 
 def _one_example_bundle(tmp_path: Path):
@@ -987,6 +1056,23 @@ def test_swag_stream_closes_owned_bundle_on_exhaustion(tmp_path):
     assert bundle._closed
     with pytest.raises(StopIteration):
         next(stream)
+
+
+def test_swag_stream_uses_owned_arrays_without_public_bucket_lease(tmp_path):
+    """Internal zero-copy iteration must not enter the public borrow protocol."""
+    from sml.data.swag import SwagBatchStream, SwagCursor
+
+    bundle = _one_example_bundle(tmp_path)
+    stream = SwagBatchStream(bundle, _one_example_loader(), cursor=SwagCursor.initial())
+    assert bundle._bucket_leases == 0
+    envelope = next(stream)
+    try:
+        assert bundle._bucket_leases == 0
+    finally:
+        envelope.release()
+        stream.close()
+    assert bundle._bucket_leases == 0
+    assert bundle._closed
 
 
 def test_swag_stream_closes_owned_bundle_on_early_return_and_double_close(tmp_path):
@@ -1401,7 +1487,8 @@ def test_swag_semantic_failure_closes_real_mmaps_phase_wide(tmp_path, monkeypatc
     prepared = _one_example_bundle(tmp_path)
     path = prepared.path
     manifest = prepared.manifest
-    labels = np.array(prepared.buckets[0].labels)
+    with prepared.borrow_buckets() as buckets:
+        labels = np.array(buckets[0].labels)
     prepared.close()
     labels[0] = 4
     _replace_array_bytes(
@@ -2249,7 +2336,8 @@ def test_load_rejects_bucket_length_that_is_not_a_declared_boundary(tmp_path):
     prepared = prepare_swag_bundle(
         tiny_swag_config(provider), tiny_base_model(), output
     )
-    bucket_length = prepared.buckets[0].length
+    with prepared.borrow_buckets() as buckets:
+        bucket_length = buckets[0].length
     preprocessing = dict(prepared.manifest.preprocessing)
     prepared.close()
     preprocessing["bucket_boundaries"] = [8, 32]
@@ -2302,11 +2390,10 @@ def test_chunked_ingest_does_not_stack_all_examples_at_once(tmp_path, monkeypatc
         tmp_path / "swag",
     )
     try:
-        labels = [
-            int(label)
-            for bucket in bundle.buckets
-            for label in np.asarray(bucket.labels)
-        ]
+        with bundle.borrow_buckets() as buckets:
+            labels = [
+                int(label) for bucket in buckets for label in np.asarray(bucket.labels)
+            ]
         assert bundle.manifest.example_count == 5
         assert labels == [index % 4 for index in range(5)]
         assert all(count <= 2 for count in stacked_example_batches)

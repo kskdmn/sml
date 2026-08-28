@@ -434,59 +434,64 @@ def _load_opened_tokenizer_bundle(
         raise SMLArtifactError("tokenizer vocab logical path must be tokenizer.vocab")
     _validate_training_metadata(manifest)
 
-    with artifact.open_payload(manifest.model) as model_payload:
+    with (
+        artifact.open_payload(manifest.model) as model_payload,
+        artifact.open_payload(manifest.vocab) as vocab_payload,
+    ):
         model_bytes = model_payload.stream.read()
-    with artifact.open_payload(manifest.vocab) as vocab_payload:
         vocab_bytes = vocab_payload.stream.read()
-    vocab_entries = _read_vocab(vocab_bytes)
+        vocab_entries = _read_vocab(vocab_bytes)
 
-    import sentencepiece
+        import sentencepiece
 
-    try:
-        processor = sentencepiece.SentencePieceProcessor(model_proto=model_bytes)
-        piece_count = processor.get_piece_size()
-    except Exception as error:
-        raise SMLArtifactError("invalid tokenizer model payload") from error
-    if piece_count != manifest.vocab_size:
-        raise SMLArtifactError(
-            "tokenizer processor piece count does not match manifest vocab_size"
-        )
-    if len(vocab_entries) != manifest.vocab_size:
-        raise SMLArtifactError(
-            "tokenizer vocabulary piece count does not match manifest vocab_size"
-        )
-    for index, (expected_piece, expected_score) in enumerate(vocab_entries):
         try:
-            actual_piece = processor.id_to_piece(index)
-            actual_score = processor.get_score(index)
+            processor = sentencepiece.SentencePieceProcessor(model_proto=model_bytes)
+            piece_count = processor.get_piece_size()
         except Exception as error:
+            raise SMLArtifactError("invalid tokenizer model payload") from error
+        if piece_count != manifest.vocab_size:
             raise SMLArtifactError(
-                "tokenizer vocabulary consistency check failed"
-            ) from error
-        if actual_piece != expected_piece:
-            raise SMLArtifactError(f"tokenizer vocabulary mismatch at piece ID {index}")
-        if actual_score != expected_score:
-            raise SMLArtifactError(
-                f"tokenizer vocabulary score mismatch at piece ID {index}"
+                "tokenizer processor piece count does not match manifest vocab_size"
             )
+        if len(vocab_entries) != manifest.vocab_size:
+            raise SMLArtifactError(
+                "tokenizer vocabulary piece count does not match manifest vocab_size"
+            )
+        for index, (expected_piece, expected_score) in enumerate(vocab_entries):
+            try:
+                actual_piece = processor.id_to_piece(index)
+                actual_score = processor.get_score(index)
+            except Exception as error:
+                raise SMLArtifactError(
+                    "tokenizer vocabulary consistency check failed"
+                ) from error
+            if actual_piece != expected_piece:
+                raise SMLArtifactError(
+                    f"tokenizer vocabulary mismatch at piece ID {index}"
+                )
+            if actual_score != expected_score:
+                raise SMLArtifactError(
+                    f"tokenizer vocabulary score mismatch at piece ID {index}"
+                )
 
-    special_ids = {
-        "bos": (processor.bos_id(), manifest.bos_token_id),
-        "eos": (processor.eos_id(), manifest.eos_token_id),
-        "pad": (processor.pad_id(), manifest.pad_token_id),
-        "unk": (processor.unk_id(), manifest.unk_token_id),
-    }
-    for name, (actual, expected) in special_ids.items():
-        if actual != expected:
-            raise SMLArtifactError(
-                f"tokenizer {name} special ID mismatch: expected {expected}, got {actual}"
-            )
-    return LoadedTokenizer(
-        path=artifact.path,
-        manifest=manifest,
-        verification=artifact.verification,
-        processor=processor,
-    )
+        special_ids = {
+            "bos": (processor.bos_id(), manifest.bos_token_id),
+            "eos": (processor.eos_id(), manifest.eos_token_id),
+            "pad": (processor.pad_id(), manifest.pad_token_id),
+            "unk": (processor.unk_id(), manifest.unk_token_id),
+        }
+        for name, (actual, expected) in special_ids.items():
+            if actual != expected:
+                raise SMLArtifactError(
+                    f"tokenizer {name} special ID mismatch: "
+                    f"expected {expected}, got {actual}"
+                )
+        return LoadedTokenizer(
+            path=artifact.path,
+            manifest=manifest,
+            verification=artifact.verification,
+            processor=processor,
+        )
 
 
 def load_tokenizer_bundle(

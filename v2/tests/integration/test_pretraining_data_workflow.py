@@ -4,6 +4,8 @@ import io
 import json
 import queue
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -461,6 +463,56 @@ def test_preparation_rejects_invalid_processor_token_ids_before_publication(
     assert not output.exists()
 
 
+def test_public_pretraining_rows_remain_safe_after_stream_close_in_subprocess(
+    prepared_bundle,
+):
+    """A retained single-shard batch must not dereference an unmapped shard."""
+    expected_rows = _load_rows(prepared_bundle.path)
+
+    program = """
+import sys
+from pathlib import Path
+
+from sml.artifacts.manifest import (
+    PretrainingDataManifest,
+    VerificationLevel,
+    read_manifest,
+)
+from sml.data.pretraining import (
+    PreparedDataBundle,
+    PretrainingBatchStream,
+    PretrainingCursor,
+)
+
+path = Path(sys.argv[1])
+verified = read_manifest(path, PretrainingDataManifest, VerificationLevel.FULL)
+bundle = PreparedDataBundle(path, verified.manifest, verified.verification)
+stream = PretrainingBatchStream(
+    bundle,
+    batch_size=1,
+    seed=5,
+    prefetch_depth=1,
+    cursor=PretrainingCursor.initial(),
+)
+envelope = next(stream)
+retained = envelope.rows
+value = int(retained[0, 0])
+envelope.release()
+stream.close()
+assert int(retained[0, 0]) == value
+print(value)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(prepared_bundle.path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert int(completed.stdout.strip()) in set(expected_rows[:, 0].tolist())
+
+
 def test_epoch_stream_crosses_shards_and_drops_one_tail(prepared_bundle):
     stream = PretrainingBatchStream(
         prepared_bundle,
@@ -699,13 +751,14 @@ def test_prefetch_pool_double_release_cannot_free_a_reused_live_buffer(
     first_pointer = first.rows.__array_interface__["data"][0]
     first.release()
     second = next(iterator)
-    assert second.rows.__array_interface__["data"][0] == first_pointer
+    third = next(iterator)
+    assert third.rows.__array_interface__["data"][0] == first_pointer
 
     delivered = []
     failures = []
     completed = threading.Event()
 
-    def consume_third():
+    def consume_fourth():
         try:
             delivered.append(next(iterator))
         except Exception as error:  # noqa: BLE001 - captured from worker thread
@@ -713,7 +766,7 @@ def test_prefetch_pool_double_release_cannot_free_a_reused_live_buffer(
         finally:
             completed.set()
 
-    consumer = threading.Thread(target=consume_third)
+    consumer = threading.Thread(target=consume_fourth)
     consumer.start()
     try:
         assert not completed.wait(0.15)
@@ -725,6 +778,7 @@ def test_prefetch_pool_double_release_cannot_free_a_reused_live_buffer(
         assert len(delivered) == 1
     finally:
         second.release()
+        third.release()
         for envelope in delivered:
             envelope.release()
         stream.close()
@@ -747,6 +801,8 @@ def test_mlx_transfer_does_not_alias_released_prefetch_staging(prepared_bundle):
     first_pointer = first.rows.__array_interface__["data"][0]
     device_rows = mx.array(first.rows)
     first.release()
+    intervening = next(iterator)
+    intervening.release()
     reused = next(iterator)
     try:
         assert reused.rows.__array_interface__["data"][0] == first_pointer

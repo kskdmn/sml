@@ -612,6 +612,198 @@ def test_opened_artifact_child_uses_retained_root_after_path_replacement(tmp_pat
         artifact.close()
 
 
+@pytest.mark.parametrize("recursive", [False, True], ids=("top-level", "child"))
+def test_manifest_reader_rejects_noncanonical_json_encoding(tmp_path, recursive):
+    """A digest-valid manifest must still use the one canonical wire encoding."""
+    root = tmp_path / "bundle"
+    _write_tokenizer_artifact(root)
+    target = root
+    if recursive:
+        target = root / "tokenizer"
+        _write_tokenizer_artifact(target)
+
+    raw = json.loads((target / "manifest.json").read_bytes())
+    (target / "manifest.json").write_text(
+        json.dumps(raw, indent=2, sort_keys=False), encoding="utf-8"
+    )
+
+    if recursive:
+        with (
+            manifest_module.open_artifact(
+                root, (TokenizerManifest,), VerificationLevel.MANIFEST_TRUSTED
+            ) as artifact,
+            pytest.raises(SMLArtifactError, match="canonical"),
+        ):
+            artifact.open_child("tokenizer", (TokenizerManifest,))
+    else:
+        with pytest.raises(SMLArtifactError, match="canonical"):
+            manifest_module.open_artifact(
+                root, (TokenizerManifest,), VerificationLevel.MANIFEST_TRUSTED
+            )
+
+
+@pytest.mark.parametrize("recursive", [False, True], ids=("top-level", "child"))
+def test_manifest_reader_rejects_in_place_mutation_during_schema_parse(
+    tmp_path, monkeypatch, recursive
+):
+    """The manifest descriptor must remain pinned through schema validation."""
+    root = tmp_path / "bundle"
+    _write_tokenizer_artifact(root)
+    target = root
+    if recursive:
+        target = root / "tokenizer"
+        _write_tokenizer_artifact(target)
+    manifest_path = target / "manifest.json"
+    real_parse = manifest_module._parse_manifest
+    parse_count = 0
+
+    def mutating_parse(raw, manifest_type):
+        nonlocal parse_count
+        parse_count += 1
+        if parse_count == (2 if recursive else 1):
+            before = manifest_path.stat()
+            os.utime(
+                manifest_path,
+                ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+            )
+        return real_parse(raw, manifest_type)
+
+    monkeypatch.setattr(manifest_module, "_parse_manifest", mutating_parse)
+
+    if recursive:
+        with (
+            manifest_module.open_artifact(
+                root, (TokenizerManifest,), VerificationLevel.MANIFEST_TRUSTED
+            ) as artifact,
+            pytest.raises(SMLArtifactError, match="changed during use"),
+        ):
+            artifact.open_child("tokenizer", (TokenizerManifest,))
+    else:
+        with pytest.raises(SMLArtifactError, match="changed during use"):
+            manifest_module.open_artifact(
+                root, (TokenizerManifest,), VerificationLevel.MANIFEST_TRUSTED
+            )
+
+
+def test_opened_artifact_detach_root_is_one_shot_and_invalidates_owner(tmp_path):
+    """Root ownership transfer must be explicit, unique, and leave no split owner."""
+    _write_tokenizer_artifact(tmp_path)
+    artifact = manifest_module.open_artifact(
+        tmp_path, (TokenizerManifest,), VerificationLevel.MANIFEST_TRUSTED
+    )
+
+    root = artifact.detach_root()
+    descriptor = root.fileno()
+    os.fstat(descriptor)
+    with pytest.raises(SMLArtifactError, match="already transferred"):
+        artifact.detach_root()
+    with pytest.raises(SMLArtifactError, match="closed"):
+        artifact.open_payload(artifact.manifest.model)
+    with pytest.raises(SMLArtifactError, match="closed"):
+        artifact.open_child("child", (TokenizerManifest,))
+    artifact.close()
+    os.fstat(descriptor)
+    root.close()
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+
+
+def test_manifest_type_validation_rejects_invalid_inputs(tmp_path, monkeypatch):
+    """Dispatch must reject malformed type sets before opening an artifact root."""
+    with pytest.raises(TypeError, match="tuple"):
+        manifest_module.open_artifact(  # type: ignore[arg-type]
+            tmp_path, [TokenizerManifest], VerificationLevel.MANIFEST_TRUSTED
+        )
+    for invalid in ((), (object,)):
+        with pytest.raises(SMLArtifactError, match="unsupported manifest types"):
+            manifest_module.open_artifact(
+                tmp_path, invalid, VerificationLevel.MANIFEST_TRUSTED
+            )
+
+    monkeypatch.setattr(PretrainingDataManifest, "MANIFEST_FILENAME", "data.json")
+    with pytest.raises(SMLArtifactError, match="share one filename"):
+        manifest_module._validated_manifest_types(
+            (TokenizerManifest, PretrainingDataManifest)
+        )
+    monkeypatch.setattr(PretrainingDataManifest, "MANIFEST_FILENAME", "manifest.json")
+    monkeypatch.setattr(
+        PretrainingDataManifest, "EXPECTED_KIND", TokenizerManifest.EXPECTED_KIND
+    )
+    with pytest.raises(SMLArtifactError, match="unique kinds"):
+        manifest_module._validated_manifest_types(
+            (TokenizerManifest, PretrainingDataManifest)
+        )
+
+
+def test_payload_acquisition_preserves_primary_when_cleanup_also_fails(
+    tmp_path, monkeypatch
+):
+    """Cleanup failure must be attached without replacing corruption evidence."""
+    (tmp_path / "payload.bin").write_bytes(b"payload")
+    real_fdopen = os.fdopen
+    real_fstat = os.fstat
+
+    class FailingClose:
+        def __init__(self, stream):
+            self._stream = stream
+
+        def fileno(self):
+            return self._stream.fileno()
+
+        def close(self):
+            self._stream.close()
+            raise RuntimeError("injected payload close failure")
+
+    def wrapped_fdopen(*args, **kwargs):
+        return FailingClose(real_fdopen(*args, **kwargs))
+
+    def linked_fstat(descriptor):
+        result = real_fstat(descriptor)
+        if stat.S_ISREG(result.st_mode):
+            values = list(result)
+            values[3] = 2
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(manifest_module.os, "fdopen", wrapped_fdopen)
+    monkeypatch.setattr(manifest_module.os, "fstat", linked_fstat)
+    with (
+        manifest_module.ArtifactRoot.open(tmp_path, writable=False) as root,
+        pytest.raises(SMLArtifactError, match="link count") as caught,
+    ):
+        root._open_payload_with_stat("payload.bin")
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "injected payload close failure" in str(caught.value.__cause__)
+
+
+def test_artifact_acquisition_preserves_parse_error_when_root_close_fails(
+    tmp_path, monkeypatch
+):
+    """A root-close failure must not replace the original manifest failure."""
+    primary = ValueError("injected manifest parse failure")
+
+    class FailingRoot:
+        def close(self):
+            raise RuntimeError("injected root close failure")
+
+    def fail_read(*_args, **_kwargs):
+        raise primary
+
+    monkeypatch.setattr(manifest_module, "_read_manifest_from_root", fail_read)
+    with pytest.raises(ValueError, match="manifest parse failure") as caught:
+        manifest_module._open_artifact_from_root(
+            tmp_path,
+            FailingRoot(),
+            (TokenizerManifest,),
+            VerificationLevel.MANIFEST_TRUSTED,
+        )
+
+    assert caught.value is primary
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "injected root close failure" in str(caught.value.__cause__)
+
+
 def test_full_payload_proof_and_reader_share_one_final_descriptor_after_swap(
     tmp_path, monkeypatch
 ):

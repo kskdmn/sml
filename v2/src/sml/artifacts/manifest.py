@@ -10,7 +10,7 @@ import re
 import stat
 import sys
 import unicodedata
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path, PurePath
@@ -289,6 +289,23 @@ def _stable_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]
     )
 
 
+def _cleanup_exception(
+    actions: Sequence[Callable[[], object]],
+) -> BaseException | None:
+    """Run every cleanup action and retain all failures for exception chaining."""
+    failures: list[BaseException] = []
+    for action in actions:
+        try:
+            action()
+        except BaseException as error:  # noqa: BLE001 - cleanup is exhaustive
+            failures.append(error)
+    if not failures:
+        return None
+    if len(failures) == 1:
+        return failures[0]
+    return BaseExceptionGroup("multiple artifact cleanup failures", failures)
+
+
 def _validated_payload_references(
     references: Sequence[PayloadRef],
 ) -> tuple[PayloadRef, ...]:
@@ -471,6 +488,8 @@ class ArtifactRoot:
         current_descriptor = -1
         final_descriptor = -1
         stream: BinaryIO | None = None
+        result: tuple[BinaryIO, os.stat_result] | None = None
+        primary_error: BaseException | None = None
         try:
             current_descriptor = self._open_directory_descriptor(
                 components[:-1],
@@ -502,26 +521,41 @@ class ArtifactRoot:
                 )
             self._inode_paths[inode] = components
 
-            result = stream
+            result_stream = stream
             stream = None
-            return result, payload_stat
-        except SMLArtifactError:
-            raise
+            result = (result_stream, payload_stat)
+        except SMLArtifactError as error:
+            primary_error = error
         except OSError as error:
-            raise SMLArtifactError(
+            primary_error = SMLArtifactError(
                 f"no-follow traversal failed for payload: {logical_path}"
-            ) from error
-        finally:
-            try:
-                if stream is not None:
-                    stream.close()
-            finally:
-                try:
-                    if final_descriptor >= 0:
-                        os.close(final_descriptor)
-                finally:
-                    if current_descriptor >= 0:
-                        os.close(current_descriptor)
+            )
+            primary_error.__cause__ = error
+        except BaseException as error:  # noqa: BLE001 - preserve unexpected primary
+            primary_error = error
+
+        cleanup_actions: list[Callable[[], object]] = []
+        if stream is not None:
+            cleanup_actions.append(stream.close)
+        if final_descriptor >= 0:
+            cleanup_actions.append(lambda: os.close(final_descriptor))
+        if current_descriptor >= 0:
+            cleanup_actions.append(lambda: os.close(current_descriptor))
+        cleanup_error = _cleanup_exception(cleanup_actions)
+
+        if primary_error is not None:
+            if cleanup_error is not None:
+                raise primary_error from cleanup_error
+            raise primary_error
+        if cleanup_error is not None:
+            assert result is not None
+            escaped_stream = result[0]
+            secondary_cleanup = _cleanup_exception((escaped_stream.close,))
+            if secondary_cleanup is not None:
+                raise cleanup_error from secondary_cleanup
+            raise cleanup_error
+        assert result is not None
+        return result
 
     def open_payload(self, logical_path: str) -> BinaryIO:
         stream, _opened_stat = self._open_payload_with_stat(logical_path)
@@ -573,6 +607,102 @@ class VerificationLevel(Enum):
     FULL = "full"
 
 
+def _close_descriptor_bound_stream(
+    stream: BinaryIO,
+    opened_stat: os.stat_result,
+    *,
+    logical_path: str,
+) -> None:
+    postcheck_error: BaseException | None = None
+    try:
+        current_stat = os.fstat(stream.fileno())
+        if _stable_stat_fields(current_stat) != _stable_stat_fields(opened_stat):
+            postcheck_error = SMLArtifactError(
+                f"payload changed during use: {logical_path}"
+            )
+    except OSError as error:
+        postcheck_error = SMLArtifactError(
+            f"could not perform payload stability postcheck: {logical_path}"
+        )
+        postcheck_error.__cause__ = error
+    except BaseException as error:  # noqa: BLE001 - cleanup must still run
+        postcheck_error = error
+
+    close_error = _cleanup_exception((stream.close,))
+    if postcheck_error is not None:
+        if close_error is not None:
+            raise postcheck_error from close_error
+        raise postcheck_error
+    if close_error is not None:
+        raise close_error
+
+
+class _StablePayload:
+    """A raw payload descriptor pinned through a caller's semantic consumption."""
+
+    def __init__(
+        self,
+        *,
+        logical_path: str,
+        stream: BinaryIO,
+        opened_stat: os.stat_result,
+    ) -> None:
+        self.logical_path = logical_path
+        self.stream = stream
+        self.opened_stat = opened_stat
+        self.closed = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            _close_descriptor_bound_stream(
+                self.stream,
+                self.opened_stat,
+                logical_path=self.logical_path,
+            )
+        finally:
+            self.closed = True
+
+    def read(self) -> bytes:
+        if self.closed:
+            raise SMLArtifactError("stable payload is closed")
+        encoded = self.stream.read()
+        consumed_stat = os.fstat(self.stream.fileno())
+        if _stable_stat_fields(consumed_stat) != _stable_stat_fields(self.opened_stat):
+            raise SMLArtifactError(
+                f"payload changed while being read: {self.logical_path}"
+            )
+        return encoded
+
+    def __enter__(self) -> Self:
+        if self.closed:
+            raise SMLArtifactError("stable payload is closed")
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> None:
+        try:
+            self.close()
+        except BaseException as close_error:
+            if isinstance(exception, BaseException):
+                raise exception from close_error
+            raise
+
+
+def _open_stable_payload(root: ArtifactRoot, logical_path: str) -> _StablePayload:
+    stream, opened_stat = root._open_payload_with_stat(logical_path)
+    return _StablePayload(
+        logical_path=logical_path,
+        stream=stream,
+        opened_stat=opened_stat,
+    )
+
+
 class VerifiedPayload:
     """One proven payload descriptor retained through semantic consumption."""
 
@@ -593,39 +723,14 @@ class VerifiedPayload:
     def close(self) -> None:
         if self.closed:
             return
-        postcheck_error: BaseException | None = None
-        close_error: BaseException | None = None
         try:
-            try:
-                current_stat = os.fstat(self.stream.fileno())
-                if _stable_stat_fields(current_stat) != _stable_stat_fields(
-                    self.opened_stat
-                ):
-                    postcheck_error = SMLArtifactError(
-                        f"payload changed during use: {self.reference.logical_path}"
-                    )
-            except OSError as error:
-                postcheck_error = SMLArtifactError(
-                    "could not perform payload stability postcheck: "
-                    f"{self.reference.logical_path}"
-                )
-                postcheck_error.__cause__ = error
-            except BaseException as error:  # noqa: BLE001 - cleanup must still run
-                postcheck_error = error
+            _close_descriptor_bound_stream(
+                self.stream,
+                self.opened_stat,
+                logical_path=self.reference.logical_path,
+            )
         finally:
-            try:
-                self.stream.close()
-            except BaseException as error:  # noqa: BLE001 - retain close failure
-                close_error = error
-            finally:
-                self.closed = True
-
-        if postcheck_error is not None:
-            if close_error is not None:
-                raise postcheck_error from close_error
-            raise postcheck_error
-        if close_error is not None:
-            raise close_error
+            self.closed = True
 
     def __enter__(self) -> Self:
         if self.closed:
@@ -1532,22 +1637,29 @@ def _read_manifest_from_root[M: _Manifest](
     filename = next(iter(filenames))
     manifest_path = path / filename
     try:
-        manifest_file, opened_stat = root._open_payload_with_stat(filename)
-        with manifest_file:
-            encoded = manifest_file.read()
-            consumed_stat = os.fstat(manifest_file.fileno())
-            if _stable_stat_fields(opened_stat) != _stable_stat_fields(consumed_stat):
+        with _open_stable_payload(root, filename) as payload:
+            encoded = payload.read()
+            text = encoded.decode("utf-8")
+            raw = json.loads(
+                text,
+                parse_constant=_reject_json_constant,
+                object_pairs_hook=_json_object_no_duplicates,
+            )
+            manifest_type = _manifest_type_for_raw(raw, manifest_types)
+            manifest = _parse_manifest(raw, manifest_type)
+
+            recomputed = manifest.recompute_identity()
+            if recomputed != manifest.identity:
                 raise SMLArtifactError(
-                    f"manifest changed during parsing: {manifest_path}"
+                    "manifest identity mismatch: "
+                    f"stored {manifest.identity}, recomputed {recomputed}"
                 )
-        text = encoded.decode("utf-8")
-        raw = json.loads(
-            text,
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=_json_object_no_duplicates,
-        )
-        manifest_type = _manifest_type_for_raw(raw, manifest_types)
-        manifest = _parse_manifest(raw, manifest_type)
+
+            canonical = canonical_json_bytes(manifest)
+            if encoded != canonical:
+                raise SMLArtifactError(
+                    f"manifest is not canonical JSON: {manifest_path}"
+                )
     except SMLArtifactError:
         raise
     except (
@@ -1561,12 +1673,6 @@ def _read_manifest_from_root[M: _Manifest](
             f"invalid manifest at {manifest_path}: {error}"
         ) from error
 
-    recomputed = manifest.recompute_identity()
-    if recomputed != manifest.identity:
-        raise SMLArtifactError(
-            "manifest identity mismatch: "
-            f"stored {manifest.identity}, recomputed {recomputed}"
-        )
     return manifest
 
 
@@ -1584,8 +1690,11 @@ def _open_artifact_from_root[M: _Manifest](
             manifest=manifest,
             verification=verification,
         )
-    except BaseException:
-        root.close()
+    except BaseException as error:
+        try:
+            root.close()
+        except BaseException as close_error:
+            raise error from close_error
         raise
 
 

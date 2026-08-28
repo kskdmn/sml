@@ -18,6 +18,7 @@ from sml.artifacts.manifest import (
     open_artifact,
     read_manifest,
 )
+from sml.data import tokenizer as tokenizer_module
 from sml.data.corpus import CorpusConfig
 from sml.data.tokenizer import (
     CONVERSATION_USER_SYMBOLS,
@@ -417,6 +418,71 @@ def test_loader_consumes_descriptor_read_model_bytes_not_payload_paths(
     load_tokenizer_bundle(output, VerificationLevel.MANIFEST_TRUSTED)
 
     assert processor_calls == [{"model_proto": b"model"}]
+
+
+def test_loader_retains_both_payload_descriptors_through_all_semantic_checks(
+    tmp_path, monkeypatch
+):
+    """Model and vocab proofs must remain stable until every tokenizer check ends."""
+    _install_fake_sentencepiece(monkeypatch)
+    shard = tmp_path / "a.jsonl.zst"
+    shard.write_bytes(b"unused")
+    monkeypatch.setattr(
+        "sml.data.tokenizer.discover_corpus_files", lambda _config: (shard,)
+    )
+    monkeypatch.setattr(
+        "sml.data.tokenizer.iter_filtered_texts", lambda *_args: iter(("text",))
+    )
+    output = tmp_path / "bundle"
+    train_tokenizer_bundle(_config(tmp_path), output)
+    payloads = {}
+    descriptors = {}
+    real_open_payload = OpenedArtifact.open_payload
+    real_read_vocab = tokenizer_module._read_vocab
+
+    def record_payload(artifact, reference):
+        payload = real_open_payload(artifact, reference)
+        payloads[reference.logical_path] = payload
+        descriptors[reference.logical_path] = payload.stream.fileno()
+        return payload
+
+    def assert_both_open():
+        assert set(payloads) == {"tokenizer.model", "tokenizer.vocab"}
+        for payload in payloads.values():
+            os.fstat(payload.stream.fileno())
+
+    def read_vocab_while_open(encoded):
+        assert_both_open()
+        return real_read_vocab(encoded)
+
+    class DescriptorCheckingProcessor(_Processor):
+        def __init__(self, **_kwargs):
+            assert_both_open()
+            super().__init__(pieces=("<unk>", "<s>", "</s>", "<pad>", "piece"))
+
+        def id_to_piece(self, index):
+            assert_both_open()
+            return super().id_to_piece(index)
+
+        def bos_id(self):
+            assert_both_open()
+            return super().bos_id()
+
+    monkeypatch.setattr(OpenedArtifact, "open_payload", record_payload)
+    monkeypatch.setattr(tokenizer_module, "_read_vocab", read_vocab_while_open)
+    monkeypatch.setitem(
+        sys.modules,
+        "sentencepiece",
+        SimpleNamespace(SentencePieceProcessor=DescriptorCheckingProcessor),
+    )
+
+    loaded = load_tokenizer_bundle(output, VerificationLevel.FULL)
+
+    assert loaded.manifest.kind == "tokenizer"
+    for logical_path, payload in payloads.items():
+        assert payload.closed is True
+        with pytest.raises(OSError):
+            os.fstat(descriptors[logical_path])
 
 
 def test_loader_closes_its_retained_owner_when_processor_construction_fails(
