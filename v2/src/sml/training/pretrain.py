@@ -64,6 +64,7 @@ from sml.training.common import (
     learning_rate_at,
     normalize_and_clip,
 )
+from sml.training.random import counter_random_key
 
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
 _CHECKPOINT_ARRAY_PATHS = (
@@ -844,7 +845,7 @@ def _config_from_run(
 def _initial_state(
     config: PretrainingConfig,
 ) -> tuple[SMLLanguageModel, _RestoredTrainingState]:
-    model_key, trainer_key = mx.random.split(mx.random.key(config.seed))
+    model_key, _unused_key = mx.random.split(mx.random.key(config.seed))
     model = SMLLanguageModel(config.model, key=model_key)
     working = model.parameters()
     mx.eval(working)
@@ -853,7 +854,7 @@ def _initial_state(
     trainer = TrainerState(
         accumulators=tree_map(mx.zeros_like, parameters.master_parameters),
         accumulation_count=mx.array(0, dtype=mx.int32),
-        next_key=trainer_key,
+        next_key=counter_random_key(config.seed, 0),
         loss_numerator=mx.array(0.0, dtype=mx.float32),
     )
     mx.eval(parameters.to_tree(), optimizer.to_tree(), trainer.to_tree())
@@ -959,7 +960,18 @@ def _run_training(
                 microstep = kernels.microstep(parameters, trainer, envelope.rows)
                 pending_cursor = envelope.cursor_after
             parameters = microstep.parameters
-            trainer = microstep.trainer
+            trainer_tree = microstep.trainer.to_tree()
+            trainer = TrainerState.from_compiled_tree(
+                (
+                    trainer_tree[0],
+                    trainer_tree[1],
+                    counter_random_key(
+                        config.seed,
+                        scalar.microsteps + window_microsteps + 1,
+                    ),
+                    trainer_tree[3],
+                )
+            )
             window_microsteps += 1
             if window_microsteps == config.loader.gradient_accumulation_steps:
                 complete_update()

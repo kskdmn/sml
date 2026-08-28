@@ -17,6 +17,8 @@ from sml.artifacts.manifest import (
     ArraySpec,
     LatestIndex,
     PayloadRef,
+    PretrainingCheckpointManifest,
+    PretrainingRunManifest,
     VerificationLevel,
     canonical_json_bytes,
     file_identity,
@@ -225,6 +227,56 @@ def _rewrite_working_weights_not_cast_of_master(run: Path) -> None:
     (run / "latest.json").write_bytes(canonical_json_bytes(repaired))
 
 
+def _rewrite_bound_pretraining_run(run: Path, **changes: object) -> None:
+    resolved = resolve_latest_step(
+        run,
+        writable=False,
+        verification=VerificationLevel.MANIFEST_TRUSTED,
+    )
+    assert isinstance(resolved.run, PretrainingRunManifest)
+    assert isinstance(resolved.checkpoint, PretrainingCheckpointManifest)
+    rebound_run = replace(resolved.run, **changes)
+    rebound_run = replace(rebound_run, identity=rebound_run.recompute_identity())
+    (run / PretrainingRunManifest.MANIFEST_FILENAME).write_bytes(
+        canonical_json_bytes(rebound_run)
+    )
+
+    state_path = resolved.step_directory / resolved.checkpoint.scalar_state.logical_path
+    state = json.loads(state_path.read_bytes())
+    state["owning_run_identity"] = rebound_run.identity
+    state_path.write_bytes(canonical_json_bytes(state))
+    with state_path.open("rb") as payload:
+        state_identity = file_identity(payload)
+    rebound_checkpoint = replace(
+        resolved.checkpoint,
+        owning_run_identity=rebound_run.identity,
+        scalar_state=PayloadRef(
+            resolved.checkpoint.scalar_state.logical_path,
+            state_identity,
+            state_path.stat().st_size,
+        ),
+    )
+    rebound_checkpoint = replace(
+        rebound_checkpoint,
+        identity=rebound_checkpoint.recompute_identity(),
+    )
+    (resolved.step_directory / "checkpoint.json").write_bytes(
+        canonical_json_bytes(rebound_checkpoint)
+    )
+    latest = read_manifest(
+        run,
+        LatestIndex,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    latest = replace(
+        latest,
+        owning_run_identity=rebound_run.identity,
+        checkpoint_identity=rebound_checkpoint.identity,
+    )
+    latest = replace(latest, identity=latest.recompute_identity())
+    (run / LatestIndex.MANIFEST_FILENAME).write_bytes(canonical_json_bytes(latest))
+
+
 def test_read_only_stale_latest_recovery_does_not_persist(
     tiny_pretraining_run: Path,
 ) -> None:
@@ -395,6 +447,23 @@ def test_full_resolve_rejects_master_working_cast_mismatch(
 ) -> None:
     _rewrite_working_weights_not_cast_of_master(tiny_pretraining_run)
     with pytest.raises(SMLArtifactError, match="exact BF16 cast"):
+        resolve_model_artifact(tiny_pretraining_run, full_verify=True)
+
+
+def test_full_pretraining_resolve_applies_exact_run_semantics(
+    tiny_pretraining_run: Path,
+) -> None:
+    optimizer = dict(
+        read_manifest(
+            tiny_pretraining_run,
+            PretrainingRunManifest,
+            VerificationLevel.MANIFEST_TRUSTED,
+        ).manifest.optimizer
+    )
+    optimizer["beta1"] = 1.0
+    _rewrite_bound_pretraining_run(tiny_pretraining_run, optimizer=optimizer)
+
+    with pytest.raises(SMLArtifactError, match="invalid run optimizer"):
         resolve_model_artifact(tiny_pretraining_run, full_verify=True)
 
 

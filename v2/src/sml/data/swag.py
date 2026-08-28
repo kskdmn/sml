@@ -1204,6 +1204,32 @@ def _validate_bucket_arrays(
 ) -> None:
     if bucket_length not in bucket_boundaries:
         raise SMLArtifactError("SWAG bucket length is not a declared boundary")
+    row_chunk_size = 1_024
+    for start in range(0, input_ids.shape[0], row_chunk_size):
+        stop = min(start + row_chunk_size, input_ids.shape[0])
+        _validate_bucket_array_chunk(
+            input_ids=input_ids[start:stop],
+            valid_token_mask=valid_token_mask[start:stop],
+            score_mask=score_mask[start:stop],
+            vocab_size=vocab_size,
+            pad_token_id=pad_token_id,
+            eos_token_id=eos_token_id,
+            bos_token_id=bos_token_id,
+            maximum_length=maximum_length,
+        )
+
+
+def _validate_bucket_array_chunk(
+    *,
+    input_ids: np.ndarray,
+    valid_token_mask: np.ndarray,
+    score_mask: np.ndarray,
+    vocab_size: int,
+    pad_token_id: int,
+    eos_token_id: int,
+    bos_token_id: int,
+    maximum_length: int,
+) -> None:
     if np.any(input_ids < 0) or np.any(input_ids >= vocab_size):
         raise SMLArtifactError("SWAG token id is outside the tokenizer vocabulary")
     invalid = ~valid_token_mask

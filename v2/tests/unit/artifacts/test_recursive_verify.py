@@ -11,6 +11,9 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import zstandard as zstd
+from sml.artifacts import arrays as arrays_module
+from sml.artifacts import checkpoint as checkpoint_module
+from sml.artifacts import semantics as semantics_module
 from sml.artifacts import verify as verify_module
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
@@ -35,6 +38,7 @@ from sml.artifacts.manifest import (
     structured_identity,
 )
 from sml.artifacts.verify import verify_artifact
+from sml.data import swag as swag_module
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
     PretrainingPreparationConfig,
@@ -53,8 +57,48 @@ from sml.training.common import (
 )
 from sml.training.lora import LoRAPrecisionConfig
 from sml.training.pretrain import train
+from sml.training.random import counter_random_key
 
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
+
+
+@pytest.mark.parametrize("field", ("maximum_steps", "maximum_epochs", "log_interval"))
+def test_full_checkpoint_configuration_rejects_values_above_signed_int32(field):
+    """Saved runtime counters must obey the same signed-int32 bound as training."""
+    values = {
+        "interval": 1,
+        "maximum_steps": 1,
+        "maximum_epochs": 1,
+        "log_interval": 1,
+        "seed": 0,
+        "compile": False,
+    }
+    values[field] = 2**31
+
+    with pytest.raises(SMLArtifactError, match="checkpoint config"):
+        semantics_module.checkpoint_configuration(values, context="run")
+
+
+def test_expected_training_key_is_constant_work_for_arbitrarily_long_histories(
+    monkeypatch,
+):
+    """FULL verification must never replay historical random splits."""
+
+    def reject_split(*_args, **_kwargs):
+        raise AssertionError("linear random split replay is forbidden")
+
+    monkeypatch.setattr(semantics_module.mx.random, "split", reject_split)
+    expected = counter_random_key(17, 9_000_000_000_000)
+
+    actual = semantics_module.expected_next_key(
+        seed=17,
+        microsteps=9_000_000_000_000,
+        model=ModelConfig(),
+    )
+
+    assert bool(mx.array_equal(actual, expected))
+    assert actual.tolist() == [3_390_189_612, 2_683_648_302]
+    assert not bool(mx.array_equal(actual, counter_random_key(17, 9_000_000_000_001)))
 
 
 def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
@@ -290,6 +334,21 @@ def _write_base_bundle(root: Path) -> tuple[BaseSnapshotManifest, dict[str, mx.a
     return manifest, arrays
 
 
+def test_full_base_verification_is_metadata_only(tmp_path, monkeypatch):
+    """Standalone FULL verification must not materialize a live model copy."""
+    root = tmp_path / "base"
+    _write_base_bundle(root)
+
+    def reject_materialization(*_args, **_kwargs):
+        raise AssertionError("model materialization is forbidden in verification")
+
+    monkeypatch.setattr(arrays_module.mx, "load", reject_materialization)
+
+    result = verify_artifact(root, full=True)
+
+    assert result.verification is VerificationLevel.FULL
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
@@ -514,6 +573,23 @@ def _write_export_bundle(root: Path, tokenizer_root: Path) -> ExportManifest:
     manifest = replace(manifest, identity=manifest.recompute_identity())
     (root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
     return manifest
+
+
+def test_full_export_verification_is_metadata_only(
+    tmp_path, prepared_template, monkeypatch
+):
+    """Export FULL verification must validate leaves without loading their values."""
+    root = tmp_path / "export"
+    _write_export_bundle(root, prepared_template / "tokenizer")
+
+    def reject_materialization(*_args, **_kwargs):
+        raise AssertionError("model materialization is forbidden in verification")
+
+    monkeypatch.setattr(arrays_module.mx, "load", reject_materialization)
+
+    result = verify_artifact(root, full=True)
+
+    assert result.verification is VerificationLevel.FULL
 
 
 @pytest.mark.parametrize(
@@ -925,6 +1001,42 @@ def test_full_swag_rejects_resigned_nondeterministic_bucket_order(
         verify_artifact(root, full=True)
 
 
+def test_swag_semantic_validation_uses_fixed_row_chunks(monkeypatch):
+    """Verifier scratch arrays must not grow with the dataset row count."""
+    rows = 5_000
+    input_ids = np.full((rows, 4, 4), 3, dtype=np.int32)
+    input_ids[:, :, 0] = 1
+    input_ids[:, :, 1] = 7
+    input_ids[:, :, 2] = 2
+    valid = np.zeros(input_ids.shape, dtype=np.bool_)
+    valid[:, :, :3] = True
+    score = np.zeros(input_ids.shape, dtype=np.bool_)
+    score[:, :, 1:3] = True
+    real_arange = swag_module.np.arange
+    requested: list[int] = []
+
+    def bounded_arange(stop, *args, **kwargs):
+        requested.append(int(stop))
+        return real_arange(stop, *args, **kwargs)
+
+    monkeypatch.setattr(swag_module.np, "arange", bounded_arange)
+
+    swag_module._validate_bucket_arrays(
+        input_ids=input_ids,
+        valid_token_mask=valid,
+        score_mask=score,
+        vocab_size=16,
+        pad_token_id=3,
+        eos_token_id=2,
+        bos_token_id=1,
+        maximum_length=4,
+        bucket_length=4,
+        bucket_boundaries=(4,),
+    )
+
+    assert max(requested) <= 1_024
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
@@ -1112,6 +1224,26 @@ def _latest_checkpoint(run: Path) -> tuple[Path, PretrainingCheckpointManifest]:
     ).manifest
     assert isinstance(checkpoint, PretrainingCheckpointManifest)
     return step, checkpoint
+
+
+def test_full_run_verification_does_not_materialize_checkpoint_groups(
+    pretraining_run_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Standalone recursive FULL uses headers and fixed chunks, never live groups."""
+
+    def reject_materialization(*_args, **_kwargs):
+        raise AssertionError("checkpoint group materialization is forbidden")
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_checkpoint_array_stream",
+        reject_materialization,
+    )
+
+    result = verify_artifact(pretraining_run_template, full=True)
+
+    assert result.verification is VerificationLevel.FULL
 
 
 def _rebind_latest_checkpoint(

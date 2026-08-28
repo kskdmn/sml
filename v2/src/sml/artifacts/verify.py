@@ -2,34 +2,27 @@
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-import mlx.core as mx
-
-from sml.artifacts.arrays import load_safetensors_payload
+from sml.artifacts.arrays import verify_safetensors_metadata
 from sml.artifacts.checkpoint import (
     CheckpointReader,
     open_latest_checkpoint_reader,
     require_lora_base_snapshot,
-    verify_checkpoint_current_state,
 )
 from sml.artifacts.manifest import (
     CHECKPOINT_MANIFEST_TYPES,
     RUN_MANIFEST_TYPES,
-    ArraySpec,
     ArtifactRoot,
     BaseSnapshotManifest,
     CheckpointManifest,
     ExportManifest,
-    LoRACheckpointManifest,
     LoRARunManifest,
     OpenedArtifact,
     PayloadRef,
-    PretrainingCheckpointManifest,
     PretrainingDataManifest,
     PretrainingRunManifest,
     RunManifest,
@@ -41,25 +34,15 @@ from sml.artifacts.manifest import (
     _reject_json_constant,
     canonical_json_bytes,
 )
+from sml.artifacts.semantics import (
+    validate_base_semantics,
+    validate_export_semantics,
+    validate_full_run_semantics,
+)
 from sml.data.pretraining import _verify_opened_pretraining_bundle
 from sml.data.swag import _load_opened_swag_bundle
 from sml.data.tokenizer import _load_opened_tokenizer_bundle
-from sml.errors import SMLArtifactError, SMLConfigurationError
-from sml.model.config import ModelConfig
-from sml.model.language_model import model_parameter_specs
-from sml.training.common import (
-    CheckpointPolicy,
-    LoaderConfig,
-    OptimizerConfig,
-    PrecisionConfig,
-    WeightDecayPolicy,
-)
-from sml.training.lora import (
-    LoRAConfig,
-    LoRAPrecisionConfig,
-    lora_config_from_mapping,
-    lora_parameter_specs,
-)
+from sml.errors import SMLArtifactError
 
 type ArtifactManifest = (
     TokenizerManifest
@@ -297,224 +280,6 @@ def _verify_structural_payloads(
         _verify_payload(artifact, reference)
 
 
-def _exact_configuration(
-    configuration: object,
-    projection: object,
-    *,
-    context: str,
-) -> None:
-    if dataclasses.asdict(configuration) != projection:
-        raise SMLArtifactError(f"{context} is not an exact canonical configuration")
-
-
-def _model_configuration(projection: object, *, context: str) -> ModelConfig:
-    if not isinstance(projection, dict) and not hasattr(projection, "items"):
-        raise SMLArtifactError(f"{context} model configuration must be a mapping")
-    try:
-        configuration = ModelConfig(**dict(projection))
-        _exact_configuration(
-            configuration,
-            dict(projection),
-            context=f"{context} model configuration",
-        )
-    except SMLArtifactError:
-        raise
-    except (TypeError, ValueError) as error:
-        raise SMLArtifactError(f"invalid {context} model configuration") from error
-    if configuration.rope_scaling_factor != 1.0:
-        raise SMLArtifactError(f"{context} rope_scaling_factor must be exactly 1.0")
-    return configuration
-
-
-def _precision_configuration(
-    projection: object,
-    precision_type: type[PrecisionConfig | LoRAPrecisionConfig],
-    *,
-    context: str,
-) -> None:
-    if not isinstance(projection, dict) and not hasattr(projection, "items"):
-        raise SMLArtifactError(f"{context} precision must be a mapping")
-    try:
-        precision = precision_type(**dict(projection))
-        _exact_configuration(
-            precision, dict(projection), context=f"{context} precision"
-        )
-    except SMLArtifactError:
-        raise
-    except (TypeError, ValueError, SMLConfigurationError) as error:
-        raise SMLArtifactError(f"invalid {context} precision") from error
-
-
-def _optimizer_configuration(projection: object, *, context: str) -> OptimizerConfig:
-    if not isinstance(projection, dict) and not hasattr(projection, "items"):
-        raise SMLArtifactError(f"{context} optimizer must be a mapping")
-    try:
-        values = dict(projection)
-        weight_decay = values.pop("weight_decay")
-        if not isinstance(weight_decay, dict) and not hasattr(weight_decay, "items"):
-            raise TypeError("weight_decay must be a mapping")
-        configuration = OptimizerConfig(
-            weight_decay=WeightDecayPolicy(**dict(weight_decay)),
-            **values,
-        )
-        _exact_configuration(
-            configuration,
-            dict(projection),
-            context=f"{context} optimizer",
-        )
-        return configuration
-    except SMLArtifactError:
-        raise
-    except (KeyError, TypeError, ValueError, SMLConfigurationError) as error:
-        raise SMLArtifactError(f"invalid {context} optimizer") from error
-
-
-def _loader_configuration(projection: object, *, context: str) -> LoaderConfig:
-    if not isinstance(projection, dict) and not hasattr(projection, "items"):
-        raise SMLArtifactError(f"{context} loader must be a mapping")
-    try:
-        configuration = LoaderConfig(**dict(projection))
-        _exact_configuration(
-            configuration,
-            dict(projection),
-            context=f"{context} loader",
-        )
-        return configuration
-    except SMLArtifactError:
-        raise
-    except (TypeError, ValueError, SMLConfigurationError) as error:
-        raise SMLArtifactError(f"invalid {context} loader") from error
-
-
-def _checkpoint_configuration(projection: object, *, context: str) -> dict[str, object]:
-    if not isinstance(projection, dict) and not hasattr(projection, "items"):
-        raise SMLArtifactError(f"{context} checkpoint config must be a mapping")
-    values = dict(projection)
-    expected = {
-        "interval",
-        "maximum_steps",
-        "maximum_epochs",
-        "log_interval",
-        "seed",
-        "compile",
-    }
-    if set(values) != expected:
-        raise SMLArtifactError(f"{context} checkpoint config has invalid fields")
-    try:
-        CheckpointPolicy(interval=values["interval"])
-        for name in ("maximum_steps", "maximum_epochs"):
-            value = values[name]
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value < 1
-            ):
-                raise ValueError(f"{name} must be positive or None")
-        if values["maximum_steps"] is None and values["maximum_epochs"] is None:
-            raise ValueError("one training termination limit is required")
-        log_interval = values["log_interval"]
-        if (
-            isinstance(log_interval, bool)
-            or not isinstance(log_interval, int)
-            or log_interval < 1
-        ):
-            raise ValueError("log_interval must be positive")
-        seed = values["seed"]
-        if (
-            isinstance(seed, bool)
-            or not isinstance(seed, int)
-            or not 0 <= seed <= 2**32 - 1
-        ):
-            raise ValueError("seed must be uint32")
-        if not isinstance(values["compile"], bool):
-            raise TypeError("compile must be bool")
-    except (TypeError, ValueError, SMLConfigurationError) as error:
-        raise SMLArtifactError(f"invalid {context} checkpoint config") from error
-    return values
-
-
-def _tokenizer_matches_model(
-    tokenizer: TokenizerManifest,
-    model: ModelConfig,
-    *,
-    context: str,
-) -> None:
-    tokenizer_values = (
-        tokenizer.vocab_size,
-        tokenizer.bos_token_id,
-        tokenizer.eos_token_id,
-        tokenizer.pad_token_id,
-        tokenizer.unk_token_id,
-    )
-    model_values = (
-        model.vocab_size,
-        model.bos_token_id,
-        model.eos_token_id,
-        model.pad_token_id,
-        model.unk_token_id,
-    )
-    if tokenizer_values != model_values:
-        raise SMLArtifactError(f"{context} tokenizer metadata does not match model")
-
-
-def _expected_next_key(
-    *,
-    seed: int,
-    microsteps: int,
-    model: ModelConfig,
-    lora: LoRAConfig | None = None,
-) -> mx.array:
-    splits_per_microstep = model.num_layers if model.hidden_dropout > 0.0 else 0
-    if lora is not None and lora.dropout > 0.0:
-        splits_per_microstep += model.num_layers * len(lora.target_modules)
-    advances = microsteps * splits_per_microstep
-    if advances > 1_000_000:
-        raise SMLArtifactError("checkpoint RNG verification exceeds its bounded limit")
-    _model_key, key = mx.random.split(mx.random.key(seed))
-    for _ in range(advances):
-        key, _used_key = mx.random.split(key)
-    mx.eval(key)
-    return key
-
-
-def _verify_progress(
-    scalar: object,
-    *,
-    checkpoint_step: int,
-    loader: LoaderConfig,
-    lora: bool,
-) -> int:
-    if not isinstance(scalar, dict) and not hasattr(scalar, "items"):
-        raise SMLArtifactError("checkpoint scalar current state must be a mapping")
-    values = dict(scalar)
-    step = values.get("step")
-    microsteps = values.get("microsteps")
-    if (
-        step != checkpoint_step
-        or isinstance(microsteps, bool)
-        or not isinstance(microsteps, int)
-    ):
-        raise SMLArtifactError("checkpoint scalar progress disagrees with checkpoint")
-    if microsteps != step * loader.gradient_accumulation_steps:
-        raise SMLArtifactError("checkpoint scalar microsteps disagree with step")
-    if lora:
-        examples = values.get("examples")
-        if (
-            isinstance(examples, bool)
-            or not isinstance(examples, int)
-            or not microsteps <= examples <= microsteps * loader.microbatch_size
-        ):
-            raise SMLArtifactError("checkpoint scalar examples disagree with loader")
-    else:
-        if values.get("rows") != microsteps * loader.microbatch_size:
-            raise SMLArtifactError("checkpoint scalar rows disagree with loader")
-    return microsteps
-
-
-def _require_model_specs(reference, model: ModelConfig, *, context: str) -> None:
-    expected = model_parameter_specs(model)
-    if reference.arrays != expected:
-        raise SMLArtifactError(f"{context} model parameter specs do not match config")
-
-
 def _tokenizer_binding(
     outer: PretrainingDataManifest | ExportManifest,
     tokenizer: TokenizerManifest,
@@ -594,18 +359,8 @@ def _verify_opened_base(
 ) -> VerificationResult:
     manifest = artifact.manifest
     if artifact.verification is VerificationLevel.FULL:
-        model = _model_configuration(manifest.model, context="base snapshot")
-        _precision_configuration(
-            manifest.precision,
-            PrecisionConfig,
-            context="base snapshot",
-        )
-        _require_model_specs(
-            manifest.working_weights,
-            model,
-            context="base snapshot",
-        )
-        load_safetensors_payload(artifact, manifest.working_weights)
+        validate_base_semantics(manifest)
+        verify_safetensors_metadata(artifact, manifest.working_weights)
     else:
         _verify_payload(artifact, manifest.working_weights.payload)
     return VerificationResult(
@@ -644,15 +399,8 @@ def _verify_opened_export(
     _tokenizer_binding(artifact.manifest, tokenizer.manifest)
     manifest = artifact.manifest
     if artifact.verification is VerificationLevel.FULL:
-        model = _model_configuration(manifest.model, context="export")
-        _tokenizer_matches_model(tokenizer.manifest, model, context="export")
-        _precision_configuration(
-            manifest.precision,
-            LoRAPrecisionConfig,
-            context="export",
-        )
-        _require_model_specs(manifest.model_weights, model, context="export")
-        load_safetensors_payload(artifact, manifest.model_weights)
+        validate_export_semantics(manifest, tokenizer.manifest)
+        verify_safetensors_metadata(artifact, manifest.model_weights)
     else:
         _verify_payload(artifact, manifest.model_weights.payload)
     return VerificationResult(
@@ -678,91 +426,12 @@ def _verify_opened_bundle(artifact: OpenedArtifact) -> VerificationResult:
     raise SMLArtifactError(f"unsupported portable artifact kind: {manifest.kind!r}")
 
 
-def _verify_full_run_semantics(
-    reader: CheckpointReader,
-    tokenizer: TokenizerManifest,
-) -> None:
-    run = reader.resolved.run
-    checkpoint = reader.resolved.checkpoint
-    model = _model_configuration(run.model, context="run")
-    _optimizer_configuration(run.optimizer, context="run")
-    loader = _loader_configuration(run.loader, context="run")
-    checkpoint_config = _checkpoint_configuration(run.checkpoint, context="run")
-    _tokenizer_matches_model(tokenizer, model, context="run")
-    contents = reader.read_contents()
-    if isinstance(run, PretrainingRunManifest):
-        if not isinstance(checkpoint, PretrainingCheckpointManifest):
-            raise SMLArtifactError("pretraining run owns the wrong checkpoint kind")
-        _precision_configuration(
-            run.precision,
-            PrecisionConfig,
-            context="pretraining run",
-        )
-        expected_model = model_parameter_specs(model)
-        expected_master = tuple(
-            ArraySpec(spec.name, spec.shape, "float32") for spec in expected_model
-        )
-        if checkpoint.model.arrays != expected_model:
-            raise SMLArtifactError(
-                "pretraining checkpoint model parameter specs do not match config"
-            )
-        if checkpoint.master.arrays != expected_master:
-            raise SMLArtifactError(
-                "pretraining checkpoint master parameter specs do not match config"
-            )
-        microsteps = _verify_progress(
-            contents.scalar_state,
-            checkpoint_step=checkpoint.step,
-            loader=loader,
-            lora=False,
-        )
-        expected_key = _expected_next_key(
-            seed=checkpoint_config["seed"],
-            microsteps=microsteps,
-            model=model,
-        )
-    else:
-        if not isinstance(run, LoRARunManifest) or not isinstance(
-            checkpoint, LoRACheckpointManifest
-        ):
-            raise SMLArtifactError("LoRA run owns the wrong checkpoint kind")
-        try:
-            lora = lora_config_from_mapping(run.lora)
-            _exact_configuration(lora, dict(run.lora), context="LoRA configuration")
-        except SMLArtifactError:
-            raise
-        except (KeyError, TypeError, ValueError, SMLConfigurationError) as error:
-            raise SMLArtifactError("invalid LoRA configuration") from error
-        _precision_configuration(
-            run.precision,
-            LoRAPrecisionConfig,
-            context="LoRA run",
-        )
-        expected_adapters = lora_parameter_specs(model, lora)
-        if checkpoint.adapters.arrays != expected_adapters:
-            raise SMLArtifactError(
-                "LoRA checkpoint adapter parameter specs do not match config"
-            )
-        microsteps = _verify_progress(
-            contents.scalar_state,
-            checkpoint_step=checkpoint.step,
-            loader=loader,
-            lora=True,
-        )
-        expected_key = _expected_next_key(
-            seed=checkpoint_config["seed"],
-            microsteps=microsteps,
-            model=model,
-            lora=lora,
-        )
-    verify_checkpoint_current_state(reader, expected_next_key=expected_key)
-
-
 def _verify_opened_run(artifact: OpenedArtifact[RunManifest]) -> VerificationResult:
     level = artifact.verification
     with open_latest_checkpoint_reader(
         artifact.path,
         verification=level,
+        load_array_groups=(frozenset() if level is VerificationLevel.FULL else None),
         run_descriptor=artifact.root.fileno(),
     ) as reader:
         resolved = reader.resolved
@@ -800,7 +469,7 @@ def _verify_opened_run(artifact: OpenedArtifact[RunManifest]) -> VerificationRes
                 require_lora_base_snapshot(base.manifest, resolved.run)
             children.append(base)
         if level is VerificationLevel.FULL:
-            _verify_full_run_semantics(reader, tokenizer.manifest)
+            validate_full_run_semantics(reader, tokenizer.manifest)
         checkpoint = VerificationResult(
             resolved.step_directory,
             resolved.checkpoint,

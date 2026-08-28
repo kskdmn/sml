@@ -77,6 +77,7 @@ from sml.training.lora import (
     merged_model_weights,
     split_adapter_parameters,
 )
+from sml.training.random import counter_random_key
 
 
 def _merge_adapter_parameters(adapters: object, frozen_base: object) -> object:
@@ -1162,6 +1163,19 @@ def _run_training(
                     trainer,
                     batch,
                 )
+                trainer_tree = trainer.to_tree()
+                trainer = SwagTrainerState.from_compiled_tree(
+                    (
+                        trainer_tree[0],
+                        trainer_tree[1],
+                        counter_random_key(
+                            config.seed,
+                            scalar.microsteps + window_microsteps + 1,
+                        ),
+                        trainer_tree[3],
+                        trainer_tree[4],
+                    )
+                )
                 pending_cursor = batch.cursor_after
                 window_microsteps += 1
                 window_examples += int(batch.example_mask.astype(mx.int32).sum().item())
@@ -1313,7 +1327,7 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
                     data_identity=bundle.manifest.identity,
                 )
                 (private_run / "run.json").write_bytes(canonical_json_bytes(manifest))
-                model_key, trainer_key = mx.random.split(mx.random.key(config.seed))
+                model_key, _unused_key = mx.random.split(mx.random.key(config.seed))
                 with open_artifact(
                     private_run / "base",
                     (BaseSnapshotManifest,),
@@ -1326,7 +1340,10 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
                         model_key,
                     )
                 optimizer = initialize_adam_state(adapters)
-                trainer = initial_swag_trainer_state(adapters, key=trainer_key)
+                trainer = initial_swag_trainer_state(
+                    adapters,
+                    key=counter_random_key(config.seed, 0),
+                )
                 mx.eval(adapters, optimizer.to_tree(), trainer.to_tree(), frozen_base)
                 restored = _RestoredSwagState(
                     adapters,

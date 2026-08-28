@@ -14,15 +14,18 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, ModuleType
-from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, BinaryIO, Protocol, cast, runtime_checkable
+
+import numpy as np
 
 if TYPE_CHECKING:
     import mlx.core as mx
 
+from sml.artifacts.arrays import SafetensorsLayout, TensorSlice, read_safetensors_layout
 from sml.artifacts.manifest import (
     CHECKPOINT_MANIFEST_TYPES,
     RUN_MANIFEST_TYPES,
@@ -49,6 +52,7 @@ from sml.artifacts.manifest import (
     _manifest_type_for_raw,
     _open_artifact_from_root,
     _open_stable_payload,
+    _open_verified_payload,
     _parse_manifest,
     _reject_json_constant,
     canonical_json_bytes,
@@ -1739,10 +1743,6 @@ def _read_manifest_from_descriptor[M](
                     raise SMLArtifactError(f"manifest identity mismatch in {context}")
                 if manifest_bytes != canonical_json_bytes(manifest):
                     raise SMLArtifactError(f"noncanonical manifest bytes in {context}")
-            artifact_root.verify_payloads(
-                tuple(_payload_references(manifest)),
-                full=verification is VerificationLevel.FULL,
-            )
             return cast(M, manifest)
     except SMLArtifactError:
         raise
@@ -1757,10 +1757,20 @@ def _read_manifest_from_descriptor[M](
 
 
 @dataclass(frozen=True, slots=True)
+class CheckpointBoundaryState:
+    optimizer_step: int
+    accumulation_count: int
+    loss_numerator: float
+    next_key: tuple[int, int]
+    accumulators_zero: bool
+
+
+@dataclass(frozen=True, slots=True)
 class VerifiedCheckpointContents:
     scalar_state: Mapping[str, object]
     array_groups: Mapping[str, Mapping[str, mx.array]]
     payload_bytes: Mapping[str, bytes] = dataclasses.field(default_factory=dict)
+    boundary_state: CheckpointBoundaryState | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.scalar_state, Mapping):
@@ -1769,6 +1779,10 @@ class VerifiedCheckpointContents:
             raise TypeError("array_groups must be a mapping")
         if not isinstance(self.payload_bytes, Mapping):
             raise TypeError("payload_bytes must be a mapping")
+        if self.boundary_state is not None and not isinstance(
+            self.boundary_state, CheckpointBoundaryState
+        ):
+            raise TypeError("boundary_state must be a CheckpointBoundaryState or None")
         frozen_groups: dict[str, object] = {}
         for path, group in self.array_groups.items():
             if not isinstance(path, str) or not isinstance(group, Mapping):
@@ -1898,6 +1912,31 @@ def verify_checkpoint_current_state(
     if reader.resolved.verification is not VerificationLevel.FULL:
         raise SMLArtifactError("checkpoint current-state verification requires FULL")
     contents = reader.read_contents()
+    if "trainer.safetensors" not in contents.array_groups:
+        boundary = contents.boundary_state
+        if boundary is None:
+            raise SMLArtifactError("checkpoint trainer current state is incomplete")
+        if boundary.accumulation_count != 0:
+            raise SMLArtifactError("checkpoint trainer accumulation must be empty")
+        if boundary.loss_numerator != 0.0:
+            raise SMLArtifactError("checkpoint trainer loss numerator must be empty")
+        if not boundary.accumulators_zero:
+            raise SMLArtifactError("checkpoint trainer accumulators must be empty")
+        mx = _mlx_core()
+        try:
+            matches = bool(
+                mx.array_equal(
+                    mx.array(boundary.next_key, dtype=mx.uint32),
+                    expected_next_key,
+                )
+            )
+        except (TypeError, ValueError, RuntimeError) as error:
+            raise SMLArtifactError(
+                "checkpoint trainer has an invalid next RNG key"
+            ) from error
+        if not matches:
+            raise SMLArtifactError("checkpoint trainer next RNG key is incorrect")
+        return
     try:
         trainer = contents.array_groups["trainer.safetensors"]
         accumulation_count = trainer["accumulation_count"]
@@ -2027,6 +2066,156 @@ def _load_checkpoint_array_payload(
             f"invalid checkpoint safetensors payload: {logical_path}"
         ) from error
     return result
+
+
+def _load_checkpoint_array_stream(
+    stream: BinaryIO,
+    reference: ArrayPayloadRef,
+    *,
+    payload_bytes: dict[str, bytes] | None,
+) -> dict[str, mx.array]:
+    """Materialize a requested group from its already-proven retained descriptor."""
+    mx = _mlx_core()
+    logical_path = reference.payload.logical_path
+    try:
+        stream.seek(0)
+        arrays = mx.load(stream, format="safetensors")
+        if not isinstance(arrays, dict):
+            raise SMLArtifactError(
+                f"checkpoint array payload must be a mapping: {logical_path}"
+            )
+        expected = {spec.name: spec for spec in reference.arrays}
+        if set(arrays) != set(expected):
+            raise SMLArtifactError(f"checkpoint array keys mismatch: {logical_path}")
+        names = sorted(expected)
+        result = {name: arrays[name] for name in names}
+        mx.eval(*result.values())
+        if payload_bytes is not None:
+            stream.seek(0)
+            raw_bytes = stream.read()
+            if len(raw_bytes) != reference.payload.byte_size:
+                raise SMLArtifactError(
+                    f"checkpoint payload byte size mismatch: {logical_path}"
+                )
+            payload_bytes[logical_path] = raw_bytes
+        return result
+    except SMLArtifactError:
+        raise
+    except (OSError, TypeError, ValueError, RuntimeError) as error:
+        raise SMLArtifactError(
+            f"invalid checkpoint safetensors payload: {logical_path}"
+        ) from error
+
+
+def _read_tensor_bytes(
+    stream: BinaryIO,
+    tensor: TensorSlice,
+) -> bytes:
+    stream.seek(tensor.start)
+    encoded = stream.read(tensor.end - tensor.start)
+    if len(encoded) != tensor.end - tensor.start:
+        raise SMLArtifactError(f"checkpoint tensor is truncated: {tensor.spec.name}")
+    return encoded
+
+
+def _tensor_is_zero(stream: BinaryIO, tensor: TensorSlice) -> bool:
+    if tensor.spec.dtype != "float32":
+        raise SMLArtifactError(
+            f"checkpoint zero reduction requires float32: {tensor.spec.name}"
+        )
+    stream.seek(tensor.start)
+    remaining = tensor.end - tensor.start
+    chunk_bytes = 1024 * 1024
+    while remaining:
+        encoded = stream.read(min(remaining, chunk_bytes))
+        if not encoded:
+            raise SMLArtifactError(
+                f"checkpoint tensor is truncated: {tensor.spec.name}"
+            )
+        if bool(np.any(np.frombuffer(encoded, dtype="<f4") != 0.0)):
+            return False
+        remaining -= len(encoded)
+    return True
+
+
+def _checkpoint_boundary_state(
+    manifest: CheckpointManifest,
+    streams: Mapping[str, BinaryIO],
+    layouts: Mapping[str, SafetensorsLayout],
+) -> CheckpointBoundaryState:
+    optimizer = layouts["optimizer.safetensors"].tensors
+    trainer = layouts["trainer.safetensors"].tensors
+    optimizer_step = int.from_bytes(
+        _read_tensor_bytes(streams["optimizer.safetensors"], optimizer["step"]),
+        byteorder="little",
+        signed=True,
+    )
+    accumulation_count = int.from_bytes(
+        _read_tensor_bytes(
+            streams["trainer.safetensors"], trainer["accumulation_count"]
+        ),
+        byteorder="little",
+        signed=True,
+    )
+    loss_bytes = _read_tensor_bytes(
+        streams["trainer.safetensors"], trainer["loss_numerator"]
+    )
+    loss_numerator = float(np.frombuffer(loss_bytes, dtype="<f4")[0])
+    key_bytes = _read_tensor_bytes(streams["trainer.safetensors"], trainer["next_key"])
+    next_key_values = np.frombuffer(key_bytes, dtype="<u4")
+    next_key = (int(next_key_values[0]), int(next_key_values[1]))
+    accumulators_zero = all(
+        _tensor_is_zero(streams["trainer.safetensors"], tensor)
+        for name, tensor in trainer.items()
+        if name.startswith("accumulators.")
+    )
+    if optimizer_step != manifest.step:
+        raise SMLArtifactError("checkpoint optimizer step does not match manifest")
+    return CheckpointBoundaryState(
+        optimizer_step=optimizer_step,
+        accumulation_count=accumulation_count,
+        loss_numerator=loss_numerator,
+        next_key=next_key,
+        accumulators_zero=accumulators_zero,
+    )
+
+
+def _verify_streaming_model_master_cast(
+    streams: Mapping[str, BinaryIO],
+    layouts: Mapping[str, SafetensorsLayout],
+) -> None:
+    mx = _mlx_core()
+    working = layouts["model.safetensors"].tensors
+    masters = layouts["master.safetensors"].tensors
+    if set(working) != set(masters):
+        raise SMLArtifactError("checkpoint model and master keys do not match")
+    chunk_elements = 256 * 1024
+    for name, master in masters.items():
+        model = working[name]
+        element_count = (master.end - master.start) // 4
+        for start_element in range(0, element_count, chunk_elements):
+            count = min(chunk_elements, element_count - start_element)
+            master_stream = streams["master.safetensors"]
+            model_stream = streams["model.safetensors"]
+            master_stream.seek(master.start + start_element * 4)
+            model_stream.seek(model.start + start_element * 2)
+            master_bytes = master_stream.read(count * 4)
+            model_bytes = model_stream.read(count * 2)
+            if len(master_bytes) != count * 4 or len(model_bytes) != count * 2:
+                raise SMLArtifactError(
+                    f"checkpoint parameter tensor is truncated: {name}"
+                )
+            converted = mx.array(np.frombuffer(master_bytes, dtype="<f4")).astype(
+                mx.bfloat16
+            )
+            expected_bits = mx.array(
+                np.frombuffer(model_bytes, dtype="<u2"), dtype=mx.uint16
+            )
+            if not bool(mx.array_equal(converted.view(mx.uint16), expected_bits)):
+                raise SMLArtifactError(
+                    "checkpoint working parameter is not the exact BF16 cast of "
+                    f"master: {name}"
+                )
 
 
 def _plain_nonnegative(value: object, name: str) -> int:
@@ -2307,7 +2496,6 @@ def _verify_checkpoint_semantics(
     load_array_groups: frozenset[str] | None = None,
     materialize_byte_groups: frozenset[str] | None = None,
 ) -> VerifiedCheckpointContents:
-    mx = _mlx_core()
     local_apfs = _descriptor_is_local_apfs(descriptor)
     full = verification is VerificationLevel.FULL
     references = checkpoint_array_payloads(manifest)
@@ -2329,14 +2517,40 @@ def _verify_checkpoint_semantics(
         raise SMLArtifactError("unknown checkpoint byte groups requested")
     if not byte_groups <= selected:
         raise SMLArtifactError("checkpoint byte groups must also be loaded")
-    with ArtifactRoot(os.dup(descriptor), local_apfs=local_apfs) as root:
+    with (
+        ArtifactRoot(os.dup(descriptor), local_apfs=local_apfs) as root,
+        ExitStack() as payload_stack,
+    ):
         scalar = _read_checkpoint_scalar_payload(root, manifest, full=full)
+        payloads = {
+            reference.payload.logical_path: payload_stack.enter_context(
+                _open_verified_payload(root, reference.payload, verification)
+            )
+            for reference in references
+        }
+        layouts = {
+            reference.payload.logical_path: read_safetensors_layout(
+                payloads[reference.payload.logical_path].stream,
+                reference,
+            )
+            for reference in references
+        }
+        if isinstance(manifest, PretrainingCheckpointManifest):
+            _validate_pretraining_parameter_specs(manifest)
+            trainable_specs = _array_specs_by_name(manifest.master)
+        else:
+            trainable_specs = _array_specs_by_name(manifest.adapters)
+        _validate_optimizer_and_trainer_specs(
+            set(trainable_specs),
+            manifest.optimizer,
+            manifest.trainer,
+            master_specs=trainable_specs,
+        )
         payload_bytes: dict[str, bytes] = {}
         groups = {
-            reference.payload.logical_path: _load_checkpoint_array_payload(
-                root,
+            reference.payload.logical_path: _load_checkpoint_array_stream(
+                payloads[reference.payload.logical_path].stream,
                 reference,
-                full=full,
                 payload_bytes=(
                     payload_bytes
                     if reference.payload.logical_path in byte_groups
@@ -2346,72 +2560,19 @@ def _verify_checkpoint_semantics(
             for reference in references
             if reference.payload.logical_path in selected
         }
+        streams = {path: payload.stream for path, payload in payloads.items()}
+        boundary_state = None
+        if full:
+            boundary_state = _checkpoint_boundary_state(manifest, streams, layouts)
+            if isinstance(manifest, PretrainingCheckpointManifest):
+                _verify_streaming_model_master_cast(streams, layouts)
 
-    if isinstance(manifest, PretrainingCheckpointManifest):
-        _validate_pretraining_parameter_specs(manifest)
-        if "model.safetensors" in groups and "master.safetensors" in groups:
-            working = groups["model.safetensors"]
-            masters = groups["master.safetensors"]
-            if set(working) != set(masters):
-                raise SMLArtifactError("checkpoint model and master keys do not match")
-            for name, master in masters.items():
-                model = working[name]
-                if _checkpoint_dtype_name(master) != "float32":
-                    raise SMLArtifactError(
-                        "checkpoint master parameters must be float32"
-                    )
-                if _checkpoint_dtype_name(model) != "bfloat16" or tuple(
-                    model.shape
-                ) != tuple(master.shape):
-                    raise SMLArtifactError(
-                        "checkpoint working parameters must be BF16 master-shaped arrays"
-                    )
-                if full and not bool(mx.array_equal(model, master.astype(mx.bfloat16))):
-                    raise SMLArtifactError(
-                        "checkpoint working parameter is not the exact BF16 cast of "
-                        f"master: {name}"
-                    )
-        if "optimizer.safetensors" in groups and "trainer.safetensors" in groups:
-            if "master.safetensors" not in groups:
-                raise SMLArtifactError(
-                    "optimizer verification requires loaded master arrays"
-                )
-            _verify_optimizer_and_trainer_groups(
-                groups["master.safetensors"],
-                groups["optimizer.safetensors"],
-                groups["trainer.safetensors"],
-                step=manifest.step,
-            )
-        else:
-            master_specs = _array_specs_by_name(manifest.master)
-            _validate_optimizer_and_trainer_specs(
-                set(master_specs),
-                manifest.optimizer,
-                manifest.trainer,
-                master_specs=master_specs,
-            )
-    else:
-        if (
-            "adapters.safetensors" in groups
-            and "optimizer.safetensors" in groups
-            and "trainer.safetensors" in groups
-        ):
-            adapters = groups["adapters.safetensors"]
-            _verify_optimizer_and_trainer_groups(
-                adapters,
-                groups["optimizer.safetensors"],
-                groups["trainer.safetensors"],
-                step=manifest.step,
-            )
-        else:
-            adapter_specs = _array_specs_by_name(manifest.adapters)
-            _validate_optimizer_and_trainer_specs(
-                set(adapter_specs),
-                manifest.optimizer,
-                manifest.trainer,
-                master_specs=adapter_specs,
-            )
-    return VerifiedCheckpointContents(scalar, groups, payload_bytes)
+    return VerifiedCheckpointContents(
+        scalar,
+        groups,
+        payload_bytes,
+        boundary_state,
+    )
 
 
 def _validate_checkpoint_owner(
@@ -2540,7 +2701,7 @@ def _open_verified_step_from_descriptor(
             descriptor,
             manifest,
             manifest_present=True,
-            full=verification is VerificationLevel.FULL,
+            full=False,
         )
         effective_load_groups = load_array_groups
         if effective_load_groups is None and materialize_byte_groups:
@@ -2787,6 +2948,7 @@ def open_latest_checkpoint_reader(
                 verification=verification,
                 fs=fs,
                 allow_empty=False,
+                defer_selected_proof=True,
             )
             if recovered is None:
                 raise SMLArtifactError("run has no published checkpoints")
@@ -2952,7 +3114,6 @@ def _stored_latest(
     run_manifest: RunManifest,
     run_descriptor: int,
     checkpoints_descriptor: int,
-    verification: VerificationLevel,
     fs: FilesystemOps,
 ) -> tuple[LatestIndex | None, ResolvedStep | None]:
     try:
@@ -2972,7 +3133,7 @@ def _stored_latest(
             run_manifest,
             checkpoints_descriptor,
             step=index.step,
-            verification=verification,
+            verification=VerificationLevel.MANIFEST_TRUSTED,
             fs=fs,
         )
     except SMLArtifactError:
@@ -2999,7 +3160,6 @@ def _scan_checkpoint_candidates(
     checkpoints_descriptor: int,
     *,
     lower_bound: int | None,
-    verification: VerificationLevel,
     fs: FilesystemOps,
 ) -> list[ResolvedStep]:
     candidates: list[ResolvedStep] = []
@@ -3021,7 +3181,7 @@ def _scan_checkpoint_candidates(
                 run_manifest,
                 checkpoints_descriptor,
                 step=step,
-                verification=verification,
+                verification=VerificationLevel.MANIFEST_TRUSTED,
                 fs=fs,
             )
         )
@@ -3038,13 +3198,15 @@ def _recover_latest_open(
     verification: VerificationLevel,
     fs: FilesystemOps,
     allow_empty: bool,
+    defer_selected_proof: bool = False,
 ) -> ResolvedStep | None:
+    if writable and defer_selected_proof:
+        raise SMLArtifactError("writable latest recovery cannot defer winner proof")
     stored_index, pointed = _stored_latest(
         run,
         run_manifest,
         run_descriptor,
         checkpoints_descriptor,
-        verification,
         fs,
     )
     lower_bound = pointed.step if pointed is not None else None
@@ -3053,7 +3215,6 @@ def _recover_latest_open(
         run_manifest,
         checkpoints_descriptor,
         lower_bound=lower_bound,
-        verification=verification,
         fs=fs,
     )
     available = ([pointed] if pointed is not None else []) + candidates
@@ -3073,6 +3234,22 @@ def _recover_latest_open(
         latest_recovered=recovered,
         latest_repair_persisted=False,
     )
+    if not defer_selected_proof:
+        proven = _resolve_step_from_descriptor(
+            run,
+            run_manifest,
+            checkpoints_descriptor,
+            step=selected.step,
+            verification=verification,
+            fs=fs,
+        )
+        if proven.checkpoint.identity != selected.checkpoint.identity:
+            raise SMLArtifactError("selected latest changed before winner proof")
+        selected = dataclasses.replace(
+            proven,
+            latest_recovered=recovered,
+            latest_repair_persisted=False,
+        )
     if writable and recovered:
         _persist_latest_index(run_descriptor, selected, fs)
         selected = dataclasses.replace(

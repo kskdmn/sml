@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import io
 import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from sml.artifacts import checkpoint as checkpoint_module
+from sml.artifacts.arrays import SafetensorsLayout, TensorSlice
 from sml.artifacts.checkpoint import (
     VerifiedCheckpointContents,
     open_checkpoint_reader,
@@ -30,10 +33,64 @@ from sml.errors import SMLArtifactError
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
 
 
+class _RecordingBytesIO(io.BytesIO):
+    def __init__(self, initial_bytes: bytes) -> None:
+        super().__init__(initial_bytes)
+        self.read_requests: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_requests.append(size)
+        return super().read(size)
+
+
 def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
     with path.open("rb") as payload:
         identity = file_identity(payload)
     return PayloadRef(logical_path, identity, path.stat().st_size)
+
+
+def test_model_master_comparison_uses_fixed_256k_element_chunks() -> None:
+    element_count = 600_000
+    model_stream = _RecordingBytesIO(bytes(element_count * 2))
+    master_stream = _RecordingBytesIO(bytes(element_count * 4))
+    model_tensor = TensorSlice(
+        ArraySpec("weight", (element_count,), "bfloat16"),
+        0,
+        element_count * 2,
+    )
+    master_tensor = TensorSlice(
+        ArraySpec("weight", (element_count,), "float32"),
+        0,
+        element_count * 4,
+    )
+
+    checkpoint_module._verify_streaming_model_master_cast(
+        {
+            "model.safetensors": model_stream,
+            "master.safetensors": master_stream,
+        },
+        {
+            "model.safetensors": SafetensorsLayout({"weight": model_tensor}),
+            "master.safetensors": SafetensorsLayout({"weight": master_tensor}),
+        },
+    )
+
+    assert len(model_stream.read_requests) == len(master_stream.read_requests) == 3
+    assert max(model_stream.read_requests) <= 256 * 1024 * 2
+    assert max(master_stream.read_requests) <= 256 * 1024 * 4
+
+
+def test_trainer_zero_reduction_uses_fixed_one_mib_chunks() -> None:
+    byte_count = 3 * 1024 * 1024
+    stream = _RecordingBytesIO(np.zeros(byte_count, dtype=np.uint8).tobytes())
+    tensor = TensorSlice(
+        ArraySpec("accumulators.weight", (byte_count // 4,), "float32"),
+        0,
+        byte_count,
+    )
+
+    assert checkpoint_module._tensor_is_zero(stream, tensor) is True
+    assert stream.read_requests == [1024 * 1024] * 3
 
 
 def _array_ref(

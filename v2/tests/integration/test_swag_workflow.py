@@ -310,6 +310,11 @@ def _rewrite_bound_base_snapshot(run: Path, **changes: object) -> None:
     ).manifest
     run_manifest = replace(run_manifest, base_identity=snapshot.identity)
     run_manifest = replace(run_manifest, identity=run_manifest.recompute_identity())
+
+    _write_bound_lora_run(run, run_manifest)
+
+
+def _write_bound_lora_run(run: Path, run_manifest: LoRARunManifest) -> None:
     (run / LoRARunManifest.MANIFEST_FILENAME).write_bytes(
         canonical_json_bytes(run_manifest)
     )
@@ -460,6 +465,44 @@ def test_lora_checkpoint_omits_frozen_base(tiny_lora_run):
     assert verified.manifest.precision.get("working_parameter_dtype") == "bfloat16"
     assert verified.manifest.precision.get("master_weights") is True
     assert "adapter_parameter_dtype" not in verified.manifest.precision
+
+
+def test_full_lora_resolve_applies_exact_run_semantics(tiny_lora_run: Path) -> None:
+    run = read_manifest(
+        tiny_lora_run,
+        LoRARunManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    optimizer = dict(run.optimizer)
+    optimizer["beta1"] = 1.0
+    rebound = replace(run, optimizer=optimizer)
+    rebound = replace(rebound, identity=rebound.recompute_identity())
+    _write_bound_lora_run(tiny_lora_run, rebound)
+
+    with pytest.raises(SMLArtifactError, match="invalid run optimizer"):
+        resolve_model_artifact(tiny_lora_run, full_verify=True)
+
+
+def test_full_export_resolve_applies_exact_export_semantics(
+    tiny_lora_run: Path,
+    tmp_path: Path,
+) -> None:
+    exported = export_merged(tiny_lora_run, tmp_path / "semantic-export")
+    manifest = read_manifest(
+        exported.path,
+        ExportManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    precision = dict(manifest.precision)
+    precision["adapter_parameter_dtype"] = "bfloat16"
+    rebound = replace(manifest, precision=precision)
+    rebound = replace(rebound, identity=rebound.recompute_identity())
+    (exported.path / ExportManifest.MANIFEST_FILENAME).write_bytes(
+        canonical_json_bytes(rebound)
+    )
+
+    with pytest.raises(SMLArtifactError, match="invalid export precision"):
+        resolve_model_artifact(exported.path, full_verify=True)
 
 
 def test_uninterrupted_and_interrupted_adapter_state_match(

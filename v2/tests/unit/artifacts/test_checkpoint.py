@@ -1028,6 +1028,55 @@ def test_read_only_recovery_never_persists_latest(valid_run: Path) -> None:
     assert latest.read_bytes() == original_bytes
 
 
+def test_latest_reader_full_proves_only_selected_winner_once(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Candidate selection is metadata-only; the retained winner gets one proof."""
+    _publish_step(valid_run, 2)
+    real_verify = checkpoint._verify_checkpoint_semantics
+    proved_steps: list[int] = []
+
+    def record_proof(descriptor, manifest, verification, **kwargs):
+        proved_steps.append(manifest.step)
+        return real_verify(descriptor, manifest, verification, **kwargs)
+
+    monkeypatch.setattr(checkpoint, "_verify_checkpoint_semantics", record_proof)
+
+    with checkpoint.open_latest_checkpoint_reader(
+        valid_run,
+        verification=VerificationLevel.FULL,
+        load_array_groups=frozenset(),
+    ) as reader:
+        assert reader.resolved.step == 2
+
+    assert proved_steps == [2]
+
+
+def test_trusted_requested_group_does_not_reduce_trainer_state(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trusted materialization validates metadata without unrelated value reads."""
+
+    def reject_boundary_reduction(*_args, **_kwargs):
+        raise AssertionError("trusted trainer/optimizer reduction is forbidden")
+
+    monkeypatch.setattr(
+        checkpoint,
+        "_checkpoint_boundary_state",
+        reject_boundary_reduction,
+    )
+
+    with checkpoint.open_checkpoint_reader(
+        valid_run,
+        step=1,
+        verification=VerificationLevel.MANIFEST_TRUSTED,
+        load_array_groups=frozenset({"model.safetensors"}),
+    ) as reader:
+        assert set(reader.read_contents().array_groups) == {"model.safetensors"}
+
+
 def test_malformed_required_scan_candidate_fails(valid_run: Path) -> None:
     """A newer published candidate cannot be silently omitted from recovery."""
     malformed = valid_run / "checkpoints" / "step-000000002"

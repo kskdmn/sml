@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import tracemalloc
 from dataclasses import replace
 from pathlib import Path
 
@@ -91,6 +93,73 @@ def test_exact_array_contract_returns_eager_sorted_fresh_mapping(
     assert list(loaded) == ["a.weight", "z.weight"]
     assert mx.array_equal(loaded["a.weight"], mx.array([1.0, 2.0]))
     assert mx.array_equal(loaded["z.weight"], mx.array([3.0, 4.0]))
+
+
+def test_metadata_verification_is_bounded_for_large_sparse_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FULL header validation must not allocate storage proportional to tensor bytes."""
+    root = tmp_path / "sparse-bundle"
+    root.mkdir()
+    payload_path = root / "model.safetensors"
+    data_bytes = 128 * 1024 * 1024
+    element_count = data_bytes // 4
+    header = json.dumps(
+        {
+            "huge.weight": {
+                "dtype": "F32",
+                "shape": [element_count],
+                "data_offsets": [0, data_bytes],
+            }
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    header += b" " * (-len(header) % 8)
+    with payload_path.open("wb") as payload:
+        payload.write(len(header).to_bytes(8, byteorder="little"))
+        payload.write(header)
+        payload.seek(data_bytes - 1, os.SEEK_CUR)
+        payload.write(b"\0")
+    with payload_path.open("rb") as payload:
+        payload_ref = PayloadRef(
+            "model.safetensors",
+            file_identity(payload),
+            payload_path.stat().st_size,
+        )
+    reference = ArrayPayloadRef(
+        payload_ref,
+        (ArraySpec("huge.weight", (element_count,), "float32"),),
+    )
+    manifest = BaseSnapshotManifest(
+        kind="base-snapshot",
+        version=1,
+        identity=_PLACEHOLDER_IDENTITY,
+        model={"rope_scaling_factor": 1.0},
+        precision={"working_parameter_dtype": "bfloat16"},
+        tokenizer_identity=_TOKENIZER_IDENTITY,
+        working_weights=reference,
+        diagnostic_source_run_identity=_RUN_IDENTITY,
+        diagnostic_source_step=0,
+    )
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+    def reject_materialization(*_args, **_kwargs):
+        raise AssertionError("large sparse payload materialization is forbidden")
+
+    monkeypatch.setattr(arrays_module.mx, "load", reject_materialization)
+    tracemalloc.start()
+    try:
+        with _open_array_artifact(root) as artifact:
+            layout = arrays_module.verify_safetensors_metadata(artifact, reference)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    tensor = layout.tensors["huge.weight"]
+    assert tensor.end - tensor.start == data_bytes
+    assert peak < 16 * 1024 * 1024
 
 
 @pytest.mark.parametrize(

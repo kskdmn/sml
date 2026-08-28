@@ -34,6 +34,11 @@ from sml.artifacts.manifest import (
     _open_artifact_from_root,
     open_artifact,
 )
+from sml.artifacts.semantics import (
+    validate_base_semantics,
+    validate_export_semantics,
+    validate_full_run_semantics,
+)
 from sml.data.tokenizer import LoadedTokenizer, _load_opened_tokenizer_bundle
 from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.model.cache import allocate_kv_state, reset_kv_state
@@ -451,12 +456,16 @@ def _require_unit_rope(model: Mapping[str, object], *, context: str) -> ModelCon
 
 
 def _resolve_pretraining_run(
-    path: Path, *, full_verify: bool, run_descriptor: int | None = None
+    path: Path,
+    *,
+    full_verify: bool,
+    expected_run: PretrainingRunManifest,
+    run_descriptor: int | None = None,
 ) -> ResolvedModel:
     verification = (
         VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
     )
-    groups = frozenset({_MODEL_GROUP, _MASTER_GROUP} if full_verify else {_MODEL_GROUP})
+    groups = frozenset({_MODEL_GROUP})
     with open_latest_checkpoint_reader(
         path,
         verification=verification,
@@ -466,9 +475,12 @@ def _resolve_pretraining_run(
         resolved_step = reader.resolved
         if not isinstance(resolved_step.run, PretrainingRunManifest):
             raise SMLArtifactError("pretraining resolution requires a pretraining run")
-        model_config = _require_unit_rope(
-            resolved_step.run.model, context="pretraining"
-        )
+        if resolved_step.run != expected_run:
+            raise SMLArtifactError("run manifest changed during model resolution")
+        if full_verify and resolved_step.latest_recovered:
+            raise SMLArtifactError(
+                "run latest index must directly bind the latest checkpoint"
+            )
         contents = reader.read_contents()
         owned = dict(contents.array_groups[_MODEL_GROUP])
         mx.eval(*owned.values())
@@ -478,6 +490,13 @@ def _resolve_pretraining_run(
             tokenizer = _load_opened_tokenizer_bundle(tokenizer_artifact)
         if tokenizer.manifest.identity != resolved_step.run.tokenizer_identity:
             raise SMLArtifactError("run tokenizer identity does not match run.json")
+        if full_verify:
+            model_config = validate_full_run_semantics(reader, tokenizer.manifest)
+        else:
+            model_config = _require_unit_rope(
+                resolved_step.run.model,
+                context="pretraining",
+            )
     return ResolvedModel(
         artifact_kind=resolved_step.run.kind,
         run_identity=resolved_step.run.identity,
@@ -492,16 +511,16 @@ def _resolve_pretraining_run(
 
 
 def _resolve_lora_run(
-    path: Path, *, full_verify: bool, run_descriptor: int | None = None
+    path: Path,
+    *,
+    full_verify: bool,
+    expected_run: LoRARunManifest,
+    run_descriptor: int | None = None,
 ) -> ResolvedModel:
     verification = (
         VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
     )
-    load_groups = (
-        frozenset({_ADAPTER_GROUP, "optimizer.safetensors", "trainer.safetensors"})
-        if full_verify
-        else frozenset({_ADAPTER_GROUP})
-    )
+    load_groups = frozenset({_ADAPTER_GROUP})
     with open_latest_checkpoint_reader(
         path,
         verification=verification,
@@ -511,9 +530,16 @@ def _resolve_lora_run(
         recovered = reader.resolved
         if not isinstance(recovered.run, LoRARunManifest):
             raise SMLArtifactError("LoRA resolution requires a LoRA run")
-        model_config = _require_unit_rope(recovered.run.model, context="LoRA run")
+        if recovered.run != expected_run:
+            raise SMLArtifactError("run manifest changed during model resolution")
+        if full_verify and recovered.latest_recovered:
+            raise SMLArtifactError(
+                "run latest index must directly bind the latest checkpoint"
+            )
         with reader.open_run_child("base", (BaseSnapshotManifest,)) as base:
             require_lora_base_snapshot(base.manifest, recovered.run)
+            if full_verify:
+                validate_base_semantics(base.manifest)
             base_arrays = load_safetensors_payload(base, base.manifest.working_weights)
         contents = reader.read_contents()
         adapters = dict(contents.array_groups[_ADAPTER_GROUP])
@@ -525,6 +551,10 @@ def _resolve_lora_run(
             tokenizer = _load_opened_tokenizer_bundle(tokenizer_artifact)
         if tokenizer.manifest.identity != recovered.run.tokenizer_identity:
             raise SMLArtifactError("run tokenizer identity does not match run.json")
+        if full_verify:
+            model_config = validate_full_run_semantics(reader, tokenizer.manifest)
+        else:
+            model_config = _require_unit_rope(recovered.run.model, context="LoRA run")
         model = SMLLanguageModel(model_config, key=mx.random.key(0))
         model.update(tree_unflatten(sorted(base_arrays.items())))
         apply_lora(
@@ -552,7 +582,6 @@ def _resolve_opened_export(artifact, *, full_verify: bool) -> ResolvedModel:
     verification = (
         VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
     )
-    model_config = _require_unit_rope(artifact.manifest.model, context="export")
     with artifact.open_child("tokenizer", (TokenizerManifest,)) as tokenizer_artifact:
         tokenizer = _load_opened_tokenizer_bundle(tokenizer_artifact)
         child_manifest = tokenizer_artifact.manifest
@@ -575,6 +604,13 @@ def _resolve_opened_export(artifact, *, full_verify: bool) -> ResolvedModel:
             )
     if tokenizer.manifest.identity != artifact.manifest.tokenizer_identity:
         raise SMLArtifactError("export tokenizer identity does not match manifest")
+    if full_verify:
+        model_config = validate_export_semantics(
+            artifact.manifest,
+            tokenizer.manifest,
+        )
+    else:
+        model_config = _require_unit_rope(artifact.manifest.model, context="export")
     arrays = load_safetensors_payload(artifact, artifact.manifest.model_weights)
     manifest = artifact.manifest
     return ResolvedModel(
@@ -626,12 +662,14 @@ def resolve_model_artifact(path: Path, *, full_verify: bool) -> ResolvedModel:
                     return _resolve_pretraining_run(
                         path,
                         full_verify=full_verify,
+                        expected_run=artifact.manifest,
                         run_descriptor=artifact.root.fileno(),
                     )
                 if isinstance(artifact.manifest, LoRARunManifest):
                     return _resolve_lora_run(
                         path,
                         full_verify=full_verify,
+                        expected_run=artifact.manifest,
                         run_descriptor=artifact.root.fileno(),
                     )
                 raise SMLArtifactError("unsupported run kind for model resolution")
