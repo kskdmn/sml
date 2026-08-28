@@ -11,7 +11,7 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 import zstandard as zstd
-from sml.artifacts.checkpoint import resolve_latest_step
+from sml.artifacts.checkpoint import CheckpointReader, resolve_latest_step
 from sml.artifacts.manifest import (
     ArtifactRoot,
     BaseSnapshotManifest,
@@ -963,31 +963,85 @@ def test_export_fails_closed_when_open_run_child_is_replaced(
     )
     run = trained.run
     displaced = tmp_path / f"displaced-{child}"
-    closed_descriptors: list[int] = []
+    descriptors: list[int] = []
+    real_open_child = CheckpointReader.open_run_child
+
+    def replace_after_open(reader, logical_path, manifest_types):
+        artifact = real_open_child(reader, logical_path, manifest_types)
+        if logical_path == child:
+            descriptors.extend(
+                [
+                    reader._run_descriptor,
+                    reader._checkpoints_descriptor,
+                    reader._owned_step.descriptor,
+                    artifact.root.fileno(),
+                ]
+            )
+            source = run / child
+            source.rename(displaced)
+            source.mkdir()
+        return artifact
+
+    monkeypatch.setattr(CheckpointReader, "open_run_child", replace_after_open)
+    try:
+        exported = export_merged(run, tmp_path / f"replaced-{child}-export")
+    finally:
+        source = run / child
+        source.rmdir()
+        displaced.rename(source)
+    assert exported.path.is_dir()
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_fresh_finetune_uses_materialized_base_payload_after_name_replacement(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    """Copied-base publication cannot reopen a replacement checkpoint payload."""
+    descriptors: list[int] = []
     real_open_latest = swag_module.open_latest_checkpoint_reader
+    moved: Path | None = None
+    replacement: Path | None = None
 
     @contextmanager
-    def replace_child(*args, **kwargs):
-        reader = None
-        try:
-            with real_open_latest(*args, **kwargs) as reader:
-                source = run / child
-                source.rename(displaced)
-                source.mkdir()
-                try:
-                    yield reader
-                finally:
-                    source.rmdir()
-                    displaced.rename(source)
-        finally:
-            if reader is not None:
-                closed_descriptors.append(reader._owned_step.descriptor)
+    def replace_after_materialization(*args, **kwargs):
+        nonlocal moved, replacement
+        with real_open_latest(*args, **kwargs) as reader:
+            descriptors.extend(
+                [
+                    reader._run_descriptor,
+                    reader._checkpoints_descriptor,
+                    reader._owned_step.descriptor,
+                ]
+            )
+            payload = reader.resolved.step_directory / "model.safetensors"
+            moved = payload.with_name("retained-model.safetensors")
+            payload.rename(moved)
+            payload.write_bytes(b"replacement")
+            replacement = payload
+            yield reader
 
-    monkeypatch.setattr(swag_module, "open_latest_checkpoint_reader", replace_child)
-
-    with pytest.raises(SMLArtifactError):
-        export_merged(run, tmp_path / f"replaced-{child}-export")
-    assert closed_descriptors == [-1]
+    monkeypatch.setattr(
+        swag_module, "open_latest_checkpoint_reader", replace_after_materialization
+    )
+    try:
+        trained = finetune(
+            tiny_swag_training_config(
+                tiny_base_run,
+                tiny_swag_bundle,
+                tmp_path / "fresh-replaced-base-run",
+                maximum_steps=1,
+            )
+        )
+    finally:
+        if replacement is not None and moved is not None:
+            replacement.unlink()
+            moved.rename(replacement)
+    assert trained.run.is_dir()
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_export_closes_reader_when_merge_fails(

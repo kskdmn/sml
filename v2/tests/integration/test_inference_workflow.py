@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from contextlib import contextmanager
 from dataclasses import replace
@@ -270,10 +271,16 @@ def test_pretraining_resolution_closes_checkpoint_owner_when_tokenizer_construct
         reader = None
         try:
             with real_open_latest(*args, **kwargs) as reader:
+                observed_descriptors.extend(
+                    [
+                        reader._run_descriptor,
+                        reader._checkpoints_descriptor,
+                        reader._owned_step.descriptor,
+                    ]
+                )
                 yield reader
         finally:
-            if reader is not None:
-                observed_descriptors.append(reader._owned_step.descriptor)
+            pass
 
     monkeypatch.setattr(inference, "open_latest_checkpoint_reader", record_reader)
     monkeypatch.setattr(
@@ -286,7 +293,9 @@ def test_pretraining_resolution_closes_checkpoint_owner_when_tokenizer_construct
 
     with pytest.raises(RuntimeError, match="tokenizer failed"):
         resolve_model_artifact(tiny_pretraining_run, full_verify=False)
-    assert observed_descriptors == [-1]
+    for descriptor in observed_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_pretraining_resolution_uses_open_run_after_outer_name_replacement(
@@ -302,6 +311,13 @@ def test_pretraining_resolution_uses_open_run_after_outer_name_replacement(
     @contextmanager
     def replace_outer_name(*args, **kwargs):
         with real_open_latest(*args, **kwargs) as reader:
+            closed_descriptors.extend(
+                [
+                    reader._run_descriptor,
+                    reader._checkpoints_descriptor,
+                    reader._owned_step.descriptor,
+                ]
+            )
             tiny_pretraining_run.rename(displaced)
             tiny_pretraining_run.mkdir()
             try:
@@ -309,14 +325,15 @@ def test_pretraining_resolution_uses_open_run_after_outer_name_replacement(
             finally:
                 tiny_pretraining_run.rmdir()
                 displaced.rename(tiny_pretraining_run)
-        closed_descriptors.append(reader._owned_step.descriptor)
 
     monkeypatch.setattr(inference, "open_latest_checkpoint_reader", replace_outer_name)
 
     resolved = resolve_model_artifact(tiny_pretraining_run, full_verify=False)
 
     assert resolved.artifact_kind == "pretraining-run"
-    assert closed_descriptors == [-1]
+    for descriptor in closed_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_pretraining_resolution_uses_loaded_checkpoint_payload_after_replacement(
@@ -332,20 +349,28 @@ def test_pretraining_resolution_uses_loaded_checkpoint_payload_after_replacement
         reader = None
         try:
             with real_open_latest(*args, **kwargs) as reader:
+                closed_descriptors.extend(
+                    [
+                        reader._run_descriptor,
+                        reader._checkpoints_descriptor,
+                        reader._owned_step.descriptor,
+                    ]
+                )
                 (reader.resolved.step_directory / "model.safetensors").write_bytes(
                     b"replacement"
                 )
                 yield reader
         finally:
-            if reader is not None:
-                closed_descriptors.append(reader._owned_step.descriptor)
+            pass
 
     monkeypatch.setattr(inference, "open_latest_checkpoint_reader", replace_payload)
 
     resolved = resolve_model_artifact(tiny_pretraining_run, full_verify=False)
 
     assert resolved.artifact_kind == "pretraining-run"
-    assert closed_descriptors == [-1]
+    for descriptor in closed_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_resolve_reports_manifest_trusted_versus_full_metadata(
