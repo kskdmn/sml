@@ -220,14 +220,16 @@ def test_session_loads_latest_once_and_pins_identity(
     tiny_pretraining_run: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     calls = 0
-    real_loader = inference.load_owned_model_arrays
+    real_open_latest = inference.open_latest_checkpoint_reader
 
-    def counted_loader(*args, **kwargs):
+    @contextmanager
+    def counted_open_latest(*args, **kwargs):
         nonlocal calls
         calls += 1
-        return real_loader(*args, **kwargs)
+        with real_open_latest(*args, **kwargs) as reader:
+            yield reader
 
-    monkeypatch.setattr(inference, "load_owned_model_arrays", counted_loader)
+    monkeypatch.setattr(inference, "open_latest_checkpoint_reader", counted_open_latest)
     session = InferenceSession.from_checkpoint(tiny_pretraining_run)
     first_identity = session.model_identity
     assert session.resolved_model.model_config.rope_scaling_factor == 1.0

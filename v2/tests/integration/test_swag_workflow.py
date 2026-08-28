@@ -10,6 +10,7 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 import zstandard as zstd
+from sml import inference as inference_module
 from sml.artifacts.checkpoint import resolve_latest_step
 from sml.artifacts.manifest import (
     BaseSnapshotManifest,
@@ -17,6 +18,7 @@ from sml.artifacts.manifest import (
     LatestIndex,
     LoRACheckpointManifest,
     LoRARunManifest,
+    OpenedArtifact,
     PayloadRef,
     VerificationLevel,
     canonical_json_bytes,
@@ -839,6 +841,7 @@ def test_export_consumes_run_descriptor_after_outer_name_replacement(
     run = trained.run
     displaced = tmp_path / "displaced-run"
     real_open_latest = swag_module.open_latest_checkpoint_reader
+    closed_descriptors: list[int] = []
 
     @contextmanager
     def replace_outer_name(*args, **kwargs):
@@ -850,6 +853,7 @@ def test_export_consumes_run_descriptor_after_outer_name_replacement(
             finally:
                 run.rmdir()
                 displaced.rename(run)
+        closed_descriptors.append(reader._owned_step.descriptor)
 
     monkeypatch.setattr(
         swag_module, "open_latest_checkpoint_reader", replace_outer_name
@@ -858,6 +862,293 @@ def test_export_consumes_run_descriptor_after_outer_name_replacement(
     exported = export_merged(run, tmp_path / "descriptor-export")
 
     assert exported.path.is_dir()
+    assert closed_descriptors == [-1]
+
+
+def test_merged_inference_uses_open_export_after_outer_name_replacement(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    """Merged inference retains the export root while loading its child and payload."""
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "inference-export-source",
+            maximum_steps=1,
+        )
+    )
+    exported = export_merged(trained.run, tmp_path / "inference-export")
+    displaced = tmp_path / "displaced-export"
+    closed: list[OpenedArtifact] = []
+    real_open_artifact = inference_module.open_artifact
+
+    @contextmanager
+    def replace_outer_name(*args, **kwargs):
+        artifact = None
+        try:
+            with real_open_artifact(*args, **kwargs) as artifact:
+                exported.path.rename(displaced)
+                exported.path.mkdir()
+                try:
+                    yield artifact
+                finally:
+                    exported.path.rmdir()
+                    displaced.rename(exported.path)
+        finally:
+            if artifact is not None:
+                closed.append(artifact)
+
+    monkeypatch.setattr(inference_module, "open_artifact", replace_outer_name)
+
+    resolved = resolve_model_artifact(exported.path, full_verify=True)
+
+    assert resolved.artifact_kind == "export"
+    assert len(closed) == 1
+    assert closed[0].closed
+
+
+@pytest.mark.parametrize("replacement", ["tokenizer", "model.safetensors"])
+def test_merged_inference_fails_closed_on_child_or_payload_replacement(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch, replacement: str
+):
+    """An export never consumes a new tokenizer child or model payload by pathname."""
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / f"inference-{replacement}-source",
+            maximum_steps=1,
+        )
+    )
+    exported = export_merged(trained.run, tmp_path / f"inference-{replacement}-export")
+    closed: list[OpenedArtifact] = []
+    real_open_artifact = inference_module.open_artifact
+
+    @contextmanager
+    def replace_verified_name(*args, **kwargs):
+        artifact = None
+        try:
+            with real_open_artifact(*args, **kwargs) as artifact:
+                target = exported.path / replacement
+                if target.is_dir():
+                    displaced = tmp_path / f"displaced-{replacement}"
+                    target.rename(displaced)
+                    target.mkdir()
+                    try:
+                        yield artifact
+                    finally:
+                        target.rmdir()
+                        displaced.rename(target)
+                else:
+                    target.write_bytes(b"replacement")
+                    yield artifact
+        finally:
+            if artifact is not None:
+                closed.append(artifact)
+
+    monkeypatch.setattr(inference_module, "open_artifact", replace_verified_name)
+
+    with pytest.raises(SMLArtifactError):
+        resolve_model_artifact(exported.path, full_verify=True)
+    assert len(closed) == 1
+    assert closed[0].closed
+
+
+@pytest.mark.parametrize("child", ["base", "tokenizer"])
+def test_export_fails_closed_when_open_run_child_is_replaced(
+    tiny_base_run,
+    tiny_swag_bundle,
+    tmp_path,
+    monkeypatch,
+    child: str,
+):
+    """Export never falls back to a replacement base or tokenizer child pathname."""
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / f"replaced-{child}-run",
+            maximum_steps=1,
+        )
+    )
+    run = trained.run
+    displaced = tmp_path / f"displaced-{child}"
+    closed_descriptors: list[int] = []
+    real_open_latest = swag_module.open_latest_checkpoint_reader
+
+    @contextmanager
+    def replace_child(*args, **kwargs):
+        reader = None
+        try:
+            with real_open_latest(*args, **kwargs) as reader:
+                source = run / child
+                source.rename(displaced)
+                source.mkdir()
+                try:
+                    yield reader
+                finally:
+                    source.rmdir()
+                    displaced.rename(source)
+        finally:
+            if reader is not None:
+                closed_descriptors.append(reader._owned_step.descriptor)
+
+    monkeypatch.setattr(swag_module, "open_latest_checkpoint_reader", replace_child)
+
+    with pytest.raises(SMLArtifactError):
+        export_merged(run, tmp_path / f"replaced-{child}-export")
+    assert closed_descriptors == [-1]
+
+
+def test_export_closes_reader_when_merge_fails(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    """A semantic merge failure remains primary and releases the checkpoint owner."""
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "merge-failure-run",
+            maximum_steps=1,
+        )
+    )
+    closed_descriptors: list[int] = []
+    real_open_latest = swag_module.open_latest_checkpoint_reader
+
+    @contextmanager
+    def record_reader(*args, **kwargs):
+        reader = None
+        try:
+            with real_open_latest(*args, **kwargs) as reader:
+                yield reader
+        finally:
+            if reader is not None:
+                closed_descriptors.append(reader._owned_step.descriptor)
+
+    monkeypatch.setattr(swag_module, "open_latest_checkpoint_reader", record_reader)
+    monkeypatch.setattr(
+        swag_module,
+        "merged_model_weights",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("merge failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="merge failed"):
+        export_merged(trained.run, tmp_path / "merge-failure-export")
+    assert closed_descriptors == [-1]
+
+
+def test_export_uses_loaded_adapter_payload_after_name_replacement(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    """The adapter tensors come from the verified checkpoint payload, not its path."""
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "adapter-payload-run",
+            maximum_steps=1,
+        )
+    )
+    closed_descriptors: list[int] = []
+    real_open_latest = swag_module.open_latest_checkpoint_reader
+
+    @contextmanager
+    def replace_payload(*args, **kwargs):
+        with real_open_latest(*args, **kwargs) as reader:
+            (reader.resolved.step_directory / "adapters.safetensors").write_bytes(
+                b"replacement"
+            )
+            yield reader
+        closed_descriptors.append(reader._owned_step.descriptor)
+
+    monkeypatch.setattr(swag_module, "open_latest_checkpoint_reader", replace_payload)
+
+    exported = export_merged(trained.run, tmp_path / "adapter-payload-export")
+
+    assert exported.path.is_dir()
+    assert closed_descriptors == [-1]
+
+
+def test_resume_closes_run_and_children_when_checkpoint_restore_fails(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    """A LoRA resume restore error releases both its preliminary and full readers."""
+    completed = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "resume-checkpoint-failure-run",
+            maximum_steps=1,
+        )
+    )
+    closed_descriptors: list[int] = []
+    real_open_latest = swag_module.open_latest_checkpoint_reader
+
+    @contextmanager
+    def record_reader(*args, **kwargs):
+        reader = None
+        try:
+            with real_open_latest(*args, **kwargs) as reader:
+                yield reader
+        finally:
+            if reader is not None:
+                closed_descriptors.append(reader._owned_step.descriptor)
+
+    monkeypatch.setattr(swag_module, "open_latest_checkpoint_reader", record_reader)
+    monkeypatch.setattr(
+        swag_module,
+        "_restore_adapter_checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("restore failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        resume_finetune(
+            completed.run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
+    assert closed_descriptors == [-1, -1]
+
+
+def test_resume_closes_reader_when_copied_base_load_fails(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    """A copied-base load error is semantic-primary and releases the full reader."""
+    completed = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "resume-base-failure-run",
+            maximum_steps=1,
+        )
+    )
+    closed_descriptors: list[int] = []
+    real_open_latest = swag_module.open_latest_checkpoint_reader
+
+    @contextmanager
+    def record_reader(*args, **kwargs):
+        reader = None
+        try:
+            with real_open_latest(*args, **kwargs) as reader:
+                yield reader
+        finally:
+            if reader is not None:
+                closed_descriptors.append(reader._owned_step.descriptor)
+
+    monkeypatch.setattr(swag_module, "open_latest_checkpoint_reader", record_reader)
+    monkeypatch.setattr(
+        swag_module,
+        "_load_base_snapshot_arrays",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("base failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="base failed"):
+        resume_finetune(
+            completed.run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
+    assert closed_descriptors == [-1, -1]
 
 
 def test_resolve_rejects_export_that_changes_copied_base_rope(

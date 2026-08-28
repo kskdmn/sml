@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
@@ -254,6 +255,97 @@ def test_resolve_holds_shared_access_lock_through_owned_array_evaluation(
     monkeypatch.setattr(inference.mx, "eval", checking_eval)
     resolve_model_artifact(tiny_pretraining_run, full_verify=False)
     assert observed
+
+
+def test_pretraining_resolution_closes_checkpoint_owner_when_tokenizer_construction_fails(
+    tiny_pretraining_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches inference failures leaking the retained latest checkpoint reader."""
+    observed_descriptors: list[int] = []
+    real_open_latest = inference.open_latest_checkpoint_reader
+
+    @contextmanager
+    def record_reader(*args, **kwargs):
+        reader = None
+        try:
+            with real_open_latest(*args, **kwargs) as reader:
+                yield reader
+        finally:
+            if reader is not None:
+                observed_descriptors.append(reader._owned_step.descriptor)
+
+    monkeypatch.setattr(inference, "open_latest_checkpoint_reader", record_reader)
+    monkeypatch.setattr(
+        inference,
+        "_load_opened_tokenizer_bundle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("tokenizer failed")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="tokenizer failed"):
+        resolve_model_artifact(tiny_pretraining_run, full_verify=False)
+    assert observed_descriptors == [-1]
+
+
+def test_pretraining_resolution_uses_open_run_after_outer_name_replacement(
+    tiny_pretraining_run: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inference must read the original run inode after resolving latest."""
+    displaced = tmp_path / "displaced-run"
+    closed_descriptors: list[int] = []
+    real_open_latest = inference.open_latest_checkpoint_reader
+
+    @contextmanager
+    def replace_outer_name(*args, **kwargs):
+        with real_open_latest(*args, **kwargs) as reader:
+            tiny_pretraining_run.rename(displaced)
+            tiny_pretraining_run.mkdir()
+            try:
+                yield reader
+            finally:
+                tiny_pretraining_run.rmdir()
+                displaced.rename(tiny_pretraining_run)
+        closed_descriptors.append(reader._owned_step.descriptor)
+
+    monkeypatch.setattr(inference, "open_latest_checkpoint_reader", replace_outer_name)
+
+    resolved = resolve_model_artifact(tiny_pretraining_run, full_verify=False)
+
+    assert resolved.artifact_kind == "pretraining-run"
+    assert closed_descriptors == [-1]
+
+
+def test_pretraining_resolution_uses_loaded_checkpoint_payload_after_replacement(
+    tiny_pretraining_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolved inference weights cannot be redirected by a later payload replacement."""
+    closed_descriptors: list[int] = []
+    real_open_latest = inference.open_latest_checkpoint_reader
+
+    @contextmanager
+    def replace_payload(*args, **kwargs):
+        reader = None
+        try:
+            with real_open_latest(*args, **kwargs) as reader:
+                (reader.resolved.step_directory / "model.safetensors").write_bytes(
+                    b"replacement"
+                )
+                yield reader
+        finally:
+            if reader is not None:
+                closed_descriptors.append(reader._owned_step.descriptor)
+
+    monkeypatch.setattr(inference, "open_latest_checkpoint_reader", replace_payload)
+
+    resolved = resolve_model_artifact(tiny_pretraining_run, full_verify=False)
+
+    assert resolved.artifact_kind == "pretraining-run"
+    assert closed_descriptors == [-1]
 
 
 def test_resolve_reports_manifest_trusted_versus_full_metadata(

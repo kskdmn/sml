@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 from sml.artifacts.manifest import (
+    OpenedArtifact,
     PayloadRef,
     TokenizerManifest,
     VerificationLevel,
@@ -417,6 +418,76 @@ def test_loader_consumes_descriptor_read_model_bytes_not_payload_paths(
     assert processor_calls == [{"model_proto": b"model"}]
 
 
+def test_loader_closes_its_retained_owner_when_processor_construction_fails(
+    tmp_path, monkeypatch
+):
+    """Catches tokenizer construction leaking the verified root on failure."""
+    _install_fake_sentencepiece(monkeypatch)
+    shard = tmp_path / "a.jsonl.zst"
+    shard.write_bytes(b"unused")
+    monkeypatch.setattr(
+        "sml.data.tokenizer.discover_corpus_files", lambda _config: (shard,)
+    )
+    monkeypatch.setattr(
+        "sml.data.tokenizer.iter_filtered_texts", lambda *_args: iter(("text",))
+    )
+    output = tmp_path / "bundle"
+    train_tokenizer_bundle(_config(tmp_path), output)
+    closed: list[OpenedArtifact] = []
+    original_close = OpenedArtifact.close
+
+    def record_close(artifact):
+        closed.append(artifact)
+        original_close(artifact)
+
+    monkeypatch.setattr(OpenedArtifact, "close", record_close)
+    monkeypatch.setitem(
+        sys.modules,
+        "sentencepiece",
+        SimpleNamespace(
+            SentencePieceProcessor=lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("processor failed")
+            )
+        ),
+    )
+
+    with pytest.raises(SMLArtifactError, match="tokenizer model"):
+        load_tokenizer_bundle(output, VerificationLevel.FULL)
+    assert len(closed) == 1
+    assert closed[0].closed
+
+
+def test_loader_consumes_open_root_after_outer_name_replacement(tmp_path, monkeypatch):
+    """A tokenizer opened before a parent swap must use its original inode."""
+    _install_fake_sentencepiece(monkeypatch)
+    shard = tmp_path / "a.jsonl.zst"
+    shard.write_bytes(b"unused")
+    monkeypatch.setattr(
+        "sml.data.tokenizer.discover_corpus_files", lambda _config: (shard,)
+    )
+    monkeypatch.setattr(
+        "sml.data.tokenizer.iter_filtered_texts", lambda *_args: iter(("text",))
+    )
+    output = tmp_path / "bundle"
+    displaced = tmp_path / "displaced-bundle"
+    train_tokenizer_bundle(_config(tmp_path), output)
+
+    def swap_after_open(*args):
+        artifact = open_artifact(*args)
+        output.rename(displaced)
+        output.mkdir()
+        return artifact
+
+    monkeypatch.setattr("sml.data.tokenizer.open_artifact", swap_after_open)
+    try:
+        loaded = load_tokenizer_bundle(output, VerificationLevel.FULL)
+    finally:
+        output.rmdir()
+        displaced.rename(output)
+
+    assert loaded.manifest.kind == "tokenizer"
+
+
 def test_full_loader_rehashes_the_exact_bytes_passed_to_processor(
     tmp_path, monkeypatch
 ):
@@ -431,6 +502,12 @@ def test_full_loader_rehashes_the_exact_bytes_passed_to_processor(
     )
     output = tmp_path / "bundle"
     train_tokenizer_bundle(_config(tmp_path), output)
+    closed: list[OpenedArtifact] = []
+    original_close = OpenedArtifact.close
+
+    def record_close(artifact):
+        closed.append(artifact)
+        original_close(artifact)
 
     def swap_after_open(*args):
         artifact = open_artifact(*args)
@@ -438,9 +515,12 @@ def test_full_loader_rehashes_the_exact_bytes_passed_to_processor(
         return artifact
 
     monkeypatch.setattr("sml.data.tokenizer.open_artifact", swap_after_open)
+    monkeypatch.setattr(OpenedArtifact, "close", record_close)
 
     with pytest.raises(SMLArtifactError, match="model.*identity|identity.*model"):
         load_tokenizer_bundle(output, VerificationLevel.FULL)
+    assert len(closed) == 1
+    assert closed[0].closed
 
 
 @pytest.mark.parametrize("mutation", ["algorithm", "model_path", "vocab_path"])
