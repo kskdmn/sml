@@ -23,12 +23,15 @@ from sml.artifacts.checkpoint import (
     run_access_lock,
 )
 from sml.artifacts.manifest import (
+    ArtifactRoot,
     BaseSnapshotManifest,
     ExportManifest,
     LoRARunManifest,
+    PayloadRef,
     PretrainingRunManifest,
     TokenizerManifest,
     VerificationLevel,
+    _open_artifact_from_root,
     open_artifact,
 )
 from sml.data.tokenizer import LoadedTokenizer, _load_opened_tokenizer_bundle
@@ -447,13 +450,18 @@ def _require_unit_rope(model: Mapping[str, object], *, context: str) -> ModelCon
     return model_config
 
 
-def _resolve_pretraining_run(path: Path, *, full_verify: bool) -> ResolvedModel:
+def _resolve_pretraining_run(
+    path: Path, *, full_verify: bool, run_descriptor: int | None = None
+) -> ResolvedModel:
     verification = (
         VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
     )
     groups = frozenset({_MODEL_GROUP, _MASTER_GROUP} if full_verify else {_MODEL_GROUP})
     with open_latest_checkpoint_reader(
-        path, verification=verification, load_array_groups=groups
+        path,
+        verification=verification,
+        load_array_groups=groups,
+        run_descriptor=run_descriptor,
     ) as reader:
         resolved_step = reader.resolved
         if not isinstance(resolved_step.run, PretrainingRunManifest):
@@ -483,7 +491,9 @@ def _resolve_pretraining_run(path: Path, *, full_verify: bool) -> ResolvedModel:
     )
 
 
-def _resolve_lora_run(path: Path, *, full_verify: bool) -> ResolvedModel:
+def _resolve_lora_run(
+    path: Path, *, full_verify: bool, run_descriptor: int | None = None
+) -> ResolvedModel:
     verification = (
         VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
     )
@@ -493,7 +503,10 @@ def _resolve_lora_run(path: Path, *, full_verify: bool) -> ResolvedModel:
         else frozenset({_ADAPTER_GROUP})
     )
     with open_latest_checkpoint_reader(
-        path, verification=verification, load_array_groups=load_groups
+        path,
+        verification=verification,
+        load_array_groups=load_groups,
+        run_descriptor=run_descriptor,
     ) as reader:
         recovered = reader.resolved
         if not isinstance(recovered.run, LoRARunManifest):
@@ -535,20 +548,35 @@ def _resolve_lora_run(path: Path, *, full_verify: bool) -> ResolvedModel:
         )
 
 
-def _resolve_export(path: Path, *, full_verify: bool) -> ResolvedModel:
+def _resolve_opened_export(artifact, *, full_verify: bool) -> ResolvedModel:
     verification = (
         VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
     )
-    with open_artifact(path, (ExportManifest,), verification) as artifact:
-        model_config = _require_unit_rope(artifact.manifest.model, context="export")
-        with artifact.open_child(
-            "tokenizer", (TokenizerManifest,)
-        ) as tokenizer_artifact:
-            tokenizer = _load_opened_tokenizer_bundle(tokenizer_artifact)
-        if tokenizer.manifest.identity != artifact.manifest.tokenizer_identity:
-            raise SMLArtifactError("export tokenizer identity does not match manifest")
-        arrays = load_safetensors_payload(artifact, artifact.manifest.model_weights)
-        manifest = artifact.manifest
+    model_config = _require_unit_rope(artifact.manifest.model, context="export")
+    with artifact.open_child("tokenizer", (TokenizerManifest,)) as tokenizer_artifact:
+        tokenizer = _load_opened_tokenizer_bundle(tokenizer_artifact)
+        child_manifest = tokenizer_artifact.manifest
+        expected_model = PayloadRef(
+            f"tokenizer/{child_manifest.model.logical_path}",
+            child_manifest.model.identity,
+            child_manifest.model.byte_size,
+        )
+        expected_vocab = PayloadRef(
+            f"tokenizer/{child_manifest.vocab.logical_path}",
+            child_manifest.vocab.identity,
+            child_manifest.vocab.byte_size,
+        )
+        if (
+            artifact.manifest.tokenizer_model != expected_model
+            or artifact.manifest.tokenizer_vocab != expected_vocab
+        ):
+            raise SMLArtifactError(
+                "export tokenizer payload references do not bind its child manifest"
+            )
+    if tokenizer.manifest.identity != artifact.manifest.tokenizer_identity:
+        raise SMLArtifactError("export tokenizer identity does not match manifest")
+    arrays = load_safetensors_payload(artifact, artifact.manifest.model_weights)
+    manifest = artifact.manifest
     return ResolvedModel(
         artifact_kind=manifest.kind,
         run_identity=None,
@@ -562,22 +590,55 @@ def _resolve_export(path: Path, *, full_verify: bool) -> ResolvedModel:
     )
 
 
+def _resolve_export(path: Path, *, full_verify: bool) -> ResolvedModel:
+    verification = (
+        VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
+    )
+    with open_artifact(path, (ExportManifest,), verification) as artifact:
+        return _resolve_opened_export(artifact, full_verify=full_verify)
+
+
 def resolve_model_artifact(path: Path, *, full_verify: bool) -> ResolvedModel:
     path = _require_run_path(path)
     if not isinstance(full_verify, bool):
         raise TypeError("full_verify must be a bool")
-    if (path / PretrainingRunManifest.MANIFEST_FILENAME).exists():
-        recovered = recover_latest_index(
-            path,
-            writable=False,
-            verification=VerificationLevel.MANIFEST_TRUSTED,
-        )
-        if isinstance(recovered.run, PretrainingRunManifest):
-            return _resolve_pretraining_run(path, full_verify=full_verify)
-        if isinstance(recovered.run, LoRARunManifest):
-            return _resolve_lora_run(path, full_verify=full_verify)
-        raise SMLArtifactError("unsupported run kind for model resolution")
-    return _resolve_export(path, full_verify=full_verify)
+    verification = (
+        VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
+    )
+    with ArtifactRoot.open(path, writable=False) as root:
+        try:
+            with root.open_payload(PretrainingRunManifest.MANIFEST_FILENAME):
+                pass
+        except SMLArtifactError as error:
+            if not isinstance(error.__cause__, FileNotFoundError):
+                raise
+            is_run = False
+        else:
+            is_run = True
+        if is_run:
+            with _open_artifact_from_root(
+                path,
+                root.duplicate(),
+                (PretrainingRunManifest, LoRARunManifest),
+                verification,
+            ) as artifact:
+                if isinstance(artifact.manifest, PretrainingRunManifest):
+                    return _resolve_pretraining_run(
+                        path,
+                        full_verify=full_verify,
+                        run_descriptor=artifact.root.fileno(),
+                    )
+                if isinstance(artifact.manifest, LoRARunManifest):
+                    return _resolve_lora_run(
+                        path,
+                        full_verify=full_verify,
+                        run_descriptor=artifact.root.fileno(),
+                    )
+                raise SMLArtifactError("unsupported run kind for model resolution")
+        with _open_artifact_from_root(
+            path, root.duplicate(), (ExportManifest,), verification
+        ) as artifact:
+            return _resolve_opened_export(artifact, full_verify=full_verify)
 
 
 class InferenceSession:

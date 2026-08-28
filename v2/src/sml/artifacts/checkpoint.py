@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 
 if TYPE_CHECKING:
@@ -1759,12 +1759,15 @@ def _read_manifest_from_descriptor[M](
 class VerifiedCheckpointContents:
     scalar_state: Mapping[str, object]
     array_groups: Mapping[str, Mapping[str, mx.array]]
+    payload_bytes: Mapping[str, bytes] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.scalar_state, Mapping):
             raise TypeError("scalar_state must be a mapping")
         if not isinstance(self.array_groups, Mapping):
             raise TypeError("array_groups must be a mapping")
+        if not isinstance(self.payload_bytes, Mapping):
+            raise TypeError("payload_bytes must be a mapping")
         frozen_groups: dict[str, object] = {}
         for path, group in self.array_groups.items():
             if not isinstance(path, str) or not isinstance(group, Mapping):
@@ -1776,6 +1779,12 @@ class VerifiedCheckpointContents:
             _freeze_normalized(dict(self.scalar_state)),
         )
         object.__setattr__(self, "array_groups", _freeze_normalized(frozen_groups))
+        raw_payloads: dict[str, bytes] = {}
+        for path, raw in self.payload_bytes.items():
+            if not isinstance(path, str) or not isinstance(raw, bytes):
+                raise TypeError("payload_bytes must map paths to bytes")
+            raw_payloads[path] = raw
+        object.__setattr__(self, "payload_bytes", MappingProxyType(raw_payloads))
 
 
 def _mlx_core() -> ModuleType:
@@ -1830,7 +1839,7 @@ class CheckpointReader:
         return contents
 
     def read_payload_bytes(self, logical_path: str) -> bytes:
-        """Copy one proven payload through the owned step descriptor."""
+        """Return bytes materialized during the payload's original verification."""
 
         if not isinstance(logical_path, str):
             raise TypeError("logical_path must be a string")
@@ -1843,15 +1852,13 @@ class CheckpointReader:
             directory_descriptor=self._owned_step.descriptor,
             context="named checkpoint step before payload copy",
         )
-        local_apfs = _descriptor_is_local_apfs(self._owned_step.descriptor)
-        with (
-            ArtifactRoot(
-                os.dup(self._owned_step.descriptor),
-                local_apfs=local_apfs,
-            ) as root,
-            root.open_payload(logical_path) as payload,
-        ):
-            data = payload.read()
+        contents = self.read_contents()
+        try:
+            data = contents.payload_bytes[logical_path]
+        except KeyError as error:
+            raise SMLArtifactError(
+                f"checkpoint payload was not materialized: {logical_path}"
+            ) from error
         _require_named_directory_inode(
             self._fs,
             self._owned_step.name,
@@ -1884,6 +1891,7 @@ def _load_checkpoint_array_payload(
     reference: ArrayPayloadRef,
     *,
     full: bool,
+    payload_bytes: dict[str, bytes] | None = None,
 ) -> dict[str, mx.array]:
     mx = _mlx_core()
     logical_path = reference.payload.logical_path
@@ -1924,6 +1932,12 @@ def _load_checkpoint_array_payload(
                     )
             result = {name: arrays[name] for name in names}
             mx.eval(*result.values())
+            payload.seek(0)
+            raw_bytes = payload.read()
+            if len(raw_bytes) != reference.payload.byte_size:
+                raise SMLArtifactError(
+                    f"checkpoint payload byte size mismatch: {logical_path}"
+                )
             if full:
                 payload.seek(0)
                 if file_identity(payload) != reference.payload.identity:
@@ -1931,6 +1945,19 @@ def _load_checkpoint_array_payload(
                         "checkpoint payload changed while being consumed: "
                         f"{logical_path}"
                     )
+            consumed = os.fstat(payload.fileno())
+            if (
+                opened.st_dev != consumed.st_dev
+                or opened.st_ino != consumed.st_ino
+                or opened.st_size != consumed.st_size
+                or opened.st_mtime_ns != consumed.st_mtime_ns
+                or opened.st_ctime_ns != consumed.st_ctime_ns
+            ):
+                raise SMLArtifactError(
+                    f"checkpoint payload changed while being consumed: {logical_path}"
+                )
+            if payload_bytes is not None:
+                payload_bytes[logical_path] = raw_bytes
     except SMLArtifactError:
         raise
     except (OSError, TypeError, ValueError, RuntimeError) as error:
@@ -2226,9 +2253,10 @@ def _verify_checkpoint_semantics(
         selected = set(load_array_groups)
     with ArtifactRoot(os.dup(descriptor), local_apfs=local_apfs) as root:
         scalar = _read_checkpoint_scalar_payload(root, manifest, full=full)
+        payload_bytes: dict[str, bytes] = {}
         groups = {
             reference.payload.logical_path: _load_checkpoint_array_payload(
-                root, reference, full=full
+                root, reference, full=full, payload_bytes=payload_bytes
             )
             for reference in references
             if reference.payload.logical_path in selected
@@ -2298,7 +2326,7 @@ def _verify_checkpoint_semantics(
                 manifest.trainer,
                 master_specs=adapter_specs,
             )
-    return VerifiedCheckpointContents(scalar, groups)
+    return VerifiedCheckpointContents(scalar, groups, payload_bytes)
 
 
 def _validate_checkpoint_owner(
@@ -2475,6 +2503,29 @@ def _open_verified_step_from_descriptor(
             os.close(descriptor)
 
 
+def _close_reader_resources(
+    owned: _OwnedStep | None,
+    checkpoints_descriptor: int,
+    run_descriptor: int,
+) -> BaseException | None:
+    """Close every reader owner, retaining the first cleanup error."""
+    first_error: BaseException | None = None
+    closers: tuple[Callable[[], None], ...] = (
+        owned.close if owned is not None else (lambda: None),
+        (lambda: os.close(checkpoints_descriptor))
+        if checkpoints_descriptor >= 0
+        else (lambda: None),
+        (lambda: os.close(run_descriptor)) if run_descriptor >= 0 else (lambda: None),
+    )
+    for close in closers:
+        try:
+            close()
+        except BaseException as error:  # noqa: BLE001 - all descriptors must close
+            if first_error is None:
+                first_error = error
+    return first_error
+
+
 @contextmanager
 def open_checkpoint_reader(
     run: Path,
@@ -2525,6 +2576,7 @@ def open_checkpoint_reader(
         )
         checkpoints_descriptor = -1
         owned: _OwnedStep | None = None
+        failure: BaseException | None = None
         try:
             run_manifest = _read_manifest_from_descriptor(
                 run_descriptor,
@@ -2561,12 +2613,17 @@ def open_checkpoint_reader(
                 _checkpoints_descriptor=checkpoints_descriptor,
                 _fs=fs,
             )
+        except BaseException as error:
+            failure = error
+            raise
         finally:
-            if owned is not None:
-                owned.close()
-            if checkpoints_descriptor >= 0:
-                os.close(checkpoints_descriptor)
-            os.close(run_descriptor)
+            cleanup_error = _close_reader_resources(
+                owned, checkpoints_descriptor, run_descriptor
+            )
+            if cleanup_error is not None:
+                if failure is not None:
+                    raise failure from cleanup_error
+                raise cleanup_error
 
 
 @contextmanager
@@ -2575,6 +2632,7 @@ def open_latest_checkpoint_reader(
     *,
     verification: VerificationLevel = VerificationLevel.FULL,
     load_array_groups: frozenset[str] | None = None,
+    run_descriptor: int | None = None,
     fs: FilesystemOps = OS_FILESYSTEM,
 ) -> Iterator[CheckpointReader]:
     """Resolve and retain the latest checkpoint under one run-access lock."""
@@ -2587,29 +2645,36 @@ def open_latest_checkpoint_reader(
         or not all(isinstance(name, str) for name in load_array_groups)
     ):
         raise TypeError("load_array_groups must be a frozenset of strings or None")
+    if run_descriptor is not None and (
+        isinstance(run_descriptor, bool) or not isinstance(run_descriptor, int)
+    ):
+        raise TypeError("run_descriptor must be an int or None")
     if not isinstance(fs, FilesystemOps):
         raise TypeError("fs must implement FilesystemOps")
 
     with _protected_lock(run, category="run-access", exclusive=False, wait=True):
-        run_descriptor = _open_directory(
-            run, fs, writable=False, context="run directory"
+        owned_run_descriptor = (
+            os.dup(run_descriptor)
+            if run_descriptor is not None
+            else _open_directory(run, fs, writable=False, context="run directory")
         )
         checkpoints_descriptor = -1
         owned: _OwnedStep | None = None
+        failure: BaseException | None = None
         try:
             run_manifest = _read_manifest_from_descriptor(
-                run_descriptor,
+                owned_run_descriptor,
                 RUN_MANIFEST_TYPES,
                 verification,
                 context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
             )
             checkpoints_descriptor = _open_checkpoints_directory(
-                run, fs, run_descriptor, writable=False
+                run, fs, owned_run_descriptor, writable=False
             )
             recovered = _recover_latest_open(
                 run,
                 run_manifest,
-                run_descriptor,
+                owned_run_descriptor,
                 checkpoints_descriptor,
                 writable=False,
                 verification=verification,
@@ -2638,16 +2703,21 @@ def open_latest_checkpoint_reader(
             yield CheckpointReader(
                 resolved=reader_resolved,
                 _owned_step=owned,
-                _run_descriptor=run_descriptor,
+                _run_descriptor=owned_run_descriptor,
                 _checkpoints_descriptor=checkpoints_descriptor,
                 _fs=fs,
             )
+        except BaseException as error:
+            failure = error
+            raise
         finally:
-            if owned is not None:
-                owned.close()
-            if checkpoints_descriptor >= 0:
-                os.close(checkpoints_descriptor)
-            os.close(run_descriptor)
+            cleanup_error = _close_reader_resources(
+                owned, checkpoints_descriptor, owned_run_descriptor
+            )
+            if cleanup_error is not None:
+                if failure is not None:
+                    raise failure from cleanup_error
+                raise cleanup_error
 
 
 def _resolve_step_from_descriptor(

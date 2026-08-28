@@ -379,6 +379,14 @@ class ArtifactRoot:
     def local_apfs(self) -> bool:
         return self._local_apfs
 
+    def duplicate(self) -> ArtifactRoot:
+        """Return an independently owned descriptor for this same root inode."""
+        return ArtifactRoot(os.dup(self._fd), local_apfs=self._local_apfs)
+
+    def fileno(self) -> int:
+        """Expose the owned directory descriptor for descriptor-relative consumers."""
+        return self._fd
+
     def close(self) -> None:
         descriptor = self._fd
         self._fd = -1

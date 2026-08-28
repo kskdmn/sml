@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -10,15 +11,14 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 import zstandard as zstd
-from sml import inference as inference_module
 from sml.artifacts.checkpoint import resolve_latest_step
 from sml.artifacts.manifest import (
+    ArtifactRoot,
     BaseSnapshotManifest,
     ExportManifest,
     LatestIndex,
     LoRACheckpointManifest,
     LoRARunManifest,
-    OpenedArtifact,
     PayloadRef,
     VerificationLevel,
     canonical_json_bytes,
@@ -879,32 +879,27 @@ def test_merged_inference_uses_open_export_after_outer_name_replacement(
     )
     exported = export_merged(trained.run, tmp_path / "inference-export")
     displaced = tmp_path / "displaced-export"
-    closed: list[OpenedArtifact] = []
-    real_open_artifact = inference_module.open_artifact
+    descriptors: list[int] = []
+    real_duplicate = ArtifactRoot.duplicate
 
-    @contextmanager
-    def replace_outer_name(*args, **kwargs):
-        artifact = None
-        try:
-            with real_open_artifact(*args, **kwargs) as artifact:
-                exported.path.rename(displaced)
-                exported.path.mkdir()
-                try:
-                    yield artifact
-                finally:
-                    exported.path.rmdir()
-                    displaced.rename(exported.path)
-        finally:
-            if artifact is not None:
-                closed.append(artifact)
+    def replace_outer_name(root):
+        duplicated = real_duplicate(root)
+        descriptors.append(duplicated.fileno())
+        exported.path.rename(displaced)
+        exported.path.mkdir()
+        return duplicated
 
-    monkeypatch.setattr(inference_module, "open_artifact", replace_outer_name)
-
-    resolved = resolve_model_artifact(exported.path, full_verify=True)
+    monkeypatch.setattr(ArtifactRoot, "duplicate", replace_outer_name)
+    try:
+        resolved = resolve_model_artifact(exported.path, full_verify=True)
+    finally:
+        exported.path.rmdir()
+        displaced.rename(exported.path)
 
     assert resolved.artifact_kind == "export"
-    assert len(closed) == 1
-    assert closed[0].closed
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
 
 
 @pytest.mark.parametrize("replacement", ["tokenizer", "model.safetensors"])
@@ -921,37 +916,32 @@ def test_merged_inference_fails_closed_on_child_or_payload_replacement(
         )
     )
     exported = export_merged(trained.run, tmp_path / f"inference-{replacement}-export")
-    closed: list[OpenedArtifact] = []
-    real_open_artifact = inference_module.open_artifact
+    descriptors: list[int] = []
+    real_duplicate = ArtifactRoot.duplicate
+    target = exported.path / replacement
+    displaced = tmp_path / f"displaced-{replacement}"
 
-    @contextmanager
-    def replace_verified_name(*args, **kwargs):
-        artifact = None
-        try:
-            with real_open_artifact(*args, **kwargs) as artifact:
-                target = exported.path / replacement
-                if target.is_dir():
-                    displaced = tmp_path / f"displaced-{replacement}"
-                    target.rename(displaced)
-                    target.mkdir()
-                    try:
-                        yield artifact
-                    finally:
-                        target.rmdir()
-                        displaced.rename(target)
-                else:
-                    target.write_bytes(b"replacement")
-                    yield artifact
-        finally:
-            if artifact is not None:
-                closed.append(artifact)
+    def replace_verified_name(root):
+        duplicated = real_duplicate(root)
+        descriptors.append(duplicated.fileno())
+        if target.is_dir():
+            target.rename(displaced)
+            target.mkdir()
+        else:
+            target.write_bytes(b"replacement")
+        return duplicated
 
-    monkeypatch.setattr(inference_module, "open_artifact", replace_verified_name)
-
-    with pytest.raises(SMLArtifactError):
-        resolve_model_artifact(exported.path, full_verify=True)
-    assert len(closed) == 1
-    assert closed[0].closed
+    monkeypatch.setattr(ArtifactRoot, "duplicate", replace_verified_name)
+    try:
+        with pytest.raises(SMLArtifactError):
+            resolve_model_artifact(exported.path, full_verify=True)
+    finally:
+        if target.is_dir():
+            target.rmdir()
+            displaced.rename(target)
+    assert len(descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
 
 
 @pytest.mark.parametrize("child", ["base", "tokenizer"])
