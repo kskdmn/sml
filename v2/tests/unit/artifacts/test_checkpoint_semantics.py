@@ -233,6 +233,109 @@ def test_checkpoint_array_validation_uses_one_open_payload_through_posthash(
     assert payload_stream is not None and payload_stream.closed
 
 
+@pytest.mark.parametrize("full", [False, True])
+def test_checkpoint_array_payload_materializes_bytes_on_its_one_open_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, full: bool
+) -> None:
+    """Both verification levels retain one FD through load/eval/raw-byte capture."""
+    payload_path = tmp_path / "arrays.safetensors"
+    raw = b"original descriptor-owned checkpoint payload"
+    payload_path.write_bytes(raw)
+    reference = ArrayPayloadRef(
+        _payload_ref(payload_path, "arrays.safetensors"),
+        (ArraySpec("weight", (1,), "float32"),),
+    )
+    observed_fd: list[int] = []
+
+    class RecordingMlx:
+        def __getattr__(self, name: str):
+            return getattr(mx, name)
+
+        def load(self, stream, *, format):
+            assert format == "safetensors"
+            observed_fd.append(stream.fileno())
+            return {"weight": mx.array([1.0], dtype=mx.float32)}
+
+        def eval(self, *values):
+            assert values
+            assert os.fstat(observed_fd[0]).st_size == len(raw)
+
+    monkeypatch.setattr(checkpoint_module, "_mlx_core", lambda: RecordingMlx())
+    materialized: dict[str, bytes] = {}
+    with ArtifactRoot.open(tmp_path, writable=False) as root:
+        loaded = checkpoint_module._load_checkpoint_array_payload(
+            root, reference, full=full, payload_bytes=materialized
+        )
+
+    assert list(loaded) == ["weight"]
+    assert materialized == {"arrays.safetensors": raw}
+    with pytest.raises(OSError):
+        os.fstat(observed_fd[0])
+
+
+def test_checkpoint_array_payload_rejects_trusted_post_consumption_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Manifest-trusted loading still rejects a file changed during semantic use."""
+    payload_path = tmp_path / "arrays.safetensors"
+    payload_path.write_bytes(b"original descriptor-owned checkpoint payload")
+    reference = ArrayPayloadRef(
+        _payload_ref(payload_path, "arrays.safetensors"),
+        (ArraySpec("weight", (1,), "float32"),),
+    )
+    observed_fd: list[int] = []
+
+    class MutatingMlx:
+        def __getattr__(self, name: str):
+            return getattr(mx, name)
+
+        def load(self, stream, *, format):
+            observed_fd.append(stream.fileno())
+            return {"weight": mx.array([1.0], dtype=mx.float32)}
+
+        def eval(self, *_values):
+            payload_path.write_bytes(b"replacement")
+
+    monkeypatch.setattr(checkpoint_module, "_mlx_core", lambda: MutatingMlx())
+    with (
+        ArtifactRoot.open(tmp_path, writable=False) as root,
+        pytest.raises(SMLArtifactError, match="checkpoint payload"),
+    ):
+        checkpoint_module._load_checkpoint_array_payload(root, reference, full=False)
+    with pytest.raises(OSError):
+        os.fstat(observed_fd[0])
+
+
+def test_reader_returns_materialized_payload_bytes_after_logical_name_replacement(
+    tmp_path: Path,
+) -> None:
+    """Fresh-base callers cannot make the reader reopen a replaced payload name."""
+    run = _write_valid_checkpoint_run(tmp_path)
+    step = run / "checkpoints" / "step-000000000"
+    payload = step / "model.safetensors"
+    original = payload.read_bytes()
+    descriptors: list[int] = []
+    with open_checkpoint_reader(
+        run,
+        step=0,
+        load_array_groups=frozenset({"model.safetensors"}),
+    ) as reader:
+        descriptors.extend(
+            [
+                reader._run_descriptor,
+                reader._checkpoints_descriptor,
+                reader._owned_step.descriptor,
+            ]
+        )
+        moved = step / "retained-model.safetensors"
+        payload.rename(moved)
+        payload.write_bytes(b"replacement")
+        assert reader.read_payload_bytes("model.safetensors") == original
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_checkpoint_initial_step_name_swap_fails_opened_entry_revalidation(
     tmp_path: Path,
 ) -> None:

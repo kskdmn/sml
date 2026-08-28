@@ -650,6 +650,47 @@ def _resolve_latest_owned(run: Path, *, writable: bool) -> checkpoint.ResolvedSt
         )
 
 
+@pytest.mark.parametrize("latest", [False, True])
+def test_reader_cleanup_keeps_semantic_failure_primary_and_closes_all_fds(
+    valid_run: Path, monkeypatch: pytest.MonkeyPatch, latest: bool
+) -> None:
+    """Every reader descriptor closes even when owned-step cleanup also fails."""
+    original_close = checkpoint._OwnedStep.close
+    descriptors: list[int] = []
+    close_calls = 0
+
+    def close_then_fail(owned):
+        nonlocal close_calls
+        close_calls += 1
+        original_close(owned)
+        if close_calls == (2 if latest else 1):
+            raise RuntimeError("owned step cleanup failed")
+
+    monkeypatch.setattr(checkpoint._OwnedStep, "close", close_then_fail)
+    semantic = InjectedFailure("semantic body failure")
+    opener = (
+        checkpoint.open_latest_checkpoint_reader
+        if latest
+        else lambda run: checkpoint.open_checkpoint_reader(run, step=1)
+    )
+
+    with pytest.raises(InjectedFailure) as raised, opener(valid_run) as reader:
+        descriptors.extend(
+            [
+                reader._run_descriptor,
+                reader._checkpoints_descriptor,
+                reader._owned_step.descriptor,
+            ]
+        )
+        raise semantic
+
+    assert raised.value is semantic
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_run_writer_can_coexist_with_shared_run_access(tmp_path: Path) -> None:
     """Training ownership must not block a reader of immutable checkpoints."""
     run = tmp_path / "run-0001"

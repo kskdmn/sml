@@ -1165,3 +1165,32 @@ def test_resolve_rejects_export_that_changes_copied_base_rope(
     (exported.path / "manifest.json").write_bytes(canonical_json_bytes(tampered))
     with pytest.raises(SMLArtifactError):
         InferenceSession.from_checkpoint(exported.path, full_verify=True)
+
+
+def test_resolve_rejects_resigned_export_tokenizer_payload_mismatch(
+    tiny_base_run, tiny_swag_bundle, tmp_path
+):
+    """A self-consistent outer export must still bind its live tokenizer child."""
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "tokenizer-binding-run",
+            maximum_steps=1,
+        )
+    )
+    exported = export_merged(trained.run, tmp_path / "tokenizer-binding-export")
+    verified = read_manifest(
+        exported.path,
+        ExportManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    )
+    resigned = replace(
+        verified.manifest,
+        tokenizer_model=verified.manifest.tokenizer_vocab,
+    )
+    resigned = replace(resigned, identity=resigned.recompute_identity())
+    (exported.path / "manifest.json").write_bytes(canonical_json_bytes(resigned))
+
+    with pytest.raises(SMLArtifactError, match="tokenizer payload references"):
+        resolve_model_artifact(exported.path, full_verify=True)
