@@ -6,6 +6,7 @@ from typing import cast
 import mlx.core as mx
 from mlx import nn
 
+from sml.artifacts.manifest import ArraySpec
 from sml.model.cache import KVArrayState, KVCache
 from sml.model.config import InitializerConfig, ModelConfig
 from sml.model.layers import LoRAForwardPolicy, RMSNorm, TransformerBlock
@@ -27,6 +28,68 @@ class _VocabularyProjection(nn.Module):
 
     def __call__(self, hidden: mx.array) -> mx.array:
         return hidden @ self.weight.T
+
+
+def model_parameter_specs(config: ModelConfig) -> tuple[ArraySpec, ...]:
+    """Describe the persisted plain-model leaves without allocating a model."""
+    if not isinstance(config, ModelConfig):
+        raise TypeError("config must be a ModelConfig")
+    hidden_size = config.hidden_size
+    kv_size = config.num_kv_heads * config.head_dim
+    specs: list[ArraySpec] = [
+        ArraySpec("embed_tokens.weight", (config.vocab_size, hidden_size), "bfloat16")
+    ]
+    for layer_index in range(config.num_layers):
+        prefix = f"layers.{layer_index}"
+        specs.extend(
+            (
+                ArraySpec(f"{prefix}.input_norm.weight", (hidden_size,), "bfloat16"),
+                ArraySpec(
+                    f"{prefix}.self_attn.q_proj.weight",
+                    (hidden_size, hidden_size),
+                    "bfloat16",
+                ),
+                ArraySpec(
+                    f"{prefix}.self_attn.k_proj.weight",
+                    (kv_size, hidden_size),
+                    "bfloat16",
+                ),
+                ArraySpec(
+                    f"{prefix}.self_attn.v_proj.weight",
+                    (kv_size, hidden_size),
+                    "bfloat16",
+                ),
+                ArraySpec(
+                    f"{prefix}.self_attn.o_proj.weight",
+                    (hidden_size, hidden_size),
+                    "bfloat16",
+                ),
+                ArraySpec(
+                    f"{prefix}.post_attn_norm.weight", (hidden_size,), "bfloat16"
+                ),
+                ArraySpec(
+                    f"{prefix}.mlp.gate_proj.weight",
+                    (config.intermediate_size, hidden_size),
+                    "bfloat16",
+                ),
+                ArraySpec(
+                    f"{prefix}.mlp.up_proj.weight",
+                    (config.intermediate_size, hidden_size),
+                    "bfloat16",
+                ),
+                ArraySpec(
+                    f"{prefix}.mlp.down_proj.weight",
+                    (hidden_size, config.intermediate_size),
+                    "bfloat16",
+                ),
+            )
+        )
+    specs.append(ArraySpec("norm.weight", (hidden_size,), "bfloat16"))
+    if not config.tie_word_embeddings:
+        specs.append(
+            ArraySpec("lm_head.weight", (config.vocab_size, hidden_size), "bfloat16")
+        )
+    return tuple(sorted(specs, key=lambda spec: spec.name))
 
 
 @dataclass(slots=True)

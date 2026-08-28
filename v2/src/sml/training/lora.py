@@ -9,7 +9,9 @@ import mlx.core as mx
 from mlx import nn
 from mlx.utils import tree_flatten
 
+from sml.artifacts.manifest import ArraySpec
 from sml.errors import SMLConfigurationError
+from sml.model.config import ModelConfig
 from sml.model.layers import LoRAAdapterSpec, LoRAForwardPolicy, _Linear, _linear
 
 _ALLOWED_TARGET_MODULES = (
@@ -321,6 +323,44 @@ def lora_state_dict(model) -> dict[str, mx.array]:
         state[f"{prefix}lora_a"] = module.lora_a
         state[f"{prefix}lora_b"] = module.lora_b
     return dict(sorted(state.items()))
+
+
+def lora_parameter_specs(
+    model_config: ModelConfig,
+    lora_config: LoRAConfig,
+) -> tuple[ArraySpec, ...]:
+    """Describe persisted LoRA leaves without constructing a transformed model."""
+    if not isinstance(model_config, ModelConfig):
+        raise TypeError("model_config must be a ModelConfig")
+    if not isinstance(lora_config, LoRAConfig):
+        raise TypeError("lora_config must be a LoRAConfig")
+    hidden_size = model_config.hidden_size
+    kv_size = model_config.num_kv_heads * model_config.head_dim
+    dimensions = {
+        "q_proj": (hidden_size, hidden_size, "self_attn"),
+        "k_proj": (kv_size, hidden_size, "self_attn"),
+        "v_proj": (kv_size, hidden_size, "self_attn"),
+        "o_proj": (hidden_size, hidden_size, "self_attn"),
+        "gate_proj": (model_config.intermediate_size, hidden_size, "mlp"),
+        "up_proj": (model_config.intermediate_size, hidden_size, "mlp"),
+        "down_proj": (hidden_size, model_config.intermediate_size, "mlp"),
+    }
+    specs: list[ArraySpec] = []
+    for layer_index in range(model_config.num_layers):
+        for target in lora_config.target_modules:
+            output_size, input_size, parent = dimensions[target]
+            prefix = f"layers.{layer_index}.{parent}.{target}"
+            specs.extend(
+                (
+                    ArraySpec(
+                        f"{prefix}.lora_a", (lora_config.rank, input_size), "float32"
+                    ),
+                    ArraySpec(
+                        f"{prefix}.lora_b", (output_size, lora_config.rank), "float32"
+                    ),
+                )
+            )
+    return tuple(sorted(specs, key=lambda spec: spec.name))
 
 
 def load_lora_state_dict(model, state: dict[str, mx.array]) -> None:

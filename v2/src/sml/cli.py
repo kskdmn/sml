@@ -1150,5 +1150,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     except _DOMAIN_ERRORS as error:
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
         return _EXIT_CODES[type(error)]
-    print(result)
+    close = getattr(result, "close", None)
+    if close is not None and not callable(close):
+        close = None
+    try:
+        print(result)
+    except BaseException as error:
+        if close is not None:
+            try:
+                close()
+            except BaseException as close_error:
+                raise error from close_error
+        raise
+    if close is not None:
+        close()
     return 0

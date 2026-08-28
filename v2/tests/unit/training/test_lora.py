@@ -22,6 +22,7 @@ from sml.training.lora import (
     apply_lora,
     load_lora_state_dict,
     lora_config_from_mapping,
+    lora_parameter_specs,
     lora_state_dict,
     merged_model_weights,
     split_adapter_parameters,
@@ -222,6 +223,63 @@ def test_lora_dtype_boundaries_and_live_formula(tiny_model):
     assert layer.lora_a.dtype == mx.float32
     assert layer.lora_b.dtype == mx.float32
     assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("targets", "rank", "expected_names"),
+    [
+        (
+            ("q_proj",),
+            2,
+            (
+                "layers.0.self_attn.q_proj.lora_a",
+                "layers.0.self_attn.q_proj.lora_b",
+                "layers.1.self_attn.q_proj.lora_a",
+                "layers.1.self_attn.q_proj.lora_b",
+            ),
+        ),
+        (
+            ("k_proj", "down_proj"),
+            3,
+            (
+                "layers.0.mlp.down_proj.lora_a",
+                "layers.0.mlp.down_proj.lora_b",
+                "layers.0.self_attn.k_proj.lora_a",
+                "layers.0.self_attn.k_proj.lora_b",
+                "layers.1.mlp.down_proj.lora_a",
+                "layers.1.mlp.down_proj.lora_b",
+                "layers.1.self_attn.k_proj.lora_a",
+                "layers.1.self_attn.k_proj.lora_b",
+            ),
+        ),
+    ],
+)
+def test_lora_parameter_specs_match_adapter_state(
+    tiny_model_config,
+    targets,
+    rank,
+    expected_names,
+):
+    """Catches adapter manifest metadata drifting from transformed-model leaves."""
+    config = tiny_lora_config(target_modules=targets, rank=rank)
+    model = SMLLanguageModel(tiny_model_config, key=mx.random.key(43))
+    apply_lora(model, config, key=mx.random.key(47))
+
+    actual = {
+        spec.name: (spec.shape, spec.dtype)
+        for spec in lora_parameter_specs(tiny_model_config, config)
+    }
+    expected = {
+        name: (tuple(value.shape), str(value.dtype).removeprefix("mlx.core."))
+        for name, value in lora_state_dict(model).items()
+    }
+
+    assert tuple(actual) == expected_names
+    assert actual == expected
+    assert all(name.endswith((".lora_a", ".lora_b")) for name in actual)
+    assert all(dtype == "float32" for _shape, dtype in actual.values())
+    assert actual[expected_names[0]][0][0] == rank
+    assert actual[expected_names[1]][0][1] == rank
 
 
 def test_shared_linear_formula_matches_live_wrapper_and_manual_dropout_oracle():

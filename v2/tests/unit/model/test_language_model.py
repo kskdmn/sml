@@ -11,7 +11,12 @@ from mlx import nn
 from mlx.utils import tree_flatten, tree_map
 from sml.model.cache import KVCache
 from sml.model.config import ModelConfig
-from sml.model.language_model import ForwardOutput, SMLLanguageModel, causal_lm_loss
+from sml.model.language_model import (
+    ForwardOutput,
+    SMLLanguageModel,
+    causal_lm_loss,
+    model_parameter_specs,
+)
 from sml.model.layers import LoRAAdapterSpec, LoRAForwardPolicy
 
 
@@ -96,6 +101,30 @@ def test_untied_model_registers_an_independent_vocabulary_head():
     assert parameters["lm_head.weight"].shape == (64, 16)
     assert parameters["embed_tokens.weight"] is not parameters["lm_head.weight"]
     assert parameters["lm_head.weight"].dtype == mx.bfloat16
+
+
+@pytest.mark.parametrize("tie_word_embeddings", [True, False])
+def test_model_parameter_specs_match_plain_model_state(tie_word_embeddings):
+    """Catches artifact metadata drifting from the persisted model leaves."""
+    config = _tiny_model_config(tie_word_embeddings=tie_word_embeddings)
+    model = SMLLanguageModel(config, key=mx.random.key(41))
+    actual = {
+        spec.name: (spec.shape, spec.dtype) for spec in model_parameter_specs(config)
+    }
+    expected = {
+        name: (tuple(value.shape), str(value.dtype).removeprefix("mlx.core."))
+        for name, value in tree_flatten(model.parameters())
+    }
+
+    assert actual == expected
+    assert actual["embed_tokens.weight"] == ((64, 16), "bfloat16")
+    assert ("lm_head.weight" in actual) is (not tie_word_embeddings)
+
+
+def test_model_config_rejects_invalid_parameter_projection_dimensions():
+    """Catches accepting a configuration that cannot describe model leaves."""
+    with pytest.raises(ValueError, match="divisible"):
+        _tiny_model_config(hidden_size=15)
 
 
 def test_initialization_is_replayable_and_replaces_parameters_explicitly():

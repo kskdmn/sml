@@ -34,6 +34,7 @@ from sml.artifacts.manifest import (
     LatestIndex,
     LoRACheckpointManifest,
     LoRARunManifest,
+    OpenedArtifact,
     PayloadRef,
     PretrainingCheckpointManifest,
     PretrainingDataManifest,
@@ -46,6 +47,7 @@ from sml.artifacts.manifest import (
     _freeze_normalized,
     _json_object_no_duplicates,
     _manifest_type_for_raw,
+    _open_artifact_from_root,
     _parse_manifest,
     _reject_json_constant,
     canonical_json_bytes,
@@ -1786,8 +1788,32 @@ class CheckpointReader:
 
     resolved: ResolvedStep
     _owned_step: _OwnedStep
+    _run_descriptor: int
     _checkpoints_descriptor: int
     _fs: FilesystemOps
+
+    def open_run_child(
+        self,
+        logical_path: str,
+        manifest_types: tuple[type, ...],
+    ) -> OpenedArtifact:
+        """Open a manifest-bound run child through this reader's run inode."""
+        if self._owned_step.descriptor < 0 or self._run_descriptor < 0:
+            raise SMLArtifactError("checkpoint reader is closed")
+        root = ArtifactRoot(
+            os.dup(self._run_descriptor),
+            local_apfs=_descriptor_is_local_apfs(self._run_descriptor),
+        )
+        try:
+            child_root = root.open_child(logical_path)
+        finally:
+            root.close()
+        return _open_artifact_from_root(
+            self.resolved.step_directory.parent.parent / logical_path,
+            child_root,
+            manifest_types,
+            self.resolved.verification,
+        )
 
     def read_contents(self) -> VerifiedCheckpointContents:
         """Return identity-bound contents only while the step name remains bound."""
@@ -2531,6 +2557,88 @@ def open_checkpoint_reader(
             yield CheckpointReader(
                 resolved=owned.resolved,
                 _owned_step=owned,
+                _run_descriptor=run_descriptor,
+                _checkpoints_descriptor=checkpoints_descriptor,
+                _fs=fs,
+            )
+        finally:
+            if owned is not None:
+                owned.close()
+            if checkpoints_descriptor >= 0:
+                os.close(checkpoints_descriptor)
+            os.close(run_descriptor)
+
+
+@contextmanager
+def open_latest_checkpoint_reader(
+    run: Path,
+    *,
+    verification: VerificationLevel = VerificationLevel.FULL,
+    load_array_groups: frozenset[str] | None = None,
+    fs: FilesystemOps = OS_FILESYSTEM,
+) -> Iterator[CheckpointReader]:
+    """Resolve and retain the latest checkpoint under one run-access lock."""
+    if not isinstance(run, Path):
+        raise TypeError("run must be a Path")
+    if not isinstance(verification, VerificationLevel):
+        raise TypeError("verification must be a VerificationLevel")
+    if load_array_groups is not None and (
+        not isinstance(load_array_groups, frozenset)
+        or not all(isinstance(name, str) for name in load_array_groups)
+    ):
+        raise TypeError("load_array_groups must be a frozenset of strings or None")
+    if not isinstance(fs, FilesystemOps):
+        raise TypeError("fs must implement FilesystemOps")
+
+    with _protected_lock(run, category="run-access", exclusive=False, wait=True):
+        run_descriptor = _open_directory(
+            run, fs, writable=False, context="run directory"
+        )
+        checkpoints_descriptor = -1
+        owned: _OwnedStep | None = None
+        try:
+            run_manifest = _read_manifest_from_descriptor(
+                run_descriptor,
+                RUN_MANIFEST_TYPES,
+                verification,
+                context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
+            )
+            checkpoints_descriptor = _open_checkpoints_directory(
+                run, fs, run_descriptor, writable=False
+            )
+            recovered = _recover_latest_open(
+                run,
+                run_manifest,
+                run_descriptor,
+                checkpoints_descriptor,
+                writable=False,
+                verification=verification,
+                fs=fs,
+                allow_empty=False,
+            )
+            if recovered is None:
+                raise SMLArtifactError("run has no published checkpoints")
+            owned = _open_verified_step_from_descriptor(
+                run,
+                run_manifest,
+                checkpoints_descriptor,
+                step=recovered.step,
+                verification=verification,
+                fs=fs,
+                load_array_groups=load_array_groups,
+            )
+            if owned.resolved.checkpoint.identity != recovered.checkpoint.identity:
+                raise SMLArtifactError("resolved latest changed before state loading")
+            reader_resolved = dataclasses.replace(
+                owned.resolved,
+                latest_recovered=recovered.latest_recovered,
+                latest_repair_persisted=recovered.latest_repair_persisted,
+            )
+            owned.resolved = reader_resolved
+            yield CheckpointReader(
+                resolved=reader_resolved,
+                _owned_step=owned,
+                _run_descriptor=run_descriptor,
                 _checkpoints_descriptor=checkpoints_descriptor,
                 _fs=fs,
             )
@@ -3598,6 +3706,7 @@ __all__ = [
     "ResolvedStep",
     "VerifiedCheckpointContents",
     "open_checkpoint_reader",
+    "open_latest_checkpoint_reader",
     "prune_to_latest",
     "publication_lock",
     "publish_checkpoint",

@@ -13,6 +13,47 @@ from sml.errors import (
 )
 
 
+def test_main_closes_descriptor_owning_dispatch_results(monkeypatch) -> None:
+    """Catches CLI output leaving a prepared SWAG bundle live."""
+    closed: list[bool] = []
+
+    class Result:
+        def close(self) -> None:
+            closed.append(True)
+
+    class Command:
+        def dispatch(self) -> Result:
+            return Result()
+
+    monkeypatch.setattr("sml.cli.parse_command", lambda _arguments: Command())
+
+    assert main(["verify", "run"]) == 0
+    assert closed == [True]
+
+
+def test_main_preserves_dispatch_error_when_result_cleanup_also_fails(
+    monkeypatch,
+) -> None:
+    """Catches cleanup masking a semantic error raised while printing a result."""
+
+    class Result:
+        def __str__(self) -> str:
+            raise SMLArtifactError("semantic failure")
+
+        def close(self) -> None:
+            raise RuntimeError("cleanup failure")
+
+    class Command:
+        def dispatch(self) -> Result:
+            return Result()
+
+    monkeypatch.setattr("sml.cli.parse_command", lambda _arguments: Command())
+
+    with pytest.raises(SMLArtifactError, match="semantic failure") as caught:
+        main(["verify", "run"])
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
 def test_cli_precedence_is_defaults_then_toml_then_explicit(tmp_path):
     config = tmp_path / "train.toml"
     config.write_text(

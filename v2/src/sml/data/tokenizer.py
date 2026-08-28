@@ -13,12 +13,12 @@ from typing import Any
 
 from sml.artifacts.checkpoint import publish_immutable_bundle
 from sml.artifacts.manifest import (
-    ArtifactRoot,
+    OpenedArtifact,
     PayloadRef,
     TokenizerManifest,
     VerificationLevel,
     file_identity,
-    read_manifest,
+    open_artifact,
 )
 from sml.data.corpus import CorpusConfig, discover_corpus_files, iter_filtered_texts
 from sml.errors import SMLArtifactError, SMLDataError
@@ -433,20 +433,13 @@ def _validate_training_metadata(manifest: TokenizerManifest) -> None:
         ) from error
 
 
-def load_tokenizer_bundle(
-    path: Path,
-    verification: VerificationLevel,
+def _load_opened_tokenizer_bundle(
+    artifact: OpenedArtifact[TokenizerManifest],
 ) -> LoadedTokenizer:
-    """Verify the bundle and the processor-visible model contract before use."""
-    if not isinstance(path, Path):
-        raise TypeError("path must be a Path")
-    if not isinstance(verification, VerificationLevel):
-        raise TypeError("verification must be a VerificationLevel")
-    if not path.is_dir():
-        raise SMLArtifactError(f"tokenizer bundle directory is required: {path}")
-
-    verified = read_manifest(path, TokenizerManifest, verification)
-    manifest = verified.manifest
+    """Build a tokenizer from one retained, manifest-bound artifact owner."""
+    if not isinstance(artifact, OpenedArtifact):
+        raise TypeError("artifact must be an OpenedArtifact")
+    manifest = artifact.manifest
     if manifest.algorithm != "bpe":
         raise SMLArtifactError("tokenizer manifest algorithm must be 'bpe'")
     if manifest.model.logical_path != _MODEL_FILENAME:
@@ -455,14 +448,10 @@ def load_tokenizer_bundle(
         raise SMLArtifactError("tokenizer vocab logical path must be tokenizer.vocab")
     _validate_training_metadata(manifest)
 
-    with ArtifactRoot.open(path, writable=False) as artifact_root:
-        with artifact_root.open_payload(_MODEL_FILENAME) as model_payload:
-            model_bytes = model_payload.read()
-        with artifact_root.open_payload(_VOCAB_FILENAME) as vocab_payload:
-            vocab_bytes = vocab_payload.read()
-    full = verification is VerificationLevel.FULL
-    _verify_consumed_payload(manifest.model, model_bytes, full=full)
-    _verify_consumed_payload(manifest.vocab, vocab_bytes, full=full)
+    with artifact.open_payload(manifest.model) as model_payload:
+        model_bytes = model_payload.stream.read()
+    with artifact.open_payload(manifest.vocab) as vocab_payload:
+        vocab_bytes = vocab_payload.stream.read()
     vocab_entries = _read_vocab(vocab_bytes)
 
     import sentencepiece
@@ -507,11 +496,26 @@ def load_tokenizer_bundle(
                 f"tokenizer {name} special ID mismatch: expected {expected}, got {actual}"
             )
     return LoadedTokenizer(
-        path=path,
+        path=artifact.path,
         manifest=manifest,
-        verification=verified.verification,
+        verification=artifact.verification,
         processor=processor,
     )
+
+
+def load_tokenizer_bundle(
+    path: Path,
+    verification: VerificationLevel,
+) -> LoadedTokenizer:
+    """Verify the bundle and materialize a tokenizer independent of its files."""
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
+    if not isinstance(verification, VerificationLevel):
+        raise TypeError("verification must be a VerificationLevel")
+    if not path.is_dir():
+        raise SMLArtifactError(f"tokenizer bundle directory is required: {path}")
+    with open_artifact(path, (TokenizerManifest,), verification) as artifact:
+        return _load_opened_tokenizer_bundle(artifact)
 
 
 __all__ = [

@@ -13,6 +13,7 @@ from sml.artifacts.manifest import (
     TokenizerManifest,
     VerificationLevel,
     canonical_json_bytes,
+    open_artifact,
     read_manifest,
 )
 from sml.data.corpus import CorpusConfig
@@ -431,12 +432,12 @@ def test_full_loader_rehashes_the_exact_bytes_passed_to_processor(
     output = tmp_path / "bundle"
     train_tokenizer_bundle(_config(tmp_path), output)
 
-    def swap_after_manifest(*args):
-        verified = read_manifest(*args)
+    def swap_after_open(*args):
+        artifact = open_artifact(*args)
         (output / "tokenizer.model").write_bytes(b"other")
-        return verified
+        return artifact
 
-    monkeypatch.setattr("sml.data.tokenizer.read_manifest", swap_after_manifest)
+    monkeypatch.setattr("sml.data.tokenizer.open_artifact", swap_after_open)
 
     with pytest.raises(SMLArtifactError, match="model.*identity|identity.*model"):
         load_tokenizer_bundle(output, VerificationLevel.FULL)
