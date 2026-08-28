@@ -2473,15 +2473,18 @@ def _open_verified_step_from_descriptor(
             manifest_present=True,
             full=verification is VerificationLevel.FULL,
         )
+        effective_load_groups = load_array_groups
+        if effective_load_groups is None and materialize_byte_groups:
+            effective_load_groups = materialize_byte_groups
         materialize = (
-            verification is VerificationLevel.FULL or load_array_groups is not None
+            verification is VerificationLevel.FULL or effective_load_groups is not None
         )
         contents = (
             _verify_checkpoint_semantics(
                 descriptor,
                 manifest,
                 verification,
-                load_array_groups=load_array_groups,
+                load_array_groups=effective_load_groups,
                 materialize_byte_groups=materialize_byte_groups,
             )
             if materialize

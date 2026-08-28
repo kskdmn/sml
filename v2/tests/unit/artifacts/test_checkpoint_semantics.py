@@ -353,6 +353,33 @@ def test_checkpoint_reader_retains_only_explicitly_requested_raw_bytes(
         assert set(reader.read_contents().payload_bytes) == {"model.safetensors"}
 
 
+def test_trusted_reader_materializes_requested_bytes_without_array_selection(
+    tmp_path: Path,
+) -> None:
+    """A nonempty byte request is itself an exact trusted-mode load selection."""
+    run = _write_valid_checkpoint_run(tmp_path)
+    descriptors: list[int] = []
+    with open_checkpoint_reader(
+        run,
+        step=0,
+        verification=VerificationLevel.MANIFEST_TRUSTED,
+        materialize_byte_groups=frozenset({"model.safetensors"}),
+    ) as reader:
+        descriptors.extend(
+            [
+                reader._run_descriptor,
+                reader._checkpoints_descriptor,
+                reader._owned_step.descriptor,
+            ]
+        )
+        contents = reader.read_contents()
+        assert set(contents.array_groups) == {"model.safetensors"}
+        assert set(contents.payload_bytes) == {"model.safetensors"}
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
 def test_checkpoint_initial_step_name_swap_fails_opened_entry_revalidation(
     tmp_path: Path,
 ) -> None:
