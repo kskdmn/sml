@@ -45,6 +45,23 @@ _SOURCE_REQUEST_FIELDS = (
     "revision",
     "split",
 )
+_SOURCE_RESOLVED_FIELDS = (
+    *_SOURCE_REQUEST_FIELDS,
+    "commit",
+    "provider_fingerprint",
+    "provider_package",
+    "provider_version",
+)
+_PREPROCESSING_FIELDS = {
+    "schema_version",
+    "join_policy",
+    "overlength_policy",
+    "bos_policy",
+    "eos_policy",
+    "maximum_length",
+    "bucket_boundaries",
+    "maximum_examples",
+}
 _ARRAY_NAMES = ("input_ids", "valid_token_mask", "score_mask", "labels")
 _INGEST_CHUNK_SIZE = 1024
 JOIN_POLICY_V1 = "separate-context-ending-v1"
@@ -644,7 +661,19 @@ def _recorded_identity_is_valid(value: object) -> bool:
 
 
 def _validate_recorded_projections(manifest: SwagDataManifest) -> None:
+    source = manifest.source
+    if set(source) != set(_SOURCE_RESOLVED_FIELDS):
+        raise SMLArtifactError("invalid SWAG source projection")
+    try:
+        resolved_source = ResolvedSwagSource(**dict(source))
+    except (TypeError, ValueError) as error:
+        raise SMLArtifactError("invalid SWAG source projection") from error
+    if _resolved_source_projection(resolved_source) != source:
+        raise SMLArtifactError("invalid SWAG source projection")
+
     preprocessing = manifest.preprocessing
+    if set(preprocessing) != _PREPROCESSING_FIELDS:
+        raise SMLArtifactError("invalid SWAG preprocessing projection")
     if preprocessing.get("schema_version") != 1:
         raise SMLArtifactError("unsupported SWAG preprocessing schema")
     expected_policies = {
@@ -677,6 +706,15 @@ def _validate_recorded_projections(manifest: SwagDataManifest) -> None:
         previous = boundary
     if boundaries[-1] < maximum_length:
         raise SMLArtifactError("SWAG bucket_boundaries do not cover maximum_length")
+    maximum_examples = preprocessing.get("maximum_examples")
+    if maximum_examples is not None and (
+        isinstance(maximum_examples, bool)
+        or not isinstance(maximum_examples, int)
+        or maximum_examples < 1
+    ):
+        raise SMLArtifactError("invalid SWAG maximum_examples")
+    if not _recorded_identity_is_valid(manifest.base_identity):
+        raise SMLArtifactError("invalid SWAG base identity")
     if not _recorded_identity_is_valid(manifest.tokenizer_identity):
         raise SMLArtifactError("invalid SWAG tokenizer identity")
     vocab_size = manifest.vocab_size
@@ -905,8 +943,17 @@ def _group_manifest_buckets(
             raise SMLArtifactError(
                 f"invalid SWAG bucket path: {reference.payload.logical_path}"
             )
-        length = int(parts[1].removeprefix("length-"))
+        try:
+            length = int(parts[1].removeprefix("length-"))
+        except ValueError as error:
+            raise SMLArtifactError(
+                f"invalid SWAG bucket path: {reference.payload.logical_path}"
+            ) from error
         name = Path(parts[2]).stem
+        if parts[1] != f"length-{length:04d}":
+            raise SMLArtifactError(
+                f"noncanonical SWAG bucket path: {reference.payload.logical_path}"
+            )
         if name not in _ARRAY_NAMES:
             raise SMLArtifactError(f"unexpected SWAG array name: {name}")
         bucket = grouped.setdefault(length, {})
@@ -969,6 +1016,10 @@ def _validate_bucket_arrays(
     if input_ids.shape[0] and np.any(~last_scored):
         raise SMLArtifactError("SWAG EOS token is not scored")
     first_score = np.argmax(score_mask, axis=-1)
+    if input_ids.shape[0] and np.any(first_score != first_score[:, :1]):
+        raise SMLArtifactError(
+            "SWAG score masks must share one context boundary per example"
+        )
     positions = np.arange(input_ids.shape[-1])
     expected_score = (positions >= first_score[..., None]) & (
         positions < lengths[..., None]
@@ -1066,17 +1117,15 @@ def _open_buckets(
         raise
 
 
-def _load_swag_bundle(
-    path: Path,
-    verification: VerificationLevel,
+def _load_opened_swag_bundle(
+    artifact: OpenedArtifact[SwagDataManifest],
     *,
     validate_projections: bool,
 ) -> SwagDataBundle:
-    if not isinstance(path, Path):
-        raise TypeError("path must be a Path")
-    if not isinstance(verification, VerificationLevel):
-        raise TypeError("verification must be a VerificationLevel")
-    artifact = open_artifact(path, (SwagDataManifest,), verification)
+    if not isinstance(artifact, OpenedArtifact):
+        raise TypeError("artifact must be an OpenedArtifact")
+    if not isinstance(artifact.manifest, SwagDataManifest):
+        raise TypeError("artifact must own a SwagDataManifest")
     buckets: tuple[SwagBucket, ...] = ()
     mappings: tuple[_OwnedNpyMapping, ...] = ()
     detached_root: ArtifactRoot | None = None
@@ -1086,7 +1135,7 @@ def _load_swag_bundle(
         buckets, mappings = _open_buckets(artifact, artifact.manifest)
         detached_root = artifact.detach_root()
         bundle = SwagDataBundle(
-            path,
+            artifact.path,
             artifact.manifest,
             artifact.verification,
             buckets,
@@ -1112,6 +1161,23 @@ def _load_swag_bundle(
         if cleanup_errors:
             raise error from cleanup_errors[0]
         raise
+
+
+def _load_swag_bundle(
+    path: Path,
+    verification: VerificationLevel,
+    *,
+    validate_projections: bool,
+) -> SwagDataBundle:
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
+    if not isinstance(verification, VerificationLevel):
+        raise TypeError("verification must be a VerificationLevel")
+    artifact = open_artifact(path, (SwagDataManifest,), verification)
+    return _load_opened_swag_bundle(
+        artifact,
+        validate_projections=validate_projections,
+    )
 
 
 def load_swag_bundle(path: Path, verification: VerificationLevel) -> SwagDataBundle:

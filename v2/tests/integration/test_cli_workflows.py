@@ -5,13 +5,27 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from importlib import metadata
 from pathlib import Path
 
 import pytest
 import zstandard as zstd
-from sml.artifacts.manifest import VerificationLevel
+from sml.artifacts.manifest import (
+    BaseSnapshotManifest,
+    ExportManifest,
+    LatestIndex,
+    LoRACheckpointManifest,
+    LoRARunManifest,
+    PayloadRef,
+    VerificationLevel,
+    canonical_json_bytes,
+    file_identity,
+    read_checkpoint_manifest,
+    read_manifest,
+)
+from sml.artifacts.verify import VerificationResult, verify_artifact
+from sml.errors import SMLArtifactError
 from sml.evaluation import read_evaluation_result
 from sml.evaluation_result import normalize_json_value
 from sml.inference import ModelIdentity, resolve_model_artifact
@@ -395,7 +409,7 @@ def cli_workspace(tmp_path_factory: pytest.TempPathFactory) -> CLIWorkspace:
             [finetune.lora]
             rank = 2
             alpha = 4.0
-            dropout = 0.0
+            dropout = 0.1
             target_modules = ["q_proj", "v_proj"]
             """,
         ),
@@ -422,6 +436,61 @@ def _manifest(path: Path) -> dict[str, object]:
 
 def _latest_step(path: Path) -> int:
     return int(json.loads((path / "latest.json").read_text(encoding="utf-8"))["step"])
+
+
+def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
+    with path.open("rb") as payload:
+        identity = file_identity(payload)
+    return PayloadRef(logical_path, identity, path.stat().st_size)
+
+
+def _rebind_lora_run_checkpoint(
+    run: Path,
+    manifest: LoRARunManifest,
+) -> None:
+    latest = read_manifest(
+        run,
+        LatestIndex,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    step = run / "checkpoints" / f"step-{latest.step:09d}"
+    checkpoint = read_checkpoint_manifest(
+        step,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    assert isinstance(checkpoint, LoRACheckpointManifest)
+    state_path = step / checkpoint.scalar_state.logical_path
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["owning_run_identity"] = manifest.identity
+    state_path.write_bytes(canonical_json_bytes(state))
+    checkpoint = replace(
+        checkpoint,
+        owning_run_identity=manifest.identity,
+        scalar_state=_payload_ref(state_path, checkpoint.scalar_state.logical_path),
+    )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    (step / "checkpoint.json").write_bytes(canonical_json_bytes(checkpoint))
+    latest = replace(
+        latest,
+        owning_run_identity=manifest.identity,
+        checkpoint_identity=checkpoint.identity,
+    )
+    latest = replace(latest, identity=latest.recompute_identity())
+    (run / "latest.json").write_bytes(canonical_json_bytes(latest))
+
+
+def _result_tree(result: VerificationResult) -> tuple[str, tuple]:
+    return (
+        result.manifest.kind,
+        tuple(_result_tree(child) for child in result.children),
+    )
+
+
+def _all_levels(result: VerificationResult) -> tuple[VerificationLevel, ...]:
+    return (
+        result.verification,
+        *(level for child in result.children for level in _all_levels(child)),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -598,6 +667,144 @@ def test_every_cli_workflow_runs_offline_in_subprocesses(
     assert "VerificationLevel.FULL" in workspace.results["base_infer_full"].stdout
     assert "artifact_kind='export'" in workspace.results["export_infer"].stdout
     assert "VerificationLevel.FULL" in workspace.results["verify"].stdout
+
+
+def test_recursive_verify_reports_exact_owned_trees_at_both_levels(
+    completed_cli_workspace: CLIWorkspace,
+) -> None:
+    """Owner recursion must be complete, ordered, and independent of directory order."""
+    workspace = completed_cli_workspace
+    cases = (
+        (workspace.tokenizer, ("tokenizer", ())),
+        (
+            workspace.pretraining_data,
+            ("pretraining-data", (("tokenizer", ()),)),
+        ),
+        (workspace.swag_data, ("swag-data", ())),
+        (workspace.lora_run / "base", ("base-snapshot", ())),
+        (workspace.export, ("export", (("tokenizer", ()),))),
+        (
+            workspace.base_run,
+            (
+                "pretraining-run",
+                (("tokenizer", ()), ("pretraining-checkpoint", ())),
+            ),
+        ),
+        (
+            workspace.lora_run,
+            (
+                "lora-run",
+                (
+                    ("tokenizer", ()),
+                    ("base-snapshot", ()),
+                    ("lora-checkpoint", ()),
+                ),
+            ),
+        ),
+    )
+
+    for path, expected in cases:
+        full = verify_artifact(path, full=True)
+        trusted = verify_artifact(path, full=False)
+        assert _result_tree(full) == expected
+        assert _result_tree(trusted) == expected
+        assert set(_all_levels(full)) == {VerificationLevel.FULL}
+        assert set(_all_levels(trusted)) == {VerificationLevel.MANIFEST_TRUSTED}
+
+
+def test_cli_full_verifies_every_kind_and_rejects_resigned_export_semantics(
+    completed_cli_workspace: CLIWorkspace,
+) -> None:
+    """The CLI must expose FULL owner semantics while trusted mode stays structural."""
+    workspace = completed_cli_workspace
+    valid = (
+        workspace.tokenizer,
+        workspace.pretraining_data,
+        workspace.swag_data,
+        workspace.lora_run / "base",
+        workspace.export,
+        workspace.base_run,
+        workspace.lora_run,
+    )
+    for path in valid:
+        completed = workspace.run("verify", "--full", path)
+        assert "VerificationLevel.FULL" in completed.stdout
+
+    corrupted = workspace.root / "resigned-semantic-export"
+    shutil.copytree(workspace.export, corrupted)
+    manifest = read_manifest(
+        corrupted,
+        ExportManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    model = dict(manifest.model)
+    model["hidden_size"] = int(model["hidden_size"]) + 4
+    resigned = replace(manifest, model=model)
+    resigned = replace(resigned, identity=resigned.recompute_identity())
+    (corrupted / "manifest.json").write_bytes(canonical_json_bytes(resigned))
+
+    trusted = workspace.run("verify", corrupted)
+    full = workspace.run("verify", "--full", corrupted, check=False)
+    assert "MANIFEST_TRUSTED" in trusted.stdout
+    assert full.returncode == 3
+    assert full.stderr.startswith("SMLArtifactError:")
+    assert "model parameter specs" in full.stderr
+    assert "Traceback" not in full.stderr
+
+
+def test_recursive_lora_verification_is_exact_but_trusted_stays_structural(
+    completed_cli_workspace: CLIWorkspace,
+) -> None:
+    """LoRA FULL consumes exact specs; trusted recursion avoids config reductions."""
+    workspace = completed_cli_workspace
+    wrong_rank = workspace.root / "resigned-lora-rank"
+    shutil.copytree(workspace.lora_run, wrong_rank)
+    run = read_manifest(
+        wrong_rank,
+        LoRARunManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    lora = dict(run.lora)
+    lora["rank"] = int(lora["rank"]) + 1
+    run = replace(run, lora=lora)
+    run = replace(run, identity=run.recompute_identity())
+    (wrong_rank / "run.json").write_bytes(canonical_json_bytes(run))
+    _rebind_lora_run_checkpoint(wrong_rank, run)
+
+    assert verify_artifact(wrong_rank, full=False).verification is (
+        VerificationLevel.MANIFEST_TRUSTED
+    )
+    with pytest.raises(SMLArtifactError, match="adapter parameter specs"):
+        verify_artifact(wrong_rank, full=True)
+
+    structural_base = workspace.root / "resigned-lora-base-precision"
+    shutil.copytree(workspace.lora_run, structural_base)
+    run = read_manifest(
+        structural_base,
+        LoRARunManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    base_path = structural_base / "base"
+    base = read_manifest(
+        base_path,
+        BaseSnapshotManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    precision = dict(base.precision)
+    precision["structural_only_marker"] = True
+    base = replace(base, precision=precision)
+    base = replace(base, identity=base.recompute_identity())
+    (base_path / "manifest.json").write_bytes(canonical_json_bytes(base))
+    run = replace(run, base_identity=base.identity)
+    run = replace(run, identity=run.recompute_identity())
+    (structural_base / "run.json").write_bytes(canonical_json_bytes(run))
+    _rebind_lora_run_checkpoint(structural_base, run)
+
+    assert verify_artifact(structural_base, full=False).verification is (
+        VerificationLevel.MANIFEST_TRUSTED
+    )
+    with pytest.raises(SMLArtifactError, match="base snapshot precision"):
+        verify_artifact(structural_base, full=True)
 
 
 def test_cli_resume_accepts_relocated_identity_matching_data(

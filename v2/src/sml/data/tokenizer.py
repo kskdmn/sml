@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import io
 import itertools
 import math
@@ -366,19 +365,6 @@ def _read_vocab(vocab_bytes: bytes) -> tuple[tuple[str, float], ...]:
             )
         entries.append((piece, score))
     return tuple(entries)
-
-
-def _verify_consumed_payload(
-    reference: PayloadRef, payload: bytes, *, full: bool
-) -> None:
-    if len(payload) != reference.byte_size:
-        raise SMLArtifactError(f"consumed {reference.logical_path} byte size mismatch")
-    if full:
-        identity = f"sha256:{hashlib.sha256(payload).hexdigest()}"
-        if identity != reference.identity:
-            raise SMLArtifactError(
-                f"consumed {reference.logical_path} identity mismatch"
-            )
 
 
 def _validate_training_metadata(manifest: TokenizerManifest) -> None:

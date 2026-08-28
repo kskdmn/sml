@@ -1869,6 +1869,49 @@ class CheckpointReader:
         return data
 
 
+def verify_checkpoint_current_state(
+    reader: CheckpointReader,
+    *,
+    expected_next_key: object,
+) -> None:
+    """Validate the latest persisted trainer boundary without rebuilding runtime."""
+    if not isinstance(reader, CheckpointReader):
+        raise TypeError("reader must be a CheckpointReader")
+    if reader.resolved.verification is not VerificationLevel.FULL:
+        raise SMLArtifactError("checkpoint current-state verification requires FULL")
+    contents = reader.read_contents()
+    try:
+        trainer = contents.array_groups["trainer.safetensors"]
+        accumulation_count = trainer["accumulation_count"]
+        loss_numerator = trainer["loss_numerator"]
+        next_key = trainer["next_key"]
+        accumulators = tuple(
+            array for name, array in trainer.items() if name.startswith("accumulators.")
+        )
+    except KeyError as error:
+        raise SMLArtifactError(
+            "checkpoint trainer current state is incomplete"
+        ) from error
+    if not accumulators:
+        raise SMLArtifactError("checkpoint trainer has no parameter accumulators")
+    mx = _mlx_core()
+    mx.eval(accumulation_count, loss_numerator, next_key, *accumulators)
+    if int(accumulation_count.item()) != 0:
+        raise SMLArtifactError("checkpoint trainer accumulation must be empty")
+    if float(loss_numerator.item()) != 0.0:
+        raise SMLArtifactError("checkpoint trainer loss numerator must be empty")
+    if any(bool(mx.any(array != 0)) for array in accumulators):
+        raise SMLArtifactError("checkpoint trainer accumulators must be empty")
+    try:
+        matches = bool(mx.array_equal(next_key, expected_next_key))
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise SMLArtifactError(
+            "checkpoint trainer has an invalid next RNG key"
+        ) from error
+    if not matches:
+        raise SMLArtifactError("checkpoint trainer next RNG key is incorrect")
+
+
 def _checkpoint_dtype_name(array: mx.array) -> str:
     mx = _mlx_core()
     names = {
@@ -3827,4 +3870,5 @@ __all__ = [
     "resolve_latest_step",
     "run_access_lock",
     "run_writer_lock",
+    "verify_checkpoint_current_state",
 ]

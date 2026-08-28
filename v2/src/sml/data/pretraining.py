@@ -671,6 +671,104 @@ def preflight_pretraining_bundle(
         return result
 
 
+def _verify_opened_pretraining_bundle(
+    artifact: OpenedArtifact[PretrainingDataManifest],
+    tokenizer_manifest: TokenizerManifest,
+    *,
+    batch_size: int,
+) -> None:
+    """Validate prepared rows through one retained outer artifact owner."""
+    if not isinstance(artifact, OpenedArtifact):
+        raise TypeError("artifact must be an OpenedArtifact")
+    if not isinstance(artifact.manifest, PretrainingDataManifest):
+        raise TypeError("artifact must own a PretrainingDataManifest")
+    if artifact.verification is not VerificationLevel.FULL:
+        raise SMLArtifactError("prepared bundle semantic verification requires FULL")
+    if not isinstance(tokenizer_manifest, TokenizerManifest):
+        raise TypeError("tokenizer_manifest must be a TokenizerManifest")
+    _require_plain_int(batch_size, "batch_size", minimum=1)
+
+    manifest = artifact.manifest
+    _validate_prepared_tokenizer_binding(manifest, tokenizer_manifest)
+    shard_files: list[VerifiedPayload] = []
+    mappings: list[mmap.mmap] = []
+    shard_arrays: list[np.ndarray] = []
+    payload: VerifiedPayload | None = None
+    mapping: mmap.mmap | None = None
+    array: np.ndarray | None = None
+    try:
+        for reference, row_count in zip(
+            manifest.shards,
+            manifest.shard_row_counts,
+            strict=True,
+        ):
+            payload = artifact.open_payload(reference)
+            try:
+                shard_files.append(payload)
+            except BaseException as error:
+                try:
+                    payload.close()
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+                raise
+            mapping, array = _map_npy_payload(
+                payload,
+                reference,
+                declared_rows=row_count,
+                row_width=manifest.row_width,
+            )
+            try:
+                mappings.append(mapping)
+            except BaseException as error:
+                if error.__traceback__ is not None:
+                    clear_frames(error.__traceback__)
+                array = None
+                try:
+                    mapping.close()
+                except BaseException as cleanup_error:
+                    raise error from cleanup_error
+                raise
+            shard_arrays.append(array)
+            payload = None
+            mapping = None
+            array = None
+
+        if not shard_arrays:
+            raise SMLDataError("prepared bundle contains no shards")
+        minimum = min(int(shard.min()) for shard in shard_arrays)
+        maximum = max(int(shard.max()) for shard in shard_arrays)
+        if minimum < 0 or maximum >= tokenizer_manifest.vocab_size:
+            raise SMLArtifactError(
+                "prepared bundle token IDs must be in "
+                f"[0, {tokenizer_manifest.vocab_size})"
+            )
+        row_count = sum(manifest.shard_row_counts)
+        actual_identity = row_content_identity(
+            (row for shard in shard_arrays for row in shard),
+            row_count,
+            manifest.row_width,
+        )
+        if actual_identity != manifest.row_content_identity:
+            raise SMLArtifactError("prepared bundle row-content identity mismatch")
+        if row_count < batch_size:
+            raise SMLDataError(
+                "prepared bundle does not contain one full runtime batch"
+            )
+    except BaseException as error:
+        if error.__traceback__ is not None:
+            clear_frames(error.__traceback__)
+        payload = None
+        mapping = None
+        array = None
+        try:
+            _close_prepared_resources(None, shard_files, mappings, shard_arrays)
+        except BaseException as cleanup_error:
+            raise error from cleanup_error
+        raise
+    else:
+        _close_prepared_resources(None, shard_files, mappings, shard_arrays)
+
+
 class PretrainingBatchStream(Iterator[BatchEnvelope]):
     """Bounded deterministic NumPy prefetch over memory-mapped epochs."""
 
