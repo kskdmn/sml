@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -14,6 +15,7 @@ from sml.artifacts import verify as verify_module
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
+    ArtifactRoot,
     BaseSnapshotManifest,
     ExportManifest,
     LatestIndex,
@@ -29,6 +31,8 @@ from sml.artifacts.manifest import (
     file_identity,
     read_checkpoint_manifest,
     read_manifest,
+    row_content_identity,
+    structured_identity,
 )
 from sml.artifacts.verify import verify_artifact
 from sml.data.corpus import CorpusConfig
@@ -47,6 +51,7 @@ from sml.training.common import (
     PrecisionConfig,
     PretrainingConfig,
 )
+from sml.training.lora import LoRAPrecisionConfig
 from sml.training.pretrain import train
 
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
@@ -169,6 +174,168 @@ def test_recursive_dispatch_requires_exactly_one_manifest_candidate(
         verify_artifact(root, full=False)
 
 
+@pytest.mark.parametrize("full", (False, True))
+@pytest.mark.parametrize("mutation", ("ambiguous", "noncanonical"))
+def test_recursive_tokenizer_dispatch_rejects_invalid_candidates_and_closes_root(
+    tmp_path: Path,
+    prepared_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    full: bool,
+    mutation: str,
+) -> None:
+    """Every child root needs the same exact retained-root dispatch as its owner."""
+    root = tmp_path / f"prepared-{full}-{mutation}"
+    shutil.copytree(prepared_template, root)
+    tokenizer = root / "tokenizer"
+    if mutation == "ambiguous":
+        (tokenizer / "run.json").write_bytes((tokenizer / "manifest.json").read_bytes())
+        message = "exactly one"
+    else:
+        raw = json.loads((tokenizer / "manifest.json").read_bytes())
+        (tokenizer / "manifest.json").write_text(
+            json.dumps(raw, indent=2),
+            encoding="utf-8",
+        )
+        message = "canonical JSON bytes"
+
+    opened_fds: list[int] = []
+    original_open_child = ArtifactRoot.open_child
+
+    def recording_open_child(owner: ArtifactRoot, logical_path: str) -> ArtifactRoot:
+        child = original_open_child(owner, logical_path)
+        if logical_path == "tokenizer":
+            opened_fds.append(child.fileno())
+        return child
+
+    monkeypatch.setattr(ArtifactRoot, "open_child", recording_open_child)
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(root, full=full)
+
+    assert len(opened_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_fds[0])
+
+
+def test_recursive_child_dispatch_preserves_semantic_error_over_cleanup_failure(
+    tmp_path: Path,
+    prepared_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child cleanup failure is chained behind the semantic candidate error."""
+    root = tmp_path / "prepared-cleanup-failure"
+    shutil.copytree(prepared_template, root)
+    tokenizer = root / "tokenizer"
+    (tokenizer / "run.json").write_bytes((tokenizer / "manifest.json").read_bytes())
+    child_fd = -1
+    original_open_child = ArtifactRoot.open_child
+    original_close = ArtifactRoot.close
+
+    def recording_open_child(owner: ArtifactRoot, logical_path: str) -> ArtifactRoot:
+        nonlocal child_fd
+        child = original_open_child(owner, logical_path)
+        if logical_path == "tokenizer":
+            child_fd = child.fileno()
+        return child
+
+    def failing_child_close(owner: ArtifactRoot) -> None:
+        descriptor = owner.fileno()
+        original_close(owner)
+        if descriptor == child_fd:
+            raise RuntimeError("injected child cleanup failure")
+
+    monkeypatch.setattr(ArtifactRoot, "open_child", recording_open_child)
+    monkeypatch.setattr(ArtifactRoot, "close", failing_child_close)
+
+    with pytest.raises(SMLArtifactError, match="exactly one") as raised:
+        verify_artifact(root, full=True)
+
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert str(raised.value.__cause__) == "injected child cleanup failure"
+    with pytest.raises(OSError):
+        os.fstat(child_fd)
+
+
+def _write_base_bundle(root: Path) -> tuple[BaseSnapshotManifest, dict[str, mx.array]]:
+    root.mkdir()
+    model = ModelConfig(
+        vocab_size=8,
+        hidden_size=4,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=1,
+        intermediate_size=8,
+        original_context_length=8,
+        hidden_dropout=0.0,
+    )
+    arrays = {
+        spec.name: mx.zeros(spec.shape, dtype=mx.bfloat16)
+        for spec in model_parameter_specs(model)
+    }
+    weights_path = root / "model.safetensors"
+    mx.save_safetensors(weights_path, arrays)
+    manifest = BaseSnapshotManifest(
+        kind="base-snapshot",
+        version=1,
+        identity=_PLACEHOLDER_IDENTITY,
+        model=dataclasses.asdict(model),
+        precision=dataclasses.asdict(PrecisionConfig()),
+        tokenizer_identity="sha256:" + "1" * 64,
+        working_weights=_array_ref(weights_path, "model.safetensors", arrays),
+        diagnostic_source_run_identity="sha256:" + "2" * 64,
+        diagnostic_source_step=0,
+    )
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+    return manifest, arrays
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing-leaf", "model parameter specs"),
+        ("wrong-dtype", "model parameter specs"),
+        ("wrong-shape", "model parameter specs"),
+        ("invalid-config", "invalid base snapshot model configuration"),
+    ),
+)
+def test_full_base_rejects_resigned_semantic_corruption(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    """Base FULL requires the exact BF16 plain-model tree and canonical config."""
+    root = tmp_path / f"base-{mutation}"
+    manifest, arrays = _write_base_bundle(root)
+    if mutation == "invalid-config":
+        model = dict(manifest.model)
+        model["hidden_size"] = 0
+        manifest = replace(manifest, model=model)
+    else:
+        name = next(iter(arrays))
+        if mutation == "missing-leaf":
+            arrays.pop(name)
+        elif mutation == "wrong-dtype":
+            arrays[name] = arrays[name].astype(mx.float32)
+        else:
+            arrays[name] = mx.zeros((*arrays[name].shape, 1), dtype=mx.bfloat16)
+        weights_path = root / manifest.working_weights.payload.logical_path
+        mx.save_safetensors(weights_path, arrays)
+        manifest = replace(
+            manifest,
+            working_weights=_array_ref(
+                weights_path,
+                manifest.working_weights.payload.logical_path,
+                arrays,
+            ),
+        )
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(root, full=True)
+
+
 def test_full_base_rejects_resigned_extra_model_leaf(tmp_path: Path) -> None:
     """Byte-valid extra leaves must not satisfy the exact plain-model contract."""
     root = tmp_path / "base"
@@ -252,6 +419,206 @@ def prepared_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return prepared.path
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("unreadable-model", "invalid tokenizer model payload"),
+        ("invalid-vocabulary", "invalid tokenizer vocabulary bytes"),
+        ("special-token-disagreement", "special IDs"),
+    ),
+)
+def test_full_tokenizer_rejects_resigned_semantic_corruption(
+    tmp_path: Path,
+    prepared_template: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    """Tokenizer FULL loads both bound payloads and checks exact special IDs."""
+    root = tmp_path / f"tokenizer-{mutation}"
+    shutil.copytree(prepared_template / "tokenizer", root)
+    manifest = read_manifest(
+        root,
+        TokenizerManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    if mutation == "unreadable-model":
+        path = root / manifest.model.logical_path
+        path.write_bytes(b"not a SentencePiece model")
+        manifest = replace(
+            manifest,
+            model=_payload_ref(path, manifest.model.logical_path),
+        )
+    elif mutation == "invalid-vocabulary":
+        path = root / manifest.vocab.logical_path
+        path.write_bytes(b"\xff")
+        manifest = replace(
+            manifest,
+            vocab=_payload_ref(path, manifest.vocab.logical_path),
+        )
+    else:
+        manifest = replace(manifest, bos_token_id=4)
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(root, full=True)
+
+
+def _write_export_bundle(root: Path, tokenizer_root: Path) -> ExportManifest:
+    root.mkdir()
+    shutil.copytree(tokenizer_root, root / "tokenizer")
+    tokenizer = read_manifest(
+        root / "tokenizer",
+        TokenizerManifest,
+        VerificationLevel.FULL,
+    ).manifest
+    model = ModelConfig(
+        vocab_size=tokenizer.vocab_size,
+        hidden_size=4,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=1,
+        intermediate_size=8,
+        original_context_length=8,
+        hidden_dropout=0.0,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        unk_token_id=tokenizer.unk_token_id,
+    )
+    arrays = {
+        spec.name: mx.zeros(spec.shape, dtype=mx.bfloat16)
+        for spec in model_parameter_specs(model)
+    }
+    weights_path = root / "model.safetensors"
+    mx.save_safetensors(weights_path, arrays)
+    manifest = ExportManifest(
+        kind="export",
+        version=1,
+        identity=_PLACEHOLDER_IDENTITY,
+        model=dataclasses.asdict(model),
+        precision=dataclasses.asdict(LoRAPrecisionConfig()),
+        tokenizer_identity=tokenizer.identity,
+        model_weights=_array_ref(weights_path, "model.safetensors", arrays),
+        tokenizer_model=replace(
+            tokenizer.model,
+            logical_path="tokenizer/tokenizer.model",
+        ),
+        tokenizer_vocab=replace(
+            tokenizer.vocab,
+            logical_path="tokenizer/tokenizer.vocab",
+        ),
+        diagnostic_source_run_identity="sha256:" + "1" * 64,
+        diagnostic_source_step=0,
+    )
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+    return manifest
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "vocab_size",
+        "bos_token_id",
+        "eos_token_id",
+        "pad_token_id",
+        "unk_token_id",
+    ),
+)
+def test_full_export_rejects_resigned_tokenizer_model_disagreement(
+    tmp_path: Path,
+    prepared_template: Path,
+    field: str,
+) -> None:
+    """Export FULL must compare exact vocabulary and special-ID metadata."""
+    root = tmp_path / f"export-{field}"
+    manifest = _write_export_bundle(root, prepared_template / "tokenizer")
+    model = dict(manifest.model)
+    if field == "vocab_size":
+        model[field] = int(model[field]) + 1
+    else:
+        used = {
+            int(model[name])
+            for name in (
+                "bos_token_id",
+                "eos_token_id",
+                "pad_token_id",
+                "unk_token_id",
+            )
+        }
+        model[field] = next(
+            token_id
+            for token_id in range(int(model["vocab_size"]))
+            if token_id not in used
+        )
+    resigned = replace(manifest, model=model)
+    resigned = replace(resigned, identity=resigned.recompute_identity())
+    (root / "manifest.json").write_bytes(canonical_json_bytes(resigned))
+
+    with pytest.raises(
+        SMLArtifactError,
+        match="export tokenizer metadata does not match model",
+    ):
+        verify_artifact(root, full=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("outer-tokenizer-mismatch", "owned tokenizer identity"),
+        ("inner-tokenizer-mismatch", "payload references"),
+        ("adapter-only-leaf", "model parameter specs"),
+        ("wrong-dtype", "model parameter specs"),
+        ("wrong-shape", "model parameter specs"),
+    ),
+)
+def test_full_export_rejects_resigned_tree_or_tokenizer_corruption(
+    tmp_path: Path,
+    prepared_template: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    """Export FULL binds its child and permits only exact plain-model BF16 leaves."""
+    root = tmp_path / f"export-{mutation}"
+    manifest = _write_export_bundle(root, prepared_template / "tokenizer")
+    if mutation == "outer-tokenizer-mismatch":
+        manifest = replace(manifest, tokenizer_identity="sha256:" + "9" * 64)
+    elif mutation == "inner-tokenizer-mismatch":
+        manifest = replace(
+            manifest,
+            tokenizer_model=replace(
+                manifest.tokenizer_model,
+                identity="sha256:" + "8" * 64,
+            ),
+        )
+    else:
+        weights_path = root / manifest.model_weights.payload.logical_path
+        arrays = dict(mx.load(weights_path))
+        mx.eval(*arrays.values())
+        name = next(iter(arrays))
+        if mutation == "adapter-only-leaf":
+            arrays[f"{name}.lora_a"] = mx.zeros((1,), dtype=mx.float32)
+        elif mutation == "wrong-dtype":
+            arrays[name] = arrays[name].astype(mx.float32)
+        else:
+            arrays[name] = mx.zeros((*arrays[name].shape, 1), dtype=mx.bfloat16)
+        mx.save_safetensors(weights_path, arrays)
+        manifest = replace(
+            manifest,
+            model_weights=_array_ref(
+                weights_path,
+                manifest.model_weights.payload.logical_path,
+                arrays,
+            ),
+        )
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(root, full=True)
+
+
 def test_full_pretraining_data_rejects_resigned_wrong_row_identity(
     tmp_path: Path,
     prepared_template: Path,
@@ -279,6 +646,53 @@ def test_full_pretraining_data_rejects_resigned_wrong_row_identity(
     (root / "manifest.json").write_bytes(canonical_json_bytes(resigned))
 
     with pytest.raises(SMLArtifactError, match="row-content identity"):
+        verify_artifact(root, full=True)
+
+
+def test_full_pretraining_data_rejects_resigned_out_of_vocabulary_token(
+    tmp_path: Path,
+    prepared_template: Path,
+) -> None:
+    """A recomputed row identity cannot legitimize a token outside the vocabulary."""
+    root = tmp_path / "prepared-oov"
+    shutil.copytree(prepared_template, root)
+    manifest = read_manifest(
+        root,
+        PretrainingDataManifest,
+        VerificationLevel.FULL,
+    ).manifest
+    tokenizer = read_manifest(
+        root / "tokenizer",
+        TokenizerManifest,
+        VerificationLevel.FULL,
+    ).manifest
+    first_path = root / manifest.shards[0].logical_path
+    first_rows = np.load(first_path, allow_pickle=False)
+    first_rows[0, 0] = tokenizer.vocab_size
+    with first_path.open("wb") as destination:
+        np.save(destination, first_rows, allow_pickle=False)
+    shards = (
+        _payload_ref(first_path, manifest.shards[0].logical_path),
+        *manifest.shards[1:],
+    )
+    all_rows = (
+        row
+        for shard in shards
+        for row in np.load(root / shard.logical_path, allow_pickle=False)
+    )
+    resigned = replace(
+        manifest,
+        shards=shards,
+        row_content_identity=row_content_identity(
+            all_rows,
+            sum(manifest.shard_row_counts),
+            manifest.row_width,
+        ),
+    )
+    resigned = replace(resigned, identity=resigned.recompute_identity())
+    (root / "manifest.json").write_bytes(canonical_json_bytes(resigned))
+
+    with pytest.raises(SMLArtifactError, match="token IDs must be in"):
         verify_artifact(root, full=True)
 
 
@@ -414,6 +828,207 @@ def _write_swag_bundle(root: Path) -> SwagDataManifest:
     manifest = replace(manifest, identity=manifest.recompute_identity())
     (root / "manifest.json").write_bytes(canonical_json_bytes(manifest))
     return manifest
+
+
+def _write_resigned_swag(root: Path, manifest: SwagDataManifest) -> None:
+    resigned = replace(manifest, identity=manifest.recompute_identity())
+    (root / "manifest.json").write_bytes(canonical_json_bytes(resigned))
+
+
+def test_full_swag_rejects_resigned_false_source_backend(tmp_path: Path) -> None:
+    """The resolved source must retain the exact supported request backend."""
+    root = tmp_path / "swag-source-backend"
+    manifest = _write_swag_bundle(root)
+    source = dict(manifest.source)
+    source["backend"] = "local-files"
+    _write_resigned_swag(root, replace(manifest, source=source))
+
+    with pytest.raises(SMLArtifactError, match="source projection"):
+        verify_artifact(root, full=True)
+
+
+def test_full_swag_rejects_resigned_example_count_above_cap(tmp_path: Path) -> None:
+    """A recorded preparation cap must bound the exact materialized row count."""
+    root = tmp_path / "swag-cap"
+    manifest = _write_swag_bundle(root)
+    buckets = []
+    for reference in manifest.buckets:
+        path = root / reference.payload.logical_path
+        array = np.load(path, allow_pickle=False)
+        doubled = np.concatenate((array, array), axis=0)
+        with path.open("wb") as destination:
+            np.save(destination, doubled, allow_pickle=False)
+        buckets.append(
+            _npy_ref(
+                path,
+                reference.payload.logical_path,
+                reference.arrays[0].name,
+            )
+        )
+    preprocessing = dict(manifest.preprocessing)
+    preprocessing["maximum_examples"] = 1
+    _write_resigned_swag(
+        root,
+        replace(
+            manifest,
+            preprocessing=preprocessing,
+            example_count=2,
+            buckets=tuple(buckets),
+        ),
+    )
+
+    with pytest.raises(SMLArtifactError, match="maximum_examples"):
+        verify_artifact(root, full=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("wrong-name", "array spec name"),
+        ("multiple-specs", "exactly one array spec"),
+    ),
+)
+def test_full_swag_rejects_resigned_array_spec_contract_corruption(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    """Each one-array NPY declaration must use its canonical path stem as name."""
+    root = tmp_path / f"swag-spec-{mutation}"
+    manifest = _write_swag_bundle(root)
+    reference = manifest.buckets[0]
+    if mutation == "wrong-name":
+        arrays = (replace(reference.arrays[0], name="labels"),)
+    else:
+        arrays = (
+            reference.arrays[0],
+            replace(reference.arrays[0], name="unexpected"),
+        )
+    buckets = (replace(reference, arrays=arrays), *manifest.buckets[1:])
+    _write_resigned_swag(root, replace(manifest, buckets=buckets))
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(root, full=True)
+
+
+def test_full_swag_rejects_resigned_nondeterministic_bucket_order(
+    tmp_path: Path,
+) -> None:
+    """Manifest order is part of the deterministic canonical SWAG tree."""
+    root = tmp_path / "swag-order"
+    manifest = _write_swag_bundle(root)
+    buckets = list(manifest.buckets)
+    buckets[0], buckets[1] = buckets[1], buckets[0]
+    _write_resigned_swag(root, replace(manifest, buckets=tuple(buckets)))
+
+    with pytest.raises(SMLArtifactError, match="deterministic bucket order"):
+        verify_artifact(root, full=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("invalid-mask-nesting", "score mask is true"),
+        ("wrong-bos", "start with BOS"),
+        ("wrong-eos", "end with EOS"),
+    ),
+)
+def test_full_swag_rejects_resigned_token_layout_corruption(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    """FULL reduces the exact masks and BOS/EOS positions of mapped buckets."""
+    root = tmp_path / f"swag-{mutation}"
+    manifest = _write_swag_bundle(root)
+    buckets = list(manifest.buckets)
+    target_name = (
+        "valid_token_mask" if mutation == "invalid-mask-nesting" else "input_ids"
+    )
+    index = next(
+        position
+        for position, reference in enumerate(buckets)
+        if reference.arrays[0].name == target_name
+    )
+    reference = buckets[index]
+    path = root / reference.payload.logical_path
+    array = np.load(path, allow_pickle=False)
+    if mutation == "invalid-mask-nesting":
+        array[0, 0, 2] = False
+    elif mutation == "wrong-bos":
+        array[0, 0, 0] = 4
+    else:
+        array[0, 0, 3] = 4
+    with path.open("wb") as destination:
+        np.save(destination, array, allow_pickle=False)
+    buckets[index] = _npy_ref(path, reference.payload.logical_path, target_name)
+    _write_resigned_swag(root, replace(manifest, buckets=tuple(buckets)))
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(root, full=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("undeclared-boundary", "declared boundary"),
+        ("wrong-example-count", "example_count"),
+        ("noncanonical-path", "noncanonical SWAG bucket path"),
+    ),
+)
+def test_full_swag_rejects_resigned_boundary_count_or_path_corruption(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    """Bucket boundaries, counts, and paths are exact manifest semantics."""
+    root = tmp_path / f"swag-{mutation}"
+    manifest = _write_swag_bundle(root)
+    if mutation == "undeclared-boundary":
+        preprocessing = dict(manifest.preprocessing)
+        preprocessing["bucket_boundaries"] = [9]
+        manifest = replace(manifest, preprocessing=preprocessing)
+    elif mutation == "wrong-example-count":
+        manifest = replace(manifest, example_count=2)
+    else:
+        reference = manifest.buckets[0]
+        old_path = root / reference.payload.logical_path
+        logical_path = reference.payload.logical_path.replace(
+            "length-0008",
+            "length-00008",
+        )
+        new_path = root / logical_path
+        new_path.parent.mkdir(parents=True)
+        old_path.rename(new_path)
+        buckets = (
+            replace(reference, payload=_payload_ref(new_path, logical_path)),
+            *manifest.buckets[1:],
+        )
+        manifest = replace(manifest, buckets=buckets)
+    _write_resigned_swag(root, manifest)
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(root, full=True)
+
+
+@pytest.mark.parametrize("field", ("base_identity", "tokenizer_identity"))
+def test_full_swag_rejects_resigned_invalid_identity_field(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    """SWAG provenance identities remain strict without external path resolution."""
+    root = tmp_path / f"swag-{field}"
+    _write_swag_bundle(root)
+    raw = json.loads((root / "manifest.json").read_bytes())
+    raw[field] = "sha256:not-hex"
+    raw["identity"] = structured_identity(
+        SwagDataManifest.IDENTITY_DOMAIN,
+        {name: value for name, value in raw.items() if name != "identity"},
+    )
+    (root / "manifest.json").write_bytes(canonical_json_bytes(raw))
+
+    with pytest.raises(SMLArtifactError, match=field):
+        verify_artifact(root, full=True)
 
 
 def test_full_swag_rejects_resigned_out_of_range_label(tmp_path: Path) -> None:

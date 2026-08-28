@@ -1807,6 +1807,16 @@ class CheckpointReader:
         manifest_types: tuple[type, ...],
     ) -> OpenedArtifact:
         """Open a manifest-bound run child through this reader's run inode."""
+        child_root = self.open_run_child_root(logical_path)
+        return _open_artifact_from_root(
+            self.resolved.step_directory.parent.parent / logical_path,
+            child_root,
+            manifest_types,
+            self.resolved.verification,
+        )
+
+    def open_run_child_root(self, logical_path: str) -> ArtifactRoot:
+        """Open a raw run child root for retained-root candidate dispatch."""
         if self._owned_step.descriptor < 0 or self._run_descriptor < 0:
             raise SMLArtifactError("checkpoint reader is closed")
         root = ArtifactRoot(
@@ -1817,12 +1827,7 @@ class CheckpointReader:
             child_root = root.open_child(logical_path)
         finally:
             root.close()
-        return _open_artifact_from_root(
-            self.resolved.step_directory.parent.parent / logical_path,
-            child_root,
-            manifest_types,
-            self.resolved.verification,
-        )
+        return child_root
 
     def read_contents(self) -> VerifiedCheckpointContents:
         """Return identity-bound contents only while the step name remains bound."""

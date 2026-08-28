@@ -171,6 +171,21 @@ def _open_artifact_once(
     verification: VerificationLevel,
 ) -> OpenedArtifact[ArtifactManifest]:
     root = ArtifactRoot.open(path, writable=False)
+    return _open_artifact_from_retained_root(
+        path,
+        root,
+        verification,
+        (*_BUNDLE_TYPES, *RUN_MANIFEST_TYPES),
+    )
+
+
+def _open_artifact_from_retained_root(
+    path: Path,
+    root: ArtifactRoot,
+    verification: VerificationLevel,
+    allowed_types: tuple[type, ...],
+) -> OpenedArtifact[ArtifactManifest]:
+    """Dispatch one already-owned root and transfer it only on success."""
     try:
         candidates: list[tuple[str, bytes, tuple[type[ArtifactManifest], ...]]] = []
         for filename, manifest_types in _MANIFEST_CANDIDATES:
@@ -219,6 +234,10 @@ def _open_artifact_once(
             raise SMLArtifactError("artifact manifest identity mismatch")
         if encoded != canonical_json_bytes(manifest):
             raise SMLArtifactError("artifact manifest must use canonical JSON bytes")
+        if not isinstance(manifest, allowed_types):
+            raise SMLArtifactError(
+                f"owned child has unexpected artifact kind: {manifest.kind!r}"
+            )
         return OpenedArtifact(
             path=path,
             root=root,
@@ -231,6 +250,38 @@ def _open_artifact_once(
         except BaseException as cleanup_error:
             raise error from cleanup_error
         raise
+
+
+def _open_child_artifact(
+    artifact: OpenedArtifact,
+    logical_path: str,
+    allowed_types: tuple[type, ...],
+) -> OpenedArtifact[ArtifactManifest]:
+    child_root = artifact.root.open_child(logical_path)
+    child_path = artifact.path.joinpath(*logical_path.split("/"))
+    return _open_artifact_from_retained_root(
+        child_path,
+        child_root,
+        artifact.verification,
+        allowed_types,
+    )
+
+
+def _open_reader_child_artifact(
+    reader: CheckpointReader,
+    logical_path: str,
+    allowed_types: tuple[type, ...],
+) -> OpenedArtifact[ArtifactManifest]:
+    child_root = reader.open_run_child_root(logical_path)
+    child_path = reader.resolved.step_directory.parent.parent.joinpath(
+        *logical_path.split("/")
+    )
+    return _open_artifact_from_retained_root(
+        child_path,
+        child_root,
+        reader.resolved.verification,
+        allowed_types,
+    )
 
 
 def _verify_payload(artifact: OpenedArtifact, reference: PayloadRef) -> None:
@@ -507,7 +558,11 @@ def _verify_opened_tokenizer(
 def _verify_tokenizer_child(
     artifact: OpenedArtifact,
 ) -> VerificationResult:
-    with artifact.open_child("tokenizer", (TokenizerManifest,)) as tokenizer:
+    with _open_child_artifact(
+        artifact,
+        "tokenizer",
+        (TokenizerManifest,),
+    ) as tokenizer:
         return _verify_opened_tokenizer(tokenizer)
 
 
@@ -590,6 +645,7 @@ def _verify_opened_export(
     manifest = artifact.manifest
     if artifact.verification is VerificationLevel.FULL:
         model = _model_configuration(manifest.model, context="export")
+        _tokenizer_matches_model(tokenizer.manifest, model, context="export")
         _precision_configuration(
             manifest.precision,
             LoRAPrecisionConfig,
@@ -716,13 +772,21 @@ def _verify_opened_run(artifact: OpenedArtifact[RunManifest]) -> VerificationRes
             raise SMLArtifactError(
                 "run latest index must directly bind the latest checkpoint"
             )
-        with reader.open_run_child("tokenizer", (TokenizerManifest,)) as opened:
+        with _open_reader_child_artifact(
+            reader,
+            "tokenizer",
+            (TokenizerManifest,),
+        ) as opened:
             tokenizer = _verify_opened_tokenizer(opened)
         if tokenizer.manifest.identity != resolved.run.tokenizer_identity:
             raise SMLArtifactError("run tokenizer identity does not match run.json")
         children: list[VerificationResult] = [tokenizer]
         if isinstance(resolved.run, LoRARunManifest):
-            with reader.open_run_child("base", (BaseSnapshotManifest,)) as opened:
+            with _open_reader_child_artifact(
+                reader,
+                "base",
+                (BaseSnapshotManifest,),
+            ) as opened:
                 base = _verify_opened_base(opened)
             if base.manifest.identity != resolved.run.base_identity:
                 raise SMLArtifactError(

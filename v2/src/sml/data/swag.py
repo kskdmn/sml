@@ -665,10 +665,15 @@ def _validate_recorded_projections(manifest: SwagDataManifest) -> None:
     if set(source) != set(_SOURCE_RESOLVED_FIELDS):
         raise SMLArtifactError("invalid SWAG source projection")
     try:
+        request = {name: source[name] for name in _SOURCE_REQUEST_FIELDS}
+        source_config = SwagSourceConfig(**request)
         resolved_source = ResolvedSwagSource(**dict(source))
     except (TypeError, ValueError) as error:
         raise SMLArtifactError("invalid SWAG source projection") from error
-    if _resolved_source_projection(resolved_source) != source:
+    if (
+        _source_request_projection(source_config) != request
+        or _resolved_source_projection(resolved_source) != source
+    ):
         raise SMLArtifactError("invalid SWAG source projection")
 
     preprocessing = manifest.preprocessing
@@ -713,6 +718,8 @@ def _validate_recorded_projections(manifest: SwagDataManifest) -> None:
         or maximum_examples < 1
     ):
         raise SMLArtifactError("invalid SWAG maximum_examples")
+    if maximum_examples is not None and manifest.example_count > maximum_examples:
+        raise SMLArtifactError("SWAG example_count exceeds maximum_examples")
     if not _recorded_identity_is_valid(manifest.base_identity):
         raise SMLArtifactError("invalid SWAG base identity")
     if not _recorded_identity_is_valid(manifest.tokenizer_identity):
@@ -932,6 +939,7 @@ def _group_manifest_buckets(
     manifest: SwagDataManifest,
 ) -> tuple[tuple[int, dict[str, ArrayPayloadRef]], ...]:
     grouped: dict[int, dict[str, ArrayPayloadRef]] = {}
+    observed_order: list[tuple[int, str]] = []
     for reference in manifest.buckets:
         parts = reference.payload.logical_path.split("/")
         if (
@@ -956,10 +964,23 @@ def _group_manifest_buckets(
             )
         if name not in _ARRAY_NAMES:
             raise SMLArtifactError(f"unexpected SWAG array name: {name}")
+        if reference.payload.logical_path != _logical_array_path(length, name):
+            raise SMLArtifactError(
+                f"noncanonical SWAG bucket path: {reference.payload.logical_path}"
+            )
+        if len(reference.arrays) != 1:
+            raise SMLArtifactError(
+                "SWAG NPY payload must declare exactly one array spec"
+            )
+        if reference.arrays[0].name != name:
+            raise SMLArtifactError(
+                "SWAG array spec name must match its canonical path stem"
+            )
         bucket = grouped.setdefault(length, {})
         if name in bucket:
             raise SMLArtifactError(f"duplicate SWAG array in bucket {length}: {name}")
         bucket[name] = reference
+        observed_order.append((length, name))
     ordered: list[tuple[int, dict[str, ArrayPayloadRef]]] = []
     for length in sorted(grouped):
         arrays = grouped[length]
@@ -968,6 +989,11 @@ def _group_manifest_buckets(
         ordered.append((length, arrays))
     if not ordered:
         raise SMLArtifactError("SWAG bundle does not contain any buckets")
+    expected_order = [
+        (length, name) for length, _arrays in ordered for name in _ARRAY_NAMES
+    ]
+    if observed_order != expected_order:
+        raise SMLArtifactError("SWAG manifest has nondeterministic bucket order")
     return tuple(ordered)
 
 

@@ -9,20 +9,27 @@ from dataclasses import dataclass, field, replace
 from importlib import metadata
 from pathlib import Path
 
+import mlx.core as mx
 import pytest
 import zstandard as zstd
 from sml.artifacts.manifest import (
+    ArrayPayloadRef,
+    ArraySpec,
     BaseSnapshotManifest,
     ExportManifest,
     LatestIndex,
     LoRACheckpointManifest,
     LoRARunManifest,
     PayloadRef,
+    PretrainingCheckpointManifest,
+    PretrainingRunManifest,
+    RunManifest,
     VerificationLevel,
     canonical_json_bytes,
     file_identity,
     read_checkpoint_manifest,
     read_manifest,
+    structured_identity,
 )
 from sml.artifacts.verify import VerificationResult, verify_artifact
 from sml.errors import SMLArtifactError
@@ -444,10 +451,34 @@ def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
     return PayloadRef(logical_path, identity, path.stat().st_size)
 
 
-def _rebind_lora_run_checkpoint(
+def _array_ref(
+    path: Path,
+    logical_path: str,
+    arrays: dict[str, mx.array],
+) -> ArrayPayloadRef:
+    dtype_names = {
+        mx.bfloat16: "bfloat16",
+        mx.float32: "float32",
+        mx.int32: "int32",
+        mx.uint32: "uint32",
+        mx.bool_: "bool",
+    }
+    return ArrayPayloadRef(
+        _payload_ref(path, logical_path),
+        tuple(
+            ArraySpec(name, tuple(array.shape), dtype_names[array.dtype])
+            for name, array in sorted(arrays.items())
+        ),
+    )
+
+
+def _latest_checkpoint(
     run: Path,
-    manifest: LoRARunManifest,
-) -> None:
+) -> tuple[
+    LatestIndex,
+    Path,
+    PretrainingCheckpointManifest | LoRACheckpointManifest,
+]:
     latest = read_manifest(
         run,
         LatestIndex,
@@ -458,25 +489,66 @@ def _rebind_lora_run_checkpoint(
         step,
         VerificationLevel.MANIFEST_TRUSTED,
     ).manifest
-    assert isinstance(checkpoint, LoRACheckpointManifest)
+    return latest, step, checkpoint
+
+
+def _write_checkpoint_and_latest(
+    run: Path,
+    checkpoint: PretrainingCheckpointManifest | LoRACheckpointManifest,
+    *,
+    owning_run_identity: str | None = None,
+) -> None:
+    latest = read_manifest(
+        run,
+        LatestIndex,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    step = run / "checkpoints" / f"step-{latest.step:09d}"
+    (step / "checkpoint.json").write_bytes(canonical_json_bytes(checkpoint))
+    rebound = replace(
+        latest,
+        checkpoint_identity=checkpoint.identity,
+        owning_run_identity=(
+            latest.owning_run_identity
+            if owning_run_identity is None
+            else owning_run_identity
+        ),
+    )
+    rebound = replace(rebound, identity=rebound.recompute_identity())
+    (run / "latest.json").write_bytes(canonical_json_bytes(rebound))
+
+
+def _rebind_run_checkpoint(
+    run: Path,
+    manifest: RunManifest,
+) -> None:
+    _rebind_checkpoint_owner_identity(run, manifest.identity)
+
+
+def _rebind_checkpoint_owner_identity(run: Path, run_identity: str) -> None:
+    _latest, step, checkpoint = _latest_checkpoint(run)
     state_path = step / checkpoint.scalar_state.logical_path
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    state["owning_run_identity"] = manifest.identity
+    state["owning_run_identity"] = run_identity
     state_path.write_bytes(canonical_json_bytes(state))
     checkpoint = replace(
         checkpoint,
-        owning_run_identity=manifest.identity,
+        owning_run_identity=run_identity,
         scalar_state=_payload_ref(state_path, checkpoint.scalar_state.logical_path),
     )
     checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
-    (step / "checkpoint.json").write_bytes(canonical_json_bytes(checkpoint))
-    latest = replace(
-        latest,
-        owning_run_identity=manifest.identity,
-        checkpoint_identity=checkpoint.identity,
+    _write_checkpoint_and_latest(
+        run,
+        checkpoint,
+        owning_run_identity=run_identity,
     )
-    latest = replace(latest, identity=latest.recompute_identity())
-    (run / "latest.json").write_bytes(canonical_json_bytes(latest))
+
+
+def _rebind_lora_run_checkpoint(
+    run: Path,
+    manifest: LoRARunManifest,
+) -> None:
+    _rebind_run_checkpoint(run, manifest)
 
 
 def _result_tree(result: VerificationResult) -> tuple[str, tuple]:
@@ -805,6 +877,289 @@ def test_recursive_lora_verification_is_exact_but_trusted_stays_structural(
     )
     with pytest.raises(SMLArtifactError, match="base snapshot precision"):
         verify_artifact(structural_base, full=True)
+
+
+@pytest.mark.parametrize("full", (False, True))
+@pytest.mark.parametrize("child", ("tokenizer", "base"))
+@pytest.mark.parametrize("mutation", ("ambiguous", "noncanonical"))
+def test_recursive_lora_child_dispatch_rejects_every_invalid_candidate_root(
+    tmp_path: Path,
+    completed_cli_workspace: CLIWorkspace,
+    full: bool,
+    child: str,
+    mutation: str,
+) -> None:
+    """Run children use exact candidate dispatch at trusted and FULL levels."""
+    run = tmp_path / f"lora-{child}-{mutation}-{full}"
+    shutil.copytree(completed_cli_workspace.lora_run, run)
+    child_root = run / child
+    manifest_path = child_root / "manifest.json"
+    if mutation == "ambiguous":
+        (child_root / "run.json").write_bytes(manifest_path.read_bytes())
+        message = "exactly one"
+    else:
+        raw = json.loads(manifest_path.read_bytes())
+        manifest_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        message = "canonical JSON bytes"
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(run, full=full)
+
+
+def test_full_pretraining_run_rejects_resigned_run_checkpoint_disagreement(
+    tmp_path: Path,
+    completed_cli_workspace: CLIWorkspace,
+) -> None:
+    """Latest and checkpoint signatures cannot override their run owner binding."""
+    run = tmp_path / "pretraining-checkpoint-owner"
+    shutil.copytree(completed_cli_workspace.base_run, run)
+    _latest, step, checkpoint = _latest_checkpoint(run)
+    assert isinstance(checkpoint, PretrainingCheckpointManifest)
+    other_owner = "sha256:" + "9" * 64
+    state_path = step / checkpoint.scalar_state.logical_path
+    state = json.loads(state_path.read_bytes())
+    state["owning_run_identity"] = other_owner
+    state_path.write_bytes(canonical_json_bytes(state))
+    checkpoint = replace(
+        checkpoint,
+        owning_run_identity=other_owner,
+        scalar_state=_payload_ref(state_path, checkpoint.scalar_state.logical_path),
+    )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    _write_checkpoint_and_latest(run, checkpoint)
+
+    with pytest.raises(SMLArtifactError, match="different run"):
+        verify_artifact(run, full=True)
+
+
+def test_full_pretraining_run_rejects_resigned_tokenizer_disagreement(
+    tmp_path: Path,
+    completed_cli_workspace: CLIWorkspace,
+) -> None:
+    """A fully rebound run still owns the exact tokenizer identity in run.json."""
+    run = tmp_path / "pretraining-tokenizer-owner"
+    shutil.copytree(completed_cli_workspace.base_run, run)
+    manifest = read_manifest(
+        run,
+        PretrainingRunManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    manifest = replace(manifest, tokenizer_identity="sha256:" + "9" * 64)
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (run / "run.json").write_bytes(canonical_json_bytes(manifest))
+    _rebind_run_checkpoint(run, manifest)
+
+    with pytest.raises(SMLArtifactError, match="tokenizer identity"):
+        verify_artifact(run, full=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("base-mismatch", "base snapshot identity"),
+        ("tokenizer-mismatch", "tokenizer identity"),
+        ("invalid-lora", "invalid LoRA configuration"),
+        ("invalid-precision", "invalid LoRA run precision"),
+        ("invalid-data-identity", "data_identity"),
+    ),
+)
+def test_full_lora_run_rejects_resigned_owner_configuration_mismatch(
+    tmp_path: Path,
+    completed_cli_workspace: CLIWorkspace,
+    mutation: str,
+    message: str,
+) -> None:
+    """LoRA FULL binds base/tokenizer and validates every portable run field."""
+    run = tmp_path / f"lora-owner-{mutation}"
+    shutil.copytree(completed_cli_workspace.lora_run, run)
+    manifest = read_manifest(
+        run,
+        LoRARunManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    if mutation == "base-mismatch":
+        manifest = replace(manifest, base_identity="sha256:" + "9" * 64)
+    elif mutation == "tokenizer-mismatch":
+        manifest = replace(manifest, tokenizer_identity="sha256:" + "9" * 64)
+    elif mutation == "invalid-lora":
+        lora = dict(manifest.lora)
+        lora["rank"] = 0
+        manifest = replace(manifest, lora=lora)
+    elif mutation == "invalid-precision":
+        precision = dict(manifest.precision)
+        precision["adapter_parameter_dtype"] = "bfloat16"
+        manifest = replace(manifest, precision=precision)
+    else:
+        raw = json.loads((run / "run.json").read_bytes())
+        raw["data_identity"] = "sha256:not-hex"
+        raw["identity"] = structured_identity(
+            LoRARunManifest.IDENTITY_DOMAIN,
+            {
+                name: value
+                for name, value in raw.items()
+                if name != "identity" and not name.startswith("diagnostic_")
+            },
+        )
+        _rebind_checkpoint_owner_identity(run, raw["identity"])
+        (run / "run.json").write_bytes(canonical_json_bytes(raw))
+        with pytest.raises(SMLArtifactError, match=message):
+            verify_artifact(run, full=True)
+        return
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (run / "run.json").write_bytes(canonical_json_bytes(manifest))
+    _rebind_run_checkpoint(run, manifest)
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(run, full=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("wrong-adapter-leaf", "adapter parameter specs"),
+        ("wrong-adapter-dtype", "trainable state must be float32"),
+    ),
+)
+def test_full_lora_run_rejects_resigned_adapter_leaf_or_dtype(
+    tmp_path: Path,
+    completed_cli_workspace: CLIWorkspace,
+    mutation: str,
+    message: str,
+) -> None:
+    """Adapter payloads remain exact float32 LoRA trees after honest re-signing."""
+    run = tmp_path / f"lora-adapter-{mutation}"
+    shutil.copytree(completed_cli_workspace.lora_run, run)
+    _latest, step, checkpoint = _latest_checkpoint(run)
+    assert isinstance(checkpoint, LoRACheckpointManifest)
+    adapter_path = step / checkpoint.adapters.payload.logical_path
+    adapters = dict(mx.load(adapter_path))
+    mx.eval(*adapters.values())
+    old_name = next(iter(adapters))
+    if mutation == "wrong-adapter-dtype":
+        adapters[old_name] = adapters[old_name].astype(mx.bfloat16)
+        mx.save_safetensors(adapter_path, adapters)
+        checkpoint = replace(
+            checkpoint,
+            adapters=_array_ref(
+                adapter_path,
+                checkpoint.adapters.payload.logical_path,
+                adapters,
+            ),
+        )
+    else:
+        new_name = f"{old_name}.unexpected"
+        adapters[new_name] = adapters.pop(old_name)
+        mx.save_safetensors(adapter_path, adapters)
+        optimizer_path = step / checkpoint.optimizer.payload.logical_path
+        optimizer = dict(mx.load(optimizer_path))
+        mx.eval(*optimizer.values())
+        for prefix in ("first_moments.", "second_moments."):
+            optimizer[f"{prefix}{new_name}"] = optimizer.pop(f"{prefix}{old_name}")
+        mx.save_safetensors(optimizer_path, optimizer)
+        trainer_path = step / checkpoint.trainer.payload.logical_path
+        trainer = dict(mx.load(trainer_path))
+        mx.eval(*trainer.values())
+        trainer[f"accumulators.{new_name}"] = trainer.pop(f"accumulators.{old_name}")
+        mx.save_safetensors(trainer_path, trainer)
+        checkpoint = replace(
+            checkpoint,
+            adapters=_array_ref(
+                adapter_path,
+                checkpoint.adapters.payload.logical_path,
+                adapters,
+            ),
+            optimizer=_array_ref(
+                optimizer_path,
+                checkpoint.optimizer.payload.logical_path,
+                optimizer,
+            ),
+            trainer=_array_ref(
+                trainer_path,
+                checkpoint.trainer.payload.logical_path,
+                trainer,
+            ),
+        )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    _write_checkpoint_and_latest(run, checkpoint)
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(run, full=True)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("optimizer-state", "optimizer step"),
+        ("trainer-state", "loss numerator"),
+        ("cursor-schema", "cursor has invalid fields"),
+        ("cursor-range", "cursor row_offset"),
+        ("progress-state", "microsteps disagree"),
+        ("next-rng", "next RNG key"),
+    ),
+)
+def test_full_lora_run_rejects_resigned_checkpoint_current_state_corruption(
+    tmp_path: Path,
+    completed_cli_workspace: CLIWorkspace,
+    mutation: str,
+    message: str,
+) -> None:
+    """Portable LoRA FULL validates cursor schema/ranges and derivable state only."""
+    run = tmp_path / f"lora-current-{mutation}"
+    shutil.copytree(completed_cli_workspace.lora_run, run)
+    _latest, step, checkpoint = _latest_checkpoint(run)
+    assert isinstance(checkpoint, LoRACheckpointManifest)
+    if mutation == "optimizer-state":
+        path = step / checkpoint.optimizer.payload.logical_path
+        arrays = dict(mx.load(path))
+        mx.eval(*arrays.values())
+        arrays["step"] = mx.array(checkpoint.step + 1, dtype=mx.int32)
+        mx.save_safetensors(path, arrays)
+        checkpoint = replace(
+            checkpoint,
+            optimizer=_array_ref(
+                path,
+                checkpoint.optimizer.payload.logical_path,
+                arrays,
+            ),
+        )
+    elif mutation in {"trainer-state", "next-rng"}:
+        path = step / checkpoint.trainer.payload.logical_path
+        arrays = dict(mx.load(path))
+        mx.eval(*arrays.values())
+        if mutation == "trainer-state":
+            arrays["loss_numerator"] = mx.array(1.0, dtype=mx.float32)
+        else:
+            arrays["next_key"] = mx.random.key(999)
+        mx.save_safetensors(path, arrays)
+        checkpoint = replace(
+            checkpoint,
+            trainer=_array_ref(
+                path,
+                checkpoint.trainer.payload.logical_path,
+                arrays,
+            ),
+        )
+    else:
+        path = step / checkpoint.scalar_state.logical_path
+        state = json.loads(path.read_bytes())
+        cursor = dict(state["cursor"])
+        if mutation == "cursor-schema":
+            cursor["unexpected"] = 0
+        elif mutation == "cursor-range":
+            cursor["row_offset"] = -1
+        else:
+            state["microsteps"] = int(state["microsteps"]) + 1
+        state["cursor"] = cursor
+        path.write_bytes(canonical_json_bytes(state))
+        checkpoint = replace(
+            checkpoint,
+            scalar_state=_payload_ref(path, checkpoint.scalar_state.logical_path),
+        )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    _write_checkpoint_and_latest(run, checkpoint)
+
+    with pytest.raises(SMLArtifactError, match=message):
+        verify_artifact(run, full=True)
 
 
 def test_cli_resume_accepts_relocated_identity_matching_data(
