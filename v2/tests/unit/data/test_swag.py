@@ -1326,6 +1326,75 @@ def test_swag_pre_registration_failure_closes_pending_real_mapping_phase_wide(
     _assert_real_swag_cleanup(events, owners, roots)
 
 
+def test_swag_post_append_failure_closes_real_mapping_exactly_once(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle
+
+    prepared = _one_example_bundle(tmp_path)
+    path = prepared.path
+    prepared.close()
+    events, owners, roots = _instrument_real_swag_cleanup(monkeypatch)
+    semantic_error = RuntimeError("injected post-append failure")
+    cleanup_error = RuntimeError("injected payload postcheck failure")
+    instrumented_open = swag._OwnedNpyMapping.open.__func__
+    instrumented_payload_close = swag._OwnedNpyMapping._close_payload
+    registration_pending = False
+    registration_line_count = 0
+    observed_pending_list_overlap = False
+    previous_trace = sys.gettrace()
+
+    def open_then_arm_registration_failure(cls, artifact, reference):
+        nonlocal registration_pending
+        owner = instrumented_open(cls, artifact, reference)
+        registration_pending = True
+        return owner
+
+    def fail_after_list_registration(frame, event, _argument):
+        nonlocal observed_pending_list_overlap
+        nonlocal registration_pending, registration_line_count
+        if event == "line" and frame.f_code is swag._open_buckets.__code__:
+            if not registration_pending:
+                return fail_after_list_registration
+            registration_line_count += 1
+            if registration_line_count == 2:
+                observed_pending_list_overlap = (
+                    frame.f_locals["mappings"][-1] is frame.f_locals["pending_owner"]
+                )
+                registration_pending = False
+                sys.settrace(previous_trace)
+                raise semantic_error
+        return fail_after_list_registration
+
+    def fail_after_payload_close(owner):
+        instrumented_payload_close(owner)
+        raise cleanup_error
+
+    monkeypatch.setattr(
+        swag._OwnedNpyMapping,
+        "open",
+        classmethod(open_then_arm_registration_failure),
+    )
+    monkeypatch.setattr(
+        swag._OwnedNpyMapping,
+        "_close_payload",
+        fail_after_payload_close,
+    )
+    sys.settrace(fail_after_list_registration)
+    try:
+        with pytest.raises(RuntimeError, match="post-append") as caught:
+            load_swag_bundle(path, VerificationLevel.FULL)
+    finally:
+        sys.settrace(previous_trace)
+
+    assert registration_line_count == 2
+    assert observed_pending_list_overlap
+    assert caught.value is semantic_error
+    assert caught.value.__cause__ is cleanup_error
+    _assert_real_swag_cleanup(events, owners, roots)
+
+
 def test_swag_semantic_failure_closes_real_mmaps_phase_wide(tmp_path, monkeypatch):
     from sml.data.swag import load_swag_bundle
 

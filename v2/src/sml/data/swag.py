@@ -356,9 +356,12 @@ def _close_swag_resources(
     pending_mapping: _OwnedNpyMapping | None = None,
 ) -> None:
     errors: list[BaseException] = []
-    if pending_mapping is not None:
+    unregistered_pending = pending_mapping
+    if mappings and mappings[-1] is unregistered_pending:
+        unregistered_pending = None
+    if unregistered_pending is not None:
         try:
-            pending_mapping._release_view()
+            unregistered_pending._release_view()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     for owner in reversed(mappings):
@@ -366,9 +369,9 @@ def _close_swag_resources(
             owner._release_view()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
-    if pending_mapping is not None:
+    if unregistered_pending is not None:
         try:
-            pending_mapping._close_mapping()
+            unregistered_pending._close_mapping()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     for owner in reversed(mappings):
@@ -376,9 +379,9 @@ def _close_swag_resources(
             owner._close_mapping()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
-    if pending_mapping is not None:
+    if unregistered_pending is not None:
         try:
-            pending_mapping._close_payload()
+            unregistered_pending._close_payload()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     for owner in reversed(mappings):
