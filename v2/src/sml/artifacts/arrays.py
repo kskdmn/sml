@@ -26,6 +26,7 @@ _SAFETENSORS_DTYPES = {
     "U32": ("uint32", 4),
     "BOOL": ("bool", 1),
 }
+_MAX_SAFETENSORS_HEADER_BYTES = 100_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +64,10 @@ def read_safetensors_layout(
                 f"safetensors payload has a truncated header length: {logical_path}"
             )
         header_length = int.from_bytes(encoded_length, byteorder="little")
+        if header_length > _MAX_SAFETENSORS_HEADER_BYTES:
+            raise SMLArtifactError(
+                f"safetensors header exceeds parser limit: {logical_path}"
+            )
         if header_length > reference.payload.byte_size - 8:
             raise SMLArtifactError(
                 f"safetensors header exceeds payload bytes: {logical_path}"

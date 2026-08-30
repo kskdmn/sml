@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tracemalloc
@@ -29,6 +30,40 @@ _RUN_IDENTITY = "sha256:" + "2" * 64
 
 class InjectedFailure(RuntimeError):
     pass
+
+
+class _TrackingHeaderStream(io.BytesIO):
+    def __init__(self, payload: bytes) -> None:
+        super().__init__(payload)
+        self.read_requests: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_requests.append(size)
+        if size > 1024:
+            raise AssertionError("oversized header read was attempted")
+        return super().read(size)
+
+
+def test_safetensors_rejects_oversized_header_before_read_or_allocation():
+    claimed = 100_000_001
+    stream = _TrackingHeaderStream(claimed.to_bytes(8, "little"))
+    reference = ArrayPayloadRef(
+        PayloadRef(
+            "model.safetensors",
+            "sha256:" + "0" * 64,
+            claimed + 8,
+        ),
+        (),
+    )
+    tracemalloc.start()
+    try:
+        with pytest.raises(SMLArtifactError, match="header.*limit"):
+            arrays_module.read_safetensors_layout(stream, reference)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert stream.read_requests == [8]
+    assert peak < 1024 * 1024
 
 
 def _write_array_artifact(
