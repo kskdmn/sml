@@ -1074,11 +1074,12 @@ def _verify_closed_world(
                 f"closed-world payload byte size mismatch: {'/'.join(manifest_path)}"
             )
 
-    if verify_contents:
+    if verify_contents or manifest_present:
         with ArtifactRoot(
             os.dup(temporary_descriptor), local_apfs=True
         ) as artifact_root:
-            artifact_root.verify_payloads(references, full=full)
+            if verify_contents:
+                artifact_root.verify_payloads(references, full=full)
             if manifest_present:
                 with artifact_root.open_payload(
                     manifest.MANIFEST_FILENAME

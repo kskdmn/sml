@@ -1130,6 +1130,64 @@ def test_selected_checkpoint_payloads_are_opened_once_for_proof_and_use(
         assert opens[name] == 1
 
 
+def test_materializing_reader_rechecks_equal_length_replaced_publisher_manifest(
+    valid_run: Path,
+) -> None:
+    """Stat-only size proof must not accept a replaced named checkpoint manifest."""
+    original = checkpoint.resolve_exact_step(
+        valid_run,
+        step=1,
+        verification=VerificationLevel.FULL,
+    ).checkpoint
+    assert isinstance(original, PretrainingCheckpointManifest)
+    digest = original.model.payload.identity.removeprefix("sha256:")
+    replacement_digest = ("0" if digest[0] != "0" else "1") + digest[1:]
+    replacement_payload = replace(
+        original.model.payload,
+        identity=f"sha256:{replacement_digest}",
+    )
+    replacement = replace(
+        original,
+        identity="sha256:" + "0" * 64,
+        model=replace(original.model, payload=replacement_payload),
+    )
+    replacement = replace(replacement, identity=replacement.recompute_identity())
+    original_bytes = canonical_json_bytes(original)
+    replacement_bytes = canonical_json_bytes(replacement)
+    assert replacement.identity != original.identity
+    assert len(replacement_bytes) == len(original_bytes)
+
+    step = valid_run / "checkpoints" / "step-000000001"
+    manifest_path = step / PretrainingCheckpointManifest.MANIFEST_FILENAME
+
+    class ReplaceManifestDuringClosedWorld(checkpoint._OSFilesystemOps):
+        def __init__(self) -> None:
+            self.swapped = False
+
+        def listdir(self, descriptor: int) -> list[str]:
+            names = super().listdir(descriptor)
+            if not self.swapped and "checkpoint.json" in names:
+                temporary = step / ".replacement-checkpoint.json"
+                temporary.write_bytes(replacement_bytes)
+                os.replace(temporary, manifest_path)
+                self.swapped = True
+            return names
+
+    fs = ReplaceManifestDuringClosedWorld()
+    with (
+        pytest.raises(SMLArtifactError, match="publisher-owned manifest changed"),
+        checkpoint.open_checkpoint_reader(
+            valid_run,
+            step=1,
+            verification=VerificationLevel.FULL,
+            fs=fs,
+        ) as reader,
+    ):
+        reader.read_contents()
+
+    assert fs.swapped is True
+
+
 def test_non_deferred_trusted_resolution_retains_one_structural_content_proof(
     valid_run: Path,
     monkeypatch: pytest.MonkeyPatch,
