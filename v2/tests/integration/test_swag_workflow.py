@@ -870,6 +870,134 @@ def test_limit_satisfied_resume_returns_before_iterator_or_kernel_construction(
     assert result.run == completed.run
 
 
+def _run_with_unpruned_lora_history(
+    tiny_base_run: Path,
+    tiny_swag_bundle: SwagDataBundle,
+    run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    real_prune = swag_module.prune_to_latest
+
+    def interrupt_retention(*_args, **_kwargs):
+        raise RuntimeError("retention interrupted")
+
+    monkeypatch.setattr(swag_module, "prune_to_latest", interrupt_retention)
+    with pytest.raises(RuntimeError, match="retention interrupted"):
+        finetune(
+            tiny_swag_training_config(
+                tiny_base_run,
+                tiny_swag_bundle,
+                run,
+                maximum_steps=1,
+            )
+        )
+    monkeypatch.setattr(swag_module, "prune_to_latest", real_prune)
+    assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
+        "step-000000000",
+        "step-000000001",
+    ]
+    return run
+
+
+def test_limit_satisfied_resume_prunes_stale_history_after_full_reader_closes(
+    tiny_base_run,
+    tiny_swag_bundle,
+    tmp_path,
+    monkeypatch,
+):
+    run = _run_with_unpruned_lora_history(
+        tiny_base_run,
+        tiny_swag_bundle,
+        tmp_path / "stale-limit-run",
+        monkeypatch,
+    )
+    real_open = swag_module.open_latest_checkpoint_reader
+    real_prune = swag_module.prune_to_latest
+    full_readers: list[CheckpointReader] = []
+    prune_calls = 0
+
+    @contextmanager
+    def record_reader(*args, **kwargs):
+        with real_open(*args, **kwargs) as reader:
+            if kwargs.get("verification") is VerificationLevel.FULL:
+                full_readers.append(reader)
+            yield reader
+
+    def prune_after_reader_close(*args, **kwargs):
+        nonlocal prune_calls
+        prune_calls += 1
+        assert len(full_readers) == 1
+        assert full_readers[0]._owned_step.descriptor == -1
+        return real_prune(*args, **kwargs)
+
+    monkeypatch.setattr(swag_module, "open_latest_checkpoint_reader", record_reader)
+    monkeypatch.setattr(swag_module, "prune_to_latest", prune_after_reader_close)
+
+    result = resume_finetune(
+        run,
+        data=tiny_swag_bundle.path,
+        overrides=ResumeOverrides(maximum_steps=1),
+    )
+
+    assert result.step == 1
+    assert prune_calls == 1
+    assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
+        "step-000000001"
+    ]
+
+
+def test_resume_prunes_stale_history_before_continuing_model_failure(
+    tiny_base_run,
+    tiny_swag_bundle,
+    tmp_path,
+    monkeypatch,
+):
+    run = _run_with_unpruned_lora_history(
+        tiny_base_run,
+        tiny_swag_bundle,
+        tmp_path / "stale-continuing-run",
+        monkeypatch,
+    )
+    real_open = swag_module.open_latest_checkpoint_reader
+    real_prune = swag_module.prune_to_latest
+    full_readers: list[CheckpointReader] = []
+    order: list[str] = []
+
+    @contextmanager
+    def record_reader(*args, **kwargs):
+        with real_open(*args, **kwargs) as reader:
+            if kwargs.get("verification") is VerificationLevel.FULL:
+                full_readers.append(reader)
+            yield reader
+
+    def record_prune(*args, **kwargs):
+        assert len(full_readers) == 1
+        assert full_readers[0]._owned_step.descriptor == -1
+        retained = real_prune(*args, **kwargs)
+        order.append("retention")
+        return retained
+
+    def fail_model_construction(*_args, **_kwargs):
+        order.append("model")
+        raise RuntimeError("model construction failed")
+
+    monkeypatch.setattr(swag_module, "open_latest_checkpoint_reader", record_reader)
+    monkeypatch.setattr(swag_module, "prune_to_latest", record_prune)
+    monkeypatch.setattr(swag_module, "_wrap_copied_base", fail_model_construction)
+
+    with pytest.raises(RuntimeError, match="model construction failed"):
+        resume_finetune(
+            run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
+
+    assert order == ["retention", "model"]
+    assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
+        "step-000000001"
+    ]
+
+
 def test_finetune_closes_swag_bundle_exactly_once_on_success(
     tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
 ):

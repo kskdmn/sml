@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import sml.training.pretrain as pretrain_module
 from mlx.utils import tree_flatten, tree_map
+from sml.data.pretraining import PretrainingCursor
 from sml.errors import SMLArtifactError
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel, causal_lm_loss
@@ -25,6 +26,7 @@ from sml.training.common import (
     initialize_base_parameter_state,
 )
 from sml.training.pretrain import build_pretraining_kernels
+from sml.training.random import counter_random_key
 
 
 def assert_tree_close(
@@ -390,6 +392,110 @@ def test_enabled_dropout_advances_explicit_prng_key(tmp_path: Path):
 
     mx.eval(state.trainer.next_key, expected)
     assert bool(mx.array_equal(state.trainer.next_key, expected))
+
+
+def test_training_loop_publishes_exact_forward_returned_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runtime = build_tiny_runtime(tmp_path, dropout=0.2)
+    config = replace(
+        runtime.config,
+        loader=replace(
+            runtime.config.loader,
+            microbatch_size=2,
+            gradient_accumulation_steps=1,
+        ),
+        maximum_steps=1,
+        maximum_epochs=None,
+        seed=23,
+    )
+    terminal = mx.array([101, 202], dtype=mx.uint32)
+    captured = []
+
+    class ControlledKernels:
+        @staticmethod
+        def microstep(parameters, trainer, _rows):
+            addressed = counter_random_key(config.seed, 0)
+            mx.eval(trainer.next_key, addressed)
+            assert bool(mx.array_equal(trainer.next_key, addressed))
+            trainer_tree = trainer.to_tree()
+            returned = TrainerState.from_compiled_tree(
+                (
+                    trainer_tree[0],
+                    trainer_tree[1],
+                    terminal,
+                    trainer_tree[3],
+                )
+            )
+            return pretrain_module.MicrostepState(parameters, returned)
+
+        @staticmethod
+        def optimizer_step(parameters, optimizer, trainer):
+            assert trainer.next_key is terminal
+            return pretrain_module.OptimizerStepState(
+                parameters,
+                optimizer,
+                trainer,
+                {},
+            )
+
+    class SingleEnvelope:
+        rows = runtime.rows
+        cursor_after = PretrainingCursor(0, 0, 1)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class SingleStream:
+        def iter_epoch(self, _epoch):
+            yield SingleEnvelope()
+
+        def commit(self, _cursor):
+            return None
+
+    def capture_publication(_run, _manifest, state):
+        captured.append(state)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        pretrain_module,
+        "build_pretraining_kernels",
+        lambda *_args, **_kwargs: ControlledKernels(),
+    )
+    monkeypatch.setattr(
+        pretrain_module,
+        "_publish_training_state",
+        capture_publication,
+    )
+    restored = pretrain_module._RestoredTrainingState(
+        runtime.parameters,
+        runtime.optimizer,
+        runtime.trainer,
+        pretrain_module.ScalarTrainingState(
+            0,
+            0,
+            0,
+            PretrainingCursor.initial(),
+        ),
+    )
+
+    result = pretrain_module._run_training(
+        tmp_path / "run",
+        SimpleNamespace(),
+        config,
+        runtime.model,
+        restored,
+        SingleStream(),
+    )
+
+    assert result.step == 1
+    assert len(captured) == 1
+    assert captured[0].trainer.next_key is terminal
+    assert bool(mx.array_equal(captured[0].trainer.next_key, terminal))
 
 
 def test_resume_overrides_and_checkpoint_policy_expose_only_reviewed_controls():

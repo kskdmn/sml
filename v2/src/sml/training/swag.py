@@ -1418,9 +1418,6 @@ def resume_finetune(
             base_identity=None,
         )
         with bundle:
-            runtime: (
-                tuple[LoRARunManifest, SMLLanguageModel, _RestoredSwagState] | None
-            ) = None
             with open_latest_checkpoint_reader(
                 run,
                 verification=VerificationLevel.FULL,
@@ -1451,37 +1448,43 @@ def resume_finetune(
                 adapters, optimizer, trainer, scalar = _restore_adapter_checkpoint(
                     reader
                 )
-                if _limit_reached(config, scalar):
-                    return _training_result(run, scalar)
-                model_config = ModelConfig(**_mapping_dict(resolved.run.model, "model"))
-                model_key, _trainer_key = mx.random.split(mx.random.key(config.seed))
-                model, _initialized, frozen_base = _wrap_copied_base(
-                    model_config,
+                mx.eval(
                     base_arrays,
-                    config.lora,
-                    model_key,
-                )
-                restored = _RestoredSwagState(
                     adapters,
-                    frozen_base,
-                    optimizer,
-                    trainer,
-                    scalar,
+                    optimizer.to_tree(),
+                    trainer.to_tree(),
                 )
-                runtime = (resolved.run, model, restored)
+                limit_reached = _limit_reached(config, scalar)
+                run_manifest = resolved.run
+                checkpoint_identity = resolved.checkpoint.identity
             retained = prune_to_latest(run)
-            if retained.checkpoint.identity != resolved.checkpoint.identity:
+            if retained.checkpoint.identity != checkpoint_identity:
                 raise SMLArtifactError(
                     "latest checkpoint changed during writable recovery"
                 )
-            if runtime is None:
-                raise SMLArtifactError("LoRA resume did not construct runtime state")
+            if limit_reached:
+                return _training_result(run, scalar)
+            model_config = ModelConfig(**_mapping_dict(run_manifest.model, "model"))
+            model_key, _trainer_key = mx.random.split(mx.random.key(config.seed))
+            model, _initialized, frozen_base = _wrap_copied_base(
+                model_config,
+                base_arrays,
+                config.lora,
+                model_key,
+            )
+            restored = _RestoredSwagState(
+                adapters,
+                frozen_base,
+                optimizer,
+                trainer,
+                scalar,
+            )
             return _run_training(
                 run,
-                runtime[0],
+                run_manifest,
                 config,
-                runtime[1],
-                runtime[2],
+                model,
+                restored,
                 bundle,
             )
 

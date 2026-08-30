@@ -32,6 +32,7 @@ from sml.training.common import (
     initialize_adam_state,
 )
 from sml.training.lora import LoRAConfig, LoRAInitializerConfig, apply_lora
+from sml.training.random import counter_random_key
 from sml.training.swag import (
     SwagKernelConfig,
     SwagTrainingConfig,
@@ -1219,6 +1220,91 @@ def test_second_compiled_step_sees_returned_adapter_optimizer_and_key_state(
                 compiled_trainer_tree[index], eager_trainer_tree[index]
             ).item()
         )
+
+
+def test_training_loop_publishes_exact_forward_returned_key(
+    tiny_swag_runtime,
+    tmp_path,
+    monkeypatch,
+):
+    config = replace(
+        tiny_swag_runtime.config,
+        lora=replace(tiny_swag_runtime.config.lora, dropout=0.5),
+        loader=replace(
+            tiny_swag_runtime.config.loader,
+            microbatch_size=1,
+            gradient_accumulation_steps=1,
+        ),
+        maximum_steps=1,
+        maximum_epochs=None,
+        seed=29,
+    )
+    adapters = clone_tree(tiny_swag_runtime.initial_adapters)
+    optimizer = initialize_adam_state(adapters)
+    trainer = swag_module.initial_swag_trainer_state(
+        adapters,
+        key=mx.random.key(7),
+    )
+    terminal = mx.array([303, 404], dtype=mx.uint32)
+    captured = []
+
+    class ControlledKernels:
+        @staticmethod
+        def ranking_microstep(_adapters, _frozen_base, trainer, _batch):
+            addressed = counter_random_key(config.seed, 0)
+            mx.eval(trainer.next_key, addressed)
+            assert bool(mx.array_equal(trainer.next_key, addressed))
+            trainer_tree = trainer.to_tree()
+            return swag_module.SwagTrainerState.from_compiled_tree(
+                (
+                    trainer_tree[0],
+                    mx.array(1, dtype=mx.int32),
+                    terminal,
+                    trainer_tree[3],
+                    trainer_tree[4],
+                )
+            )
+
+        @staticmethod
+        def optimizer_step(adapters, optimizer, trainer):
+            assert trainer.next_key is terminal
+            return adapters, optimizer, trainer
+
+    def capture_publication(_run, _manifest, state):
+        captured.append(state)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(
+        swag_module,
+        "build_swag_kernels",
+        lambda *_args, **_kwargs: ControlledKernels(),
+    )
+    monkeypatch.setattr(
+        swag_module,
+        "_publish_training_state",
+        capture_publication,
+    )
+    restored = swag_module._RestoredSwagState(
+        adapters,
+        tiny_swag_runtime.frozen_base,
+        optimizer,
+        trainer,
+        swag_module.ScalarSwagState(0, 0, 0, SwagCursor.initial()),
+    )
+
+    result = swag_module._run_training(
+        tmp_path / "run",
+        SimpleNamespace(),
+        config,
+        tiny_swag_runtime.model,
+        restored,
+        tiny_swag_runtime.bundle,
+    )
+
+    assert result.step == 1
+    assert len(captured) == 1
+    assert captured[0].trainer.next_key is terminal
+    assert bool(mx.array_equal(captured[0].trainer.next_key, terminal))
 
 
 def test_kernel_config_is_frozen_from_loader_optimizer_and_compile(tiny_swag_runtime):
