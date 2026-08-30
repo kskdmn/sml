@@ -721,6 +721,24 @@ def test_lora_microbatch_progress_supports_full_checkpoint_consumers(
     verify_artifact(trained.run, full=True)
     InferenceSession.from_checkpoint(trained.run, full_verify=True)
 
+    resumed = resume_finetune(
+        trained.run,
+        data=tiny_swag_bundle.path,
+        overrides=ResumeOverrides(maximum_steps=2),
+    )
+    assert resumed.run == trained.run
+    assert resumed.step == 2
+    resumed_resolved = resolve_latest_step(
+        resumed.run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+    resumed_state = json.loads(
+        (resumed_resolved.step_directory / "state.json").read_text()
+    )
+    assert resumed_resolved.step == resumed_state["step"] == 2
+    verify_artifact(resumed.run, full=True)
+
 
 def test_resume_rejects_mismatches_before_allocation(
     tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
