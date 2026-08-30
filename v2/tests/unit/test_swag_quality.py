@@ -101,16 +101,17 @@ def test_harness_identity_hashes_only_the_two_reviewed_files_in_order():
     assert harness_content_identity(ROOT) == f"sha256:{expected.hexdigest()}"
 
 
-def test_recorded_validator_rejects_re_signed_bridge_omission():
+def test_recorded_validator_rejects_re_signed_required_component_omission():
     manifest = json.loads(
         (ROOT / swag_quality.CANONICAL_MANIFEST_PATH).read_text(encoding="utf-8")
     )
     source_commit = manifest["source_commit"]
     workload = SwagQualityWorkload.from_dict(manifest["workload"])
+    omitted_component = "v2/src/sml/model/layers.py"
     retained_components = tuple(
         component
         for component in workload.production_dependency_components
-        if component != swag_quality.LEGACY_BRIDGE_COMPONENT.as_posix()
+        if component != omitted_component
     )
     assert len(retained_components) + 1 == len(
         workload.production_dependency_components
