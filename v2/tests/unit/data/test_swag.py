@@ -1075,6 +1075,41 @@ def test_swag_stream_uses_owned_arrays_without_public_bucket_lease(tmp_path):
     assert bundle._closed
 
 
+def test_swag_stream_rejects_active_public_lease_without_changing_ownership(
+    tmp_path, monkeypatch
+):
+    from sml.data.swag import SwagBatchStream, SwagCursor
+
+    bundle = _one_example_bundle(tmp_path)
+    lease = bundle.borrow_buckets()
+    first = int(lease.buckets[0].input_ids[0, 0, 0])
+    transfer_rejected = False
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setattr("threading.Thread.start", lambda _thread: None)
+            with pytest.raises(SMLDataError, match="active bucket leases"):
+                SwagBatchStream(
+                    bundle,
+                    _one_example_loader(),
+                    cursor=SwagCursor.initial(),
+                )
+        assert int(lease.buckets[0].input_ids[0, 0, 0]) == first
+        assert bundle._closed is False
+        transfer_rejected = True
+    finally:
+        lease.close()
+        if not transfer_rejected:
+            bundle.close()
+
+    stream = SwagBatchStream(
+        bundle,
+        _one_example_loader(),
+        cursor=SwagCursor.initial(),
+    )
+    stream.close()
+    assert bundle._closed is True
+
+
 def test_swag_stream_closes_owned_bundle_on_early_return_and_double_close(tmp_path):
     from sml.data.swag import SwagBatchStream, SwagCursor
 
@@ -2134,6 +2169,59 @@ def test_load_rejects_token_id_outside_vocabulary(tmp_path):
     _rewrite_swag_array(output, logical, mutate)
     with pytest.raises(SMLArtifactError, match="vocab"):
         load_swag_bundle(output, VerificationLevel.FULL)
+
+
+def test_full_swag_reduction_operands_are_bounded_to_1024_rows(tmp_path, monkeypatch):
+    from sml.data import swag
+    from sml.data.swag import load_swag_bundle, prepare_swag_bundle
+
+    output = tmp_path / "swag"
+    prepared = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider((VALID_ROW,))), tiny_base_model(), output
+    )
+    manifest = prepared.manifest
+    prepared.close()
+    row_count = 2_049
+    for name in ("input_ids", "valid_token_mask", "score_mask", "labels"):
+        logical = _array_logical_path(manifest, name)
+        _rewrite_swag_array(
+            output,
+            logical,
+            lambda array: np.repeat(array, row_count, axis=0),
+        )
+    _rewrite_swag_manifest(output, example_count=row_count)
+
+    recorded: list[tuple[int, ...]] = []
+    real_np = np
+
+    class RecordingNumpy:
+        def __getattr__(self, name):
+            return getattr(real_np, name)
+
+        def _record(self, operation, operand, *args, **kwargs):
+            recorded.append(np.shape(operand))
+            return operation(operand, *args, **kwargs)
+
+        def min(self, operand, *args, **kwargs):
+            return self._record(real_np.min, operand, *args, **kwargs)
+
+        def max(self, operand, *args, **kwargs):
+            return self._record(real_np.max, operand, *args, **kwargs)
+
+        def any(self, operand, *args, **kwargs):
+            return self._record(real_np.any, operand, *args, **kwargs)
+
+        def all(self, operand, *args, **kwargs):
+            return self._record(real_np.all, operand, *args, **kwargs)
+
+    monkeypatch.setattr(swag, "np", RecordingNumpy())
+    loaded = load_swag_bundle(output, VerificationLevel.FULL)
+    loaded.close()
+
+    row_operands = [shape for shape in recorded if shape and shape[0] > 1]
+    assert row_operands
+    assert (1_024,) in row_operands
+    assert max(shape[0] for shape in row_operands) <= 1_024
 
 
 def test_load_rejects_score_mask_true_where_valid_mask_is_false(tmp_path):

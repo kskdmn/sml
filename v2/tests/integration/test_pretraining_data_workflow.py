@@ -30,6 +30,7 @@ from sml.artifacts.manifest import (
     read_manifest,
     row_content_identity,
 )
+from sml.artifacts.verify import verify_artifact
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
     BatchEnvelope,
@@ -1437,6 +1438,46 @@ def test_prepared_semantic_failure_closes_real_mappings_payloads_and_root(
         pretraining_module._open_validated_prepared_resources(prepared_bundle)
 
     _assert_real_prepared_cleanup(events, mappings, payloads, roots)
+
+
+def test_full_prepared_reduction_operands_are_bounded_to_1024_rows(
+    prepared_bundle, monkeypatch
+):
+    width = prepared_bundle.manifest.row_width
+    row_count = 2_049
+    rows = np.zeros((row_count, width), dtype="<i4")
+    prepared_bundle = _replace_shards(prepared_bundle, (rows,))
+
+    recorded: list[tuple[int, ...]] = []
+    real_np = np
+
+    class RecordingNumpy:
+        def __getattr__(self, name):
+            return getattr(real_np, name)
+
+        def _record(self, operation, operand, *args, **kwargs):
+            recorded.append(np.shape(operand))
+            return operation(operand, *args, **kwargs)
+
+        def min(self, operand, *args, **kwargs):
+            return self._record(real_np.min, operand, *args, **kwargs)
+
+        def max(self, operand, *args, **kwargs):
+            return self._record(real_np.max, operand, *args, **kwargs)
+
+        def any(self, operand, *args, **kwargs):
+            return self._record(real_np.any, operand, *args, **kwargs)
+
+        def all(self, operand, *args, **kwargs):
+            return self._record(real_np.all, operand, *args, **kwargs)
+
+    monkeypatch.setattr(pretraining_module, "np", RecordingNumpy())
+    preflight_pretraining_bundle(prepared_bundle, batch_size=1)
+    verify_artifact(prepared_bundle.path, full=True)
+
+    row_operands = [shape for shape in recorded if shape and shape[0] > 1]
+    assert row_operands
+    assert max(shape[0] for shape in row_operands) <= 1_024
 
 
 def test_prepared_detach_failure_closes_real_mappings_payloads_and_root(

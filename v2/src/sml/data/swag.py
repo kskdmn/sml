@@ -1194,6 +1194,7 @@ def _validate_bucket_arrays(
     input_ids: np.ndarray,
     valid_token_mask: np.ndarray,
     score_mask: np.ndarray,
+    labels: np.ndarray | None = None,
     vocab_size: int,
     pad_token_id: int,
     eos_token_id: int,
@@ -1207,10 +1208,14 @@ def _validate_bucket_arrays(
     row_chunk_size = 1_024
     for start in range(0, input_ids.shape[0], row_chunk_size):
         stop = min(start + row_chunk_size, input_ids.shape[0])
+        chunk_labels = (
+            labels[start:stop] if labels is not None else np.empty((0,), dtype=_INT32)
+        )
         _validate_bucket_array_chunk(
             input_ids=input_ids[start:stop],
             valid_token_mask=valid_token_mask[start:stop],
             score_mask=score_mask[start:stop],
+            labels=chunk_labels,
             vocab_size=vocab_size,
             pad_token_id=pad_token_id,
             eos_token_id=eos_token_id,
@@ -1224,6 +1229,7 @@ def _validate_bucket_array_chunk(
     input_ids: np.ndarray,
     valid_token_mask: np.ndarray,
     score_mask: np.ndarray,
+    labels: np.ndarray,
     vocab_size: int,
     pad_token_id: int,
     eos_token_id: int,
@@ -1232,13 +1238,17 @@ def _validate_bucket_array_chunk(
 ) -> None:
     if np.any(input_ids < 0) or np.any(input_ids >= vocab_size):
         raise SMLArtifactError("SWAG token id is outside the tokenizer vocabulary")
+    if bool(np.any(score_mask[:, :, 0])):
+        raise SMLArtifactError("SWAG score mask must be false at position zero")
+    if labels.shape[0] and (int(np.min(labels)) < 0 or int(np.max(labels)) >= 4):
+        raise SMLArtifactError("SWAG labels must be in 0..3")
     invalid = ~valid_token_mask
     if np.any(score_mask & invalid):
         raise SMLArtifactError("SWAG score mask is true where the valid mask is false")
     lengths = valid_token_mask.sum(axis=-1, dtype=np.int64)
     expected_valid = np.arange(input_ids.shape[-1]) < lengths[..., None]
     if not np.array_equal(valid_token_mask, expected_valid) or np.any(
-        input_ids[invalid] != pad_token_id
+        (input_ids != pad_token_id) & invalid
     ):
         raise SMLArtifactError("SWAG padding is inconsistent with the valid mask")
     if input_ids.shape[0] and np.any(~score_mask.any(axis=-1)):
@@ -1311,14 +1321,11 @@ def _open_buckets(
                 or labels.shape != (example_count,)
             ):
                 raise SMLArtifactError("SWAG bucket arrays have incompatible shapes")
-            if bool(np.any(score_mask[:, :, 0])):
-                raise SMLArtifactError("SWAG score mask must be false at position zero")
-            if example_count and (int(labels.min()) < 0 or int(labels.max()) >= 4):
-                raise SMLArtifactError("SWAG labels must be in 0..3")
             _validate_bucket_arrays(
                 input_ids=input_ids,
                 valid_token_mask=valid_token_mask,
                 score_mask=score_mask,
+                labels=labels,
                 vocab_size=manifest.vocab_size,
                 pad_token_id=manifest.pad_token_id,
                 eos_token_id=manifest.eos_token_id,
@@ -2172,6 +2179,10 @@ class SwagBatchStream:
             raise TypeError("cursor must be a SwagCursor")
         if bundle._closed:
             raise SMLDataError("SWAG data bundle is closed")
+        if owns_bundle and bundle._bucket_leases:
+            raise SMLDataError(
+                "cannot transfer SWAG bundle ownership with active bucket leases"
+            )
         self._bundle = bundle
         self._owns_bundle = owns_bundle
         self._loader = loader

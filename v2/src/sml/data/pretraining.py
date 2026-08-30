@@ -7,7 +7,7 @@ import mmap
 import queue
 import threading
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from traceback import clear_frames
@@ -41,6 +41,7 @@ _TOKENIZER_MANIFEST = "manifest.json"
 _TOKENIZER_MODEL = "tokenizer.model"
 _TOKENIZER_VOCAB = "tokenizer.vocab"
 _INT32 = np.dtype("<i4")
+_PREPARED_ROW_SCAN_SIZE = 1_024
 
 
 def _require_plain_int(value: object, name: str, *, minimum: int = 0) -> int:
@@ -441,6 +442,23 @@ def _close_prepared_resources(
         raise errors[0]
 
 
+def _validated_prepared_rows(
+    shards: Sequence[np.ndarray],
+    *,
+    vocab_size: int,
+) -> Iterator[np.ndarray]:
+    for shard in shards:
+        for start in range(0, shard.shape[0], _PREPARED_ROW_SCAN_SIZE):
+            chunk = shard[start : start + _PREPARED_ROW_SCAN_SIZE]
+            if chunk.shape[0] and (
+                int(np.min(chunk)) < 0 or int(np.max(chunk)) >= vocab_size
+            ):
+                raise SMLArtifactError(
+                    f"prepared bundle token IDs must be in [0, {vocab_size})"
+                )
+            yield from chunk
+
+
 def _open_validated_prepared_resources(
     bundle: PreparedDataBundle,
 ) -> tuple[
@@ -529,13 +547,13 @@ def _open_validated_prepared_resources(
 
         if not shard_arrays:
             raise SMLDataError("prepared bundle contains no shards")
-        minimum = min(int(array.min()) for array in shard_arrays)
-        maximum = max(int(array.max()) for array in shard_arrays)
-        if minimum < 0 or maximum >= tokenizer_manifest.vocab_size:
-            raise SMLArtifactError(
-                "prepared bundle token IDs must be in "
-                f"[0, {tokenizer_manifest.vocab_size})"
-            )
+        deque(
+            _validated_prepared_rows(
+                shard_arrays,
+                vocab_size=tokenizer_manifest.vocab_size,
+            ),
+            maxlen=0,
+        )
         root = artifact.detach_root()
         return root, shard_files, mappings, shard_arrays, manifest
     except BaseException as error:
@@ -658,16 +676,12 @@ def _verify_opened_pretraining_bundle(
 
         if not shard_arrays:
             raise SMLDataError("prepared bundle contains no shards")
-        minimum = min(int(shard.min()) for shard in shard_arrays)
-        maximum = max(int(shard.max()) for shard in shard_arrays)
-        if minimum < 0 or maximum >= tokenizer_manifest.vocab_size:
-            raise SMLArtifactError(
-                "prepared bundle token IDs must be in "
-                f"[0, {tokenizer_manifest.vocab_size})"
-            )
         row_count = sum(manifest.shard_row_counts)
         actual_identity = row_content_identity(
-            (row for shard in shard_arrays for row in shard),
+            _validated_prepared_rows(
+                shard_arrays,
+                vocab_size=tokenizer_manifest.vocab_size,
+            ),
             row_count,
             manifest.row_width,
         )
