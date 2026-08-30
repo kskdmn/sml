@@ -1353,12 +1353,12 @@ def test_full_pretraining_run_rejects_resigned_invalid_current_state(
         verify_artifact(run, full=True)
 
 
-def test_full_pretraining_run_rejects_incomplete_resigned_accumulation_progress(
+def test_full_pretraining_run_accepts_re_signed_partial_progress(
     tmp_path: Path,
     pretraining_run_template: Path,
 ) -> None:
-    """An empty checkpoint boundary must represent every configured microstep."""
-    run = tmp_path / "run-incomplete-progress"
+    """FULL verification accepts an epoch-ending partial accumulation window."""
+    run = tmp_path / "run-partial-progress"
     shutil.copytree(pretraining_run_template, run)
     step, checkpoint = _latest_checkpoint(run)
     state_path = step / checkpoint.scalar_state.logical_path
@@ -1375,6 +1375,62 @@ def test_full_pretraining_run_rejects_incomplete_resigned_accumulation_progress(
     checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
     (step / "checkpoint.json").write_bytes(canonical_json_bytes(checkpoint))
     _rebind_latest_checkpoint(run, checkpoint)
+
+    run_manifest = read_manifest(
+        run,
+        PretrainingRunManifest,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    trainer_path = step / checkpoint.trainer.payload.logical_path
+    trainer = dict(mx.load(trainer_path))
+    mx.eval(*trainer.values())
+    trainer["next_key"] = counter_random_key(
+        int(run_manifest.checkpoint["seed"]),
+        1,
+    )
+    mx.save_safetensors(trainer_path, trainer)
+    checkpoint = replace(
+        checkpoint,
+        trainer=_array_ref(
+            trainer_path,
+            checkpoint.trainer.payload.logical_path,
+            trainer,
+        ),
+    )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    (step / "checkpoint.json").write_bytes(canonical_json_bytes(checkpoint))
+    _rebind_latest_checkpoint(run, checkpoint)
+
+    verified = verify_artifact(run, full=True)
+    assert verified.manifest.kind == "pretraining-run"
+    assert verified.children[-1].manifest.step == 1
+
+
+@pytest.mark.parametrize("microsteps", (0, 3))
+def test_full_pretraining_run_rejects_progress_outside_step_bounds(
+    tmp_path: Path,
+    pretraining_run_template: Path,
+    microsteps: int,
+) -> None:
+    """FULL verification rejects progress below or above the accumulation bounds."""
+    run = tmp_path / f"run-invalid-progress-{microsteps}"
+    shutil.copytree(pretraining_run_template, run)
+    step, checkpoint = _latest_checkpoint(run)
+    state_path = step / checkpoint.scalar_state.logical_path
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["microsteps"] = microsteps
+    state["rows"] = microsteps
+    state_path.write_bytes(canonical_json_bytes(state))
+    rebound = replace(
+        checkpoint,
+        scalar_state=_payload_ref(
+            state_path,
+            checkpoint.scalar_state.logical_path,
+        ),
+    )
+    rebound = replace(rebound, identity=rebound.recompute_identity())
+    (step / "checkpoint.json").write_bytes(canonical_json_bytes(rebound))
+    _rebind_latest_checkpoint(run, rebound)
 
     with pytest.raises(SMLArtifactError, match="microsteps disagree"):
         verify_artifact(run, full=True)

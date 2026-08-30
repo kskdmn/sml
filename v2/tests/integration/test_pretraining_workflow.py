@@ -10,6 +10,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
+import zstandard as zstd
 from mlx.utils import tree_unflatten
 from sml.artifacts import checkpoint as checkpoint_module
 from sml.artifacts.checkpoint import (
@@ -33,8 +34,16 @@ from sml.artifacts.manifest import (
     read_manifest,
     row_content_identity,
 )
-from sml.data.pretraining import PretrainingCursor
+from sml.artifacts.verify import verify_artifact
+from sml.data.corpus import CorpusConfig
+from sml.data.pretraining import (
+    PretrainingCursor,
+    PretrainingPreparationConfig,
+    prepare_pretraining_bundle,
+)
+from sml.data.tokenizer import TokenizerTrainingConfig, train_tokenizer_bundle
 from sml.errors import SMLArtifactError
+from sml.inference import InferenceSession
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
 from sml.training import common as training_common
@@ -484,6 +493,86 @@ def test_interrupted_accumulation_replays_the_complete_window(
 
     assert resumed.step == uninterrupted.step == 2
     _assert_run_states_equal(resumed.run, uninterrupted.run)
+
+
+def test_partial_window_progress_supports_full_verify_inference_and_resume(
+    tmp_path: Path,
+) -> None:
+    """An epoch-ending partial accumulation window remains a usable checkpoint."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    payload = b"".join(
+        json.dumps(
+            {"text": "alpha beta gamma delta epsilon zeta eta theta " * 8}
+        ).encode("utf-8")
+        + b"\n"
+        for _ in range(12)
+    )
+    (corpus / "tiny-0000.jsonl.zst").write_bytes(
+        zstd.ZstdCompressor().compress(payload)
+    )
+    corpus_config = CorpusConfig(
+        input_root=corpus,
+        shuffle_files=False,
+        min_text_bytes=1,
+        max_rows_per_file=None,
+    )
+    tokenizer = train_tokenizer_bundle(
+        TokenizerTrainingConfig(
+            corpus=corpus_config,
+            vocab_size=300,
+            hard_vocab_limit=False,
+            num_threads=1,
+        ),
+        tmp_path / "tokenizer",
+    )
+    data = prepare_pretraining_bundle(
+        PretrainingPreparationConfig(
+            corpus=corpus_config,
+            tokenizer_bundle=tokenizer.path,
+            sequence_length=4,
+            shuffle_window_rows=4,
+            output_shard_rows=8,
+            seed=7,
+        ),
+        tmp_path / "single-row-data",
+    )
+    row_count = sum(
+        read_manifest(
+            data.path,
+            PretrainingDataManifest,
+            VerificationLevel.FULL,
+        ).manifest.shard_row_counts
+    )
+    data_path = data.path
+    config = _config(data_path, tmp_path / "partial-window-run", maximum_steps=1)
+    trained = pretrain.train(
+        replace(
+            config,
+            model=replace(config.model, vocab_size=tokenizer.manifest.vocab_size),
+            loader=replace(config.loader, microbatch_size=row_count),
+            maximum_epochs=1,
+        )
+    )
+
+    resolved = resolve_latest_step(
+        trained.run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+    scalar = pretrain.read_scalar_state(resolved)
+    assert scalar.step == 1
+    assert scalar.microsteps == 1
+    verify_artifact(trained.run, full=True)
+    InferenceSession.from_checkpoint(trained.run, full_verify=True)
+
+    resumed = pretrain.resume(
+        trained.run,
+        data=data_path,
+        overrides=_overrides(maximum_steps=2, maximum_epochs=2),
+    )
+
+    assert resumed.step == 2
 
 
 def test_resume_accepts_relocation_rejects_resharding_and_prunes_to_latest(

@@ -26,6 +26,7 @@ from sml.artifacts.manifest import (
     file_identity,
     read_manifest,
 )
+from sml.artifacts.verify import verify_artifact
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
     PretrainingPreparationConfig,
@@ -551,6 +552,40 @@ def test_uninterrupted_and_interrupted_adapter_state_match(
     _assert_array_maps_equal(left["adapters"], right["adapters"])
     _assert_array_maps_equal(left["optimizer"], right["optimizer"])
     _assert_array_maps_equal(left["trainer"], right["trainer"])
+
+
+def test_lora_microbatch_progress_supports_full_checkpoint_consumers(
+    tiny_base_run,
+    tiny_swag_bundle,
+    tmp_path,
+) -> None:
+    """One partial LoRA microbatch is a complete, verifiable optimizer step."""
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "microbatch-progress-run",
+            loader=LoaderConfig(
+                microbatch_size=2,
+                gradient_accumulation_steps=2,
+                prefetch_depth=1,
+                epoch_seed=13,
+            ),
+            maximum_steps=1,
+        )
+    )
+
+    resolved = resolve_latest_step(
+        trained.run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+    state = json.loads((resolved.step_directory / "state.json").read_text())
+    assert state["step"] == 1
+    assert state["microsteps"] == 1
+    assert 1 <= state["examples"] <= 2
+    verify_artifact(trained.run, full=True)
+    InferenceSession.from_checkpoint(trained.run, full_verify=True)
 
 
 def test_resume_rejects_mismatches_before_allocation(

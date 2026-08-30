@@ -232,7 +232,8 @@ def _verify_progress(
         or not isinstance(microsteps, int)
     ):
         raise SMLArtifactError("checkpoint scalar progress disagrees with checkpoint")
-    if microsteps != step * loader.gradient_accumulation_steps:
+    maximum_microsteps = step * loader.gradient_accumulation_steps
+    if not step <= microsteps <= maximum_microsteps:
         raise SMLArtifactError("checkpoint scalar microsteps disagree with step")
     if lora:
         examples = values.get("examples")
