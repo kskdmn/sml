@@ -1,11 +1,395 @@
-# V2 Refactor Handoff: Part 2 Task 6.4 Next
+# V2 Refactor Handoff: Artifact Residual Corrections Complete
 
 **Recorded:** 2026-08-22 (Asia/Shanghai)
 
-**Last updated:** 2026-08-25 (Asia/Shanghai)
+**Last updated:** 2026-08-30 (Asia/Shanghai)
 
-**Purpose:** Give a fresh session enough repository-backed context to continue
-Part 2 at Task 6.4, without reading the prior conversation.
+**Purpose:** Give a fresh session enough repository-backed context to resume
+the final-acceptance remediation from the exact current checkout, without
+reading the prior conversation.
+
+## 2026-08-30 Artifact Residual Closure — Current Takeover Point
+
+This section supersedes every older current-status, residual-finding, and
+next-action statement below. Older sections remain as implementation history.
+
+### Exact checkout state
+
+- Work in the user-authorized current `main` checkout at
+  `/Users/keisukedaimon/git/sml`; do not create a worktree, reset to
+  `origin/main`, rewrite history, merge, or push unless the user explicitly
+  asks.
+- Current committed HEAD is
+  `2a2388802a2569fb9e60c88aae8879f030ecf656`
+  (`test(v2): cover partial LoRA resume`).
+- The index and V2 implementation are clean. This handoff is the sole tracked
+  modification and remains intentionally unstaged.
+- `pyproject.toml` and `uv.lock` are unchanged. Every pytest command must run
+  outside the sandbox so MLX/Metal can access the Apple GPU.
+
+### Approved correction documents
+
+- Design:
+  `docs/superpowers/specs/2026-08-30-v2-artifact-residual-corrections-design.md`
+  (commit `e114570`).
+- Plan:
+  `docs/superpowers/plans/2026-08-30-v2-artifact-residual-corrections.md`
+  (commit `32cde9e`).
+- Ignored execution/review workspace:
+  `.superpowers/sdd/2026-08-30-v2-artifact-residual-corrections/`.
+
+### Correction commits and outcomes
+
+- `a255565` — accept exact bounded partial checkpoint progress.
+- `9e06d71`, `0bc0527` — require the exact forward-terminal RNG schedule,
+  persist the actual forward-returned terminal key, validate before resume use,
+  and retain SWAG writable-recovery ordering.
+- `b84bd44` — unify retained-root exact manifest dispatch and stable nested
+  manifest lifecycles.
+- `e4c713f` — cap safetensors headers at 100,000,000 bytes before any
+  header-sized read/allocation.
+- `1972d93` — make SWAG ownership transfer failure-atomic and bound remaining
+  mapped reductions to 1,024 rows.
+- `b6fe604`, `09569fa` — make checkpoint namespace proof stat-only for
+  deferred selected proof/use, open selected state/array payloads exactly once,
+  and preserve independent canonical `checkpoint.json` name binding.
+- `2a23888` — add the final lasting partial-LoRA resume regression required by
+  the approved design.
+
+All five Important and three Minor residuals recorded in the previous
+takeover section are resolved. There is no remaining artifact finding at any
+severity.
+
+### Review closure
+
+Each implementation task passed an independent specification/code-quality
+review. Clean final per-task reports are:
+
+- `.superpowers/sdd/2026-08-30-v2-artifact-residual-corrections/task-1-review.md`
+- `.superpowers/sdd/2026-08-30-v2-artifact-residual-corrections/task-2-rereview.md`
+- `.superpowers/sdd/2026-08-30-v2-artifact-residual-corrections/task-3-review.md`
+- `.superpowers/sdd/2026-08-30-v2-artifact-residual-corrections/task-4-review.md`
+- `.superpowers/sdd/2026-08-30-v2-artifact-residual-corrections/task-5-review.md`
+- `.superpowers/sdd/2026-08-30-v2-artifact-residual-corrections/task-6-rereview.md`
+
+The whole-component review over `32cde9e..09569fa` found no production defect
+and one Minor missing partial-LoRA resume regression:
+`.superpowers/sdd/2026-08-30-v2-artifact-residual-corrections/whole-component-review.md`.
+The single authorized final test-only correction closed it. The scoped
+re-review over `09569fa..2a23888` is **CLEAN** with 0 Critical, 0 Important,
+and 0 Minor findings and explicitly says final acceptance is ready:
+`.superpowers/sdd/2026-08-30-v2-artifact-residual-corrections/whole-component-scoped-rereview.md`.
+
+### Fresh final evidence at `2a23888`
+
+- Forbidden-pattern scan from the correction plan: no matches.
+- `uv run ruff check v2`: `All checks passed!`.
+- `uv run ruff format --check v2`: `104 files already formatted`.
+- `uv run pytest v2/tests`: `1568 passed in 92.91s`.
+- `git diff --check`: clean.
+- `git diff --name-only HEAD -- pyproject.toml uv.lock`: no output.
+- `git status --short`: only this unstaged handoff modification.
+
+### Exact next action
+
+The artifact remediation gate is clean and unlocks
+`docs/superpowers/plans/2026-08-25-v2-remediation-final-acceptance.md`.
+A fresh model should start that final-acceptance plan from `2a23888`; it should
+not repeat the artifact correction wave or consume another artifact review
+round. Preserve this handoff as unstaged, do not push unless asked, and rerun
+all plan-required pytest commands outside the sandbox.
+
+## 2026-08-30 Superseding Takeover Point
+
+This section supersedes every older current-status or next-action statement
+below. Older sections remain as implementation history.
+
+### Exact checkout state
+
+- Work in the user-authorized current `main` checkout at
+  `/Users/keisukedaimon/git/sml`; do not create a worktree, reset to
+  `origin/main`, rewrite history, or push unless the user explicitly asks.
+- Current committed HEAD is
+  `27ff11b037f7f8d0346422d0981ec64cc1e3ed76`
+  (`fix(v2): bound artifact verification semantics`).
+- The index and V2 implementation are clean. This handoff is the sole tracked
+  modification and must remain excluded from implementation commits.
+- `pyproject.toml` and `uv.lock` are unchanged. All pytest commands must run
+  outside the sandbox so MLX/Metal can access the Apple GPU.
+
+### Artifact-remediation status
+
+Artifact Tasks 1–5 in
+`docs/superpowers/plans/2026-08-25-v2-remediation-artifacts.md` were implemented,
+individually reviewed, and approved. Their execution range begins at
+`734d7a9459cb49dc6c29fa7b8c6e0352b86a286d` and ends at `c36434d` before the
+whole-component correction wave.
+
+The whole-component review found one Critical, five Important, and three Minor
+issues. The single authorized combined fix wave produced:
+
+- `ac98aa7` — safe SWAG leases, bounded pretraining staging, canonical/stable
+  manifest and checkpoint scalar lifetimes, tokenizer lifetime, cleanup
+  precedence, and deferred ownership/type coverage;
+- `27ff11b` — metadata/chunk-bounded FULL verification, metadata-first latest
+  selection, neutral shared semantic validators, FULL inference parity,
+  signed-int32 saved bounds, and an O(1) counter-addressed RNG attempt.
+
+That wave resolved the SIGSEGV mmap escape and most original findings, but its
+single permitted scoped re-review was **not clean**. There are no Critical
+findings; five Important and three Minor residuals remain. Do not advance to
+`2026-08-25-v2-remediation-final-acceptance.md` yet.
+
+### Remaining Important findings
+
+1. `v2/src/sml/artifacts/semantics.py` requires
+   `microsteps == step * gradient_accumulation_steps`. Valid partial
+   pretraining windows and ordinary LoRA microbatch/example accumulation can
+   violate equality, so valid runs fail FULL verification/inference. Use the
+   internally derivable range `step <= microsteps <= step * accumulation_steps`
+   while retaining exact rows/examples checks; add partial-pretraining and
+   LoRA-microbatch>1 FULL verify/inference/resume regressions.
+2. The new O(1) schedule overwrites each forward-returned next key and advances
+   saved state even when dropout consumes no key. Resume can also consume a
+   re-signed wrong restored key once before overwrite. This violates the
+   binding explicit next-unused-key contract; it is not a backward-compatibility
+   objection. Either preserve/validate the actual terminal forward key with a
+   bounded schedule or explicitly redesign/version separate counter state.
+3. Recursive verifier candidate manifests and prepared-data's nested tokenizer
+   manifest still close before full semantic parsing/postcheck. Retain stable
+   handles through parse, identity/canonical/type validation, and postcheck;
+   test mutation plus simultaneous semantic/postcheck failure.
+4. Safetensors metadata reading lacks the upstream 100,000,000-byte header cap
+   before allocation. Add the cap and an oversized-claimed-header read/memory
+   regression. Current MLX accepts leading header whitespace; normal padding
+   must remain accepted.
+5. Inference silently selects `run.json` when a root also has `manifest.json`,
+   while recursive verification rejects the ambiguous root. Share one neutral
+   retained-root exact-candidate dispatcher across both verification levels.
+
+### Remaining Minor findings
+
+- SWAG stream ownership transfer with a live public bucket lease can leave a
+  logically closed stream unable to retry bundle teardown.
+- Selected checkpoints still receive a redundant structural payload-open pass
+  before the retained proof/use pass.
+- Prepared-data token bounds and some SWAG position/label checks still reduce
+  complete mappings instead of fixed-size chunks.
+
+### Fresh evidence at `27ff11b`
+
+- `uv run ruff check v2`: `All checks passed!`;
+- `uv run ruff format --check v2`: `103 files already formatted`;
+- `uv run pytest v2/tests`: `1523 passed in 114.60s`;
+- `git diff --check c36434d..27ff11b`: clean;
+- no top-level dependency changes and no forbidden `/dev/fd` or path-based
+  SWAG mmap consumer fallback.
+
+Detailed ignored SDD records are in
+`.superpowers/sdd/2026-08-25-v2-remediation-artifacts/`, especially
+`progress.md`, `final-review-report.md`, `final-fix-report.md`, and
+`final-re-review-report.md`.
+
+### Exact next action
+
+The artifact execution protocol allowed one final combined fix wave and one
+scoped re-review; both have been consumed. Do **not** silently start a second
+wave. Obtain explicit authorization for a new correction plan/review budget,
+then close all five Important and three Minor residuals with strict TDD and an
+independent review. Only a zero-finding artifact review may unlock the final
+acceptance plan.
+
+## 2026-08-26 Superseding Takeover Point
+
+This section supersedes every older current-status statement below. Older
+sections remain as implementation history.
+
+### Exact checkout state
+
+- Work in the user-authorized current `main` checkout at
+  `/Users/keisukedaimon/git/sml`; do not create a worktree and do not reset to
+  `origin/main`.
+- Current committed HEAD is `734d7a9459cb49dc6c29fa7b8c6e0352b86a286d`
+  (`fix(v2): gather target logits before normalization`).
+- The v2 implementation and index are clean. The expected sole tracked
+  modification is this handoff file.
+- Do not push unless the user asks. Do not edit top-level files or `uv.lock`
+  without explicit approval. Run all `uv run pytest` commands outside the
+  sandbox for MLX/Metal access.
+
+### Final-acceptance remediation sequence
+
+The approved design and plans are:
+
+- `docs/superpowers/specs/2026-08-25-v2-final-acceptance-remediation-design.md`
+- `docs/superpowers/plans/2026-08-25-v2-final-acceptance-remediation.md`
+- `docs/superpowers/plans/2026-08-25-v2-remediation-evaluation.md`
+- `docs/superpowers/plans/2026-08-25-v2-remediation-lora.md`
+- `docs/superpowers/plans/2026-08-25-v2-remediation-inference.md`
+- `docs/superpowers/plans/2026-08-25-v2-remediation-artifacts.md`
+- `docs/superpowers/plans/2026-08-25-v2-remediation-final-acceptance.md`
+
+Execute them in that order. Evaluation, LoRA, and inference are complete.
+Descriptor-bound artifacts/recursive FULL verification and final acceptance
+remain.
+
+### Evaluation remediation is complete
+
+The evaluation plan spans `a46266f..6032a2d`. Its original four tasks, two
+component correction sets, and one consolidated final-review fix wave all used
+strict TDD plus independent scoped review. The final whole-component review
+and its sole scoped re-review have zero Critical, Important, or Minor findings.
+
+Latest fresh controller evidence at `6032a2d`:
+
+- focused evaluation/unit/integration gate: `157 passed in 6.57s`;
+- full suite: `1227 passed in 81.16s`;
+- `uv run ruff check v2`: clean;
+- `uv run ruff format --check v2`: 97 files already formatted;
+- `git diff --check`: clean;
+- `uv.lock`: unchanged;
+- no uncommitted v2 or indexed changes.
+
+Final evaluation correction commits after the original four tasks:
+
+- `685417f` — artifact/schema/publication closure;
+- `938e1f9` — JSON type sensitivity, hostile mappings, exceptional cleanup;
+- `d1b8153`, `b3a9b99`, `7f0ba48` — effective provider provenance, exact
+  LoRA-run coverage, and provider-iterated dataset capture;
+- `6032a2d` — duplicate provider mappings, raced-parent durability, and
+  collision-reader close precedence.
+
+### Evaluation rulings made
+
+- Execute in the current main checkout because the user explicitly required
+  it. Cost if wrong: the commits share the active checkout instead of an
+  isolated worktree.
+- Replace the plan's direct `os.replace` spy with observable simultaneous
+  no-overwrite behavior. Cost if wrong: a forbidden API could escape detection
+  if it exactly preserved the winner/loser and immutable-destination contract.
+- Treat source logical names as portable logical paths. Cost if wrong: a future
+  non-path-shaped provider label would require a deliberate grammar expansion.
+- Serialize callables only inside each exact loaded task's provider
+  `configs[task]` subtree through lm-eval's serializer. Cost if wrong: callable
+  config values persist in provider-owned deterministic form rather than their
+  raw in-memory object form.
+- Resolve `lm_eval_source_commit` only from PEP 610 VCS metadata. Cost if
+  wrong: a local provider checkout without PEP 610 records `None` even if its
+  bytes happen to live in Git.
+- Require exactly `datasets`, `lm-eval`, `mlx`, `numpy`, and `sentencepiece`
+  provider versions. Cost if wrong: another transitive dependency remains
+  represented only by the pinned environment.
+
+### LoRA remediation is complete
+
+The LoRA plan spans `6032a2d..ecaf469`. All four tasks used strict TDD and
+independent per-task review. Task 3 required one scoped fix round for static
+policy binding and complete trainer-state parity. The final whole-component
+review found one Minor policy-ordering defect; the single permitted final fix
+wave corrected it, and the scoped re-review found zero Critical, Important, or
+Minor issues.
+
+LoRA correction commits:
+
+- `2956bf0`, `ebabab9` — immutable strict `LoRAAdapterSpec` /
+  `LoRAForwardPolicy`, canonical paths, and A/B-only array state;
+- `f9fdbe1` — the shared FP32 adapter formula plus explicit canonical dropout
+  key threading through pure-array and live model execution;
+- `101cce1`, `edf18cc` — eager/compiled SWAG state progression, fail-closed
+  static-policy binding, and complete trainer-tree parity;
+- `7f2f023` — FP32 static-scale merge, exact compiled nonzero-dropout resume,
+  and canonical persisted-config reconstruction;
+- `ecaf469` — policy records emitted in model execution order without changing
+  wrapper-initialization traversal or its PRNG assignment.
+
+Fresh controller evidence at `ecaf469`:
+
+- complete LoRA/SWAG unit, equivalence, and integration gate: `83 passed in
+  3.52s`;
+- full suite: `1263 passed in 79.47s`;
+- `uv run ruff check v2`: clean;
+- `uv run ruff format --check v2`: 97 files already formatted;
+- `git diff --check`: clean;
+- `uv.lock`: unchanged;
+- scale inspection finds only static spec validation/access and explicit FP32
+  materialization; there is no parameter-tree or checkpoint `.scale` leaf;
+- no uncommitted v2 or indexed changes.
+
+### LoRA rulings and review triage
+
+- Execute in the current main checkout because the user explicitly required
+  it. Cost if wrong: the LoRA commits share the active checkout instead of an
+  isolated worktree.
+- Permit the plan's scoped staged Task 1→2→3→4 gates because Task 1 intentionally
+  removed the scale leaf before Tasks 2 and 4 migrated its consumers. Cost if
+  wrong: intermediate commits were not independently full-suite green, though
+  every staged failure had a named downstream owner and the final component
+  and full-suite gates are green.
+- Persist the already validated normalized `LoRAConfig.dropout` float after
+  canonical JSON turns `0.0` into integer `0`; this is part of reconstructing
+  identical static policy from strict run config. Cost if wrong: a numeric
+  representation accepted at the configuration boundary is canonicalized
+  instead of preserving its original Python type.
+- The shared-formula test's use of the separately tested canonical
+  `keyed_dropout` helper is acceptable; independently duplicating its mask
+  normalization is optional and not a remaining finding.
+- Deliberate malformed-tree validation is not required inside private hot-path
+  `_linear`; model construction and checkpoint loading enforce names, shapes,
+  and dtypes at the boundary. Cost if wrong: an internal caller that bypasses
+  those boundaries receives an incidental mapping/backend error rather than a
+  dedicated configuration error.
+
+### Inference remediation is complete
+
+The inference plan spans `ecaf469..734d7a9`. Its three tasks used strict TDD
+and independent task review. The final whole-component review found zero
+Critical, Important, or Minor issues.
+
+Inference correction commits:
+
+- `bd18e46` — independent prompt-prefill and cache-capacity bucket records,
+  stable grouping, and exact four-part generation compile keys;
+- `e739683` — prompt-width token/mask/position prefill over capacity-backed
+  pooled token/KV state, including the MLX parent-slice assignment regression
+  and stale-tail processor coverage;
+- `734d7a9` — gather target logits before token-shaped log-sum-exp subtraction,
+  with FP32 scoring and independent left/right-padding numeric oracles.
+
+Fresh controller evidence at `734d7a9`:
+
+- complete inference/evaluation unit, equivalence, and integration gate: `150
+  passed in 3.74s`;
+- full suite: `1275 passed in 79.65s`;
+- `uv run ruff check v2`: clean;
+- `uv run ruff format --check v2`: 97 files already formatted;
+- `git diff --check`: clean;
+- `uv.lock`: unchanged;
+- no legacy generation `bucket.length_bucket` / `item.length_bucket` aliases
+  and no `log_probs = predictor` assignment remain;
+- no uncommitted v2 or indexed changes.
+
+### Inference rulings made
+
+- Execute in the current main checkout because the plan and user explicitly
+  require it. Cost if wrong: the inference commits share the active checkout
+  instead of an isolated worktree.
+- Preserve this tracked handoff as the sole inherited modification and exclude
+  it from inference commits. Cost if wrong: task commits do not themselves
+  contain the latest cross-session controller narrative; this handoff is the
+  durable source instead.
+
+### Exact next actions
+
+1. Start `docs/superpowers/plans/2026-08-25-v2-remediation-artifacts.md` from
+   `734d7a9` using a new SDD workspace and strict TDD.
+2. Review each artifact task and obtain a zero-finding whole-component review.
+3. Run the artifact-focused gates, full v2 Ruff and pytest, and confirm
+   `uv.lock` unchanged.
+4. The completed LoRA correction changes the controlled numerical trajectory.
+   Regenerate canonical SWAG quality evidence only at the exact point required
+   by the LoRA and final-acceptance plans, after the repaired source is
+   committed and the tracked checkout is otherwise clean.
+5. Continue with the final-acceptance plan.
 
 ## Superseding Acceptance Policy
 
@@ -43,8 +427,9 @@ they verify correctness rather than speed.
   with a clean tracked worktree on 2026-08-23.
 - Branch: main, tracking origin/main. Local main is ahead of origin/main; do
   not reset to the remote tip and do not push unless asked. Current HEAD:
-  f02c99a (`refactor(v2): cut over to unified sml package`). Part 1 closed at
-  4c190f3.
+  685417f (`fix(v2): close evaluation artifact invariants`). Part 1 closed at
+  4c190f3; the older Part 2 implementation closed at f02c99a before final
+  acceptance remediation began.
 - Documentation-audit base before this consistency update:
   ddad9a8 (docs(v2): record residual Part 1 provenance blocker).
 - Latest Part 1 repair/evidence HEAD before provenance remediation:
@@ -198,22 +583,30 @@ they verify correctness rather than speed.
   at 0 Critical, 0 Important, 0 Minor. Ruff passed, all 95 v2 Python files were
   formatted, all 1,104 v2 tests passed in 103.26 seconds, unified CLI help
   passed, canonical evidence and `uv.lock` were unchanged, and
-  `git diff --check` passed. Task 6.4 is next.
+  `git diff --check` passed. That commit became the input to Task 6.4; the
+  superseding takeover section records the remediation now in progress.
 
 ## Related Specifications and Plans
 
 | File | Role | Done | Remaining under current policy |
 | --- | --- | --- | --- |
-| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Phases 1-5 and Tasks 6.1-6.3 | Task 6.4; performance remains optional |
+| docs/superpowers/specs/2026-07-31-v2-performance-first-refactor-design.md | Umbrella design | Phases 1-5 and Tasks 6.1-6.3 | Task 6.4 remediation/final acceptance; performance remains optional |
 | docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-1.md | Phases 1-3 plan | All task bodies, the controlled run, the repeated functional gate, recorded-source validation, and checkpoint-content freeze | None required under the current policy |
-| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning is complete; Phase 4, Tasks 5.1-5.5, and Tasks 6.1-6.3 are implemented and reviewed | Task 6.4 |
+| docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md | Phases 4-6 plan | Planning is complete; Phase 4, Tasks 5.1-5.5, and Tasks 6.1-6.3 are implemented and reviewed | Task 6.4 is under the superseding remediation plans |
+| docs/superpowers/specs/2026-08-25-v2-final-acceptance-remediation-design.md | Superseding final-acceptance remediation design | Approved and committed at 9a8b170 | Evaluation remediation in progress; LoRA/inference/artifacts/final gate pending |
+| docs/superpowers/plans/2026-08-25-v2-final-acceptance-remediation.md | Master remediation sequence | Approved and committed at a46266f | Finish evaluation, then LoRA, inference, artifacts, and final acceptance |
+| docs/superpowers/plans/2026-08-25-v2-remediation-evaluation.md | Evaluation remediation plan | Tasks 1-4 implemented/reviewed; Component Fix A implemented at 685417f | Fix A review round 1, Component Fix B, then zero-finding component gate |
+| docs/superpowers/plans/2026-08-25-v2-remediation-lora.md | LoRA numerical-contract remediation | Planned | Not started |
+| docs/superpowers/plans/2026-08-25-v2-remediation-inference.md | Inference bucketing/scoring remediation | Planned | Not started |
+| docs/superpowers/plans/2026-08-25-v2-remediation-artifacts.md | Descriptor-bound/semantic verification remediation | Planned | Not started |
+| docs/superpowers/plans/2026-08-25-v2-remediation-final-acceptance.md | Final repeated gate and documentation close | Planned | Not started |
 | docs/superpowers/specs/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge-design.md | Real prepared-data benchmark owner design | Production goal implemented at ffb29f97b7770d06a95df41c2b612c07a9fa6c1b | Nothing required; screen is optional |
 | docs/superpowers/plans/2026-08-16-v2-phase-2-prepared-data-benchmark-bridge.md | Bridge implementation plan | Task 1 complete at ffb29f9 | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-stop-interruptible-pretraining-stream-design.md | Full-queue shutdown correctness design | Implemented and reviewed at 8e2291f1c87244fa8acd33d375c9e49961bb70fa | Nothing required; timing rerun is optional |
 | docs/superpowers/plans/2026-08-16-v2-stop-interruptible-pretraining-stream.md | Shutdown fix plan | Task 1 complete at 8e2291f | Task 2 retained only as an optional diagnostic |
 | docs/superpowers/specs/2026-08-16-v2-prepared-data-100-unit-measurement-design.md | Versioned 20/100 benchmark protocol | Harness design implemented | Baseline capture/comparison only if explicitly desired |
 | docs/superpowers/plans/2026-08-16-v2-prepared-data-100-unit-measurement.md | Versioned protocol implementation plan | Required Tasks 1 and 4 complete; Task 1 reviewed at 8c3b1be | Tasks 2 and 3 remain optional diagnostic procedures only |
-| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through Task 6.3 at f02c99a | Keep current through final Task 6.4 acceptance |
+| docs/superpowers/handoffs/2026-08-22-v2-performance-refactor-phase-2-handoff.md | Authoritative cross-session status | Updated through evaluation Component Fix A at 685417f | Keep current through final remediation acceptance |
 
 ## Supporting Benchmark Documents
 
@@ -353,7 +746,7 @@ no longer rebuilds an expected workload from current-tree bytes.
 | 6.1: frozen TOML configuration and unified lazy CLI | Complete and reviewed | a1e55c8, 9aa0f18; docs-close 1bca398 |
 | 6.2: local CLI workflow subprocess smoke | Complete and locally reviewed | cb04413 |
 | 6.3: delete flat implementation and migration bridge | Complete and reviewed | f02c99a |
-| 6.4: final correctness and workflow gate | Not started | Next live task |
+| 6.4: final correctness and workflow gate | In progress under superseding remediation | Evaluation Component Fix A at 685417f; its review round 1 is next |
 
 ## Part 1 Final Architecture Review Status
 
@@ -441,7 +834,7 @@ Deferred provenance-test Minors (do not block Task 4.1):
 
 ## Standing Production Facts
 
-These bind Task 6.4. Do not silently revert them.
+These bind the remaining Task 6.4 remediation. Do not silently revert them.
 
 Environment: Python 3.12.13, `uv run`, highest version directory `v2`. Run
 MLX pytest outside the sandbox. Do not edit top-level files or `uv.lock`
@@ -544,7 +937,7 @@ Part 2:
 | --- | --- | --- | --- |
 | 4: inference and evaluation | 4.1-4.4 | Complete at 0d95441 | Correctness, inference/evaluation integration, applicable CLI smoke |
 | 5: LoRA and SWAG | 5.1-5.5 | Complete at e89ce2b | Correctness, controlled SWAG quality, resume/export/inference workflow |
-| 6: unified CLI and cutover | 6.1-6.4 | Tasks 6.1-6.3 complete through f02c99a; next: Task 6.4 | Full Ruff/pytest, controlled-quality validation, all CLI workflows, clean cutover, unchanged uv.lock |
+| 6: unified CLI and cutover | 6.1-6.4 | Tasks 6.1-6.3 complete through f02c99a; Task 6.4 remediation in progress at 685417f | Finish evaluation, LoRA, inference, and artifact repairs; then full Ruff/pytest, quality validators, CLI workflows, clean cutover, unchanged uv.lock |
 
 No Phase 4, 5, 6, or final performance result file is required.
 
@@ -571,32 +964,35 @@ The absent files are not blockers and should not be fabricated.
 
 ## Takeover Procedure
 
-1. Read this handoff, the umbrella design, and the Part 2 Task 6.4 contract
-   in `docs/superpowers/plans/2026-08-01-v2-performance-first-refactor-part-2.md`.
-2. Confirm HEAD is f02c99a (or a later documentation/final-gate commit) and
-   inspect git status. The expected inherited change is this handoff only;
-   preserve unrelated user changes and local commits not on origin/main.
-3. Execute Task 6.4 without changing production behavior unless a final gate
-   exposes a real defect. Run Ruff, format check, the full v2 suite outside the
-   sandbox, both standalone controlled-quality validators, the complete CLI
-   subprocess workflow suite, unified CLI help, and the final integration
-   workflow set. Confirm the flat layout and bridge remain absent.
-4. Do not regenerate canonical pretraining or SWAG quality evidence. Their
-   validators must reconstruct and verify their recorded source commits from
-   Git; current-tree bytes are not the expected recorded workload.
-5. Confirm `uv.lock` and all canonical evidence/fixtures remain byte-identical,
-   `git diff --check` passes, and the final accepted implementation plus this
-   handoff are committed so `git status --short` is clean. Performance capture
-   remains optional and non-blocking.
-6. Request a final whole-scope review, resolve any Critical/Important findings,
-   and record final acceptance evidence here. Do not push unless asked.
+1. Read the superseding takeover section at the top of this handoff, the
+   2026-08-25 design/master plan, the evaluation plan, and the active ignored
+   evaluation ledger/briefs. The current implementation base is `685417f`, not
+   `f02c99a`.
+2. Inspect `git status --short`. The expected inherited tracked change is this
+   handoff only. The interrupted implementer made no partial Fix A changes;
+   preserve any newer user change if the checkout differs.
+3. Resume Component Fix A review round 1 exactly as recorded above. Use strict
+   TDD, commit the scoped fix, and obtain a fresh fix-only re-review with zero
+   findings.
+4. Execute and review Component Fix B from its ignored brief, then run a fresh
+   whole-evaluation review over `a46266f..<new-head>`. Do not continue until the
+   evaluation completion gate has zero Critical, Important, and Minor issues.
+5. Continue the LoRA, inference, artifact, and final-acceptance remediation
+   plans in order. Only the LoRA numerical-contract change authorizes
+   regenerating SWAG quality evidence; never regenerate pretraining evidence.
+6. At final acceptance run Ruff, format check, the full v2 suite outside the
+   sandbox, both controlled-quality validators, complete CLI/integration
+   workflows, unified CLI help, `git diff --check`, and `uv.lock`/canonical
+   evidence byte checks. Performance capture remains optional and non-blocking.
+7. Request the final whole-scope review, resolve every Critical/Important issue
+   and triage all Minors under the final plan, update this handoff, and do not
+   push unless asked.
 
-SDD notes for a continuing session: the gitignored ledger is
-`.superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-2/progress.md`.
-Successful task reviewers used `gpt-5.6-sol-medium`. Task 5.4/5.5
-`cursor-grok-4.6-xhigh` implementers stalled (hex-dumps / no progress); do
-not resume those agents. Prefer a tightly scoped mid-tier implementer and
-do not dump identifiers as hex.
+SDD notes for a continuing session: the active gitignored ledger is
+`.superpowers/sdd/2026-08-25-v2-remediation-evaluation/progress.md`. The current
+Fix A/Fix B briefs and report paths are listed in the superseding takeover
+section. The older Part 2 ledger remains historical. Keep one implementer at a
+time and use a fresh read-only reviewer after each commit/fix round.
 
 ## Invariants That Remain Strict
 
@@ -612,12 +1008,16 @@ do not dump identifiers as hex.
 
 ## Ignored Review and Historical Records
 
-The active Part 2 SDD workspace is
-`.superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-2/`,
-especially `progress.md`, `task-6.1-brief.md`, `task-6.1-report.md`,
-`task-6.1-review.md`, `task-6.1-fix-round-1.md`, and
-`task-6.1-rereview-1.md`. That workspace is gitignored supporting evidence;
-this tracked handoff is the authoritative status.
+The active final-acceptance evaluation SDD workspace is
+`.superpowers/sdd/2026-08-25-v2-remediation-evaluation/`, especially
+`progress.md`, `component-artifact-fix-brief.md`,
+`component-artifact-fix-report.md`, `component-artifact-fix-review.diff`, and
+`component-runtime-fix-brief.md`. That workspace is gitignored supporting
+evidence; this tracked handoff is the authoritative cross-session status.
+
+The older Part 2 SDD workspace is historical at
+`.superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-2/`, including
+its Task 6.1 records.
 
 The active Part 1 final-review evidence is preserved in
 `.superpowers/sdd/2026-08-01-v2-performance-first-refactor-part-1/`, especially
