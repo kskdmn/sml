@@ -34,6 +34,7 @@ from sml.artifacts.manifest import (
     read_manifest,
     row_content_identity,
 )
+from sml.artifacts.semantics import expected_next_key
 from sml.artifacts.verify import verify_artifact
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
@@ -268,6 +269,39 @@ def _rewrite_scalar_state(resolved, mutate) -> None:
     ).write_bytes(canonical_json_bytes(manifest))
 
 
+def _replace_latest_trainer_key(run: Path, key: mx.array) -> None:
+    resolved = resolve_latest_step(
+        run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+    trainer_path = resolved.step_directory / "trainer.safetensors"
+    trainer = dict(mx.load(trainer_path))
+    mx.eval(*trainer.values())
+    trainer["next_key"] = key
+    mx.save_safetensors(trainer_path, trainer)
+    assert isinstance(resolved.checkpoint, PretrainingCheckpointManifest)
+    checkpoint = replace(
+        resolved.checkpoint,
+        trainer=replace(
+            resolved.checkpoint.trainer,
+            payload=_payload_ref(trainer_path, "trainer.safetensors"),
+        ),
+    )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    (resolved.step_directory / "checkpoint.json").write_bytes(
+        canonical_json_bytes(checkpoint)
+    )
+    latest = read_manifest(
+        run,
+        LatestIndex,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    latest = replace(latest, checkpoint_identity=checkpoint.identity)
+    latest = replace(latest, identity=latest.recompute_identity())
+    (run / "latest.json").write_bytes(canonical_json_bytes(latest))
+
+
 def _run_with_unpruned_latest(
     data: Path,
     run: Path,
@@ -401,6 +435,19 @@ def _assert_run_states_equal(left: Path, right: Path) -> None:
     assert pretrain.read_scalar_state(left_resolved) == pretrain.read_scalar_state(
         right_resolved
     )
+    for resolved, groups in (
+        (left_resolved, left_groups),
+        (right_resolved, right_groups),
+    ):
+        assert isinstance(resolved.run, PretrainingRunManifest)
+        state = pretrain.read_scalar_state(resolved)
+        expected = expected_next_key(
+            seed=int(resolved.run.checkpoint["seed"]),
+            microsteps=state.microsteps,
+            model=ModelConfig(**dict(resolved.run.model)),
+        )
+        mx.eval(expected, groups[-1]["next_key"])
+        assert bool(mx.array_equal(groups[-1]["next_key"], expected))
 
 
 def _fault_after_one_successful_microstep(real_builder):
@@ -468,12 +515,19 @@ def test_failure_after_atomic_creation_leaves_complete_step_zero(
     assert trainer["loss_numerator"].dtype == mx.float32
 
 
+@pytest.mark.parametrize("hidden_dropout", (0.2, 0.0), ids=("model-only", "disabled"))
 def test_interrupted_accumulation_replays_the_complete_window(
     prepared_data: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    hidden_dropout: float,
 ) -> None:
-    uninterrupted = pretrain.train(_config(prepared_data, tmp_path / "full"))
+    config = _config(prepared_data, tmp_path / "full")
+    config = replace(
+        config,
+        model=replace(config.model, hidden_dropout=hidden_dropout),
+    )
+    uninterrupted = pretrain.train(config)
     real_builder = pretrain.build_pretraining_kernels
     monkeypatch.setattr(
         pretrain,
@@ -482,7 +536,7 @@ def test_interrupted_accumulation_replays_the_complete_window(
     )
     crashed = tmp_path / "crashed"
     with pytest.raises(InjectedFailure, match="uncommitted"):
-        pretrain.train(_config(prepared_data, crashed))
+        pretrain.train(replace(config, output_run=crashed))
     monkeypatch.setattr(pretrain, "build_pretraining_kernels", real_builder)
 
     resumed = pretrain.resume(
@@ -493,6 +547,45 @@ def test_interrupted_accumulation_replays_the_complete_window(
 
     assert resumed.step == uninterrupted.step == 2
     _assert_run_states_equal(resumed.run, uninterrupted.run)
+
+
+def test_resume_rejects_wrong_key_before_runtime_or_retention(
+    prepared_data: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trained = pretrain.train(
+        _config(prepared_data, tmp_path / "wrong-key-run", maximum_steps=1)
+    )
+    _replace_latest_trainer_key(trained.run, mx.random.key(999))
+    reached: list[str] = []
+
+    def forbidden(name):
+        def call(*_args, **_kwargs):
+            reached.append(name)
+            raise AssertionError(f"{name} reached before RNG validation")
+
+        return call
+
+    monkeypatch.setattr(pretrain, "SMLLanguageModel", forbidden("model"))
+    monkeypatch.setattr(pretrain, "PretrainingBatchStream", forbidden("stream"))
+    monkeypatch.setattr(pretrain, "prune_to_latest", forbidden("retention"))
+    monkeypatch.setattr(
+        pretrain,
+        "_publish_training_state",
+        forbidden("publication"),
+    )
+
+    with pytest.raises(
+        SMLArtifactError,
+        match="checkpoint trainer next RNG key is incorrect",
+    ):
+        pretrain.resume(
+            trained.run,
+            data=prepared_data,
+            overrides=_overrides(maximum_steps=2),
+        )
+    assert reached == []
 
 
 def test_partial_window_progress_supports_full_verify_inference_and_resume(

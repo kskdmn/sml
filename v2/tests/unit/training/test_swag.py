@@ -1174,6 +1174,12 @@ def test_second_compiled_step_sees_returned_adapter_optimizer_and_key_state(
     eager_adapters, eager_optimizer, eager_trainer, eager_keys = run_two_steps(
         compiled=False
     )
+    expected_keys = [eager_keys[0]]
+    for _microstep in range(2):
+        terminal = expected_keys[-1]
+        for _site in range(8):
+            terminal, _unused = mx.random.split(terminal)
+        expected_keys.append(terminal)
     mx.eval(
         compiled_adapters,
         compiled_optimizer.to_tree(),
@@ -1185,14 +1191,15 @@ def test_second_compiled_step_sees_returned_adapter_optimizer_and_key_state(
         before_base,
         *compiled_keys,
         *eager_keys,
+        *expected_keys,
     )
     assert int(np.array(compiled_optimizer.step)) == 2
     assert int(np.array(eager_optimizer.step)) == 2
     assert bool(mx.array_equal(compiled_keys[0], eager_keys[0]).item())
-    assert not bool(mx.array_equal(eager_keys[1], eager_keys[0]).item())
-    assert not bool(mx.array_equal(eager_keys[2], eager_keys[1]).item())
-    assert not bool(mx.array_equal(compiled_keys[1], compiled_keys[0]).item())
-    assert not bool(mx.array_equal(compiled_keys[2], compiled_keys[1]).item())
+    assert bool(mx.array_equal(eager_keys[1], expected_keys[1]).item())
+    assert bool(mx.array_equal(eager_keys[2], expected_keys[2]).item())
+    assert bool(mx.array_equal(compiled_keys[1], expected_keys[1]).item())
+    assert bool(mx.array_equal(compiled_keys[2], expected_keys[2]).item())
     assert bool(mx.array_equal(compiled_keys[1], eager_keys[1]).item())
     assert bool(mx.array_equal(compiled_keys[2], eager_keys[2]).item())
     assert_tree_dtypes(frozen_base, mx.bfloat16)

@@ -25,6 +25,7 @@ from sml.artifacts.checkpoint import (
     run_writer_lock,
 )
 from sml.artifacts.manifest import (
+    TRAINING_RNG_SCHEDULE,
     ArrayPayloadRef,
     ArraySpec,
     BaseSnapshotManifest,
@@ -42,6 +43,7 @@ from sml.artifacts.manifest import (
     open_artifact,
     structured_identity,
 )
+from sml.artifacts.semantics import validate_full_run_semantics
 from sml.data.swag import (
     SwagBatch,
     SwagBatchStream,
@@ -149,6 +151,7 @@ _SAVED_CHECKPOINT_KEYS = frozenset(
         "log_interval",
         "seed",
         "compile",
+        "rng_schedule",
     }
 )
 _TOKENIZER_FILES = ("manifest.json", "tokenizer.model", "tokenizer.vocab")
@@ -686,6 +689,7 @@ def _run_manifest(
         "log_interval": config.log_interval,
         "seed": config.seed,
         "compile": config.compile,
+        "rng_schedule": TRAINING_RNG_SCHEDULE,
     }
     manifest = LoRARunManifest(
         kind="lora-run",
@@ -726,6 +730,8 @@ def _config_from_run(
         saved = _mapping_dict(manifest.checkpoint, "checkpoint")
         if set(saved) != _SAVED_CHECKPOINT_KEYS:
             raise SMLArtifactError("saved checkpoint configuration has invalid fields")
+        if saved.pop("rng_schedule") != TRAINING_RNG_SCHEDULE:
+            raise SMLArtifactError("saved checkpoint rng_schedule is invalid")
         maximum_steps = (
             saved["maximum_steps"]
             if overrides.maximum_steps is None
@@ -1157,24 +1163,23 @@ def _run_training(
                 if _limit_reached(config, scalar):
                     break
                 batch = SwagBatch.from_envelope(envelope)
+                microstep_index = scalar.microsteps + window_microsteps
+                if model.config.hidden_dropout > 0.0 or config.lora.dropout > 0.0:
+                    trainer_tree = trainer.to_tree()
+                    trainer = SwagTrainerState.from_compiled_tree(
+                        (
+                            trainer_tree[0],
+                            trainer_tree[1],
+                            counter_random_key(config.seed, microstep_index),
+                            trainer_tree[3],
+                            trainer_tree[4],
+                        )
+                    )
                 trainer = kernels.ranking_microstep(
                     adapters,
                     frozen_base,
                     trainer,
                     batch,
-                )
-                trainer_tree = trainer.to_tree()
-                trainer = SwagTrainerState.from_compiled_tree(
-                    (
-                        trainer_tree[0],
-                        trainer_tree[1],
-                        counter_random_key(
-                            config.seed,
-                            scalar.microsteps + window_microsteps + 1,
-                        ),
-                        trainer_tree[3],
-                        trainer_tree[4],
-                    )
                 )
                 pending_cursor = batch.cursor_after
                 window_microsteps += 1
@@ -1405,6 +1410,7 @@ def resume_finetune(
                     "resume requires a prepared-data bundle location"
                 )
             config = _config_from_run(run, data_path, resolved.run, overrides)
+            preliminary_checkpoint_identity = resolved.checkpoint.identity
         bundle = _verified_swag(
             data_path,
             expected_identity=resolved.run.data_identity,
@@ -1412,11 +1418,6 @@ def resume_finetune(
             base_identity=None,
         )
         with bundle:
-            retained = prune_to_latest(run)
-            if retained.checkpoint.identity != resolved.checkpoint.identity:
-                raise SMLArtifactError(
-                    "latest checkpoint changed during writable recovery"
-                )
             runtime: (
                 tuple[LoRARunManifest, SMLLanguageModel, _RestoredSwagState] | None
             ) = None
@@ -1432,13 +1433,10 @@ def resume_finetune(
                 ),
             ) as reader:
                 resolved = reader.resolved
-                if resolved.checkpoint.identity != retained.checkpoint.identity:
+                if resolved.checkpoint.identity != preliminary_checkpoint_identity:
                     raise SMLArtifactError("latest checkpoint changed while reopening")
                 if not isinstance(resolved.run, LoRARunManifest):
                     raise SMLArtifactError("LoRA resume requires a LoRA run")
-                with reader.open_run_child("base", (BaseSnapshotManifest,)) as base:
-                    require_lora_base_snapshot(base.manifest, resolved.run)
-                    base_arrays = _load_base_snapshot_arrays(base)
                 with reader.open_run_child(
                     "tokenizer", (TokenizerManifest,)
                 ) as tokenizer:
@@ -1446,6 +1444,10 @@ def resume_finetune(
                         raise SMLArtifactError(
                             "run tokenizer identity does not match run.json"
                         )
+                    validate_full_run_semantics(reader, tokenizer.manifest)
+                with reader.open_run_child("base", (BaseSnapshotManifest,)) as base:
+                    require_lora_base_snapshot(base.manifest, resolved.run)
+                    base_arrays = _load_base_snapshot_arrays(base)
                 adapters, optimizer, trainer, scalar = _restore_adapter_checkpoint(
                     reader
                 )
@@ -1467,6 +1469,11 @@ def resume_finetune(
                     scalar,
                 )
                 runtime = (resolved.run, model, restored)
+            retained = prune_to_latest(run)
+            if retained.checkpoint.identity != resolved.checkpoint.identity:
+                raise SMLArtifactError(
+                    "latest checkpoint changed during writable recovery"
+                )
             if runtime is None:
                 raise SMLArtifactError("LoRA resume did not construct runtime state")
             return _run_training(

@@ -30,6 +30,7 @@ _OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 _DIRECTORY_OPEN_FLAGS = _OPEN_FLAGS | os.O_DIRECTORY
 _PAYLOAD_OPEN_FLAGS = _OPEN_FLAGS | os.O_NONBLOCK
 _MNT_LOCAL = 0x00001000
+TRAINING_RNG_SCHEDULE = "counter-addressed-forward-terminal-v1"
 
 
 class _DarwinFsid(ctypes.Structure):
@@ -193,6 +194,11 @@ def _freeze_json_mapping(value: object, name: str) -> Mapping[str, object]:
     if not isinstance(normalized, dict):
         raise TypeError(f"{name} must be a canonical JSON object")
     return cast(Mapping[str, object], _freeze_normalized(normalized))
+
+
+def _require_training_rng_schedule(checkpoint: Mapping[str, object]) -> None:
+    if checkpoint.get("rng_schedule") != TRAINING_RNG_SCHEDULE:
+        raise ValueError(f"checkpoint rng_schedule must be {TRAINING_RNG_SCHEDULE!r}")
 
 
 def _require_tuple(value: object, name: str) -> tuple[Any, ...]:
@@ -1056,6 +1062,7 @@ class PretrainingRunManifest(_Manifest):
             object.__setattr__(
                 self, name, _freeze_json_mapping(getattr(self, name), name)
             )
+        _require_training_rng_schedule(self.checkpoint)
         rope_factor = self.model.get("rope_scaling_factor")
         if not isinstance(rope_factor, float) or rope_factor != 1.0:
             raise ValueError(
@@ -1101,6 +1108,7 @@ class LoRARunManifest(_Manifest):
             object.__setattr__(
                 self, name, _freeze_json_mapping(getattr(self, name), name)
             )
+        _require_training_rng_schedule(self.checkpoint)
         rope_factor = self.model.get("rope_scaling_factor")
         if not isinstance(rope_factor, float) or rope_factor != 1.0:
             raise ValueError("LoRA model rope_scaling_factor must be exactly 1.0")
@@ -1752,6 +1760,7 @@ def read_checkpoint_manifest(
 __all__ = [
     "CHECKPOINT_MANIFEST_TYPES",
     "RUN_MANIFEST_TYPES",
+    "TRAINING_RNG_SCHEDULE",
     "ArrayPayloadRef",
     "ArraySpec",
     "ArtifactRoot",

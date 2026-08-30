@@ -520,7 +520,10 @@ def _run_manifest() -> PretrainingRunManifest:
         precision={"working": "bfloat16"},
         optimizer={"name": "adamw"},
         loader={"batch_size": 2},
-        checkpoint={"interval": 1},
+        checkpoint={
+            "interval": 1,
+            "rng_schedule": "counter-addressed-forward-terminal-v1",
+        },
         tokenizer_identity="sha256:" + "1" * 64,
         data_identity="sha256:" + "2" * 64,
         diagnostic_data_locator="/relocatable/data",

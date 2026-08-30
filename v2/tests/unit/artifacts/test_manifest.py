@@ -133,7 +133,10 @@ def manifest_fixtures() -> tuple[object, ...]:
             precision={"compute": "bfloat16", "master": "float32"},
             optimizer={"kind": "adam"},
             loader={"batch_size": 1},
-            checkpoint={"interval": 5},
+            checkpoint={
+                "interval": 5,
+                "rng_schedule": "counter-addressed-forward-terminal-v1",
+            },
             tokenizer_identity=IDENTITY_B,
             data_identity=IDENTITY_C,
             diagnostic_data_locator="/data",
@@ -147,7 +150,10 @@ def manifest_fixtures() -> tuple[object, ...]:
             precision={"adapter": "float32"},
             optimizer={"kind": "adam"},
             loader={"batch_size": 1},
-            checkpoint={"interval": 5},
+            checkpoint={
+                "interval": 5,
+                "rng_schedule": "counter-addressed-forward-terminal-v1",
+            },
             tokenizer_identity=IDENTITY_B,
             base_identity=IDENTITY_A,
             data_identity=IDENTITY_C,
@@ -1122,6 +1128,31 @@ def test_manifest_verification_levels_have_only_the_two_pinned_values():
     }
 
 
+@pytest.mark.parametrize("run_type", (PretrainingRunManifest, LoRARunManifest))
+@pytest.mark.parametrize("schedule", (None, "unknown-schedule"))
+def test_run_manifest_requires_exact_rng_schedule(run_type, schedule):
+    manifest = next(
+        value for value in manifest_fixtures() if isinstance(value, run_type)
+    )
+    checkpoint = dict(manifest.checkpoint)
+    if schedule is None:
+        checkpoint.pop("rng_schedule")
+    else:
+        checkpoint["rng_schedule"] = schedule
+    with pytest.raises(ValueError, match="rng_schedule"):
+        replace(manifest, checkpoint=checkpoint)
+
+
+@pytest.mark.parametrize("run_type", (PretrainingRunManifest, LoRARunManifest))
+def test_run_manifest_accepts_forward_terminal_rng_schedule(run_type):
+    manifest = next(
+        value for value in manifest_fixtures() if isinstance(value, run_type)
+    )
+    assert manifest.checkpoint["rng_schedule"] == (
+        "counter-addressed-forward-terminal-v1"
+    )
+
+
 def test_manifest_constructor_rejects_boolean_schema_version():
     """Treating True as version 1 would admit a noncanonical discriminator type."""
     with pytest.raises(ValueError, match="version"):
@@ -1139,7 +1170,9 @@ def test_pretraining_run_manifest_rejects_noncanonical_rope_factor():
             precision={},
             optimizer={},
             loader={},
-            checkpoint={},
+            checkpoint={
+                "rng_schedule": "counter-addressed-forward-terminal-v1",
+            },
             tokenizer_identity=IDENTITY_B,
             data_identity=IDENTITY_C,
             diagnostic_data_locator=None,

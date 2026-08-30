@@ -55,7 +55,7 @@ from sml.training.common import (
     PrecisionConfig,
     PretrainingConfig,
 )
-from sml.training.lora import LoRAPrecisionConfig
+from sml.training.lora import LoRAConfig, LoRAPrecisionConfig
 from sml.training.pretrain import train
 from sml.training.random import counter_random_key
 
@@ -72,6 +72,7 @@ def test_full_checkpoint_configuration_rejects_values_above_signed_int32(field):
         "log_interval": 1,
         "seed": 0,
         "compile": False,
+        "rng_schedule": "counter-addressed-forward-terminal-v1",
     }
     values[field] = 2**31
 
@@ -79,26 +80,83 @@ def test_full_checkpoint_configuration_rejects_values_above_signed_int32(field):
         semantics_module.checkpoint_configuration(values, context="run")
 
 
-def test_expected_training_key_is_constant_work_for_arbitrarily_long_histories(
+@pytest.mark.parametrize(
+    ("hidden_dropout", "lora_dropout", "targets", "expected_splits"),
+    (
+        (0.2, 0.0, (), 2),
+        (0.0, 0.3, ("q_proj", "v_proj"), 4),
+        (0.2, 0.3, ("q_proj", "v_proj"), 6),
+        (0.0, 0.0, ("q_proj", "v_proj"), 0),
+    ),
+)
+def test_expected_training_key_uses_only_current_microstep_sites(
     monkeypatch,
+    hidden_dropout,
+    lora_dropout,
+    targets,
+    expected_splits,
 ):
-    """FULL verification must never replay historical random splits."""
+    """FULL verification must reconstruct only the terminal forward key."""
+    split_calls = 0
+    real_split = semantics_module.mx.random.split
 
-    def reject_split(*_args, **_kwargs):
-        raise AssertionError("linear random split replay is forbidden")
+    def counted_split(key):
+        nonlocal split_calls
+        split_calls += 1
+        return real_split(key)
 
-    monkeypatch.setattr(semantics_module.mx.random, "split", reject_split)
-    expected = counter_random_key(17, 9_000_000_000_000)
+    monkeypatch.setattr(semantics_module.mx.random, "split", counted_split)
+    model = replace(
+        ModelConfig(num_layers=2),
+        hidden_dropout=hidden_dropout,
+    )
+    lora = None
+    if targets:
+        lora = LoRAConfig(dropout=lora_dropout, target_modules=targets)
 
     actual = semantics_module.expected_next_key(
         seed=17,
         microsteps=9_000_000_000_000,
-        model=ModelConfig(),
+        model=model,
+        lora=lora,
+    )
+    mx.eval(actual)
+    assert split_calls == expected_splits
+
+
+@pytest.mark.parametrize(
+    ("model", "lora"),
+    (
+        (ModelConfig(hidden_dropout=0.2), None),
+        (
+            ModelConfig(hidden_dropout=0.0),
+            LoRAConfig(dropout=0.3, target_modules=("q_proj", "v_proj")),
+        ),
+    ),
+)
+def test_expected_training_key_at_zero_microsteps_is_initial_counter_key(model, lora):
+    actual = semantics_module.expected_next_key(
+        seed=17,
+        microsteps=0,
+        model=model,
+        lora=lora,
     )
 
-    assert bool(mx.array_equal(actual, expected))
-    assert actual.tolist() == [3_390_189_612, 2_683_648_302]
-    assert not bool(mx.array_equal(actual, counter_random_key(17, 9_000_000_000_001)))
+    assert bool(mx.array_equal(actual, counter_random_key(17, 0)))
+
+
+def test_expected_training_key_with_disabled_dropout_is_initial_counter_key():
+    actual = semantics_module.expected_next_key(
+        seed=17,
+        microsteps=9_000_000_000_000,
+        model=ModelConfig(hidden_dropout=0.0),
+        lora=LoRAConfig(
+            dropout=0.0,
+            target_modules=("q_proj", "v_proj"),
+        ),
+    )
+
+    assert bool(mx.array_equal(actual, counter_random_key(17, 0)))
 
 
 def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
@@ -1384,9 +1442,10 @@ def test_full_pretraining_run_accepts_re_signed_partial_progress(
     trainer_path = step / checkpoint.trainer.payload.logical_path
     trainer = dict(mx.load(trainer_path))
     mx.eval(*trainer.values())
-    trainer["next_key"] = counter_random_key(
-        int(run_manifest.checkpoint["seed"]),
-        1,
+    trainer["next_key"] = semantics_module.expected_next_key(
+        seed=int(run_manifest.checkpoint["seed"]),
+        microsteps=1,
+        model=ModelConfig(**dict(run_manifest.model)),
     )
     mx.save_safetensors(trainer_path, trainer)
     checkpoint = replace(

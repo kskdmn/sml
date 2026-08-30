@@ -12,6 +12,7 @@ import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 from sml.artifacts.checkpoint import (
+    CheckpointReader,
     Published,
     ResolvedStep,
     open_checkpoint_reader,
@@ -22,6 +23,7 @@ from sml.artifacts.checkpoint import (
     run_writer_lock,
 )
 from sml.artifacts.manifest import (
+    TRAINING_RNG_SCHEDULE,
     ArrayPayloadRef,
     ArraySpec,
     ArtifactRoot,
@@ -35,6 +37,7 @@ from sml.artifacts.manifest import (
     file_identity,
     read_manifest,
 )
+from sml.artifacts.semantics import validate_full_run_semantics
 from sml.data.pretraining import (
     PreparedDataBundle,
     PretrainingBatchStream,
@@ -81,6 +84,7 @@ _SAVED_CHECKPOINT_KEYS = frozenset(
         "log_interval",
         "seed",
         "compile",
+        "rng_schedule",
     }
 )
 
@@ -604,79 +608,72 @@ def _unflatten_prefixed(arrays: Mapping[str, mx.array], prefix: str) -> dict:
     return tree_unflatten(items)
 
 
-def _restore_checkpoint(resolved: ResolvedStep) -> _RestoredTrainingState:
-    with open_checkpoint_reader(
-        resolved.step_directory.parent.parent,
-        step=resolved.step,
-        expected_checkpoint_identity=resolved.checkpoint.identity,
-    ) as reader:
-        verified = reader.resolved
-        if not isinstance(verified.checkpoint, PretrainingCheckpointManifest):
-            raise SMLArtifactError("pretraining requires a pretraining checkpoint")
-        contents = reader.read_contents()
-        scalar = _parse_scalar_document(
-            canonical_json_bytes(dict(contents.scalar_state)),
-            verified,
-        )
-        groups = {
-            logical_path: dict(contents.array_groups[logical_path])
-            for logical_path in _CHECKPOINT_ARRAY_PATHS
-        }
+def _restore_checkpoint(reader: CheckpointReader) -> _RestoredTrainingState:
+    if not isinstance(reader, CheckpointReader):
+        raise TypeError("reader must be a CheckpointReader")
+    verified = reader.resolved
+    if not isinstance(verified.checkpoint, PretrainingCheckpointManifest):
+        raise SMLArtifactError("pretraining requires a pretraining checkpoint")
+    contents = reader.read_contents()
+    scalar = _parse_scalar_document(
+        canonical_json_bytes(dict(contents.scalar_state)),
+        verified,
+    )
+    groups = {
+        logical_path: dict(contents.array_groups[logical_path])
+        for logical_path in _CHECKPOINT_ARRAY_PATHS
+    }
 
-        masters = groups["master.safetensors"]
-        working = groups["model.safetensors"]
-        try:
-            parameters = BaseParameterState(
-                tree_unflatten(list(masters.items())),
-                tree_unflatten(list(working.items())),
-            )
-            optimizer_arrays = groups["optimizer.safetensors"]
-            if set(optimizer_arrays) != {
-                "step",
-                *(f"first_moments.{name}" for name in masters),
-                *(f"second_moments.{name}" for name in masters),
-            }:
-                raise SMLArtifactError("optimizer checkpoint keys do not match masters")
-            for name, master in masters.items():
-                for prefix in ("first_moments.", "second_moments."):
-                    if optimizer_arrays[f"{prefix}{name}"].shape != master.shape:
-                        raise SMLArtifactError(
-                            "optimizer checkpoint shapes do not match masters"
-                        )
-            optimizer = AdamState(
-                optimizer_arrays["step"],
-                _unflatten_prefixed(optimizer_arrays, "first_moments."),
-                _unflatten_prefixed(optimizer_arrays, "second_moments."),
-            )
-            trainer_arrays = groups["trainer.safetensors"]
-            if set(trainer_arrays) != {
-                "accumulation_count",
-                "next_key",
-                "loss_numerator",
-                *(f"accumulators.{name}" for name in masters),
-            }:
-                raise SMLArtifactError("trainer checkpoint keys do not match masters")
-            for name, master in masters.items():
-                if trainer_arrays[f"accumulators.{name}"].shape != master.shape:
+    masters = groups["master.safetensors"]
+    working = groups["model.safetensors"]
+    try:
+        parameters = BaseParameterState(
+            tree_unflatten(list(masters.items())),
+            tree_unflatten(list(working.items())),
+        )
+        optimizer_arrays = groups["optimizer.safetensors"]
+        if set(optimizer_arrays) != {
+            "step",
+            *(f"first_moments.{name}" for name in masters),
+            *(f"second_moments.{name}" for name in masters),
+        }:
+            raise SMLArtifactError("optimizer checkpoint keys do not match masters")
+        for name, master in masters.items():
+            for prefix in ("first_moments.", "second_moments."):
+                if optimizer_arrays[f"{prefix}{name}"].shape != master.shape:
                     raise SMLArtifactError(
-                        "trainer checkpoint shapes do not match masters"
+                        "optimizer checkpoint shapes do not match masters"
                     )
-            trainer = TrainerState(
-                _unflatten_prefixed(trainer_arrays, "accumulators."),
-                trainer_arrays["accumulation_count"],
-                trainer_arrays["next_key"],
-                trainer_arrays["loss_numerator"],
-            )
-            _require_empty_trainer_state(trainer)
-            if int(optimizer.step.item()) != scalar.step:
-                raise SMLArtifactError(
-                    "checkpoint Adam step does not match scalar step"
-                )
-            return _RestoredTrainingState(parameters, optimizer, trainer, scalar)
-        except SMLArtifactError:
-            raise
-        except (SMLConfigurationError, TypeError, ValueError) as error:
-            raise SMLArtifactError("invalid pretraining checkpoint arrays") from error
+        optimizer = AdamState(
+            optimizer_arrays["step"],
+            _unflatten_prefixed(optimizer_arrays, "first_moments."),
+            _unflatten_prefixed(optimizer_arrays, "second_moments."),
+        )
+        trainer_arrays = groups["trainer.safetensors"]
+        if set(trainer_arrays) != {
+            "accumulation_count",
+            "next_key",
+            "loss_numerator",
+            *(f"accumulators.{name}" for name in masters),
+        }:
+            raise SMLArtifactError("trainer checkpoint keys do not match masters")
+        for name, master in masters.items():
+            if trainer_arrays[f"accumulators.{name}"].shape != master.shape:
+                raise SMLArtifactError("trainer checkpoint shapes do not match masters")
+        trainer = TrainerState(
+            _unflatten_prefixed(trainer_arrays, "accumulators."),
+            trainer_arrays["accumulation_count"],
+            trainer_arrays["next_key"],
+            trainer_arrays["loss_numerator"],
+        )
+        _require_empty_trainer_state(trainer)
+        if int(optimizer.step.item()) != scalar.step:
+            raise SMLArtifactError("checkpoint Adam step does not match scalar step")
+        return _RestoredTrainingState(parameters, optimizer, trainer, scalar)
+    except SMLArtifactError:
+        raise
+    except (SMLConfigurationError, TypeError, ValueError) as error:
+        raise SMLArtifactError("invalid pretraining checkpoint arrays") from error
 
 
 def _copy_run_tokenizer(data: Path, private_run: Path) -> None:
@@ -761,6 +758,7 @@ def _run_manifest(
         "log_interval": config.log_interval,
         "seed": config.seed,
         "compile": config.compile,
+        "rng_schedule": TRAINING_RNG_SCHEDULE,
     }
     manifest = PretrainingRunManifest(
         kind="pretraining-run",
@@ -802,6 +800,8 @@ def _config_from_run(
         saved = _mapping_dict(manifest.checkpoint, "checkpoint")
         if set(saved) != _SAVED_CHECKPOINT_KEYS:
             raise SMLArtifactError("saved checkpoint configuration has invalid fields")
+        if saved.pop("rng_schedule") != TRAINING_RNG_SCHEDULE:
+            raise SMLArtifactError("saved checkpoint rng_schedule is invalid")
         maximum_steps = (
             saved["maximum_steps"]
             if overrides.maximum_steps is None
@@ -957,21 +957,21 @@ def _run_training(
             if _limit_reached(config, scalar):
                 break
             with envelope:
+                microstep_index = scalar.microsteps + window_microsteps
+                if config.model.hidden_dropout > 0.0:
+                    trainer_tree = trainer.to_tree()
+                    trainer = TrainerState.from_compiled_tree(
+                        (
+                            trainer_tree[0],
+                            trainer_tree[1],
+                            counter_random_key(config.seed, microstep_index),
+                            trainer_tree[3],
+                        )
+                    )
                 microstep = kernels.microstep(parameters, trainer, envelope.rows)
                 pending_cursor = envelope.cursor_after
             parameters = microstep.parameters
-            trainer_tree = microstep.trainer.to_tree()
-            trainer = TrainerState.from_compiled_tree(
-                (
-                    trainer_tree[0],
-                    trainer_tree[1],
-                    counter_random_key(
-                        config.seed,
-                        scalar.microsteps + window_microsteps + 1,
-                    ),
-                    trainer_tree[3],
-                )
-            )
+            trainer = microstep.trainer
             window_microsteps += 1
             if window_microsteps == config.loader.gradient_accumulation_steps:
                 complete_update()
@@ -1083,7 +1083,19 @@ def resume(
                 model=config.model,
                 loader=config.loader,
             )
-            restored = _restore_checkpoint(resolved)
+            with open_checkpoint_reader(
+                run,
+                step=resolved.step,
+                expected_checkpoint_identity=resolved.checkpoint.identity,
+                verification=VerificationLevel.FULL,
+            ) as reader:
+                with reader.open_run_child(
+                    "tokenizer",
+                    (TokenizerManifest,),
+                ) as tokenizer:
+                    validate_full_run_semantics(reader, tokenizer.manifest)
+                restored = _restore_checkpoint(reader)
+                resolved = reader.resolved
             scalar = restored.scalar
             try:
                 canonical_cursor = canonicalize_pretraining_cursor(

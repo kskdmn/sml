@@ -8,6 +8,7 @@ import mlx.core as mx
 
 from sml.artifacts.checkpoint import CheckpointReader, verify_checkpoint_current_state
 from sml.artifacts.manifest import (
+    TRAINING_RNG_SCHEDULE,
     ArrayPayloadRef,
     ArraySpec,
     BaseSnapshotManifest,
@@ -143,6 +144,7 @@ def checkpoint_configuration(
         "log_interval",
         "seed",
         "compile",
+        "rng_schedule",
     }
     if set(values) != expected:
         raise SMLArtifactError(f"{context} checkpoint config has invalid fields")
@@ -174,6 +176,8 @@ def checkpoint_configuration(
             raise ValueError("seed must be uint32")
         if not isinstance(values["compile"], bool):
             raise TypeError("compile must be bool")
+        if values["rng_schedule"] != TRAINING_RNG_SCHEDULE:
+            raise ValueError(f"rng_schedule must be {TRAINING_RNG_SCHEDULE!r}")
     except (TypeError, ValueError, SMLConfigurationError) as error:
         raise SMLArtifactError(f"invalid {context} checkpoint config") from error
     return values
@@ -210,8 +214,19 @@ def expected_next_key(
     model: ModelConfig,
     lora: LoRAConfig | None = None,
 ) -> mx.array:
-    del model, lora
-    return counter_random_key(seed, microsteps)
+    model_sites = model.num_layers if model.hidden_dropout > 0.0 else 0
+    lora_sites = (
+        model.num_layers * len(lora.target_modules)
+        if lora is not None and lora.dropout > 0.0
+        else 0
+    )
+    active_sites = model_sites + lora_sites
+    if microsteps == 0 or active_sites == 0:
+        return counter_random_key(seed, 0)
+    key = counter_random_key(seed, microsteps - 1)
+    for _site in range(active_sites):
+        key, _unused = mx.random.split(key)
+    return key
 
 
 def _verify_progress(

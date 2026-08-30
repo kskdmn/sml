@@ -348,7 +348,10 @@ def _complete_run_builder(private_path: Path) -> PretrainingRunManifest:
         precision={"working": "bfloat16"},
         optimizer={"name": "adamw"},
         loader={"batch_size": 1},
-        checkpoint={"interval": 1},
+        checkpoint={
+            "interval": 1,
+            "rng_schedule": "counter-addressed-forward-terminal-v1",
+        },
         tokenizer_identity=tokenizer.identity,
         data_identity="sha256:" + "2" * 64,
         diagnostic_data_locator="/portable/data",
@@ -568,7 +571,10 @@ def test_checkpoint_full_verification_rehashes_payloads(tmp_path):
         precision={"working": "bfloat16"},
         optimizer={"name": "adamw"},
         loader={"batch_size": 1},
-        checkpoint={"interval": 1},
+        checkpoint={
+            "interval": 1,
+            "rng_schedule": "counter-addressed-forward-terminal-v1",
+        },
         tokenizer_identity="sha256:" + "1" * 64,
         data_identity="sha256:" + "2" * 64,
         diagnostic_data_locator=None,

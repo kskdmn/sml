@@ -130,7 +130,10 @@ def _write_valid_checkpoint_run(tmp_path: Path) -> Path:
         precision={"working_parameter_dtype": "bfloat16"},
         optimizer={"kind": "adamw"},
         loader={"microbatch_size": 1},
-        checkpoint={"interval": 1},
+        checkpoint={
+            "interval": 1,
+            "rng_schedule": "counter-addressed-forward-terminal-v1",
+        },
         tokenizer_identity="sha256:" + "1" * 64,
         data_identity="sha256:" + "2" * 64,
         diagnostic_data_locator=None,
@@ -703,7 +706,10 @@ def test_full_resolution_rejects_false_safetensors_metadata(tmp_path: Path) -> N
         precision={"working_parameter_dtype": "bfloat16"},
         optimizer={"kind": "adamw"},
         loader={"microbatch_size": 1},
-        checkpoint={"interval": 1},
+        checkpoint={
+            "interval": 1,
+            "rng_schedule": "counter-addressed-forward-terminal-v1",
+        },
         tokenizer_identity="sha256:" + "1" * 64,
         data_identity="sha256:" + "2" * 64,
         diagnostic_data_locator=None,

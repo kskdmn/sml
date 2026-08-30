@@ -26,6 +26,7 @@ from sml.artifacts.manifest import (
     file_identity,
     read_manifest,
 )
+from sml.artifacts.semantics import expected_next_key
 from sml.artifacts.verify import verify_artifact
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
@@ -50,7 +51,11 @@ from sml.training.common import (
     PretrainingConfig,
     ResumeOverrides,
 )
-from sml.training.lora import LoRAConfig, LoRAInitializerConfig
+from sml.training.lora import (
+    LoRAConfig,
+    LoRAInitializerConfig,
+    lora_config_from_mapping,
+)
 from sml.training.pretrain import train
 from sml.training.swag import (
     SwagTrainingConfig,
@@ -357,6 +362,39 @@ def _write_bound_lora_run(run: Path, run_manifest: LoRARunManifest) -> None:
     (run / LatestIndex.MANIFEST_FILENAME).write_bytes(canonical_json_bytes(latest))
 
 
+def _replace_latest_trainer_key(run: Path, key: mx.array) -> None:
+    resolved = resolve_latest_step(
+        run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+    trainer_path = resolved.step_directory / "trainer.safetensors"
+    trainer = _load_group(resolved.step_directory, "trainer.safetensors")
+    mx.eval(*trainer.values())
+    trainer["next_key"] = key
+    mx.save_safetensors(trainer_path, trainer)
+    assert isinstance(resolved.checkpoint, LoRACheckpointManifest)
+    checkpoint = replace(
+        resolved.checkpoint,
+        trainer=replace(
+            resolved.checkpoint.trainer,
+            payload=_payload_ref(trainer_path, "trainer.safetensors"),
+        ),
+    )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    (resolved.step_directory / "checkpoint.json").write_bytes(
+        canonical_json_bytes(checkpoint)
+    )
+    latest = read_manifest(
+        run,
+        LatestIndex,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    latest = replace(latest, checkpoint_identity=checkpoint.identity)
+    latest = replace(latest, identity=latest.recompute_identity())
+    (run / "latest.json").write_bytes(canonical_json_bytes(latest))
+
+
 @pytest.fixture(scope="module")
 def _tiny_base_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
     root = tmp_path_factory.mktemp("swag-workflow-base")
@@ -506,42 +544,74 @@ def test_full_export_resolve_applies_exact_export_semantics(
         resolve_model_artifact(exported.path, full_verify=True)
 
 
+@pytest.mark.parametrize(
+    ("hidden_dropout", "lora_dropout"),
+    ((0.0, 0.5), (0.2, 0.5), (0.0, 0.0)),
+    ids=("lora-only", "mixed", "disabled"),
+)
 def test_uninterrupted_and_interrupted_adapter_state_match(
-    tiny_base_run, tiny_swag_bundle, tmp_path
+    tmp_path,
+    hidden_dropout,
+    lora_dropout,
 ):
+    tokenizer, data = _prepare_tiny_data(tmp_path)
+    base_config = _tiny_pretraining_config(
+        data.path,
+        tmp_path / "base-run",
+        tokenizer.manifest.vocab_size,
+    )
+    base_config = replace(
+        base_config,
+        model=replace(base_config.model, hidden_dropout=hidden_dropout),
+    )
+    base_run = train(base_config).run
+    resolved_base = resolve_model_artifact(base_run, full_verify=True)
+    bundle = prepare_swag_bundle(
+        SwagPreparationConfig(
+            provider=FakeSwagProvider(_swag_rows(5)),
+            source=SwagSourceConfig(revision="deadbeef" * 5),
+            maximum_length=32,
+            bucket_boundaries=(16, 32),
+        ),
+        resolved_base,
+        tmp_path / "swag-bundle",
+    )
     lora = LoRAConfig(
         rank=3,
         alpha=1.0,
         scaling_mode="lora",
-        dropout=0.5,
+        dropout=lora_dropout,
         target_modules=("q_proj", "v_proj"),
         initializer=LoRAInitializerConfig(lora_a=0.05, lora_b=0.05),
     )
-    uninterrupted = finetune(
-        tiny_swag_training_config(
-            tiny_base_run,
-            tiny_swag_bundle,
-            tmp_path / "uninterrupted",
-            lora=lora,
-            maximum_steps=2,
-            compile=True,
+    try:
+        uninterrupted = finetune(
+            tiny_swag_training_config(
+                base_run,
+                bundle,
+                tmp_path / "uninterrupted",
+                lora=lora,
+                maximum_steps=2,
+                compile=True,
+            )
         )
-    )
-    first = finetune(
-        tiny_swag_training_config(
-            tiny_base_run,
-            tiny_swag_bundle,
-            tmp_path / "interrupted",
-            lora=lora,
-            maximum_steps=1,
-            compile=True,
+        first = finetune(
+            tiny_swag_training_config(
+                base_run,
+                bundle,
+                tmp_path / "interrupted",
+                lora=lora,
+                maximum_steps=1,
+                compile=True,
+            )
         )
-    )
-    resumed = resume_finetune(
-        first.run,
-        data=tiny_swag_bundle.path,
-        overrides=ResumeOverrides(maximum_steps=2),
-    )
+        resumed = resume_finetune(
+            first.run,
+            data=bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
+    finally:
+        bundle.close()
     left = _latest_checkpoint_state(uninterrupted.run)
     right = _latest_checkpoint_state(resumed.run)
     assert left["step"] == right["step"] == 2
@@ -552,6 +622,69 @@ def test_uninterrupted_and_interrupted_adapter_state_match(
     _assert_array_maps_equal(left["adapters"], right["adapters"])
     _assert_array_maps_equal(left["optimizer"], right["optimizer"])
     _assert_array_maps_equal(left["trainer"], right["trainer"])
+    for run, state in ((uninterrupted.run, left), (resumed.run, right)):
+        manifest = read_manifest(
+            run,
+            LoRARunManifest,
+            VerificationLevel.MANIFEST_TRUSTED,
+        ).manifest
+        expected = expected_next_key(
+            seed=int(manifest.checkpoint["seed"]),
+            microsteps=state["scalar"]["microsteps"],
+            model=ModelConfig(**dict(manifest.model)),
+            lora=lora_config_from_mapping(dict(manifest.lora)),
+        )
+        mx.eval(expected, state["trainer"]["next_key"])
+        assert bool(mx.array_equal(state["trainer"]["next_key"], expected))
+
+
+def test_resume_rejects_wrong_key_before_runtime_or_retention(
+    tiny_base_run,
+    tiny_swag_bundle,
+    tmp_path,
+    monkeypatch,
+):
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "wrong-key-run",
+            lora=LoRAConfig(
+                dropout=0.5,
+                target_modules=("q_proj", "v_proj"),
+            ),
+            maximum_steps=1,
+        )
+    )
+    _replace_latest_trainer_key(trained.run, mx.random.key(999))
+    reached: list[str] = []
+
+    def forbidden(name):
+        def call(*_args, **_kwargs):
+            reached.append(name)
+            raise AssertionError(f"{name} reached before RNG validation")
+
+        return call
+
+    monkeypatch.setattr(swag_module, "SMLLanguageModel", forbidden("model"))
+    monkeypatch.setattr(swag_module, "SwagBatchStream", forbidden("stream"))
+    monkeypatch.setattr(swag_module, "prune_to_latest", forbidden("retention"))
+    monkeypatch.setattr(
+        swag_module,
+        "_publish_training_state",
+        forbidden("publication"),
+    )
+
+    with pytest.raises(
+        SMLArtifactError,
+        match="checkpoint trainer next RNG key is incorrect",
+    ):
+        resume_finetune(
+            trained.run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
+    assert reached == []
 
 
 def test_lora_microbatch_progress_supports_full_checkpoint_consumers(

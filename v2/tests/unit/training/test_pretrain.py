@@ -382,13 +382,14 @@ def test_disabled_dropout_preserves_explicit_prng_key(tiny_runtime):
 
 
 def test_enabled_dropout_advances_explicit_prng_key(tmp_path: Path):
-    """Reusing a dropout key would repeat masks after every resumed microstep."""
+    """Enabled dropout preserves the terminal key returned by the forward."""
     runtime = build_tiny_runtime(tmp_path, dropout=0.2)
+    expected, _unused = mx.random.split(runtime.trainer.next_key)
 
     state = runtime.microstep(runtime.parameters, runtime.trainer, runtime.rows)
 
-    mx.eval(state.trainer.next_key, runtime.trainer.next_key)
-    assert not bool(mx.array_equal(state.trainer.next_key, runtime.trainer.next_key))
+    mx.eval(state.trainer.next_key, expected)
+    assert bool(mx.array_equal(state.trainer.next_key, expected))
 
 
 def test_resume_overrides_and_checkpoint_policy_expose_only_reviewed_controls():

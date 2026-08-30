@@ -59,7 +59,10 @@ def _matching_snapshot_and_run() -> tuple[BaseSnapshotManifest, LoRARunManifest]
         precision={"adapter_parameter_dtype": "float32"},
         optimizer={"kind": "adam"},
         loader={"batch_size": 1},
-        checkpoint={"interval": 5},
+        checkpoint={
+            "interval": 5,
+            "rng_schedule": "counter-addressed-forward-terminal-v1",
+        },
         tokenizer_identity=IDENTITY_B,
         base_identity=snapshot.identity,
         data_identity=IDENTITY_C,
