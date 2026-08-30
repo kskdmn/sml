@@ -13,6 +13,7 @@ import pytest
 import zstandard as zstd
 from sml.artifacts import arrays as arrays_module
 from sml.artifacts import checkpoint as checkpoint_module
+from sml.artifacts import manifest as manifest_module
 from sml.artifacts import semantics as semantics_module
 from sml.artifacts import verify as verify_module
 from sml.artifacts.manifest import (
@@ -313,6 +314,49 @@ def test_recursive_tokenizer_dispatch_rejects_invalid_candidates_and_closes_root
 
     with pytest.raises(SMLArtifactError, match=message):
         verify_artifact(root, full=full)
+
+    assert len(opened_fds) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_fds[0])
+
+
+@pytest.mark.parametrize("mutation", ("add-candidate", "replace-selected"))
+def test_recursive_manifest_mutation_during_parse_rejects_and_closes_root(
+    tmp_path: Path,
+    prepared_template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """Candidate identity and cardinality must stay stable through schema parsing."""
+    root = tmp_path / f"prepared-parse-{mutation}"
+    shutil.copytree(prepared_template, root)
+    tokenizer = root / "tokenizer"
+    manifest_path = tokenizer / "manifest.json"
+    opened_fds: list[int] = []
+    original_open_child = ArtifactRoot.open_child
+    real_parse = manifest_module._parse_manifest
+
+    def recording_open_child(owner: ArtifactRoot, logical_path: str) -> ArtifactRoot:
+        child = original_open_child(owner, logical_path)
+        if logical_path == "tokenizer":
+            opened_fds.append(child.fileno())
+        return child
+
+    def mutating_parse(raw, manifest_type):
+        if manifest_type is TokenizerManifest:
+            encoded = manifest_path.read_bytes()
+            if mutation == "add-candidate":
+                (tokenizer / "run.json").write_bytes(encoded)
+            else:
+                manifest_path.rename(tokenizer / "manifest.retained.json")
+                manifest_path.write_bytes(encoded)
+        return real_parse(raw, manifest_type)
+
+    monkeypatch.setattr(ArtifactRoot, "open_child", recording_open_child)
+    monkeypatch.setattr(manifest_module, "_parse_manifest", mutating_parse)
+
+    with pytest.raises(SMLArtifactError, match="candidate.*changed"):
+        verify_artifact(root, full=False)
 
     assert len(opened_fds) == 1
     with pytest.raises(OSError):

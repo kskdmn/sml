@@ -295,6 +295,13 @@ def _stable_stat_fields(value: os.stat_result) -> tuple[int, int, int, int, int]
     )
 
 
+def _same_stable_entry(
+    expected: os.stat_result,
+    actual: os.stat_result,
+) -> bool:
+    return _stable_stat_fields(expected) == _stable_stat_fields(actual)
+
+
 def _cleanup_exception(
     actions: Sequence[Callable[[], object]],
 ) -> BaseException | None:
@@ -485,6 +492,36 @@ class ArtifactRoot:
         except BaseException:
             os.close(descriptor)
             raise
+
+    def _stat_direct_payload(self, logical_path: str) -> os.stat_result | None:
+        components = parse_logical_path(logical_path)
+        if len(components) != 1:
+            raise SMLArtifactError(
+                f"direct payload must be one portable component: {logical_path!r}"
+            )
+        if self._fd < 0:
+            raise SMLArtifactError("artifact root is closed")
+        try:
+            payload_stat = os.stat(
+                components[0],
+                dir_fd=self._fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise SMLArtifactError(
+                f"could not stat direct artifact payload: {logical_path}"
+            ) from error
+        if not stat.S_ISREG(payload_stat.st_mode):
+            raise SMLArtifactError(
+                f"direct artifact payload is not a regular file: {logical_path}"
+            )
+        if payload_stat.st_nlink != 1:
+            raise SMLArtifactError(
+                f"direct artifact payload link count must be exactly one: {logical_path}"
+            )
+        return payload_stat
 
     def _open_payload_with_stat(
         self, logical_path: str
@@ -1635,41 +1672,34 @@ def _validated_manifest_types[M: _Manifest](
     return manifest_types
 
 
-def _read_manifest_from_root[M: _Manifest](
-    root: ArtifactRoot,
+def _parse_and_validate_manifest_bytes[M: _Manifest](
+    encoded: bytes,
     path: Path,
     manifest_types: tuple[type[M], ...],
 ) -> M:
     manifest_types = _validated_manifest_types(manifest_types)
-    filenames = {manifest_type.MANIFEST_FILENAME for manifest_type in manifest_types}
-    filename = next(iter(filenames))
-    manifest_path = path / filename
     try:
-        with _open_stable_payload(root, filename) as payload:
-            encoded = payload.read()
-            text = encoded.decode("utf-8")
-            raw = json.loads(
-                text,
-                parse_constant=_reject_json_constant,
-                object_pairs_hook=_json_object_no_duplicates,
+        text = encoded.decode("utf-8")
+        raw = json.loads(
+            text,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_json_object_no_duplicates,
+        )
+        manifest_type = _manifest_type_for_raw(raw, manifest_types)
+        manifest = _parse_manifest(raw, manifest_type)
+
+        recomputed = manifest.recompute_identity()
+        if recomputed != manifest.identity:
+            raise SMLArtifactError(
+                "manifest identity mismatch: "
+                f"stored {manifest.identity}, recomputed {recomputed}"
             )
-            manifest_type = _manifest_type_for_raw(raw, manifest_types)
-            manifest = _parse_manifest(raw, manifest_type)
 
-            recomputed = manifest.recompute_identity()
-            if recomputed != manifest.identity:
-                raise SMLArtifactError(
-                    "manifest identity mismatch: "
-                    f"stored {manifest.identity}, recomputed {recomputed}"
-                )
-
-            canonical = canonical_json_bytes(manifest)
-            if encoded != canonical:
-                raise SMLArtifactError(
-                    f"manifest is not canonical JSON: {manifest_path}"
-                )
-    except SMLArtifactError:
-        raise
+        canonical = canonical_json_bytes(manifest)
+        if encoded != canonical:
+            raise SMLArtifactError(f"manifest is not canonical JSON bytes: {path}")
+    except SMLArtifactError as error:
+        raise SMLArtifactError(f"invalid manifest at {path}: {error}") from error
     except (
         OSError,
         UnicodeError,
@@ -1677,11 +1707,35 @@ def _read_manifest_from_root[M: _Manifest](
         TypeError,
         ValueError,
     ) as error:
-        raise SMLArtifactError(
-            f"invalid manifest at {manifest_path}: {error}"
-        ) from error
+        raise SMLArtifactError(f"invalid manifest at {path}: {error}") from error
 
     return manifest
+
+
+def _read_manifest_from_root[M: _Manifest](
+    root: ArtifactRoot,
+    path: Path,
+    manifest_types: tuple[type[M], ...],
+    *,
+    validate_opened: Callable[[os.stat_result], None] | None = None,
+    validate_before_close: Callable[[os.stat_result], None] | None = None,
+) -> M:
+    manifest_types = _validated_manifest_types(manifest_types)
+    filename = next(
+        iter({manifest_type.MANIFEST_FILENAME for manifest_type in manifest_types})
+    )
+    with _open_stable_payload(root, filename) as payload:
+        if validate_opened is not None:
+            validate_opened(payload.opened_stat)
+        encoded = payload.read()
+        manifest = _parse_and_validate_manifest_bytes(
+            encoded,
+            path / filename,
+            manifest_types,
+        )
+        if validate_before_close is not None:
+            validate_before_close(payload.opened_stat)
+        return manifest
 
 
 def _open_artifact_from_root[M: _Manifest](

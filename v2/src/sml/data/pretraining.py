@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import mmap
 import queue
 import threading
@@ -25,6 +24,7 @@ from sml.artifacts.manifest import (
     TokenizerManifest,
     VerificationLevel,
     VerifiedPayload,
+    _read_manifest_from_root,
     canonical_json_bytes,
     file_identity,
     open_artifact,
@@ -304,89 +304,6 @@ class _ProducerFailure:
 _QUEUE_STOP = object()
 
 
-def _json_object_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON field: {key}")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"nonfinite JSON constant is not allowed: {value}")
-
-
-def _parsed_payload_ref(raw: object, name: str) -> PayloadRef:
-    if not isinstance(raw, dict) or set(raw) != {
-        "logical_path",
-        "identity",
-        "byte_size",
-    }:
-        raise ValueError(f"{name} must be an exact payload reference")
-    return PayloadRef(
-        logical_path=raw["logical_path"],
-        identity=raw["identity"],
-        byte_size=raw["byte_size"],
-    )
-
-
-def _parse_canonical_tokenizer_manifest(payload: bytes) -> TokenizerManifest:
-    expected_fields = {
-        "kind",
-        "version",
-        "identity",
-        "algorithm",
-        "training",
-        "vocab_size",
-        "bos_token_id",
-        "eos_token_id",
-        "pad_token_id",
-        "unk_token_id",
-        "model",
-        "vocab",
-        "diagnostic_source_locator",
-    }
-    try:
-        raw = json.loads(
-            payload.decode("utf-8"),
-            parse_constant=_reject_json_constant,
-            object_pairs_hook=_json_object_no_duplicates,
-        )
-        if not isinstance(raw, dict) or set(raw) != expected_fields:
-            raise ValueError("tokenizer manifest fields do not match the exact schema")
-        manifest = TokenizerManifest(
-            kind=raw["kind"],
-            version=raw["version"],
-            identity=raw["identity"],
-            algorithm=raw["algorithm"],
-            training=raw["training"],
-            vocab_size=raw["vocab_size"],
-            bos_token_id=raw["bos_token_id"],
-            eos_token_id=raw["eos_token_id"],
-            pad_token_id=raw["pad_token_id"],
-            unk_token_id=raw["unk_token_id"],
-            model=_parsed_payload_ref(raw["model"], "tokenizer model"),
-            vocab=_parsed_payload_ref(raw["vocab"], "tokenizer vocab"),
-            diagnostic_source_locator=raw["diagnostic_source_locator"],
-        )
-        if manifest.recompute_identity() != manifest.identity:
-            raise ValueError("tokenizer manifest identity mismatch")
-        if canonical_json_bytes(manifest) != payload:
-            raise ValueError("copied tokenizer manifest is not canonical")
-        return manifest
-    except SMLArtifactError:
-        raise
-    except (
-        KeyError,
-        TypeError,
-        UnicodeError,
-        json.JSONDecodeError,
-        ValueError,
-    ) as error:
-        raise SMLArtifactError(f"invalid copied tokenizer manifest: {error}") from error
-
-
 def _map_npy_payload(
     payload: VerifiedPayload,
     reference: PayloadRef,
@@ -553,15 +470,21 @@ def _open_validated_prepared_resources(
     mapping: mmap.mmap | None = None
     array: np.ndarray | None = None
     try:
-        with artifact.root.open_payload("manifest.json") as manifest_file:
-            manifest_bytes = manifest_file.read()
-        if manifest_bytes != canonical_json_bytes(manifest):
-            raise SMLArtifactError("prepared bundle manifest is not canonical")
-
-        with artifact.root.open_payload("tokenizer/manifest.json") as tokenizer_file:
-            tokenizer_manifest = _parse_canonical_tokenizer_manifest(
-                tokenizer_file.read()
+        tokenizer_root = artifact.root.open_child("tokenizer")
+        try:
+            tokenizer_manifest = _read_manifest_from_root(
+                tokenizer_root,
+                bundle.path / "tokenizer",
+                (TokenizerManifest,),
             )
+        except BaseException as error:
+            try:
+                tokenizer_root.close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+        else:
+            tokenizer_root.close()
         _validate_prepared_tokenizer_binding(manifest, tokenizer_manifest)
 
         for reference in (manifest.tokenizer_model, manifest.tokenizer_vocab):

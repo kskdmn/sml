@@ -442,6 +442,21 @@ def test_resolve_reports_manifest_trusted_versus_full_metadata(
         resolve_model_artifact(tiny_pretraining_run, full_verify=True)
 
 
+@pytest.mark.parametrize("full_verify", (False, True))
+def test_inference_rejects_dual_manifest_candidates(
+    tiny_pretraining_run: Path,
+    tmp_path: Path,
+    full_verify: bool,
+) -> None:
+    """Inference must not choose one of two legal manifest candidates."""
+    ambiguous = tmp_path / f"ambiguous-{full_verify}"
+    shutil.copytree(tiny_pretraining_run, ambiguous)
+    (ambiguous / "manifest.json").write_bytes((ambiguous / "run.json").read_bytes())
+
+    with pytest.raises(SMLArtifactError, match="exactly one"):
+        resolve_model_artifact(ambiguous, full_verify=full_verify)
+
+
 def test_full_resolve_rejects_master_working_cast_mismatch(
     tiny_pretraining_run: Path,
 ) -> None:

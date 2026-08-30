@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -13,12 +11,12 @@ from sml.artifacts.checkpoint import (
     open_latest_checkpoint_reader,
     require_lora_base_snapshot,
 )
+from sml.artifacts.dispatch import ArtifactManifest, open_dispatched_artifact
 from sml.artifacts.manifest import (
     CHECKPOINT_MANIFEST_TYPES,
     RUN_MANIFEST_TYPES,
     ArtifactRoot,
     BaseSnapshotManifest,
-    CheckpointManifest,
     ExportManifest,
     LoRARunManifest,
     OpenedArtifact,
@@ -29,10 +27,6 @@ from sml.artifacts.manifest import (
     SwagDataManifest,
     TokenizerManifest,
     VerificationLevel,
-    _json_object_no_duplicates,
-    _parse_manifest,
-    _reject_json_constant,
-    canonical_json_bytes,
 )
 from sml.artifacts.semantics import (
     validate_base_semantics,
@@ -43,28 +37,6 @@ from sml.data.pretraining import _verify_opened_pretraining_bundle
 from sml.data.swag import _load_opened_swag_bundle
 from sml.data.tokenizer import _load_opened_tokenizer_bundle
 from sml.errors import SMLArtifactError
-
-type ArtifactManifest = (
-    TokenizerManifest
-    | PretrainingDataManifest
-    | CheckpointManifest
-    | RunManifest
-    | BaseSnapshotManifest
-    | SwagDataManifest
-    | ExportManifest
-)
-
-_BUNDLE_TYPES: tuple[type[ArtifactManifest], ...] = (
-    TokenizerManifest,
-    PretrainingDataManifest,
-    BaseSnapshotManifest,
-    SwagDataManifest,
-    ExportManifest,
-)
-_MANIFEST_CANDIDATES: tuple[tuple[str, tuple[type[ArtifactManifest], ...]], ...] = (
-    (PretrainingRunManifest.MANIFEST_FILENAME, RUN_MANIFEST_TYPES),
-    (TokenizerManifest.MANIFEST_FILENAME, _BUNDLE_TYPES),
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,66 +72,12 @@ class VerificationResult:
             raise TypeError("children must be VerificationResult values")
 
 
-def _missing_payload(error: SMLArtifactError) -> bool:
-    cause: BaseException | None = error
-    while cause is not None:
-        if isinstance(cause, FileNotFoundError):
-            return True
-        cause = cause.__cause__
-    return False
-
-
-def _read_candidate_bytes(
-    root: ArtifactRoot,
-    filename: str,
-) -> bytes | None:
-    try:
-        stream, opened_stat = root._open_payload_with_stat(filename)
-    except SMLArtifactError as error:
-        if _missing_payload(error):
-            return None
-        raise
-    try:
-        encoded = stream.read()
-        consumed_stat = os.fstat(stream.fileno())
-        opened = (
-            opened_stat.st_dev,
-            opened_stat.st_ino,
-            opened_stat.st_size,
-            opened_stat.st_mtime_ns,
-            opened_stat.st_ctime_ns,
-        )
-        consumed = (
-            consumed_stat.st_dev,
-            consumed_stat.st_ino,
-            consumed_stat.st_size,
-            consumed_stat.st_mtime_ns,
-            consumed_stat.st_ctime_ns,
-        )
-        if opened != consumed:
-            raise SMLArtifactError(f"manifest changed during parsing: {filename}")
-    except BaseException as error:
-        try:
-            stream.close()
-        except BaseException as cleanup_error:
-            raise error from cleanup_error
-        raise
-    else:
-        stream.close()
-        return encoded
-
-
 def _open_artifact_once(
     path: Path,
     verification: VerificationLevel,
 ) -> OpenedArtifact[ArtifactManifest]:
     root = ArtifactRoot.open(path, writable=False)
-    return _open_artifact_from_retained_root(
-        path,
-        root,
-        verification,
-        (*_BUNDLE_TYPES, *RUN_MANIFEST_TYPES),
-    )
+    return open_dispatched_artifact(path, root, verification)
 
 
 def _open_artifact_from_retained_root(
@@ -169,70 +87,17 @@ def _open_artifact_from_retained_root(
     allowed_types: tuple[type, ...],
 ) -> OpenedArtifact[ArtifactManifest]:
     """Dispatch one already-owned root and transfer it only on success."""
+    artifact = open_dispatched_artifact(path, root, verification)
+    if isinstance(artifact.manifest, allowed_types):
+        return artifact
+    error = SMLArtifactError(
+        f"owned child has unexpected artifact kind: {artifact.manifest.kind!r}"
+    )
     try:
-        candidates: list[tuple[str, bytes, tuple[type[ArtifactManifest], ...]]] = []
-        for filename, manifest_types in _MANIFEST_CANDIDATES:
-            encoded = _read_candidate_bytes(root, filename)
-            if encoded is not None:
-                candidates.append((filename, encoded, manifest_types))
-        if len(candidates) != 1:
-            raise SMLArtifactError(
-                "artifact root must contain exactly one of run.json or manifest.json"
-            )
-        filename, encoded, manifest_types = candidates[0]
-        try:
-            raw = json.loads(
-                encoded.decode("utf-8"),
-                parse_constant=_reject_json_constant,
-                object_pairs_hook=_json_object_no_duplicates,
-            )
-            if not isinstance(raw, dict) or not isinstance(raw.get("kind"), str):
-                raise SMLArtifactError(
-                    "artifact manifest must contain a string kind discriminator"
-                )
-            types_by_kind = {
-                manifest_type.EXPECTED_KIND: manifest_type
-                for manifest_type in manifest_types
-            }
-            try:
-                manifest_type = types_by_kind[raw["kind"]]
-            except KeyError as error:
-                raise SMLArtifactError(
-                    f"unsupported artifact kind in {filename}: {raw['kind']!r}"
-                ) from error
-            manifest = _parse_manifest(raw, manifest_type)
-        except SMLArtifactError:
-            raise
-        except (
-            KeyError,
-            TypeError,
-            UnicodeError,
-            ValueError,
-            json.JSONDecodeError,
-        ) as error:
-            raise SMLArtifactError(
-                f"invalid artifact manifest at {path}: {error}"
-            ) from error
-        if manifest.recompute_identity() != manifest.identity:
-            raise SMLArtifactError("artifact manifest identity mismatch")
-        if encoded != canonical_json_bytes(manifest):
-            raise SMLArtifactError("artifact manifest must use canonical JSON bytes")
-        if not isinstance(manifest, allowed_types):
-            raise SMLArtifactError(
-                f"owned child has unexpected artifact kind: {manifest.kind!r}"
-            )
-        return OpenedArtifact(
-            path=path,
-            root=root,
-            manifest=manifest,
-            verification=verification,
-        )
-    except BaseException as error:
-        try:
-            root.close()
-        except BaseException as cleanup_error:
-            raise error from cleanup_error
-        raise
+        artifact.close()
+    except BaseException as cleanup_error:
+        raise error from cleanup_error
+    raise error
 
 
 def _open_child_artifact(

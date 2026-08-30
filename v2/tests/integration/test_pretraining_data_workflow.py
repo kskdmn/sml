@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import queue
 import shutil
 import subprocess
@@ -16,7 +17,9 @@ import numpy as np
 import pytest
 import sml.data.pretraining as pretraining_module
 import zstandard as zstd
+from sml.artifacts import manifest as manifest_module
 from sml.artifacts.manifest import (
+    ArtifactRoot,
     OpenedArtifact,
     PayloadRef,
     PretrainingDataManifest,
@@ -34,6 +37,7 @@ from sml.data.pretraining import (
     PretrainingBatchStream,
     PretrainingCursor,
     PretrainingPreparationConfig,
+    preflight_pretraining_bundle,
     prepare_pretraining_bundle,
 )
 from sml.data.tokenizer import TokenizerTrainingConfig, train_tokenizer_bundle
@@ -1352,8 +1356,9 @@ def _instrument_real_prepared_cleanup(
         return original_payload_close(payload)
 
     def close_root(root):
+        index = len(roots)
         roots.append(root)
-        events.append(("root", None))
+        events.append(("root", index))
         return original_root_close(root)
 
     def construct_array(*args, **kwargs):
@@ -1378,15 +1383,16 @@ def _instrument_real_prepared_cleanup(
 
 def _assert_real_prepared_cleanup(events, mappings, payloads, roots):
     assert events == [
+        ("root", 0),
         *(("mmap", index) for index in reversed(range(len(mappings)))),
         *(("payload", index) for index in reversed(range(len(payloads)))),
-        ("root", None),
+        ("root", 1),
     ]
     assert mappings
     assert all(mapping.closed for mapping in mappings)
     assert all(payload.closed for payload in payloads)
-    assert len(roots) == 1
-    assert roots[0]._fd == -1
+    assert len(roots) == 2
+    assert all(root._fd == -1 for root in roots)
 
 
 def test_prepared_ndarray_failure_closes_real_mapping_payload_and_root(
@@ -1525,6 +1531,74 @@ def test_prepared_open_failure_preserves_semantic_error_when_cleanup_fails(
 
     assert isinstance(caught.value.__cause__, RuntimeError)
     assert str(caught.value.__cause__) == "root cleanup failed"
+
+
+def test_prepared_nested_tokenizer_lifecycle_detects_parse_time_mutation(
+    prepared_bundle: PreparedDataBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The nested tokenizer descriptor must stay pinned through schema parsing."""
+    manifest_path = prepared_bundle.path / "tokenizer" / "manifest.json"
+    real_parse = manifest_module._parse_manifest
+    nested_descriptors: list[int] = []
+    original_open_child = ArtifactRoot.open_child
+
+    def recording_open_child(owner: ArtifactRoot, logical_path: str) -> ArtifactRoot:
+        child = original_open_child(owner, logical_path)
+        if logical_path == "tokenizer":
+            nested_descriptors.append(child.fileno())
+        return child
+
+    def mutating_parse(raw, manifest_type):
+        if manifest_type is TokenizerManifest:
+            before = manifest_path.stat()
+            os.utime(
+                manifest_path,
+                ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+            )
+        return real_parse(raw, manifest_type)
+
+    monkeypatch.setattr(ArtifactRoot, "open_child", recording_open_child)
+    monkeypatch.setattr(manifest_module, "_parse_manifest", mutating_parse)
+
+    with pytest.raises(SMLArtifactError, match="changed during use"):
+        preflight_pretraining_bundle(prepared_bundle, batch_size=1)
+
+    assert len(nested_descriptors) == 1
+    with pytest.raises(OSError):
+        os.fstat(nested_descriptors[0])
+
+
+def test_prepared_nested_tokenizer_dual_failure_preserves_semantic_error(
+    prepared_bundle: PreparedDataBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Schema failure stays primary when the retained manifest also changes."""
+    manifest_path = prepared_bundle.path / "tokenizer" / "manifest.json"
+    raw = json.loads(manifest_path.read_bytes())
+    raw["unexpected"] = True
+    manifest_path.write_text(
+        json.dumps(raw, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    real_parse = manifest_module._parse_manifest
+
+    def mutating_parse(raw_manifest, manifest_type):
+        if manifest_type is TokenizerManifest:
+            before = manifest_path.stat()
+            os.utime(
+                manifest_path,
+                ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+            )
+        return real_parse(raw_manifest, manifest_type)
+
+    monkeypatch.setattr(manifest_module, "_parse_manifest", mutating_parse)
+
+    with pytest.raises(SMLArtifactError, match="invalid.*tokenizer") as raised:
+        preflight_pretraining_bundle(prepared_bundle, batch_size=1)
+
+    assert isinstance(raised.value.__cause__, SMLArtifactError)
+    assert "changed during use" in str(raised.value.__cause__)
 
 
 @pytest.mark.parametrize(

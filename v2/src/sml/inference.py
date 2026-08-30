@@ -22,6 +22,7 @@ from sml.artifacts.checkpoint import (
     require_lora_base_snapshot,
     run_access_lock,
 )
+from sml.artifacts.dispatch import open_dispatched_artifact
 from sml.artifacts.manifest import (
     ArtifactRoot,
     BaseSnapshotManifest,
@@ -31,8 +32,6 @@ from sml.artifacts.manifest import (
     PretrainingRunManifest,
     TokenizerManifest,
     VerificationLevel,
-    _open_artifact_from_root,
-    open_artifact,
 )
 from sml.artifacts.semantics import (
     validate_base_semantics,
@@ -406,8 +405,6 @@ def _require_run_path(path: Path) -> Path:
         raise TypeError("path must be a Path")
     if path.name.startswith("step-"):
         raise SMLArtifactError("direct step-* paths are rejected")
-    if (path / "checkpoint.json").exists():
-        raise SMLArtifactError("direct checkpoint step paths are rejected")
     return path
 
 
@@ -626,14 +623,6 @@ def _resolve_opened_export(artifact, *, full_verify: bool) -> ResolvedModel:
     )
 
 
-def _resolve_export(path: Path, *, full_verify: bool) -> ResolvedModel:
-    verification = (
-        VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
-    )
-    with open_artifact(path, (ExportManifest,), verification) as artifact:
-        return _resolve_opened_export(artifact, full_verify=full_verify)
-
-
 def resolve_model_artifact(path: Path, *, full_verify: bool) -> ResolvedModel:
     path = _require_run_path(path)
     if not isinstance(full_verify, bool):
@@ -641,42 +630,25 @@ def resolve_model_artifact(path: Path, *, full_verify: bool) -> ResolvedModel:
     verification = (
         VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
     )
-    with ArtifactRoot.open(path, writable=False) as root:
-        try:
-            with root.open_payload(PretrainingRunManifest.MANIFEST_FILENAME):
-                pass
-        except SMLArtifactError as error:
-            if not isinstance(error.__cause__, FileNotFoundError):
-                raise
-            is_run = False
-        else:
-            is_run = True
-        if is_run:
-            with _open_artifact_from_root(
+    root = ArtifactRoot.open(path, writable=False)
+    with open_dispatched_artifact(path, root, verification) as artifact:
+        if isinstance(artifact.manifest, PretrainingRunManifest):
+            return _resolve_pretraining_run(
                 path,
-                root.duplicate(),
-                (PretrainingRunManifest, LoRARunManifest),
-                verification,
-            ) as artifact:
-                if isinstance(artifact.manifest, PretrainingRunManifest):
-                    return _resolve_pretraining_run(
-                        path,
-                        full_verify=full_verify,
-                        expected_run=artifact.manifest,
-                        run_descriptor=artifact.root.fileno(),
-                    )
-                if isinstance(artifact.manifest, LoRARunManifest):
-                    return _resolve_lora_run(
-                        path,
-                        full_verify=full_verify,
-                        expected_run=artifact.manifest,
-                        run_descriptor=artifact.root.fileno(),
-                    )
-                raise SMLArtifactError("unsupported run kind for model resolution")
-        with _open_artifact_from_root(
-            path, root.duplicate(), (ExportManifest,), verification
-        ) as artifact:
+                full_verify=full_verify,
+                expected_run=artifact.manifest,
+                run_descriptor=artifact.root.fileno(),
+            )
+        if isinstance(artifact.manifest, LoRARunManifest):
+            return _resolve_lora_run(
+                path,
+                full_verify=full_verify,
+                expected_run=artifact.manifest,
+                run_descriptor=artifact.root.fileno(),
+            )
+        if isinstance(artifact.manifest, ExportManifest):
             return _resolve_opened_export(artifact, full_verify=full_verify)
+        raise SMLArtifactError("artifact kind cannot be used for model resolution")
 
 
 class InferenceSession:
