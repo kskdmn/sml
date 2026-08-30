@@ -880,12 +880,12 @@ def _scan_closed_world(
     directory_descriptor: int,
     *,
     prefix: tuple[str, ...] = (),
-    files: set[tuple[str, ...]] | None = None,
+    files: dict[tuple[str, ...], os.stat_result] | None = None,
     directories: set[tuple[str, ...]] | None = None,
     collision_paths: dict[tuple[str, ...], tuple[str, ...]] | None = None,
-) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
+) -> tuple[dict[tuple[str, ...], os.stat_result], set[tuple[str, ...]]]:
     if files is None:
-        files = set()
+        files = {}
     if directories is None:
         directories = set()
     if collision_paths is None:
@@ -915,21 +915,7 @@ def _scan_closed_world(
                 raise SMLArtifactError(
                     f"closed-world payload is hard-linked: {'/'.join(logical_path)}"
                 )
-            descriptor, opened_stat = _opened_entry(
-                fs,
-                name,
-                parent_descriptor=directory_descriptor,
-                flags=_OPEN_PAYLOAD,
-            )
-            try:
-                if not stat.S_ISREG(opened_stat.st_mode) or opened_stat.st_nlink != 1:
-                    raise SMLArtifactError(
-                        f"closed-world payload is not a regular file: "
-                        f"{'/'.join(logical_path)}"
-                    )
-                files.add(logical_path)
-            finally:
-                os.close(descriptor)
+            files[logical_path] = entry_stat
         elif stat.S_ISDIR(entry_stat.st_mode):
             descriptor, opened_stat = _opened_entry(
                 fs,
@@ -1041,7 +1027,10 @@ def _verify_closed_world(
     *,
     manifest_present: bool,
     full: bool = True,
+    verify_contents: bool = True,
 ) -> None:
+    if not isinstance(verify_contents, bool):
+        raise TypeError("verify_contents must be a bool")
     references = tuple(_payload_references(manifest))
     expected_files, expected_directories = _expected_closed_world(references)
     if isinstance(manifest, (PretrainingDataManifest, ExportManifest)):
@@ -1053,27 +1042,51 @@ def _verify_closed_world(
         fs,
         temporary_descriptor,
     )
-    if actual_files != expected_files or actual_directories != expected_directories:
+    actual_file_paths = set(actual_files)
+    if (
+        actual_file_paths != expected_files
+        or actual_directories != expected_directories
+    ):
         raise SMLArtifactError(
             "artifact closed-world mismatch: "
-            f"unreferenced files={_format_logical_paths(actual_files - expected_files)}, "
-            f"missing files={_format_logical_paths(expected_files - actual_files)}, "
+            "unreferenced files="
+            f"{_format_logical_paths(actual_file_paths - expected_files)}, "
+            f"missing files={_format_logical_paths(expected_files - actual_file_paths)}, "
             "unreferenced directories="
             f"{_format_logical_paths(actual_directories - expected_directories)}, "
             "missing directories="
             f"{_format_logical_paths(expected_directories - actual_directories)}"
         )
 
-    with ArtifactRoot(os.dup(temporary_descriptor), local_apfs=True) as artifact_root:
-        artifact_root.verify_payloads(references, full=full)
-        if manifest_present:
-            with artifact_root.open_payload(
-                manifest.MANIFEST_FILENAME
-            ) as manifest_file:
-                if manifest_file.read() != canonical_json_bytes(manifest):
-                    raise SMLArtifactError(
-                        "publisher-owned manifest changed before immutable commit"
-                    )
+    references_by_path = {
+        parse_logical_path(reference.logical_path): reference
+        for reference in references
+    }
+    for logical_path, reference in references_by_path.items():
+        if actual_files[logical_path].st_size != reference.byte_size:
+            raise SMLArtifactError(
+                f"closed-world payload byte size mismatch: {'/'.join(logical_path)}"
+            )
+    if manifest_present:
+        manifest_path = parse_logical_path(manifest.MANIFEST_FILENAME)
+        if actual_files[manifest_path].st_size != len(canonical_json_bytes(manifest)):
+            raise SMLArtifactError(
+                f"closed-world payload byte size mismatch: {'/'.join(manifest_path)}"
+            )
+
+    if verify_contents:
+        with ArtifactRoot(
+            os.dup(temporary_descriptor), local_apfs=True
+        ) as artifact_root:
+            artifact_root.verify_payloads(references, full=full)
+            if manifest_present:
+                with artifact_root.open_payload(
+                    manifest.MANIFEST_FILENAME
+                ) as manifest_file:
+                    if manifest_file.read() != canonical_json_bytes(manifest):
+                        raise SMLArtifactError(
+                            "publisher-owned manifest changed before immutable commit"
+                        )
     if isinstance(manifest, (PretrainingDataManifest, ExportManifest)):
         _verify_pretraining_nested_tokenizer(fs, temporary_descriptor, manifest)
 
@@ -2673,6 +2686,7 @@ def _open_verified_step_from_descriptor(
     fs: FilesystemOps,
     load_array_groups: frozenset[str] | None = None,
     materialize_byte_groups: frozenset[str] | None = None,
+    verify_contents: bool | None = None,
 ) -> _OwnedStep:
     name = _step_name(step)
     descriptor = -1
@@ -2696,18 +2710,21 @@ def _open_verified_step_from_descriptor(
             manifest,
             expected_step=step,
         )
+        effective_load_groups = load_array_groups
+        if effective_load_groups is None and materialize_byte_groups:
+            effective_load_groups = materialize_byte_groups
+        materialize = (
+            verification is VerificationLevel.FULL or effective_load_groups is not None
+        )
         _verify_closed_world(
             fs,
             descriptor,
             manifest,
             manifest_present=True,
             full=False,
-        )
-        effective_load_groups = load_array_groups
-        if effective_load_groups is None and materialize_byte_groups:
-            effective_load_groups = materialize_byte_groups
-        materialize = (
-            verification is VerificationLevel.FULL or effective_load_groups is not None
+            verify_contents=(not materialize)
+            if verify_contents is None
+            else verify_contents,
         )
         contents = (
             _verify_checkpoint_semantics(
@@ -2998,6 +3015,7 @@ def _resolve_step_from_descriptor(
     step: int,
     verification: VerificationLevel,
     fs: FilesystemOps,
+    verify_contents: bool | None = None,
 ) -> ResolvedStep:
     owned = _open_verified_step_from_descriptor(
         run,
@@ -3006,6 +3024,7 @@ def _resolve_step_from_descriptor(
         step=step,
         verification=verification,
         fs=fs,
+        verify_contents=verify_contents,
     )
     try:
         return owned.resolved
@@ -3115,6 +3134,8 @@ def _stored_latest(
     run_descriptor: int,
     checkpoints_descriptor: int,
     fs: FilesystemOps,
+    *,
+    verify_contents: bool,
 ) -> tuple[LatestIndex | None, ResolvedStep | None]:
     try:
         index = _read_manifest_from_descriptor(
@@ -3135,6 +3156,7 @@ def _stored_latest(
             step=index.step,
             verification=VerificationLevel.MANIFEST_TRUSTED,
             fs=fs,
+            verify_contents=verify_contents,
         )
     except SMLArtifactError:
         return None, None
@@ -3161,6 +3183,7 @@ def _scan_checkpoint_candidates(
     *,
     lower_bound: int | None,
     fs: FilesystemOps,
+    verify_contents: bool,
 ) -> list[ResolvedStep]:
     candidates: list[ResolvedStep] = []
     for name in sorted(fs.listdir(checkpoints_descriptor)):
@@ -3183,6 +3206,7 @@ def _scan_checkpoint_candidates(
                 step=step,
                 verification=VerificationLevel.MANIFEST_TRUSTED,
                 fs=fs,
+                verify_contents=verify_contents,
             )
         )
     return candidates
@@ -3202,12 +3226,14 @@ def _recover_latest_open(
 ) -> ResolvedStep | None:
     if writable and defer_selected_proof:
         raise SMLArtifactError("writable latest recovery cannot defer winner proof")
+    preliminary_verify_contents = not defer_selected_proof
     stored_index, pointed = _stored_latest(
         run,
         run_manifest,
         run_descriptor,
         checkpoints_descriptor,
         fs,
+        verify_contents=preliminary_verify_contents,
     )
     lower_bound = pointed.step if pointed is not None else None
     candidates = _scan_checkpoint_candidates(
@@ -3216,6 +3242,7 @@ def _recover_latest_open(
         checkpoints_descriptor,
         lower_bound=lower_bound,
         fs=fs,
+        verify_contents=preliminary_verify_contents,
     )
     available = ([pointed] if pointed is not None else []) + candidates
     if not available:

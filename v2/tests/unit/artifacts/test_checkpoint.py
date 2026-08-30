@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -15,6 +16,7 @@ from sml.artifacts import checkpoint
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
+    ArtifactRoot,
     LatestIndex,
     PayloadRef,
     PretrainingCheckpointManifest,
@@ -1054,6 +1056,211 @@ def test_latest_reader_full_proves_only_selected_winner_once(
         assert reader.resolved.step == 2
 
     assert proved_steps == [2]
+
+
+@pytest.mark.parametrize(
+    ("verification", "groups"),
+    (
+        (VerificationLevel.FULL, frozenset()),
+        (
+            VerificationLevel.MANIFEST_TRUSTED,
+            frozenset({"model.safetensors"}),
+        ),
+    ),
+)
+def test_selected_checkpoint_payloads_are_opened_once_for_proof_and_use(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verification: VerificationLevel,
+    groups: frozenset[str],
+) -> None:
+    """Structural proof must not reopen payloads owned by semantic proof/use."""
+    opens: Counter[str] = Counter()
+    payload_names = {
+        "state.json",
+        "model.safetensors",
+        "master.safetensors",
+        "optimizer.safetensors",
+        "trainer.safetensors",
+    }
+    real_payload_open = ArtifactRoot._open_payload_with_stat
+    real_opened_entry = checkpoint._opened_entry
+
+    def counted_payload_open(owner, logical_path):
+        if logical_path in payload_names:
+            opens[logical_path] += 1
+        return real_payload_open(owner, logical_path)
+
+    def counted_opened_entry(
+        fs,
+        name,
+        *,
+        parent_descriptor,
+        flags,
+    ):
+        if name in payload_names:
+            opens[name] += 1
+        return real_opened_entry(
+            fs,
+            name,
+            parent_descriptor=parent_descriptor,
+            flags=flags,
+        )
+
+    monkeypatch.setattr(
+        ArtifactRoot,
+        "_open_payload_with_stat",
+        counted_payload_open,
+    )
+    monkeypatch.setattr(checkpoint, "_opened_entry", counted_opened_entry)
+    with checkpoint.open_latest_checkpoint_reader(
+        valid_run,
+        verification=verification,
+        load_array_groups=groups,
+    ) as reader:
+        reader.read_contents()
+
+    assert opens["state.json"] == 1
+    for name in (
+        "model.safetensors",
+        "master.safetensors",
+        "optimizer.safetensors",
+        "trainer.safetensors",
+    ):
+        assert opens[name] == 1
+
+
+def test_non_deferred_trusted_resolution_retains_one_structural_content_proof(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trusted metadata-only resolution still proves content when no use follows."""
+    opens: Counter[str] = Counter()
+    payload_names = {
+        "state.json",
+        "model.safetensors",
+        "master.safetensors",
+        "optimizer.safetensors",
+        "trainer.safetensors",
+    }
+    real_payload_open = ArtifactRoot._open_payload_with_stat
+    real_opened_entry = checkpoint._opened_entry
+
+    def counted_payload_open(owner, logical_path):
+        if logical_path in payload_names:
+            opens[logical_path] += 1
+        return real_payload_open(owner, logical_path)
+
+    def counted_opened_entry(fs, name, *, parent_descriptor, flags):
+        if name in payload_names:
+            opens[name] += 1
+        return real_opened_entry(
+            fs,
+            name,
+            parent_descriptor=parent_descriptor,
+            flags=flags,
+        )
+
+    monkeypatch.setattr(
+        ArtifactRoot,
+        "_open_payload_with_stat",
+        counted_payload_open,
+    )
+    monkeypatch.setattr(checkpoint, "_opened_entry", counted_opened_entry)
+
+    resolved = checkpoint.resolve_exact_step(
+        valid_run,
+        step=1,
+        verification=VerificationLevel.MANIFEST_TRUSTED,
+    )
+
+    assert resolved.step == 1
+    assert opens == Counter({name: 1 for name in payload_names})
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        ("symlink", "symlink|special|closed-world|no-follow"),
+        ("hard-link", "hard-linked|link count|closed-world"),
+        ("wrong-size", "byte size|closed-world"),
+        ("case-fold-collision", "normalized|case-folded|closed-world"),
+        ("unexpected-file", "closed-world"),
+        ("missing-file", "closed-world"),
+    ),
+)
+def test_stat_only_closed_world_rejects_checkpoint_namespace_corruption(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    match: str,
+) -> None:
+    """Namespace proof rejects corruption before any payload content is opened."""
+    step = next((valid_run / "checkpoints").glob("step-*"))
+    model = step / "model.safetensors"
+    master = step / "master.safetensors"
+    fs = checkpoint.OS_FILESYSTEM
+    if mutation == "symlink":
+        model.unlink()
+        model.symlink_to(master.name)
+    elif mutation == "hard-link":
+        model.unlink()
+        os.link(master, model)
+    elif mutation == "wrong-size":
+        with model.open("ab") as payload:
+            payload.write(b"x")
+    elif mutation == "case-fold-collision":
+
+        class CaseFoldCollisionFilesystemOps(RecordingFilesystemOps):
+            def listdir(self, descriptor: int) -> list[str]:
+                names = super().listdir(descriptor)
+                if "model.safetensors" in names:
+                    names.append("MODEL.SAFETENSORS")
+                return names
+
+        fs = CaseFoldCollisionFilesystemOps(valid_run)
+    elif mutation == "unexpected-file":
+        (step / "unexpected.bin").write_bytes(b"unexpected")
+    else:
+        assert mutation == "missing-file"
+        model.unlink()
+
+    payload_names = {
+        "state.json",
+        "model.safetensors",
+        "master.safetensors",
+        "optimizer.safetensors",
+        "trainer.safetensors",
+    }
+    real_payload_open = ArtifactRoot._open_payload_with_stat
+    real_opened_entry = checkpoint._opened_entry
+
+    def reject_payload_open(owner, logical_path):
+        if logical_path in payload_names:
+            pytest.fail(f"stat-only proof opened payload content: {logical_path}")
+        return real_payload_open(owner, logical_path)
+
+    def reject_opened_entry(fs, name, *, parent_descriptor, flags):
+        if name in payload_names:
+            pytest.fail(f"stat-only proof opened payload content: {name}")
+        return real_opened_entry(
+            fs,
+            name,
+            parent_descriptor=parent_descriptor,
+            flags=flags,
+        )
+
+    monkeypatch.setattr(ArtifactRoot, "_open_payload_with_stat", reject_payload_open)
+    monkeypatch.setattr(checkpoint, "_opened_entry", reject_opened_entry)
+    with (
+        pytest.raises(SMLArtifactError, match=match),
+        checkpoint.open_latest_checkpoint_reader(
+            valid_run,
+            verification=VerificationLevel.FULL,
+            fs=fs,
+        ),
+    ):
+        pass
 
 
 def test_trusted_requested_group_does_not_reduce_trainer_state(
