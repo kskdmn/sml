@@ -16,7 +16,7 @@ and the umbrella refactor are complete. Final production source/tests are at
 retirement is `5c54baa017b04fddc5a31cd958facbb47f2ec65d`; reviewed
 pre-documentation evidence HEAD is
 `6647282ca90cb4e1354f3dccea6406ce382acc10`; and the completion documentation
-commit is `V2_FINAL_ACCEPTANCE_COMPLETION_COMMIT_SHA_TO_BE_RECORDED`.
+commit is `34c7ba4f775ead472aa780a231e7475be1bd3831`.
 
 Task 5's final scoped architecture re-review at `6647282`, after two fix
 rounds, found Critical 0, Important 0, Minor 0. This records that scoped review,

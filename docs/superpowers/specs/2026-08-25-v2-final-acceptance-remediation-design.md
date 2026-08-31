@@ -9,7 +9,7 @@ remediation, Task 6.4, Part 2, and the umbrella refactor are complete as of
 retirement is `5c54baa017b04fddc5a31cd958facbb47f2ec65d`; reviewed
 pre-documentation evidence HEAD is
 `6647282ca90cb4e1354f3dccea6406ce382acc10`; and the completion documentation
-commit is `V2_FINAL_ACCEPTANCE_COMPLETION_COMMIT_SHA_TO_BE_RECORDED`.
+commit is `34c7ba4f775ead472aa780a231e7475be1bd3831`.
 
 The final Task 5 scoped architecture re-review at `6647282`, after two fix
 rounds, reported Critical 0, Important 0, Minor 0. It does not stand in for or
