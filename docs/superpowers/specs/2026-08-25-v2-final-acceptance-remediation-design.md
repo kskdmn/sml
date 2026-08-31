@@ -2,8 +2,46 @@
 
 ## Status
 
-The repair direction was approved in conversation on 2026-08-25. This document
-is the written design for review; implementation has not begun.
+The repair direction was approved in conversation on 2026-08-25. The
+remediation, Task 6.4, Part 2, and the umbrella refactor are complete as of
+2026-09-01. The final production source/test commit is
+`24a6627d386f7230a1ef23ec988909e7a326d69d`; clean SWAG source/harness
+retirement is `5c54baa017b04fddc5a31cd958facbb47f2ec65d`; reviewed
+pre-documentation evidence HEAD is
+`6647282ca90cb4e1354f3dccea6406ce382acc10`; and the completion documentation
+commit is `V2_FINAL_ACCEPTANCE_COMPLETION_COMMIT_SHA_TO_BE_RECORDED`.
+
+The final Task 5 scoped architecture re-review at `6647282`, after two fix
+rounds, reported Critical 0, Important 0, Minor 0. It does not stand in for or
+claim completion of the later SDD final branch review.
+
+Final evidence: full V2 `1592 passed in 101.92s`; integration `252 passed in
+23.75s`; CLI workflows `31 passed`; CLI config `13 passed`; source/package `9
+passed`; Ruff clean and `104 files already formatted`; pretraining validator
+`pass`; SWAG validator `pass`. SWAG source/harness is
+`5c54baa017b04fddc5a31cd958facbb47f2ec65d` with `harness_clean=true`; its
+manifest/raw/report SHA-256 values are respectively
+`76ed3446282054471dc813da860b6cd30ae90501e0a01c481618c23e2a773ab2`,
+`885e62e96fab950031b8185bc916878cfbd0885d898a26255785f65c7d29aa93`, and
+`a30639ff20f68974d546e9d809de4ba37f915cc30486f8809a0cc9c9b88996bb`.
+
+All seven protected hashes stayed exact: pretraining manifest
+`17a346df8e0ded255cb50e40a568517b3a1c72c0ccbc1828a044c3f3dac12763`, raw
+`e80197de96c2733a5f6790bb85a3f6f142c2a8475436772dee521656b2248beb`, report
+`b64f13920d1ffc78754070c6a5107635b2507d50ba54348f7c1d6462b6b30bd2`, train
+fixture `6de8260bb5c060c2391ab69df4baae500d1b549e812233321f46843a156e33aa`,
+validation fixture
+`b5fd31a7de28084a916290c2c89ce87b320b6aca4519d0cf6f125d20c3f14d49`, SWAG
+train fixture
+`ff5fb55512e02fd3a4a5b6eb9e72aa2bc747e4bbdb64107d183230dc94750d60`, and
+SWAG validation fixture
+`a82fe60cc118ffc68119f4b99e8cf04d859fa39997d7df5b797e5b676323101a`.
+
+`uv.lock` is unchanged from `4225c54`; no flat `v2/src/*.py` or forbidden
+legacy bridge string remains; help lists `tokenize`, `prepare`, `train`,
+`infer`, `evaluate`, `finetune`, `export`, and `verify`; and the accepted
+checkout was clean. Performance measurement remains optional and is not an
+acceptance gate.
 
 The approved
 [`2026-07-31-v2-performance-first-refactor-design.md`](2026-07-31-v2-performance-first-refactor-design.md)
@@ -39,10 +77,11 @@ found six conformance gaps that the existing tests did not expose:
    owner-level semantic validation only for part of the artifact graph. SWAG,
    base-snapshot, export, and LoRA-run semantics are incomplete.
 
-Passing tests are evidence about the implemented behavior; they do not override
-these stricter architectural requirements. Task 6.4 remains incomplete until
-the repairs, quality recapture, gates, and whole-scope review described here
-are complete.
+Passing tests were evidence about the implemented behavior; they did not
+override these stricter architectural requirements. At that review point,
+Task 6.4 was incomplete pending the repairs, quality recapture, gates, and
+whole-scope review described here. Those requirements are now complete under
+the final status above.
 
 ## Goals
 
@@ -146,7 +185,7 @@ EvaluationTaskRecord
 
 EvaluationResult
   kind: exactly "evaluation-result"
-  version: exactly 1
+  version: exactly 1 or exactly 2
   identity: structured identity
   model: ModelIdentity
   tasks: ordered nonempty tuple[EvaluationTaskRecord, ...]
@@ -158,10 +197,19 @@ object]`. Provider names are unique and sorted by name. Source logical names are
 portable logical identifiers; local filesystem locations may be exposed by an
 in-memory diagnostic result but are not serialized in this schema.
 
-`ModelIdentity` keeps the already frozen artifact kind, optional run identity,
-optional step, optional checkpoint identity, optional current run-state
-identity, tokenizer identity, and verification level. The output destination is
-not part of `EvaluationResult` and is not serialized.
+The persisted v1 field set and `sml-evaluation-result-v1` identity domain remain
+frozen. Its `ModelIdentity` has the already frozen artifact kind, optional run
+identity, optional step, optional checkpoint identity, optional current
+run-state identity, tokenizer identity, and verification level. A legacy v1
+read reports recovery state as unavailable rather than inventing values.
+
+Strict v2 adds Boolean `latest_recovered` and `pruning_pending` fields to
+`ModelIdentity` and uses the `sml-evaluation-result-v2` identity domain. The
+current writer emits v2, and readers dispatch strictly by version. Read-only
+resolution reports whether latest selection recovered from an invalid newer
+candidate and whether superseded checkpoints remain pending pruning, without
+performing a write or prune. The output destination is not part of either
+`EvaluationResult` version and is not serialized.
 
 ### Identity projections
 
@@ -194,6 +242,14 @@ fails before publication if the authoritative task source, closure, effective
 configuration, dataset revision/fingerprint, or ordered request identity cannot
 be resolved. A source commit is the sole nullable provenance field because the
 umbrella contract permits it only when available.
+
+The completed implementation captures each YAML source through a retained,
+nonblocking, no-follow descriptor, rejects non-regular files before reading,
+and verifies descriptor stability around the byte read. Stable pre/post source
+snapshots bracket provider parsing and task construction, and the retained
+snapshot is compared again before publication. Evaluation provenance is thus
+bound to the exact load-adjacent bytes without introducing a second YAML
+parser.
 
 The return from `simple_evaluate` is mandatory input. The owner normalizes and
 preserves its complete top-level payload, extracts each supported task's
@@ -515,6 +571,12 @@ FULL validation by kind is:
   checkpoint payload semantics, exact adapter leaf/rank/dtype/shape validation,
   optimizer/trainer/cursor/next-key semantics, and equality of the run's base,
   tokenizer, LoRA, precision, and data compatibility fields with its children.
+
+Merged export is also a correctness-sensitive FULL consumer. Before merging it
+validates the complete LoRA source-run semantics, including progress bounds,
+recovered latest/checkpoint identities, adapter/trainer state, and the
+seed-derived terminal key; it does not treat a payload hash alone as sufficient
+authorization to export.
 
 Checkpoint directories remain owned children of runs rather than standalone
 portable roots. A run result orders children as tokenizer, then base snapshot

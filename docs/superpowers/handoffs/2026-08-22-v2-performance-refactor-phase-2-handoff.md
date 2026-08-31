@@ -2,11 +2,87 @@
 
 **Recorded:** 2026-08-22 (Asia/Shanghai)
 
-**Last updated:** 2026-08-30 (Asia/Shanghai)
+**Last updated:** 2026-09-01 (Asia/Shanghai)
 
-**Purpose:** Give a fresh session enough repository-backed context to resume
-the final-acceptance remediation from the exact current checkout, without
-reading the prior conversation.
+**Purpose:** Record the exact final-acceptance closure and preserve the earlier
+implementation history without requiring the prior conversation.
+
+## 2026-09-01 Final Acceptance Closure — Authoritative Status
+
+This section supersedes every older current-status, takeover, next-action,
+deferred-finding, and completion statement below. Older sections are retained
+only as past-tense implementation history. No remediation task remains active.
+
+Task 6.4, the final-acceptance remediation, Part 2, and the umbrella refactor
+are complete. The final production source/test commit is
+`24a6627d386f7230a1ef23ec988909e7a326d69d`; the clean SWAG source/harness
+retirement commit is `5c54baa017b04fddc5a31cd958facbb47f2ec65d`; the final
+reviewed pre-documentation evidence HEAD is
+`6647282ca90cb4e1354f3dccea6406ce382acc10`; and the completion documentation
+commit is `V2_FINAL_ACCEPTANCE_COMPLETION_COMMIT_SHA_TO_BE_RECORDED`.
+
+The final Task 5 scoped architecture re-review at `6647282` followed two fix
+rounds and reported Critical 0, Important 0, Minor 0. This is the Task 5 scoped
+review only; the later SDD final branch review is not claimed here.
+
+### Final verified evidence
+
+- Full V2: `1592 passed in 101.92s`.
+- Integration: `252 passed in 23.75s`.
+- CLI workflow: `31 passed`; CLI config: `13 passed`.
+- Source/package: `9 passed`.
+- Ruff: clean; format: `104 files already formatted`.
+- Pretraining validator: `pass`; SWAG validator: `pass`.
+- SWAG manifest source/harness:
+  `5c54baa017b04fddc5a31cd958facbb47f2ec65d`; `harness_clean=true`.
+- Final SWAG manifest/raw/report SHA-256:
+  `76ed3446282054471dc813da860b6cd30ae90501e0a01c481618c23e2a773ab2`,
+  `885e62e96fab950031b8185bc916878cfbd0885d898a26255785f65c7d29aa93`,
+  `a30639ff20f68974d546e9d809de4ba37f915cc30486f8809a0cc9c9b88996bb`.
+
+All seven protected hashes remain exact:
+
+- pretraining manifest:
+  `17a346df8e0ded255cb50e40a568517b3a1c72c0ccbc1828a044c3f3dac12763`;
+- pretraining raw:
+  `e80197de96c2733a5f6790bb85a3f6f142c2a8475436772dee521656b2248beb`;
+- pretraining report:
+  `b64f13920d1ffc78754070c6a5107635b2507d50ba54348f7c1d6462b6b30bd2`;
+- pretraining train fixture:
+  `6de8260bb5c060c2391ab69df4baae500d1b549e812233321f46843a156e33aa`;
+- pretraining validation fixture:
+  `b5fd31a7de28084a916290c2c89ce87b320b6aca4519d0cf6f125d20c3f14d49`;
+- SWAG train fixture:
+  `ff5fb55512e02fd3a4a5b6eb9e72aa2bc747e4bbdb64107d183230dc94750d60`;
+- SWAG validation fixture:
+  `a82fe60cc118ffc68119f4b99e8cf04d859fa39997d7df5b797e5b676323101a`.
+
+`uv.lock` is unchanged from `4225c54`. The final cutover has no flat
+`v2/src/*.py` and no forbidden legacy bridge strings. CLI help lists all eight
+commands: `tokenize`, `prepare`, `train`, `infer`, `evaluate`, `finetune`,
+`export`, and `verify`. The accepted checkout was clean. Performance
+measurement remains optional and is not an acceptance gate.
+
+### Completed final-review behavior
+
+- The frozen evaluation-result v1 exact field set and
+  `sml-evaluation-result-v1` identity domain are preserved. Strict readers
+  report legacy-v1 `latest_recovered`/`pruning_pending` as unavailable; the
+  current writer emits strict v2 with real Boolean fields in the
+  `sml-evaluation-result-v2` domain.
+- Inference/evaluation results expose recovered-latest selection and pending
+  pruning read-only, without changing retention state.
+- Merged export applies FULL LoRA-run semantics, including progress bounds and
+  the seed-derived terminal key, before merging.
+- Evaluation task provenance is bound to load-adjacent regular-file YAML bytes
+  using retained, stable snapshots that bracket provider load and are rechecked
+  before publication.
+
+### Handoff
+
+There is no implementation continuation or performance gate. Preserve the two
+required docs-only completion commits, keep the branch unpushed unless asked,
+and treat all following takeover procedures as historical records.
 
 ## 2026-08-30 Artifact Residual Closure — Current Takeover Point
 
@@ -931,13 +1007,13 @@ Part 2:
 - Task 6.2: none.
 - Task 6.3: none.
 
-## Remaining Part 2 Tasks
+## Historical Part 2 Task Snapshot
 
 | Phase | Tasks | Status | Required gate |
 | --- | --- | --- | --- |
 | 4: inference and evaluation | 4.1-4.4 | Complete at 0d95441 | Correctness, inference/evaluation integration, applicable CLI smoke |
 | 5: LoRA and SWAG | 5.1-5.5 | Complete at e89ce2b | Correctness, controlled SWAG quality, resume/export/inference workflow |
-| 6: unified CLI and cutover | 6.1-6.4 | Tasks 6.1-6.3 complete through f02c99a; Task 6.4 remediation in progress at 685417f | Finish evaluation, LoRA, inference, and artifact repairs; then full Ruff/pytest, quality validators, CLI workflows, clean cutover, unchanged uv.lock |
+| 6: unified CLI and cutover | 6.1-6.4 | Historical snapshot: Tasks 6.1-6.3 were complete through f02c99a; Task 6.4 remediation was then in progress at 685417f | The final closure is recorded by the authoritative section above |
 
 No Phase 4, 5, 6, or final performance result file is required.
 

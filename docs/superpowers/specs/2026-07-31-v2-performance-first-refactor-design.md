@@ -5,11 +5,46 @@
 Approved umbrella design for a clean replacement of the entire `v2` tree.
 This specification supersedes the former checkpoint/SWAG-only design and plan.
 
-**Execution update (2026-08-24):** Phases 1-3 are complete at `4c190f3`.
-Phase 4 is complete at `0d95441`. Task 5.1 is complete at `232918c`.
-Task 5.2 is complete at `4a8e469`. Task 5.3 is complete at `c06beae`.
-Task 5.4 is complete at `4ebb4b7`. Task 5.5 is complete at `e89ce2b`.
-Task 6.1 is complete at `9aa0f18`. Task 6.2 is next.
+**Final execution update (2026-09-01):** The umbrella refactor, Part 2,
+Task 6.4, and the final-acceptance remediation are complete. The final
+production source/test commit is
+`24a6627d386f7230a1ef23ec988909e7a326d69d`; clean SWAG source/harness
+retirement is `5c54baa017b04fddc5a31cd958facbb47f2ec65d`; and the reviewed
+pre-documentation evidence HEAD is
+`6647282ca90cb4e1354f3dccea6406ce382acc10`. The completion documentation
+commit is `V2_FINAL_ACCEPTANCE_COMPLETION_COMMIT_SHA_TO_BE_RECORDED`.
+
+The final Task 5 scoped architecture re-review at `6647282` followed two fix
+rounds and reported Critical 0, Important 0, Minor 0. This is not a claim that
+the later SDD final branch review has already occurred.
+
+Final gate evidence is exact: full V2 `1592 passed in 101.92s`; integration
+`252 passed in 23.75s`; CLI workflows `31 passed`; CLI config `13 passed`;
+source/package `9 passed`; Ruff clean with `104 files already formatted`; and
+both the pretraining and SWAG validators returned `pass`. The SWAG manifest
+binds source and harness to `5c54baa017b04fddc5a31cd958facbb47f2ec65d`
+with `harness_clean=true`. Its final SHA-256 values are manifest
+`76ed3446282054471dc813da860b6cd30ae90501e0a01c481618c23e2a773ab2`, raw
+`885e62e96fab950031b8185bc916878cfbd0885d898a26255785f65c7d29aa93`, and
+report `a30639ff20f68974d546e9d809de4ba37f915cc30486f8809a0cc9c9b88996bb`.
+
+The seven protected hashes remained unchanged: pretraining manifest
+`17a346df8e0ded255cb50e40a568517b3a1c72c0ccbc1828a044c3f3dac12763`, raw
+`e80197de96c2733a5f6790bb85a3f6f142c2a8475436772dee521656b2248beb`, report
+`b64f13920d1ffc78754070c6a5107635b2507d50ba54348f7c1d6462b6b30bd2`, train
+fixture `6de8260bb5c060c2391ab69df4baae500d1b549e812233321f46843a156e33aa`,
+validation fixture
+`b5fd31a7de28084a916290c2c89ce87b320b6aca4519d0cf6f125d20c3f14d49`, SWAG
+train fixture
+`ff5fb55512e02fd3a4a5b6eb9e72aa2bc747e4bbdb64107d183230dc94750d60`, and
+SWAG validation fixture
+`a82fe60cc118ffc68119f4b99e8cf04d859fa39997d7df5b797e5b676323101a`.
+
+`uv.lock` is unchanged from `4225c54`. There are no flat `v2/src/*.py` files
+or forbidden legacy bridge strings; CLI help lists all eight commands:
+`tokenize`, `prepare`, `train`, `infer`, `evaluate`, `finetune`, `export`, and
+`verify`; and the accepted checkout was clean. Performance measurement remains
+optional and is not an acceptance gate.
 
 **Acceptance-policy update (2026-08-22):** Functional correctness is the
 required refactor gate. Ruff, the full v2 test suite, controlled mathematical
@@ -1023,6 +1058,20 @@ provider result payload. Evaluation writes one immutable JSON result file by
 temporary-file write, file `fsync`, no-replace publication, and parent `fsync`.
 An identical fully validated target is idempotent; a different existing target
 is a collision and is never overwritten.
+
+The historical persisted evaluation-result v1 field set and
+`sml-evaluation-result-v1` identity domain remain frozen. Strict readers dispatch
+by version: legacy v1 omits recovery/retention status and therefore exposes
+`latest_recovered` and `pruning_pending` as unavailable, while strict v2 adds
+both Boolean fields to the model identity and uses the
+`sml-evaluation-result-v2` domain. The current evaluation writer emits v2.
+Read-only model/evaluation results report recovered-latest selection and
+whether superseded checkpoints remain pending pruning without mutating the run.
+FULL export verifies complete source-run semantics before merging, including
+progress bounds and the seed-derived terminal key. Evaluation task provenance
+is byte-stable across the load boundary: retained, regular-file-only YAML
+snapshots bracket provider parsing/task construction and are rechecked before
+publication.
 
 The completed v2 evaluation CLI supports the current HellaSwag and WinoGrande
 scope. Its lm-eval adapter implements `loglikelihood` and `generate_until`;

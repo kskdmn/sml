@@ -2,14 +2,47 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Execution status (2026-08-24):** Part 1 remediation closed at `4c190f3`.
-Phase 4 (Tasks 4.1-4.4) is complete with scoped review approved (`7cc45ed`,
-`28c50df`, `5199b8a`, `0d95441`). Task 5.1 is complete at `232918c`. Task 5.2
-is complete at `4a8e469`. Task 5.3 is complete at `c06beae`. Task 5.4 is
-complete at `4ebb4b7`. Task 5.5 is complete at `e89ce2b`. Task 6.1 is
-complete at `9aa0f18`. Tasks 6.2-6.4 have not started. Task 6.2 is the
-next live task. The checkboxes below are the live remaining-task
-procedure.
+**Final execution status (2026-09-01):** Part 2, Task 6.4, the
+final-acceptance remediation, and the umbrella refactor are complete. The final
+production source/test commit is
+`24a6627d386f7230a1ef23ec988909e7a326d69d`; clean SWAG source/harness
+retirement is `5c54baa017b04fddc5a31cd958facbb47f2ec65d`; reviewed
+pre-documentation evidence HEAD is
+`6647282ca90cb4e1354f3dccea6406ce382acc10`; and the completion documentation
+commit is `V2_FINAL_ACCEPTANCE_COMPLETION_COMMIT_SHA_TO_BE_RECORDED`.
+
+The final Task 5 scoped architecture re-review at `6647282` followed two fix
+rounds and reported Critical 0, Important 0, Minor 0. This does not claim that
+the later SDD final branch review has occurred.
+
+Final acceptance evidence: full V2 `1592 passed in 101.92s`; integration `252
+passed in 23.75s`; CLI workflows `31 passed`; CLI config `13 passed`;
+source/package `9 passed`; Ruff clean and `104 files already formatted`; both
+pretraining and SWAG validators `pass`. SWAG source/harness is
+`5c54baa017b04fddc5a31cd958facbb47f2ec65d`, `harness_clean=true`; final
+manifest/raw/report hashes are
+`76ed3446282054471dc813da860b6cd30ae90501e0a01c481618c23e2a773ab2`,
+`885e62e96fab950031b8185bc916878cfbd0885d898a26255785f65c7d29aa93`, and
+`a30639ff20f68974d546e9d809de4ba37f915cc30486f8809a0cc9c9b88996bb`.
+
+The unchanged protected hashes are pretraining manifest
+`17a346df8e0ded255cb50e40a568517b3a1c72c0ccbc1828a044c3f3dac12763`, raw
+`e80197de96c2733a5f6790bb85a3f6f142c2a8475436772dee521656b2248beb`, report
+`b64f13920d1ffc78754070c6a5107635b2507d50ba54348f7c1d6462b6b30bd2`, train
+fixture `6de8260bb5c060c2391ab69df4baae500d1b549e812233321f46843a156e33aa`,
+validation fixture
+`b5fd31a7de28084a916290c2c89ce87b320b6aca4519d0cf6f125d20c3f14d49`, SWAG
+train fixture
+`ff5fb55512e02fd3a4a5b6eb9e72aa2bc747e4bbdb64107d183230dc94750d60`, and
+SWAG validation fixture
+`a82fe60cc118ffc68119f4b99e8cf04d859fa39997d7df5b797e5b676323101a`.
+`uv.lock` is unchanged from `4225c54`; no flat `v2/src/*.py` or forbidden
+legacy bridge string remains; CLI help lists `tokenize`, `prepare`, `train`,
+`infer`, `evaluate`, `finetune`, `export`, and `verify`; and the accepted
+checkout was clean. Performance measurement remains optional and is not an
+acceptance gate. Unchecked boxes in earlier task bodies are retained only as
+the historical execution procedure; the final Task 6.4 boxes below record the
+completed acceptance.
 
 **Goal:** Complete persistent inference/evaluation, cached SWAG LoRA fine-tuning/export, the unified CLI, and the clean removal of every replaced flat v2 path while meeting the final correctness and runnable-workflow gates.
 
@@ -172,6 +205,8 @@ class ModelIdentity:
     run_step_identity: str | None
     tokenizer_identity: str
     verification: VerificationLevel
+    latest_recovered: bool | None
+    pruning_pending: bool | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,7 +360,14 @@ git commit -m "perf(v2): batch compiled prefill and decode"
 - `score_loglikelihood_batch(session, requests, *, padding) -> tuple[LoglikelihoodResult, ...]` reuses the session's length and batch-size buckets, pads with masked finite synthetic rows, and synchronizes once per fixed-shape batch.
 - `SMLEvalLM` implements only `loglikelihood` and `generate_until`; unsupported request methods raise `SMLRuntimeError`.
 - Frozen `EvaluationConfig(checkpoint: Path, tasks: tuple[Literal["hellaswag", "winogrande"], ...], output: Path, full_verify: bool = False, padding: Literal["left", "right"] = "right", runtime: InferenceRuntimeConfig = InferenceRuntimeConfig(), limit: int | None = None)` requires at least one task and a positive optional limit.
-- Frozen `EvaluationResult(output: Path, model: ModelIdentity, tasks: tuple[str, ...], provider_versions: tuple[tuple[str, str], ...])` is returned by `evaluate(config)`, which supports repeated tasks from exactly `hellaswag` and `winogrande` and persists the complete result atomically at the required output path. Provider-version pairs are sorted by name before construction.
+- `evaluate(config)` returns the current strict `EvaluationResult` and supports
+  repeated tasks from exactly `hellaswag` and `winogrande`. The historical
+  persisted v1 exact field set and `sml-evaluation-result-v1` identity domain
+  remain frozen; strict readers expose its recovery state as unavailable.
+  Current writes are strict v2 in the `sml-evaluation-result-v2` domain, adding
+  Boolean `latest_recovered` and `pruning_pending` to the pinned
+  `ModelIdentity`. Publication preserves the complete provider result and
+  sorted provider versions atomically at the required output path.
 
 - [ ] **Step 1: Write serial/batched score and adapter contract tests**
 
@@ -1353,7 +1395,14 @@ git commit -m "refactor(v2): cut over to unified sml package"
   unified CLI, resume paths, inference/evaluation, LoRA/SWAG, export, and clean
   cutover all run correctly from the final tree.
 
-- [ ] **Step 1: Run all final static, correctness, and quality checks**
+The completed result projections report recovered-latest selection and pending
+pruning read-only. Evaluation binds provenance to retained, regular-file YAML
+bytes captured next to provider load and rechecks them before publication.
+Merged export performs FULL LoRA-run semantic validation, including progress
+bounds and the seed-derived terminal key, before producing portable BF16 plain
+weights.
+
+- [x] **Step 1: Run all final static, correctness, and quality checks**
 
 ```bash
 git status --short
@@ -1369,7 +1418,7 @@ pass outside the sandbox; and both controlled quality reports revalidate
 against their committed raw evidence, harness identities, and recorded source
 commits without rebuilding expected workloads from final-tree bytes.
 
-- [ ] **Step 2: Run every unified CLI smoke from the final tree**
+- [x] **Step 2: Run every unified CLI smoke from the final tree**
 
 ```bash
 uv run pytest v2/tests/integration/test_cli_workflows.py -v
@@ -1379,7 +1428,7 @@ uv run python -m sml --help
 Expected: all commands and fresh/resume/latest-only/full-verification paths
 pass, and historical selectors/direct step paths fail.
 
-- [ ] **Step 3: Run the final end-to-end workflow set**
+- [x] **Step 3: Run the final end-to-end workflow set**
 
 Run the integration tests covering tokenizer preparation, prepared data,
 pretraining fresh/resume/recovery, inference/evaluation, SWAG preparation,
@@ -1387,7 +1436,7 @@ LoRA fresh/resume/export, and the unified CLI. Use tiny deterministic fixtures
 where the full production workload would make correctness verification
 impractical.
 
-- [ ] **Step 4: Verify repository invariants**
+- [x] **Step 4: Verify repository invariants**
 
 ```bash
 git diff --exit-code -- uv.lock
@@ -1398,16 +1447,17 @@ Expected: `uv.lock` is unchanged and the final accepted implementation is
 committed. Optional benchmark output may remain diagnostic and is not required
 for completion.
 
-- [ ] **Step 5: Optionally collect final performance diagnostics**
+- [x] **Step 5: Resolve optional final performance diagnostics**
 
-The historical ten-pair comparison may be run to characterize the completed
+No performance capture was required or claimed for final acceptance. The
+historical ten-pair comparison may still be run to characterize the completed
 refactor. It creates no required acceptance artifact, and any missing,
 inconclusive, noisy, thermally rejected, or below-target result does not change
 the correctness acceptance decision.
 
-## Part 2 Completion Gate
+## Part 2 Completion Gate — Met
 
-The refactor is complete only when:
+The conditions below were met at the final accepted evidence boundary:
 
 - every new package unit, equivalence, artifact-safety, resume, integration, and CLI test passes;
 - pretraining checkpoints retain authoritative FP32 masters plus exact BF16 working casts, while inference, LoRA base snapshots, and merged exports own only the BF16 model state they require;
