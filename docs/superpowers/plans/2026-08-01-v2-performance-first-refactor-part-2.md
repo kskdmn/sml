@@ -5,25 +5,32 @@
 **Final execution status (2026-09-01):** Part 2, Task 6.4, the
 final-acceptance remediation, and the umbrella refactor are complete. The final
 production source/test commit is
-`24a6627d386f7230a1ef23ec988909e7a326d69d`; clean SWAG source/harness
-retirement is `5c54baa017b04fddc5a31cd958facbb47f2ec65d`; reviewed
-pre-documentation evidence HEAD is
-`6647282ca90cb4e1354f3dccea6406ce382acc10`; and the completion documentation
-commit is `34c7ba4f775ead472aa780a231e7475be1bd3831`.
+`d6a28498a33624ccb6e58b17b380c15c9f072211`; final SWAG evidence
+retirement/source-harness is `0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`;
+and reviewed pre-documentation evidence HEAD is
+`da3dc9365503059bd0e2c1f60c3b2b3c257c3443`. The original Task 6
+documentation history remains: completion
+`34c7ba4f775ead472aa780a231e7475be1bd3831`, exact-SHA metadata
+`fc9d00a4f2b97159f80eebd99599a557247cc399`, and review-scope clarification
+`6dbc059f7c36494be717c6622a2960ca26dea84c`.
 
-The final Task 5 scoped architecture re-review at `6647282` followed two fix
-rounds and reported Critical 0, Important 0, Minor 0. This does not claim that
-the later SDD final branch review has occurred.
+Task 5's plan-required architecture acceptance at `6647282` historically
+reported Critical 0, Important 0, Minor 0 after two fix rounds. The additional
+SDD final whole-branch review at `6dbc059` reported Critical 0, Important 1,
+Minor 0: a reduced-guarantee checkpoint-reader issue. The source/test wave at
+`d6a2849` fixed it, SWAG evidence was retired at `0f767cb`, and final evidence
+was refreshed at `da3dc93`. The sole scoped re-review of this complete fix wave
+is a later SDD process gate and is not claimed in this tracked plan.
 
-Final acceptance evidence: full V2 `1592 passed in 101.92s`; integration `252
-passed in 23.75s`; CLI workflows `31 passed`; CLI config `13 passed`;
-source/package `9 passed`; Ruff clean and `104 files already formatted`; both
-pretraining and SWAG validators `pass`. SWAG source/harness is
-`5c54baa017b04fddc5a31cd958facbb47f2ec65d`, `harness_clean=true`; final
-manifest/raw/report hashes are
-`76ed3446282054471dc813da860b6cd30ae90501e0a01c481618c23e2a773ab2`,
-`885e62e96fab950031b8185bc916878cfbd0885d898a26255785f65c7d29aa93`, and
-`a30639ff20f68974d546e9d809de4ba37f915cc30486f8809a0cc9c9b88996bb`.
+Final acceptance evidence at `da3dc93`: full V2 `1611 passed in 105.66s`;
+integration `252 passed in 23.10s`; CLI workflows `31 passed in 6.25s`; CLI
+config `13 passed in 1.38s`; source/package `9 passed in 0.63s`; Ruff clean and
+`104 files already formatted`; both pretraining and SWAG validators `pass`.
+SWAG source/harness is `0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`,
+`harness_clean=true`; final manifest/raw/report hashes are
+`5af2abb5200eba0a0faa3d7774bca16e129b7e5dcf9473c50c9b700a9ed8976f`,
+`837308e38e364a65a4cb1e021ec085846559ab6eb710868a83a7b2cbb8643f8d`, and
+`0bf3d935a0165178b2746a08f853bd39620ccd8ad63f66ae82adb725513d5999`.
 
 The unchanged protected hashes are pretraining manifest
 `17a346df8e0ded255cb50e40a568517b3a1c72c0ccbc1828a044c3f3dac12763`, raw
@@ -37,12 +44,18 @@ train fixture
 SWAG validation fixture
 `a82fe60cc118ffc68119f4b99e8cf04d859fa39997d7df5b797e5b676323101a`.
 `uv.lock` is unchanged from `4225c54`; no flat `v2/src/*.py` or forbidden
-legacy bridge string remains; CLI help lists `tokenize`, `prepare`, `train`,
-`infer`, `evaluate`, `finetune`, `export`, and `verify`; and the accepted
-checkout was clean. Performance measurement remains optional and is not an
-acceptance gate. Unchecked boxes in earlier task bodies are retained only as
-the historical execution procedure; the final Task 6.4 boxes below record the
-completed acceptance.
+legacy bridge string remains; the CLI/cutover scans pass; CLI help lists
+`tokenize`, `prepare`, `train`, `infer`, `evaluate`, `finetune`, `export`, and
+`verify`; and the accepted checkout was clean. Performance measurement remains
+optional and is not an acceptance gate. Unchecked boxes in earlier task bodies
+are retained only as the historical execution procedure; the final Task 6.4
+boxes below record the completed acceptance.
+
+The completed checkpoint reader keeps shared-lock protection on local APFS and
+uses an explicit reduced-guarantee read-only mode only for proven local
+non-APFS storage or narrow sidecar permission/read-only failures; that mode
+does not promise concurrent-writer or pruning exclusion. Other lock and
+filesystem failures remain fail-closed.
 
 **Goal:** Complete persistent inference/evaluation, cached SWAG LoRA fine-tuning/export, the unified CLI, and the clean removal of every replaced flat v2 path while meeting the final correctness and runnable-workflow gates.
 
