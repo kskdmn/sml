@@ -80,8 +80,11 @@ found six conformance gaps that the existing tests did not expose:
 Passing tests were evidence about the implemented behavior; they did not
 override these stricter architectural requirements. At that review point,
 Task 6.4 was incomplete pending the repairs, quality recapture, gates, and
-whole-scope review described here. Those requirements are now complete under
-the final status above.
+the plan-required fresh whole-scope architecture review. Task 5 supplied that
+review and two scoped fix re-reviews; its acceptance review was complete at
+`6647282`. Those Task 6.4 acceptance requirements are complete under the final
+status above. The additional SDD final whole-branch review after Task 6 is a
+separate process gate and is not yet complete or claimed here.
 
 ## Goals
 
