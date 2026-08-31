@@ -69,8 +69,8 @@ class ModelIdentity:
     run_step_identity: str | None
     tokenizer_identity: str
     verification: VerificationLevel
-    latest_recovered: bool = False
-    pruning_pending: bool = False
+    latest_recovered: bool | None = False
+    pruning_pending: bool | None = False
 
 
 @dataclass(frozen=True, slots=True)

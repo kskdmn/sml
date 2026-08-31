@@ -136,7 +136,7 @@ def _assert_complete_evaluation(
 ) -> None:
     result = read_evaluation_result(path)
     assert result.kind == "evaluation-result"
-    assert result.version == 1
+    assert result.version == 2
     assert result.identity.startswith("sha256:")
     assert result.model == expected_model
     assert result.model.artifact_kind == artifact_kind

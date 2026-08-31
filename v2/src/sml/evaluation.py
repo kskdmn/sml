@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import os
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -39,6 +41,10 @@ _EVALUATION_SEEDS = {
     "fewshot_random_seed": 1234,
 }
 _BOOTSTRAP_ITERS = 100000
+_YAML_SOURCE_OPEN_FLAGS = (
+    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
+_YAML_SOURCE_READ_SIZE = 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +331,18 @@ class _TaskSourceSnapshot:
         )
 
 
+def _source_descriptor_state(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
 def _source_snapshot(path: Path, package_root: Path) -> _YAMLSourceSnapshot:
     try:
         logical_name = path.relative_to(package_root).as_posix()
@@ -332,10 +350,46 @@ def _source_snapshot(path: Path, package_root: Path) -> _YAMLSourceSnapshot:
         raise SMLRuntimeError("lm-eval task YAML escapes the package root") from error
     if path.suffix != ".yaml":
         raise SMLRuntimeError("lm-eval task YAML path is missing or invalid")
+    descriptor: int | None = None
+    primary_error: SMLRuntimeError | None = None
     try:
-        contents = path.read_bytes()
+        descriptor = os.open(path, _YAML_SOURCE_OPEN_FLAGS)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise SMLRuntimeError("lm-eval task YAML path is missing or invalid")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, _YAML_SOURCE_READ_SIZE):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if not stat.S_ISREG(after.st_mode) or _source_descriptor_state(
+            before
+        ) != _source_descriptor_state(after):
+            raise SMLRuntimeError(
+                "lm-eval task YAML source changed during snapshot read"
+            )
+        contents = b"".join(chunks)
+        if len(contents) != after.st_size:
+            raise SMLRuntimeError(
+                "lm-eval task YAML source changed during snapshot read"
+            )
+    except SMLRuntimeError as error:
+        primary_error = error
+        raise
     except OSError as error:
-        raise SMLRuntimeError("lm-eval task YAML path is missing or invalid") from error
+        primary_error = SMLRuntimeError("lm-eval task YAML path is missing or invalid")
+        raise primary_error from error
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as close_error:
+                if primary_error is None:
+                    raise SMLRuntimeError(
+                        "lm-eval task YAML path is missing or invalid"
+                    ) from close_error
+                primary_error.add_note(
+                    f"lm-eval task YAML descriptor close failed: {close_error!r}"
+                )
     return _YAMLSourceSnapshot(
         path=path,
         identity=EvaluationSourceIdentity(
@@ -1081,7 +1135,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
     )
     result = EvaluationResult(
         kind="evaluation-result",
-        version=1,
+        version=2,
         identity="sha256:" + "0" * 64,
         model=session.model_identity,
         tasks=task_records,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import math
+import multiprocessing
 import os
 import shutil
 import socket
@@ -37,6 +38,17 @@ from test_inference import (  # noqa: F401
 IN_VOCAB_CONTEXTS = ("alpha", "alpha beta", "alpha beta gamma")
 IN_VOCAB_CONTINUATIONS = (" beta", " gamma", " delta")
 _PROVIDER_STUBS = Path(__file__).resolve().parents[1] / "fixtures" / "provider_stubs"
+
+
+def _snapshot_fifo_source(path: Path, package_root: Path, outcomes) -> None:
+    from sml import evaluation
+
+    try:
+        evaluation._source_snapshot(path, package_root)
+    except SMLRuntimeError:
+        outcomes.put("rejected")
+    else:
+        outcomes.put("accepted")
 
 
 @dataclass(frozen=True, slots=True)
@@ -958,6 +970,35 @@ def test_task_provenance_rejects_missing_indexed_yaml_file(fake_provider) -> Non
     manager = evaluation._RecordingTaskManager(inner, fake_provider)
     with pytest.raises(SMLRuntimeError, match="YAML|yaml"):
         manager.load(["hellaswag"])
+
+
+def test_task_source_snapshot_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    """A special .yaml source must fail closed without waiting for a writer."""
+    package_root = tmp_path / "lm_eval"
+    package_root.mkdir()
+    fifo = package_root / "task.yaml"
+    os.mkfifo(fifo)
+    context = multiprocessing.get_context("spawn")
+    outcomes = context.Queue()
+    process = context.Process(
+        target=_snapshot_fifo_source,
+        args=(fifo, package_root, outcomes),
+    )
+    try:
+        process.start()
+        process.join(timeout=2)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            pytest.fail("task YAML snapshot blocked while opening a FIFO")
+        assert process.exitcode == 0
+        assert outcomes.get(timeout=1) == "rejected"
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join()
+        outcomes.close()
+        outcomes.join_thread()
 
 
 @pytest.mark.parametrize(

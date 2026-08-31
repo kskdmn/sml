@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -62,6 +63,8 @@ def model_identity() -> ModelIdentity:
         run_step_identity=None,
         tokenizer_identity="sha256:" + "1" * 64,
         verification=VerificationLevel.FULL,
+        latest_recovered=False,
+        pruning_pending=False,
     )
 
 
@@ -107,7 +110,7 @@ def make_result(
 ) -> EvaluationResult:
     return EvaluationResult(
         kind="evaluation-result",
-        version=1,
+        version=2,
         identity="sha256:" + "0" * 64,
         model=model,
         tasks=tasks,
@@ -125,6 +128,65 @@ def identified_result(
     task = replace(task, task_identity=evaluation_task_identity(task))
     result = make_result(model=model_identity(), tasks=(task,))
     return replace(result, identity=evaluation_result_identity(result))
+
+
+def _historical_v1_payload() -> bytes:
+    document = {
+        "identity": (
+            "sha256:cdd96169a9ea984c07b065378d465e3ca160db14209761b4d64cbad94f8ad6f8"
+        ),
+        "kind": "evaluation-result",
+        "model": {
+            "artifact_kind": "export",
+            "checkpoint_identity": None,
+            "run_identity": None,
+            "run_step_identity": None,
+            "step": 7,
+            "tokenizer_identity": "sha256:" + "1" * 64,
+            "verification": "full",
+        },
+        "provider_result": {
+            "configs": {"hellaswag": {}},
+            "results": {"hellaswag": {"acc,none": 0.5}},
+        },
+        "tasks": [
+            {
+                "dataset_fingerprint": "fingerprint-1",
+                "dataset_revision": "revision-1",
+                "few_shot_config": {"num_fewshot": 5},
+                "generation_config": {"temperature": 0},
+                "include_template_closure": [
+                    {
+                        "content_identity": "sha256:" + "3" * 64,
+                        "logical_name": "tasks/common.yaml",
+                    }
+                ],
+                "limit": 10,
+                "lm_eval_package_version": "0.4.12",
+                "lm_eval_source_commit": None,
+                "metric_normalization_config": {"acc,none": "mean"},
+                "metric_payload": {"acc,none": 0.5},
+                "ordered_request_identity": "sha256:" + "4" * 64,
+                "prompt_config": {"description": "multiple choice"},
+                "provider_versions": [
+                    {"name": "datasets", "version": "3.0.0"},
+                    {"name": "lm-eval", "version": "0.4.12"},
+                ],
+                "seeds": {"fewshot": 1234},
+                "task_identity": (
+                    "sha256:d429fd4328a410283b8d0c490f03a3c9fba8975837ecfe088aad5072ef1b6b65"
+                ),
+                "task_metadata_version": "1.0",
+                "task_name": "hellaswag",
+                "task_yaml": {
+                    "content_identity": "sha256:" + "2" * 64,
+                    "logical_name": "tasks/hellaswag.yaml",
+                },
+            }
+        ],
+        "version": 1,
+    }
+    return canonical_json_bytes(document) + b"\n"
 
 
 def _publish_fifo_result(path: Path, outcomes) -> None:
@@ -281,7 +343,7 @@ def test_identity_projections_are_pinned_selective_and_complete() -> None:
     identified_task = replace(task, task_identity=expected_task_identity)
     result = make_result(model=model_identity(), tasks=(identified_task,))
     expected_result_identity = (
-        "sha256:480931ab3464232e5af7cca98844f11c6a3be03ddda012654fcbc7ce59ec8fac"
+        "sha256:e13e6c0e4a3bc369f77f0c3d8e21a2ccee0365d0f1e0cb756186bca85300beb7"
     )
     assert evaluation_result_identity(result) == expected_result_identity
     for changed_result in (
@@ -346,8 +408,73 @@ def test_records_reject_unordered_or_invalid_values() -> None:
     with pytest.raises(ValueError):
         replace(
             make_result(model=model_identity(), tasks=(make_task_record(),)),
-            version=1.0,
+            version=2.0,
         )
+
+
+def test_reader_preserves_historical_v1_payload_and_marks_status_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Breaks if v1 bytes/domain drift or legacy status is fabricated as false."""
+    payload = _historical_v1_payload()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "0368abecfb83c6ab0c38c4cc1b10403ee95ce1180ab137b182a6ada5dcbd5abe"
+    )
+    path = tmp_path / "evaluation-v1.json"
+    path.write_bytes(payload)
+
+    result = read_evaluation_result(path)
+
+    assert result.version == 1
+    assert result.identity == (
+        "sha256:cdd96169a9ea984c07b065378d465e3ca160db14209761b4d64cbad94f8ad6f8"
+    )
+    assert result.model.latest_recovered is None
+    assert result.model.pruning_pending is None
+    assert evaluation_result_identity(result) == result.identity
+    assert evaluation_result_bytes(result) == payload
+
+
+def test_reader_rejects_v2_model_fields_under_v1_discriminator(
+    tmp_path: Path,
+) -> None:
+    """Breaks if exact version dispatch accepts the incompatible round-one v1 shape."""
+    document = json.loads(_historical_v1_payload())
+    document["model"]["latest_recovered"] = False
+    document["model"]["pruning_pending"] = False
+    document["identity"] = (
+        "sha256:480931ab3464232e5af7cca98844f11c6a3be03ddda012654fcbc7ce59ec8fac"
+    )
+    path = tmp_path / "extended-v1.json"
+    path.write_bytes(canonical_json_bytes(document) + b"\n")
+
+    with pytest.raises(SMLArtifactError):
+        read_evaluation_result(path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("latest_recovered", None),
+        ("latest_recovered", 0),
+        ("pruning_pending", None),
+        ("pruning_pending", 0),
+    ),
+)
+def test_reader_requires_boolean_v2_operational_status(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    """Breaks if a v2 operational status can be null or merely truthy/falsy."""
+    document = json.loads(evaluation_result_bytes(identified_result()))
+    document["model"][field] = value
+    projection = dict(document)
+    projection.pop("identity")
+    document["identity"] = structured_identity("sml-evaluation-result-v2", projection)
+    path = tmp_path / f"invalid-v2-{field}-{value!r}.json"
+    path.write_bytes(canonical_json_bytes(document) + b"\n")
+
+    with pytest.raises(SMLArtifactError):
+        read_evaluation_result(path)
 
 
 def test_reader_rejects_strict_schema_and_tampered_identities(tmp_path: Path) -> None:
@@ -369,7 +496,7 @@ def test_reader_rejects_strict_schema_and_tampered_identities(tmp_path: Path) ->
     invalid_verification["model"]["verification"] = "invalid"
 
     documents = (
-        canonical.replace(b'"version":1', b'"version":1,"extra":true'),
+        canonical.replace(b'"version":2', b'"version":2,"extra":true'),
         canonical.replace(
             b'"kind":"evaluation-result"',
             b'"kind":"evaluation-result","kind":"evaluation-result"',
@@ -407,6 +534,8 @@ def test_reader_rejects_strict_schema_and_tampered_identities(tmp_path: Path) ->
                 "run_step_identity",
                 "tokenizer_identity",
                 "verification",
+                "latest_recovered",
+                "pruning_pending",
             ),
         ),
         (
@@ -499,7 +628,7 @@ def test_result_rejects_provider_task_key_or_metric_contradictions(
     with pytest.raises((TypeError, ValueError)):
         EvaluationResult(
             kind="evaluation-result",
-            version=1,
+            version=2,
             identity="sha256:" + "0" * 64,
             model=model_identity(),
             tasks=(make_task_record(),),
@@ -515,7 +644,7 @@ def test_reader_rejects_a_freshly_identifiable_provider_metric_contradiction(
     document["provider_result"]["results"]["hellaswag"]["acc,none"] = 0.75
     projection = dict(document)
     projection.pop("identity")
-    document["identity"] = structured_identity("sml-evaluation-result-v1", projection)
+    document["identity"] = structured_identity("sml-evaluation-result-v2", projection)
     path = tmp_path / "contradictory.json"
     path.write_bytes(canonical_json_bytes(document) + b"\n")
 
@@ -528,7 +657,7 @@ def test_result_rejects_type_distinct_provider_metrics() -> None:
     with pytest.raises(ValueError, match="metric_payload"):
         EvaluationResult(
             kind="evaluation-result",
-            version=1,
+            version=2,
             identity="sha256:" + "0" * 64,
             model=model_identity(),
             tasks=(make_task_record(metric_payload={"m": 1}),),
@@ -549,7 +678,7 @@ def test_reader_rejects_a_freshly_identifiable_type_distinct_metric(
     document["provider_result"]["results"]["hellaswag"]["m"] = True
     projection = dict(document)
     projection.pop("identity")
-    document["identity"] = structured_identity("sml-evaluation-result-v1", projection)
+    document["identity"] = structured_identity("sml-evaluation-result-v2", projection)
     path = tmp_path / "type-distinct-metric.json"
     path.write_bytes(canonical_json_bytes(document) + b"\n")
 
@@ -573,7 +702,7 @@ def test_result_rejects_duplicate_task_keys_from_hostile_mappings(
     with pytest.raises(ValueError, match="duplicate JSON object key"):
         EvaluationResult(
             kind="evaluation-result",
-            version=1,
+            version=2,
             identity="sha256:" + "0" * 64,
             model=model_identity(),
             tasks=(make_task_record(),),
