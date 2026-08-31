@@ -6,7 +6,7 @@ import secrets
 import threading
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -69,6 +69,8 @@ class ModelIdentity:
     run_step_identity: str | None
     tokenizer_identity: str
     verification: VerificationLevel
+    latest_recovered: bool = False
+    pruning_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,8 +248,14 @@ class ResolvedModel:
     model_config: ModelConfig
     tokenizer: LoadedTokenizer
     model_arrays: Mapping[str, mx.array]
+    latest_recovered: bool = False
+    pruning_pending: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.latest_recovered, bool):
+            raise TypeError("latest_recovered must be a bool")
+        if not isinstance(self.pruning_pending, bool):
+            raise TypeError("pruning_pending must be a bool")
         object.__setattr__(
             self,
             "model_arrays",
@@ -267,6 +275,8 @@ class ResolvedModel:
             run_step_identity=self.run_step_identity,
             tokenizer_identity=self.tokenizer_identity,
             verification=self.verification,
+            latest_recovered=self.latest_recovered,
+            pruning_pending=self.pruning_pending,
         )
 
 
@@ -439,7 +449,15 @@ def load_owned_model_arrays(
             model_group = contents.array_groups[_MODEL_GROUP]
             owned = {name: model_group[name] for name in model_group}
             mx.eval(*owned.values())
-            return reader.resolved, MappingProxyType(owned)
+            return (
+                replace(
+                    reader.resolved,
+                    latest_recovered=recovered.latest_recovered,
+                    latest_repair_persisted=recovered.latest_repair_persisted,
+                    pruning_pending=recovered.pruning_pending,
+                ),
+                MappingProxyType(owned),
+            )
 
 
 def _require_unit_rope(model: Mapping[str, object], *, context: str) -> ModelConfig:
@@ -474,10 +492,6 @@ def _resolve_pretraining_run(
             raise SMLArtifactError("pretraining resolution requires a pretraining run")
         if resolved_step.run != expected_run:
             raise SMLArtifactError("run manifest changed during model resolution")
-        if full_verify and resolved_step.latest_recovered:
-            raise SMLArtifactError(
-                "run latest index must directly bind the latest checkpoint"
-            )
         contents = reader.read_contents()
         owned = dict(contents.array_groups[_MODEL_GROUP])
         mx.eval(*owned.values())
@@ -504,6 +518,8 @@ def _resolve_pretraining_run(
         model_config=model_config,
         tokenizer=tokenizer,
         model_arrays=owned,
+        latest_recovered=resolved_step.latest_recovered,
+        pruning_pending=resolved_step.pruning_pending,
     )
 
 
@@ -529,10 +545,6 @@ def _resolve_lora_run(
             raise SMLArtifactError("LoRA resolution requires a LoRA run")
         if recovered.run != expected_run:
             raise SMLArtifactError("run manifest changed during model resolution")
-        if full_verify and recovered.latest_recovered:
-            raise SMLArtifactError(
-                "run latest index must directly bind the latest checkpoint"
-            )
         with reader.open_run_child("base", (BaseSnapshotManifest,)) as base:
             require_lora_base_snapshot(base.manifest, recovered.run)
             if full_verify:
@@ -572,6 +584,8 @@ def _resolve_lora_run(
             model_config=model_config,
             tokenizer=tokenizer,
             model_arrays=merged,
+            latest_recovered=recovered.latest_recovered,
+            pruning_pending=recovered.pruning_pending,
         )
 
 

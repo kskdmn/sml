@@ -281,11 +281,19 @@ def test_identity_projections_are_pinned_selective_and_complete() -> None:
     identified_task = replace(task, task_identity=expected_task_identity)
     result = make_result(model=model_identity(), tasks=(identified_task,))
     expected_result_identity = (
-        "sha256:cdd96169a9ea984c07b065378d465e3ca160db14209761b4d64cbad94f8ad6f8"
+        "sha256:480931ab3464232e5af7cca98844f11c6a3be03ddda012654fcbc7ce59ec8fac"
     )
     assert evaluation_result_identity(result) == expected_result_identity
     for changed_result in (
         replace(result, model=replace(model_identity(), step=8)),
+        replace(
+            result,
+            model=replace(model_identity(), latest_recovered=True),
+        ),
+        replace(
+            result,
+            model=replace(model_identity(), pruning_pending=True),
+        ),
         replace(
             make_result(
                 model=model_identity(),
@@ -308,6 +316,8 @@ def test_identity_projections_are_pinned_selective_and_complete() -> None:
         ("run_step_identity", "not-an-identity"),
         ("tokenizer_identity", "not-an-identity"),
         ("verification", "full"),
+        ("latest_recovered", 1),
+        ("pruning_pending", None),
     ),
 )
 def test_result_rejects_malformed_model_identity(field: str, value: object) -> None:

@@ -304,6 +304,7 @@ class ResolvedStep:
     verification: VerificationLevel
     latest_recovered: bool
     latest_repair_persisted: bool
+    pruning_pending: bool
 
     @property
     def step(self) -> int:
@@ -2620,6 +2621,7 @@ def _resolved_step(
     *,
     latest_recovered: bool,
     latest_repair_persisted: bool,
+    pruning_pending: bool = False,
 ) -> ResolvedStep:
     return ResolvedStep(
         run=run_manifest,
@@ -2635,6 +2637,7 @@ def _resolved_step(
         verification=verification,
         latest_recovered=latest_recovered,
         latest_repair_persisted=latest_repair_persisted,
+        pruning_pending=pruning_pending,
     )
 
 
@@ -2986,6 +2989,7 @@ def open_latest_checkpoint_reader(
                 owned.resolved,
                 latest_recovered=recovered.latest_recovered,
                 latest_repair_persisted=recovered.latest_repair_persisted,
+                pruning_pending=recovered.pruning_pending,
             )
             owned.resolved = reader_resolved
             yield CheckpointReader(
@@ -3213,6 +3217,21 @@ def _scan_checkpoint_candidates(
     return candidates
 
 
+def _published_checkpoint_pruning_pending(
+    checkpoints_descriptor: int,
+    *,
+    selected_step: int,
+    fs: FilesystemOps,
+) -> bool:
+    selected_name = _step_name(selected_step)
+    return any(
+        not _is_temporary_step_name(name)
+        and _parse_step_name(name) is not None
+        and name != selected_name
+        for name in fs.listdir(checkpoints_descriptor)
+    )
+
+
 def _recover_latest_open(
     run: Path,
     run_manifest: RunManifest,
@@ -3284,7 +3303,14 @@ def _recover_latest_open(
             selected,
             latest_repair_persisted=True,
         )
-    return selected
+    return dataclasses.replace(
+        selected,
+        pruning_pending=_published_checkpoint_pruning_pending(
+            checkpoints_descriptor,
+            selected_step=selected.step,
+            fs=fs,
+        ),
+    )
 
 
 def recover_latest_index(
@@ -3573,6 +3599,11 @@ def publish_checkpoint(
                     existing,
                     latest_recovered=True,
                     latest_repair_persisted=True,
+                    pruning_pending=_published_checkpoint_pruning_pending(
+                        checkpoints_descriptor,
+                        selected_step=existing.step,
+                        fs=fs,
+                    ),
                 )
             return current_latest
 
@@ -3666,6 +3697,11 @@ def publish_checkpoint(
             VerificationLevel.FULL,
             latest_recovered=False,
             latest_repair_persisted=False,
+            pruning_pending=_published_checkpoint_pruning_pending(
+                checkpoints_descriptor,
+                selected_step=manifest.step,
+                fs=fs,
+            ),
         )
         _persist_latest_index(run_descriptor, published, fs)
         return published
@@ -4068,7 +4104,7 @@ def prune_to_latest(
                     latest=owned_latest,
                     fs=fs,
                 )
-            return latest
+            return dataclasses.replace(latest, pruning_pending=False)
         finally:
             if owned_latest is not None:
                 owned_latest.close()

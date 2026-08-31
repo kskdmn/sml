@@ -1540,15 +1540,17 @@ def test_full_pretraining_run_rejects_progress_outside_step_bounds(
 
 
 @pytest.mark.parametrize("full", (False, True))
-def test_recursive_run_verification_requires_a_bound_latest_index(
+def test_recursive_pretraining_run_verification_reports_recovered_latest(
     tmp_path: Path,
     pretraining_run_template: Path,
     full: bool,
 ) -> None:
-    """Verification must not report a recovered scan as a proven latest index."""
+    """A proved recovered pretraining winner remains a successful public result."""
     run = tmp_path / f"run-missing-latest-{full}"
     shutil.copytree(pretraining_run_template, run)
     (run / "latest.json").unlink()
 
-    with pytest.raises(SMLArtifactError, match="latest index"):
-        verify_artifact(run, full=full)
+    result = verify_artifact(run, full=full)
+
+    assert result.latest_recovered is True
+    assert result.pruning_pending is False

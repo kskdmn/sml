@@ -1005,10 +1005,7 @@ def _restore_adapter_checkpoint(
     optimizer_arrays = dict(contents.array_groups["optimizer.safetensors"])
     trainer_arrays = dict(contents.array_groups["trainer.safetensors"])
     try:
-        _require_dtype(adapters, "adapters", mx.float32)
-        adapter_tree = tree_unflatten(list(adapters.items()))
-        if not isinstance(adapter_tree, dict):
-            raise SMLArtifactError("adapter checkpoint must unflatten to a dict")
+        adapter_tree = _restore_adapter_tree(adapters)
         expected_optimizer = {
             "step",
             *(f"first_moments.{name}" for name in adapters),
@@ -1049,6 +1046,14 @@ def _restore_adapter_checkpoint(
         raise
     except (SMLConfigurationError, TypeError, ValueError) as error:
         raise SMLArtifactError("invalid LoRA checkpoint arrays") from error
+
+
+def _restore_adapter_tree(adapters: Mapping[str, mx.array]) -> dict:
+    _require_dtype(adapters, "adapters", mx.float32)
+    adapter_tree = tree_unflatten(list(adapters.items()))
+    if not isinstance(adapter_tree, dict):
+        raise SMLArtifactError("adapter checkpoint must unflatten to a dict")
+    return adapter_tree
 
 
 def _require_retained_publication(
@@ -1504,30 +1509,31 @@ def export_merged(checkpoint: Path, output: Path) -> ExportResult:
     with open_latest_checkpoint_reader(
         checkpoint,
         verification=VerificationLevel.FULL,
-        load_array_groups=frozenset(
-            {
-                "adapters.safetensors",
-                "optimizer.safetensors",
-                "trainer.safetensors",
-            }
-        ),
+        load_array_groups=frozenset({"adapters.safetensors"}),
     ) as reader:
         recovered = reader.resolved
         if not isinstance(recovered.run, LoRARunManifest):
             raise SMLArtifactError("merged export requires a LoRA run")
         if recovered.run.model.get("rope_scaling_factor") != 1.0:
             raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
-        with reader.open_run_child("base", (BaseSnapshotManifest,)) as base:
-            require_lora_base_snapshot(base.manifest, recovered.run)
-            base_arrays = _load_base_snapshot_arrays(base)
         with reader.open_run_child("tokenizer", (TokenizerManifest,)) as tokenizer:
             if tokenizer.manifest.identity != recovered.run.tokenizer_identity:
                 raise SMLArtifactError(
                     "export tokenizer identity does not match the run"
                 )
+            model_config = validate_full_run_semantics(reader, tokenizer.manifest)
             tokenizer_files = _read_tokenizer_files(tokenizer)
-        adapters, _optimizer, _trainer, _scalar = _restore_adapter_checkpoint(reader)
-        model_config = ModelConfig(**_mapping_dict(recovered.run.model, "model"))
+        with reader.open_run_child("base", (BaseSnapshotManifest,)) as base:
+            require_lora_base_snapshot(base.manifest, recovered.run)
+            base_arrays = _load_base_snapshot_arrays(base)
+        try:
+            adapters = _restore_adapter_tree(
+                dict(reader.read_contents().array_groups["adapters.safetensors"])
+            )
+        except SMLArtifactError:
+            raise
+        except (KeyError, SMLConfigurationError, TypeError, ValueError) as error:
+            raise SMLArtifactError("invalid LoRA checkpoint arrays") from error
         lora = lora_config_from_mapping(_mapping_dict(recovered.run.lora, "lora"))
         model_key, _ignored = mx.random.split(mx.random.key(0))
         model, _initialized, _frozen = _wrap_copied_base(

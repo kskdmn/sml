@@ -140,6 +140,10 @@ def _validate_model_identity(model: ModelIdentity) -> None:
     _require_identity(model.tokenizer_identity, "model tokenizer_identity")
     if not isinstance(model.verification, VerificationLevel):
         raise TypeError("model verification must be a VerificationLevel")
+    if not isinstance(model.latest_recovered, bool):
+        raise TypeError("model latest_recovered must be a bool")
+    if not isinstance(model.pruning_pending, bool):
+        raise TypeError("model pruning_pending must be a bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +301,8 @@ def _model_projection(model: ModelIdentity) -> dict[str, object]:
         "run_step_identity": model.run_step_identity,
         "tokenizer_identity": model.tokenizer_identity,
         "verification": model.verification.value,
+        "latest_recovered": model.latest_recovered,
+        "pruning_pending": model.pruning_pending,
     }
 
 
@@ -476,6 +482,8 @@ def _model_from_payload(payload: object) -> ModelIdentity:
                 "run_step_identity",
                 "tokenizer_identity",
                 "verification",
+                "latest_recovered",
+                "pruning_pending",
             }
         ),
         "evaluation model",
@@ -491,6 +499,8 @@ def _model_from_payload(payload: object) -> ModelIdentity:
         run_step_identity=raw["run_step_identity"],  # type: ignore[arg-type]
         tokenizer_identity=raw["tokenizer_identity"],  # type: ignore[arg-type]
         verification=VerificationLevel(verification),
+        latest_recovered=raw["latest_recovered"],  # type: ignore[arg-type]
+        pruning_pending=raw["pruning_pending"],  # type: ignore[arg-type]
     )
 
 

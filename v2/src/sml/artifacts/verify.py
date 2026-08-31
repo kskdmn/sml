@@ -47,6 +47,8 @@ class VerificationResult:
     manifest: ArtifactManifest
     verification: VerificationLevel
     children: tuple[VerificationResult, ...] = ()
+    latest_recovered: bool = False
+    pruning_pending: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.path, Path):
@@ -70,6 +72,10 @@ class VerificationResult:
             isinstance(child, VerificationResult) for child in self.children
         ):
             raise TypeError("children must be VerificationResult values")
+        if not isinstance(self.latest_recovered, bool):
+            raise TypeError("latest_recovered must be a bool")
+        if not isinstance(self.pruning_pending, bool):
+            raise TypeError("pruning_pending must be a bool")
 
 
 def _open_artifact_once(
@@ -302,10 +308,6 @@ def _verify_opened_run(artifact: OpenedArtifact[RunManifest]) -> VerificationRes
         resolved = reader.resolved
         if resolved.run != artifact.manifest:
             raise SMLArtifactError("run manifest changed during recursive verification")
-        if resolved.latest_recovered:
-            raise SMLArtifactError(
-                "run latest index must directly bind the latest checkpoint"
-            )
         with _open_reader_child_artifact(
             reader,
             "tokenizer",
@@ -345,7 +347,9 @@ def _verify_opened_run(artifact: OpenedArtifact[RunManifest]) -> VerificationRes
             artifact.path,
             resolved.run,
             level,
-            tuple(children),
+            children=tuple(children),
+            latest_recovered=resolved.latest_recovered,
+            pruning_pending=resolved.pruning_pending,
         )
     return result
 

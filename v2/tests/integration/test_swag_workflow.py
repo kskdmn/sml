@@ -12,6 +12,7 @@ import mlx.core as mx
 import pytest
 import sml.inference as inference_module
 import zstandard as zstd
+from sml.artifacts import checkpoint as checkpoint_module
 from sml.artifacts.checkpoint import CheckpointReader, resolve_latest_step
 from sml.artifacts.manifest import (
     ArtifactRoot,
@@ -523,6 +524,99 @@ def test_full_lora_resolve_applies_exact_run_semantics(tiny_lora_run: Path) -> N
         resolve_model_artifact(tiny_lora_run, full_verify=True)
 
 
+@pytest.mark.parametrize("full", (False, True))
+def test_recursive_lora_run_verification_reports_recovered_latest(
+    tiny_lora_run: Path,
+    full: bool,
+) -> None:
+    """A proved recovered LoRA winner remains a successful public result."""
+    (tiny_lora_run / "latest.json").unlink()
+
+    result = verify_artifact(tiny_lora_run, full=full)
+
+    assert result.latest_recovered is True
+    assert result.pruning_pending is False
+
+
+def test_export_rejects_resigned_progress_outside_step_bounds_before_publication(
+    tiny_lora_run: Path,
+    tmp_path: Path,
+) -> None:
+    """Merged derivatives require valid source progress, not only valid arrays."""
+    resolved = resolve_latest_step(
+        tiny_lora_run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+    state_path = resolved.step_directory / resolved.checkpoint.scalar_state.logical_path
+    state = json.loads(state_path.read_bytes())
+    state["microsteps"] = 0
+    state["examples"] = 0
+    state_path.write_bytes(canonical_json_bytes(state))
+    checkpoint = replace(
+        resolved.checkpoint,
+        scalar_state=_payload_ref(state_path, "state.json"),
+    )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    (resolved.step_directory / "checkpoint.json").write_bytes(
+        canonical_json_bytes(checkpoint)
+    )
+    latest = read_manifest(
+        tiny_lora_run,
+        LatestIndex,
+        VerificationLevel.MANIFEST_TRUSTED,
+    ).manifest
+    latest = replace(latest, checkpoint_identity=checkpoint.identity)
+    latest = replace(latest, identity=latest.recompute_identity())
+    (tiny_lora_run / "latest.json").write_bytes(canonical_json_bytes(latest))
+    output = tmp_path / "invalid-progress-export"
+
+    with pytest.raises(SMLArtifactError, match="microsteps disagree"):
+        export_merged(tiny_lora_run, output)
+
+    assert not output.exists()
+
+
+def test_export_rejects_resigned_wrong_terminal_key_before_publication(
+    tiny_lora_run: Path,
+    tmp_path: Path,
+) -> None:
+    """Merged derivatives require the seed-derived terminal trainer key."""
+    _replace_latest_trainer_key(tiny_lora_run, mx.random.key(999))
+    output = tmp_path / "wrong-key-export"
+
+    with pytest.raises(SMLArtifactError, match="next RNG key is incorrect"):
+        export_merged(tiny_lora_run, output)
+
+    assert not output.exists()
+
+
+def test_export_materializes_only_adapter_group(
+    tiny_lora_run: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FULL export streams training-only state without materializing its tensors."""
+    real_load = checkpoint_module._load_checkpoint_array_stream
+
+    def reject_training_only_materialization(stream, reference, **kwargs):
+        if reference.payload.logical_path != "adapters.safetensors":
+            raise AssertionError(
+                f"materialized training-only group: {reference.payload.logical_path}"
+            )
+        return real_load(stream, reference, **kwargs)
+
+    monkeypatch.setattr(
+        checkpoint_module,
+        "_load_checkpoint_array_stream",
+        reject_training_only_materialization,
+    )
+
+    exported = export_merged(tiny_lora_run, tmp_path / "adapter-only-export")
+
+    assert exported.path.is_dir()
+
+
 def test_full_export_resolve_applies_exact_export_semantics(
     tiny_lora_run: Path,
     tmp_path: Path,
@@ -916,6 +1010,31 @@ def _run_with_unpruned_lora_history(
         "step-000000001",
     ]
     return run
+
+
+@pytest.mark.parametrize("full_verify", (False, True))
+def test_lora_resolution_reports_recovery_with_pending_pruning(
+    tiny_base_run,
+    tiny_swag_bundle,
+    tmp_path,
+    monkeypatch,
+    full_verify,
+):
+    """Recovered selection and unfinished retention are independent status bits."""
+    run = _run_with_unpruned_lora_history(
+        tiny_base_run,
+        tiny_swag_bundle,
+        tmp_path / f"recovered-unpruned-{full_verify}",
+        monkeypatch,
+    )
+    (run / "latest.json").unlink()
+
+    resolved = resolve_model_artifact(run, full_verify=full_verify)
+
+    assert resolved.latest_recovered is True
+    assert resolved.pruning_pending is True
+    assert resolved.identity().latest_recovered is True
+    assert resolved.identity().pruning_pending is True
 
 
 def test_limit_satisfied_resume_prunes_stale_history_after_full_reader_closes(

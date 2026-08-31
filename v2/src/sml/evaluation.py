@@ -124,11 +124,19 @@ def _import_lm_eval() -> _LMEvalProvider:
 
 
 class _RecordingTaskManager:
-    """Retain the exact task mapping consumed by one provider evaluation."""
+    """Retain the exact task mapping and source bytes consumed by one evaluation."""
 
-    def __init__(self, inner: object) -> None:
+    def __init__(
+        self,
+        inner: object,
+        provider: _LMEvalProvider | None = None,
+    ) -> None:
         self._inner = inner
+        self._provider = provider
         self._loaded: Mapping[str, object] | None = None
+        self._source_snapshots: tuple[tuple[str, _TaskSourceSnapshot], ...] | None = (
+            None
+        )
         self._attempted = False
 
     @property
@@ -144,7 +152,13 @@ class _RecordingTaskManager:
         loader = getattr(self._inner, "load", None)
         if not callable(loader):
             raise SMLRuntimeError("lm-eval task manager has no load method")
+        before = self._snapshot_sources(task_list)
         loaded = loader(task_list)
+        after = self._snapshot_sources(task_list)
+        if before != after:
+            raise SMLRuntimeError(
+                "lm-eval task YAML sources changed during task construction"
+            )
         if not isinstance(loaded, Mapping) or not isinstance(
             loaded.get("tasks"), Mapping
         ):
@@ -153,8 +167,49 @@ class _RecordingTaskManager:
             )
         for task in loaded["tasks"].values():
             _capture_effective_eval_docs(task)
+        self._source_snapshots = before
         self._loaded = loaded
         return loaded
+
+    def source_identities(
+        self,
+        task_name: str,
+        provider: _LMEvalProvider,
+    ) -> tuple[EvaluationSourceIdentity, tuple[EvaluationSourceIdentity, ...]]:
+        if self._provider != provider:
+            raise SMLRuntimeError("lm-eval task source provider does not match manager")
+        if self._source_snapshots is None:
+            raise SMLRuntimeError("lm-eval task source snapshot is unavailable")
+        snapshots = dict(self._source_snapshots)
+        try:
+            snapshot = snapshots[task_name]
+        except KeyError as error:
+            raise SMLRuntimeError(
+                f"lm-eval task source snapshot is missing: {task_name}"
+            ) from error
+        return snapshot.identities()
+
+    def verify_sources_unchanged(self) -> None:
+        if self._source_snapshots is None or self._provider is None:
+            raise SMLRuntimeError("lm-eval task source snapshot is unavailable")
+        task_names = tuple(name for name, _snapshot in self._source_snapshots)
+        current = _snapshot_task_sources(self._inner, self._provider, task_names)
+        if current != self._source_snapshots:
+            raise SMLRuntimeError(
+                "lm-eval task YAML sources changed before result publication"
+            )
+
+    def _snapshot_sources(
+        self,
+        task_list: object,
+    ) -> tuple[tuple[str, _TaskSourceSnapshot], ...] | None:
+        if self._provider is None:
+            return None
+        return _snapshot_task_sources(
+            self._inner,
+            self._provider,
+            _requested_task_names(task_list),
+        )
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._inner, name)
@@ -249,49 +304,89 @@ def _evaluation_seeds() -> dict[str, int]:
     return dict(_EVALUATION_SEEDS)
 
 
-def _source_identity(path: Path, package_root: Path) -> EvaluationSourceIdentity:
+@dataclass(frozen=True, slots=True)
+class _YAMLSourceSnapshot:
+    path: Path
+    identity: EvaluationSourceIdentity
+    contents: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _TaskSourceSnapshot:
+    primary: _YAMLSourceSnapshot
+    include_closure: tuple[_YAMLSourceSnapshot, ...]
+
+    def identities(
+        self,
+    ) -> tuple[EvaluationSourceIdentity, tuple[EvaluationSourceIdentity, ...]]:
+        return (
+            self.primary.identity,
+            tuple(source.identity for source in self.include_closure),
+        )
+
+
+def _source_snapshot(path: Path, package_root: Path) -> _YAMLSourceSnapshot:
     try:
         logical_name = path.relative_to(package_root).as_posix()
     except ValueError as error:
         raise SMLRuntimeError("lm-eval task YAML escapes the package root") from error
-    if path.suffix != ".yaml" or not path.is_file():
+    if path.suffix != ".yaml":
         raise SMLRuntimeError("lm-eval task YAML path is missing or invalid")
-    return EvaluationSourceIdentity(
-        logical_name=logical_name,
-        content_identity=f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}",
+    try:
+        contents = path.read_bytes()
+    except OSError as error:
+        raise SMLRuntimeError("lm-eval task YAML path is missing or invalid") from error
+    return _YAMLSourceSnapshot(
+        path=path,
+        identity=EvaluationSourceIdentity(
+            logical_name=logical_name,
+            content_identity=f"sha256:{hashlib.sha256(contents).hexdigest()}",
+        ),
+        contents=contents,
     )
 
 
-def _resolve_yaml_sources(
+def _snapshot_yaml_sources(
     provider: _LMEvalProvider,
     yaml_path: object,
-) -> tuple[EvaluationSourceIdentity, tuple[EvaluationSourceIdentity, ...]]:
+) -> _TaskSourceSnapshot:
     if not isinstance(yaml_path, Path):
         raise SMLRuntimeError("lm-eval task index has no YAML path")
     package_root = provider.package_root.resolve()
     primary_path = yaml_path.resolve()
-    primary = _source_identity(primary_path, package_root)
-    closure: list[EvaluationSourceIdentity] = []
+    closure: list[_YAMLSourceSnapshot] = []
     seen = {primary_path}
 
-    def declared_includes(path: Path) -> tuple[object, ...]:
+    def parse_stable(path: Path) -> tuple[_YAMLSourceSnapshot, tuple[object, ...]]:
+        before = _source_snapshot(path, package_root)
         try:
             loaded = provider.load_yaml(path, resolve_func=False, recursive=False)
         except Exception as error:
             raise SMLRuntimeError(f"cannot load lm-eval task YAML: {path}") from error
+        after = _source_snapshot(path, package_root)
+        if before != after:
+            raise SMLRuntimeError(
+                "lm-eval task YAML source changed during provider parse"
+            )
         if not isinstance(loaded, Mapping):
             raise SMLRuntimeError("lm-eval task YAML is not a mapping")
         includes = loaded.get("include")
         if includes is None:
-            return ()
-        if isinstance(includes, (str, Path)):
-            return (includes,)
-        if isinstance(includes, list):
-            return tuple(includes)
-        raise SMLRuntimeError("lm-eval task YAML include is malformed")
+            declared = ()
+        elif isinstance(includes, (str, Path)):
+            declared = (includes,)
+        elif isinstance(includes, list):
+            declared = tuple(includes)
+        else:
+            raise SMLRuntimeError("lm-eval task YAML include is malformed")
+        return before, declared
 
-    def visit(path: Path, ancestry: frozenset[Path]) -> None:
-        for included in declared_includes(path):
+    def visit(
+        path: Path,
+        ancestry: frozenset[Path],
+        included_paths: tuple[object, ...],
+    ) -> None:
+        for included in included_paths:
             if not isinstance(included, (str, Path)) or not str(included):
                 raise SMLRuntimeError("lm-eval task YAML include is malformed")
             candidate = Path(included)
@@ -309,13 +404,56 @@ def _resolve_yaml_sources(
                 raise SMLRuntimeError("lm-eval task YAML include cycle")
             if resolved in seen:
                 continue
-            source = _source_identity(resolved, package_root)
+            source, nested_includes = parse_stable(resolved)
             seen.add(resolved)
             closure.append(source)
-            visit(resolved, ancestry | {resolved})
+            visit(resolved, ancestry | {resolved}, nested_includes)
 
-    visit(primary_path, frozenset({primary_path}))
-    return primary, tuple(closure)
+    primary, primary_includes = parse_stable(primary_path)
+    visit(primary_path, frozenset({primary_path}), primary_includes)
+    return _TaskSourceSnapshot(primary, tuple(closure))
+
+
+def _resolve_yaml_sources(
+    provider: _LMEvalProvider,
+    yaml_path: object,
+) -> tuple[EvaluationSourceIdentity, tuple[EvaluationSourceIdentity, ...]]:
+    return _snapshot_yaml_sources(provider, yaml_path).identities()
+
+
+def _requested_task_names(task_list: object) -> tuple[str, ...]:
+    if not isinstance(task_list, Sequence) or isinstance(task_list, (str, bytes)):
+        raise SMLRuntimeError("lm-eval requested task list is malformed")
+    task_names = tuple(task_list)
+    if (
+        not task_names
+        or any(not isinstance(name, str) or not name for name in task_names)
+        or len(task_names) != len(set(task_names))
+    ):
+        raise SMLRuntimeError("lm-eval requested task list is malformed")
+    return task_names
+
+
+def _snapshot_task_sources(
+    manager: object,
+    provider: _LMEvalProvider,
+    task_names: tuple[str, ...],
+) -> tuple[tuple[str, _TaskSourceSnapshot], ...]:
+    task_index = getattr(manager, "task_index", None)
+    if not isinstance(task_index, Mapping):
+        raise SMLRuntimeError("lm-eval task index is unavailable")
+    snapshots: list[tuple[str, _TaskSourceSnapshot]] = []
+    for task_name in task_names:
+        if task_name not in task_index:
+            raise SMLRuntimeError(f"lm-eval task index entry is missing: {task_name}")
+        entry = task_index[task_name]
+        snapshots.append(
+            (
+                task_name,
+                _snapshot_yaml_sources(provider, getattr(entry, "yaml_path", None)),
+            )
+        )
+    return tuple(snapshots)
 
 
 def _task_config(task: object) -> tuple[Mapping[str, object], object]:
@@ -557,13 +695,7 @@ def _resolve_task_record(
 ) -> EvaluationTaskRecord:
     if not isinstance(task_name, str) or not task_name:
         raise SMLRuntimeError("lm-eval task name is invalid")
-    task_index = getattr(manager, "task_index", None)
-    if not isinstance(task_index, Mapping) or task_name not in task_index:
-        raise SMLRuntimeError(f"lm-eval task index entry is missing: {task_name}")
-    entry = task_index[task_name]
-    task_yaml, include_closure = _resolve_yaml_sources(
-        provider, getattr(entry, "yaml_path", None)
-    )
+    task_yaml, include_closure = manager.source_identities(task_name, provider)
     config, config_object = _task_config(task)
     task_metadata_version = _metadata_version(config)
     dataset_revision, dataset_fingerprint = _dataset_identity(task, config)
@@ -903,7 +1035,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
         runtime=config.runtime,
     )
     provider = _import_lm_eval()
-    manager = _RecordingTaskManager(provider.make_task_manager())
+    manager = _RecordingTaskManager(provider.make_task_manager(), provider)
     recorder = _EvaluationRequestRecorder()
     lm = _lm_eval_model(session, padding=config.padding, recorder=recorder)
     raw_result = provider.simple_evaluate(
@@ -956,6 +1088,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
         provider_result=normalize_json_value(provider_result, context="lm-eval result"),
     )
     result = replace(result, identity=evaluation_result_identity(result))
+    manager.verify_sources_unchanged()
     publish_evaluation_result(config.output, result)
     return result
 

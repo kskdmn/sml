@@ -1033,6 +1033,35 @@ def test_read_only_recovery_never_persists_latest(valid_run: Path) -> None:
     assert latest.read_bytes() == original_bytes
 
 
+def test_read_only_resolution_reports_pending_pruning_until_retention_finishes(
+    valid_run: Path,
+) -> None:
+    """Published older steps remain visible as read-only operational state."""
+    _publish_step(valid_run, 2)
+
+    resolved = checkpoint.resolve_latest_step(
+        valid_run,
+        writable=False,
+        verification=VerificationLevel.FULL,
+    )
+
+    assert resolved.latest_recovered is False
+    assert resolved.pruning_pending is True
+
+    with checkpoint.run_writer_lock(valid_run):
+        retained = checkpoint.prune_to_latest(valid_run)
+
+    assert retained.pruning_pending is False
+    assert (
+        checkpoint.resolve_latest_step(
+            valid_run,
+            writable=False,
+            verification=VerificationLevel.FULL,
+        ).pruning_pending
+        is False
+    )
+
+
 def test_latest_reader_full_proves_only_selected_winner_once(
     valid_run: Path,
     monkeypatch: pytest.MonkeyPatch,

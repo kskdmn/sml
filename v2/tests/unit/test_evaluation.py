@@ -5,6 +5,7 @@ import importlib
 import inspect
 import math
 import os
+import shutil
 import socket
 import sys
 from collections.abc import Iterator, Mapping
@@ -232,6 +233,29 @@ def fake_provider(monkeypatch: pytest.MonkeyPatch):
         sys.modules.update(original)
 
 
+def _copied_task_source_provider(fake_provider, tmp_path: Path):
+    root = tmp_path / "lm_eval"
+    tasks = root / "tasks"
+    shutil.copytree(fake_provider.package_root / "tasks", tasks)
+
+    class CopiedSourceTaskManager(fake_provider.task_manager_type):
+        def __init__(self) -> None:
+            super().__init__()
+            for task_name in ("hellaswag", "winogrande"):
+                self.task_index[task_name] = SimpleNamespace(
+                    yaml_path=tasks / f"{task_name}.yaml"
+                )
+
+    return (
+        replace(
+            fake_provider,
+            task_manager_type=CopiedSourceTaskManager,
+            package_root=root,
+        ),
+        tasks,
+    )
+
+
 def _task_record(
     fake_provider,
     *,
@@ -239,7 +263,9 @@ def _task_record(
 ):
     from sml import evaluation
 
-    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    manager = evaluation._RecordingTaskManager(
+        fake_provider.make_task_manager(), fake_provider
+    )
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
     tuple(task.doc_iterator())
@@ -313,7 +339,9 @@ def test_task_provenance_prefers_effective_fewshot_config_split(fake_provider) -
     from sml import evaluation
     from sml.artifacts.manifest import structured_identity
 
-    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    manager = evaluation._RecordingTaskManager(
+        fake_provider.make_task_manager(), fake_provider
+    )
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
     tuple(task.doc_iterator())
@@ -346,7 +374,9 @@ def test_offline_provider_task4_invocation_records_effective_zero_shot_provenanc
 ) -> None:
     from sml import evaluation
 
-    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    manager = evaluation._RecordingTaskManager(
+        fake_provider.make_task_manager(), fake_provider
+    )
     recorder = evaluation._EvaluationRequestRecorder()
     raw_result = fake_provider.simple_evaluate(
         model=evaluation._lm_eval_model(tiny_session, "right", recorder),
@@ -505,7 +535,9 @@ def test_task_provenance_hashes_yaml_include_config_and_dataset(fake_provider) -
 def test_recording_manager_captures_one_exact_valid_load(fake_provider) -> None:
     from sml import evaluation
 
-    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    manager = evaluation._RecordingTaskManager(
+        fake_provider.make_task_manager(), fake_provider
+    )
     loaded = manager.load(["hellaswag"])
     assert manager.loaded is loaded
     with pytest.raises(SMLRuntimeError, match="second|once"):
@@ -597,7 +629,9 @@ def test_task_provenance_preserves_explicit_provider_filter_pipeline(
     """Catches replacement of an explicit provider-owned filter pipeline with defaults."""
     from sml import evaluation
 
-    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    manager = evaluation._RecordingTaskManager(
+        fake_provider.make_task_manager(), fake_provider
+    )
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
     tuple(task.doc_iterator())
@@ -777,7 +811,7 @@ def test_provider_iteration_captures_first_effective_eval_dataset(
             )
             return loaded
 
-    manager = evaluation._RecordingTaskManager(IteratingTaskManager())
+    manager = evaluation._RecordingTaskManager(IteratingTaskManager(), fake_provider)
     recorder = evaluation._EvaluationRequestRecorder()
     raw_result = fake_provider.simple_evaluate(
         model=evaluation._lm_eval_model(tiny_session, "right", recorder),
@@ -907,49 +941,23 @@ def test_evaluation_fails_before_publication_for_each_invalid_provider_version(
 def test_task_provenance_rejects_missing_index_yaml_path(fake_provider) -> None:
     from sml import evaluation
 
-    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
-    loaded = manager.load(["hellaswag"])
-    manager.task_index["hellaswag"] = SimpleNamespace(yaml_path=None)
-    recorder = evaluation._EvaluationRequestRecorder()
-    recorder.record("loglikelihood", loaded["tasks"]["hellaswag"].instances)
+    inner = fake_provider.make_task_manager()
+    inner.task_index["hellaswag"] = SimpleNamespace(yaml_path=None)
+    manager = evaluation._RecordingTaskManager(inner, fake_provider)
     with pytest.raises(SMLRuntimeError, match="YAML|yaml"):
-        evaluation._resolve_task_record(
-            task_name="hellaswag",
-            task=loaded["tasks"]["hellaswag"],
-            provider=fake_provider,
-            manager=manager,
-            recorder=recorder,
-            provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
-            limit=None,
-            padding="right",
-            seeds=evaluation._evaluation_seeds(),
-            provider_versions=evaluation._provider_versions(),
-        )
+        manager.load(["hellaswag"])
 
 
 def test_task_provenance_rejects_missing_indexed_yaml_file(fake_provider) -> None:
     from sml import evaluation
 
-    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
-    loaded = manager.load(["hellaswag"])
-    manager.task_index["hellaswag"] = SimpleNamespace(
+    inner = fake_provider.make_task_manager()
+    inner.task_index["hellaswag"] = SimpleNamespace(
         yaml_path=fake_provider.package_root / "tasks" / "missing.yaml"
     )
-    recorder = evaluation._EvaluationRequestRecorder()
-    recorder.record("loglikelihood", loaded["tasks"]["hellaswag"].instances)
+    manager = evaluation._RecordingTaskManager(inner, fake_provider)
     with pytest.raises(SMLRuntimeError, match="YAML|yaml"):
-        evaluation._resolve_task_record(
-            task_name="hellaswag",
-            task=loaded["tasks"]["hellaswag"],
-            provider=fake_provider,
-            manager=manager,
-            recorder=recorder,
-            provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
-            limit=None,
-            padding="right",
-            seeds=evaluation._evaluation_seeds(),
-            provider_versions=evaluation._provider_versions(),
-        )
+        manager.load(["hellaswag"])
 
 
 @pytest.mark.parametrize(
@@ -980,26 +988,11 @@ def test_task_provenance_rejects_unsafe_include_closure(
         (tasks / "common.yaml").write_text(included, encoding="utf-8")
     (tmp_path / "outside.yaml").write_text("metadata: {}\n", encoding="utf-8")
     provider = replace(fake_provider, package_root=root)
-    manager = evaluation._RecordingTaskManager(provider.make_task_manager())
-    loaded = manager.load(["hellaswag"])
-    manager.task_index["hellaswag"] = SimpleNamespace(
-        yaml_path=tasks / "hellaswag.yaml"
-    )
-    recorder = evaluation._EvaluationRequestRecorder()
-    recorder.record("loglikelihood", loaded["tasks"]["hellaswag"].instances)
+    inner = provider.make_task_manager()
+    inner.task_index["hellaswag"] = SimpleNamespace(yaml_path=tasks / "hellaswag.yaml")
+    manager = evaluation._RecordingTaskManager(inner, provider)
     with pytest.raises(SMLRuntimeError, match=message):
-        evaluation._resolve_task_record(
-            task_name="hellaswag",
-            task=loaded["tasks"]["hellaswag"],
-            provider=provider,
-            manager=manager,
-            recorder=recorder,
-            provider_result={"results": {"hellaswag": {"acc,none": 0.5}}},
-            limit=None,
-            padding="right",
-            seeds=evaluation._evaluation_seeds(),
-            provider_versions=evaluation._provider_versions(),
-        )
+        manager.load(["hellaswag"])
 
 
 @pytest.mark.parametrize(
@@ -1019,7 +1012,9 @@ def test_task_provenance_requires_selected_dataset_identities(
 ) -> None:
     from sml import evaluation
 
-    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    manager = evaluation._RecordingTaskManager(
+        fake_provider.make_task_manager(), fake_provider
+    )
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
     dataset = task._eval_docs if dataset_object == "eval_docs" else task.sampler.df
@@ -1047,7 +1042,9 @@ def test_task_provenance_selects_test_when_validation_is_not_declared(
 ) -> None:
     from sml import evaluation
 
-    manager = evaluation._RecordingTaskManager(fake_provider.make_task_manager())
+    manager = evaluation._RecordingTaskManager(
+        fake_provider.make_task_manager(), fake_provider
+    )
     loaded = manager.load(["hellaswag"])
     task = loaded["tasks"]["hellaswag"]
     task.config._values["validation_split"] = None
@@ -1466,6 +1463,63 @@ def test_evaluate_does_not_use_the_network(
     result = evaluate(tiny_evaluation_config(tiny_pretraining_run, tmp_path))
     assert read_evaluation_result(tmp_path / "evaluation.json") == result
     assert fake_lm_eval.calls
+
+
+@pytest.mark.parametrize("source_name", ("hellaswag.yaml", "common.yaml"))
+def test_evaluate_rejects_task_source_mutation_before_publication(
+    source_name: str,
+    tiny_pretraining_run: Path,
+    fake_provider,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Task source bytes used for construction must remain stable through publish."""
+    from sml import evaluation
+
+    provider, tasks = _copied_task_source_provider(fake_provider, tmp_path)
+    source = tasks / source_name
+
+    def simple_evaluate(**kwargs: object) -> dict[str, object]:
+        raw_result = fake_provider.simple_evaluate(**kwargs)
+        source.write_bytes(source.read_bytes() + b"\n# concurrent replacement\n")
+        return raw_result
+
+    monkeypatch.setattr(
+        evaluation,
+        "_import_lm_eval",
+        lambda: replace(provider, simple_evaluate=simple_evaluate),
+    )
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+
+    with pytest.raises(SMLRuntimeError, match="source|YAML|changed"):
+        evaluate(config)
+
+    assert not config.output.exists()
+
+
+def test_task_source_snapshot_rejects_mutation_during_provider_parse(
+    fake_provider,
+    tmp_path: Path,
+) -> None:
+    """One snapshot cannot mix bytes read before and during provider parsing."""
+    from sml import evaluation
+
+    provider, tasks = _copied_task_source_provider(fake_provider, tmp_path)
+    primary = tasks / "hellaswag.yaml"
+    real_load_yaml = provider.load_yaml
+    mutated = False
+
+    def mutating_load_yaml(path: Path, **kwargs: object) -> object:
+        nonlocal mutated
+        if Path(path).resolve() == primary.resolve() and not mutated:
+            mutated = True
+            primary.write_bytes(primary.read_bytes() + b"\n# parser race\n")
+        return real_load_yaml(path, **kwargs)
+
+    provider = replace(provider, load_yaml=mutating_load_yaml)
+
+    with pytest.raises(SMLRuntimeError, match="source|YAML|changed"):
+        evaluation._resolve_yaml_sources(provider, primary)
 
 
 def test_evaluate_preserves_complete_provider_result_and_task_metrics(

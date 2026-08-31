@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 _UNIT_DIR = Path(__file__).resolve().parents[1] / "unit"
@@ -49,6 +50,27 @@ def test_evaluation_result_pins_resolved_identity(
     assert persisted.tasks[0].metric_payload["acc,none"] == 0.5
     assert persisted.provider_result == result.provider_result
     assert persisted.identity == evaluation_result_identity(persisted)
+
+
+def test_full_evaluation_persists_recovered_model_operational_state(
+    tiny_pretraining_run: Path,
+    fake_lm_eval,
+    tmp_path: Path,
+) -> None:
+    """Evaluation persistence retains recovered-index and retention status."""
+    (tiny_pretraining_run / "latest.json").write_bytes(b"not-json")
+    config = replace(
+        tiny_evaluation_config(tiny_pretraining_run, tmp_path),
+        full_verify=True,
+    )
+
+    result = evaluate(config)
+    persisted = read_evaluation_result(config.output)
+
+    assert result.model.latest_recovered is True
+    assert result.model.pruning_pending is False
+    assert persisted.model.latest_recovered is True
+    assert persisted.model.pruning_pending is False
 
 
 def test_evaluate_is_idempotent_for_identical_output(
