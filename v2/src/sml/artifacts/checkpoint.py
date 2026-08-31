@@ -46,7 +46,9 @@ from sml.artifacts.manifest import (
     SwagDataManifest,
     TokenizerManifest,
     VerificationLevel,
+    _descriptor_filesystem_capability,
     _descriptor_is_local_apfs,
+    _FilesystemCapability,
     _freeze_normalized,
     _json_object_no_duplicates,
     _manifest_type_for_raw,
@@ -330,6 +332,16 @@ class _LockUnavailable(SMLArtifactError):
     pass
 
 
+class _SidecarProtocolUnavailable(SMLArtifactError):
+    pass
+
+
+class _WritableFilesystemUnavailable(SMLArtifactError):
+    def __init__(self, capability: _FilesystemCapability) -> None:
+        self.capability = capability
+        super().__init__("writable artifact parents require a local APFS filesystem")
+
+
 def _path_parts(protected: Path) -> tuple[Path, str]:
     if not isinstance(protected, Path):
         raise TypeError("protected path must be a Path")
@@ -346,10 +358,9 @@ def _open_writable_parent(parent: Path, fs: FilesystemOps) -> int:
         parent_stat = fs.stat(descriptor)
         if not stat.S_ISDIR(parent_stat.st_mode):
             raise SMLArtifactError("artifact parent is not a directory")
-        if not _descriptor_is_local_apfs(descriptor):
-            raise SMLArtifactError(
-                "writable artifact parents require a local APFS filesystem"
-            )
+        capability = _descriptor_filesystem_capability(descriptor)
+        if capability is not _FilesystemCapability.LOCAL_APFS:
+            raise _WritableFilesystemUnavailable(capability)
         return descriptor
     except BaseException as error:
         if descriptor >= 0:
@@ -452,21 +463,36 @@ def _prune_lock_owners(
     return [holder for holder in holders if _pid_may_be_alive(holder["pid"])]
 
 
-def _open_lock_sidecar(sidecar: str, parent_descriptor: int) -> int:
+def _open_lock_sidecar(sidecar: str, parent_descriptor: int) -> tuple[int, bool]:
     existing_flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     try:
-        return OS_FILESYSTEM.open(
-            sidecar,
-            _OPEN_LOCK | os.O_EXCL,
-            0o600,
-            dir_fd=parent_descriptor,
+        return (
+            OS_FILESYSTEM.open(
+                sidecar,
+                _OPEN_LOCK | os.O_EXCL,
+                0o600,
+                dir_fd=parent_descriptor,
+            ),
+            True,
         )
     except FileExistsError:
-        return OS_FILESYSTEM.open(
-            sidecar,
-            existing_flags,
-            dir_fd=parent_descriptor,
+        return (
+            OS_FILESYSTEM.open(
+                sidecar,
+                existing_flags,
+                dir_fd=parent_descriptor,
+            ),
+            False,
         )
+
+
+def _is_expected_sidecar_authority_error(error: BaseException) -> bool:
+    current: BaseException | None = error
+    while current is not None:
+        if isinstance(current, OSError):
+            return current.errno in {errno.EACCES, errno.EPERM, errno.EROFS}
+        current = current.__cause__
+    return False
 
 
 @contextmanager
@@ -478,19 +504,23 @@ def _protected_lock(
     wait: bool = False,
 ) -> Iterator[None]:
     parent, protected_name = _path_parts(protected)
-    parent_descriptor = _open_writable_parent(parent, OS_FILESYSTEM)
+    parent_descriptor = -1
     lock_descriptor = -1
     diagnostic_descriptor = -1
     acquired = False
     protected_released = False
+    sidecar_protocol_mutated = False
     owner_token = uuid.uuid4().hex
     try:
+        parent_descriptor = _open_writable_parent(parent, OS_FILESYSTEM)
         sidecar = _lock_name(protected_name, category)
-        lock_descriptor = _open_lock_sidecar(sidecar, parent_descriptor)
-        diagnostic_descriptor = _open_lock_sidecar(
+        lock_descriptor, created = _open_lock_sidecar(sidecar, parent_descriptor)
+        sidecar_protocol_mutated = created
+        diagnostic_descriptor, created = _open_lock_sidecar(
             _diagnostic_name(protected_name, category),
             parent_descriptor,
         )
+        sidecar_protocol_mutated = sidecar_protocol_mutated or created
         for descriptor in (lock_descriptor, diagnostic_descriptor):
             sidecar_stat = OS_FILESYSTEM.stat(descriptor)
             if not stat.S_ISREG(sidecar_stat.st_mode) or sidecar_stat.st_nlink != 1:
@@ -506,6 +536,7 @@ def _protected_lock(
                 stored_holders = _read_lock_owners(diagnostic_descriptor)
                 holders = _prune_lock_owners(stored_holders)
                 if holders != stored_holders:
+                    sidecar_protocol_mutated = True
                     _write_lock_owners(diagnostic_descriptor, holders)
                 try:
                     OS_FILESYSTEM.flock(
@@ -532,6 +563,7 @@ def _protected_lock(
                             "token": owner_token,
                         }
                     )
+                    sidecar_protocol_mutated = True
                     _write_lock_owners(diagnostic_descriptor, holders)
                     OS_FILESYSTEM.fsync_directory(parent_descriptor)
                     acquired = True
@@ -547,9 +579,17 @@ def _protected_lock(
                     _LOCK_RETRY_MAX_SECONDS,
                 )
         yield
-    except SMLArtifactError:
+    except SMLArtifactError as error:
+        if not sidecar_protocol_mutated and _is_expected_sidecar_authority_error(error):
+            raise _SidecarProtocolUnavailable(
+                f"{category} sidecar protocol is unavailable for {protected}"
+            ) from error
         raise
     except OSError as error:
+        if not sidecar_protocol_mutated and _is_expected_sidecar_authority_error(error):
+            raise _SidecarProtocolUnavailable(
+                f"{category} sidecar protocol is unavailable for {protected}"
+            ) from error
         raise SMLArtifactError(
             f"could not manage {category} lock for {protected}"
         ) from error
@@ -598,7 +638,8 @@ def _protected_lock(
             os.close(lock_descriptor)
         if diagnostic_descriptor >= 0:
             os.close(diagnostic_descriptor)
-        os.close(parent_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
 
 
 def publication_lock(target: Path) -> Iterator[None]:
@@ -2908,6 +2949,44 @@ def open_checkpoint_reader(
 
 
 @contextmanager
+def _latest_checkpoint_read_access(
+    run: Path,
+    run_descriptor: int,
+) -> Iterator[None]:
+    try:
+        capability = _descriptor_filesystem_capability(run_descriptor)
+    except OSError as error:
+        raise SMLArtifactError(
+            "could not determine latest-checkpoint filesystem capability"
+        ) from error
+    if capability is _FilesystemCapability.NON_LOCAL:
+        raise SMLArtifactError(
+            "read-only latest-checkpoint access rejects non-local filesystems"
+        )
+    if capability is _FilesystemCapability.LOCAL_OTHER:
+        yield
+        return
+
+    lock_stack = ExitStack()
+    reduced_guarantee = False
+    try:
+        lock_stack.enter_context(
+            _protected_lock(run, category="run-access", exclusive=False, wait=True)
+        )
+    except _WritableFilesystemUnavailable as error:
+        if error.capability is not _FilesystemCapability.LOCAL_OTHER:
+            raise
+        reduced_guarantee = True
+    except _SidecarProtocolUnavailable:
+        reduced_guarantee = True
+    if reduced_guarantee:
+        yield
+        return
+    with lock_stack:
+        yield
+
+
+@contextmanager
 def open_latest_checkpoint_reader(
     run: Path,
     *,
@@ -2917,7 +2996,7 @@ def open_latest_checkpoint_reader(
     run_descriptor: int | None = None,
     fs: FilesystemOps = OS_FILESYSTEM,
 ) -> Iterator[CheckpointReader]:
-    """Resolve and retain the latest checkpoint under one run-access lock."""
+    """Retain latest under shared local-APFS or reduced local read access."""
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
     if not isinstance(verification, VerificationLevel):
@@ -2941,75 +3020,87 @@ def open_latest_checkpoint_reader(
     if not isinstance(fs, FilesystemOps):
         raise TypeError("fs must implement FilesystemOps")
 
-    with _protected_lock(run, category="run-access", exclusive=False, wait=True):
-        owned_run_descriptor = (
-            os.dup(run_descriptor)
-            if run_descriptor is not None
-            else _open_directory(run, fs, writable=False, context="run directory")
-        )
-        checkpoints_descriptor = -1
-        owned: _OwnedStep | None = None
-        failure: BaseException | None = None
-        try:
-            run_manifest = _read_manifest_from_descriptor(
-                owned_run_descriptor,
-                RUN_MANIFEST_TYPES,
-                verification,
-                context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
-            )
-            checkpoints_descriptor = _open_checkpoints_directory(
-                run, fs, owned_run_descriptor, writable=False
-            )
-            recovered = _recover_latest_open(
-                run,
-                run_manifest,
-                owned_run_descriptor,
-                checkpoints_descriptor,
-                writable=False,
-                verification=verification,
-                fs=fs,
-                allow_empty=False,
-                defer_selected_proof=True,
-            )
-            if recovered is None:
-                raise SMLArtifactError("run has no published checkpoints")
-            owned = _open_verified_step_from_descriptor(
-                run,
-                run_manifest,
-                checkpoints_descriptor,
-                step=recovered.step,
-                verification=verification,
-                fs=fs,
-                load_array_groups=load_array_groups,
-                materialize_byte_groups=materialize_byte_groups,
-            )
-            if owned.resolved.checkpoint.identity != recovered.checkpoint.identity:
-                raise SMLArtifactError("resolved latest changed before state loading")
-            reader_resolved = dataclasses.replace(
-                owned.resolved,
-                latest_recovered=recovered.latest_recovered,
-                latest_repair_persisted=recovered.latest_repair_persisted,
-                pruning_pending=recovered.pruning_pending,
-            )
-            owned.resolved = reader_resolved
-            yield CheckpointReader(
-                resolved=reader_resolved,
-                _owned_step=owned,
-                _run_descriptor=owned_run_descriptor,
-                _checkpoints_descriptor=checkpoints_descriptor,
-                _fs=fs,
-            )
-        except BaseException as error:
-            failure = error
-            raise
-        finally:
-            cleanup_error = _close_reader_resources(
-                owned, checkpoints_descriptor, owned_run_descriptor
-            )
-            if cleanup_error is not None:
-                if failure is not None:
-                    raise failure from cleanup_error
-                raise cleanup_error
+    owned_run_descriptor = (
+        os.dup(run_descriptor)
+        if run_descriptor is not None
+        else _open_directory(run, fs, writable=False, context="run directory")
+    )
+    reader_resources_closed = False
+    try:
+        with _latest_checkpoint_read_access(run, owned_run_descriptor):
+            checkpoints_descriptor = -1
+            owned: _OwnedStep | None = None
+            failure: BaseException | None = None
+            try:
+                run_manifest = _read_manifest_from_descriptor(
+                    owned_run_descriptor,
+                    RUN_MANIFEST_TYPES,
+                    verification,
+                    context=str(run / PretrainingRunManifest.MANIFEST_FILENAME),
+                )
+                checkpoints_descriptor = _open_checkpoints_directory(
+                    run, fs, owned_run_descriptor, writable=False
+                )
+                recovered = _recover_latest_open(
+                    run,
+                    run_manifest,
+                    owned_run_descriptor,
+                    checkpoints_descriptor,
+                    writable=False,
+                    verification=verification,
+                    fs=fs,
+                    allow_empty=False,
+                    defer_selected_proof=True,
+                )
+                if recovered is None:
+                    raise SMLArtifactError("run has no published checkpoints")
+                owned = _open_verified_step_from_descriptor(
+                    run,
+                    run_manifest,
+                    checkpoints_descriptor,
+                    step=recovered.step,
+                    verification=verification,
+                    fs=fs,
+                    load_array_groups=load_array_groups,
+                    materialize_byte_groups=materialize_byte_groups,
+                )
+                if owned.resolved.checkpoint.identity != recovered.checkpoint.identity:
+                    raise SMLArtifactError(
+                        "resolved latest changed before state loading"
+                    )
+                reader_resolved = dataclasses.replace(
+                    owned.resolved,
+                    latest_recovered=recovered.latest_recovered,
+                    latest_repair_persisted=recovered.latest_repair_persisted,
+                    pruning_pending=recovered.pruning_pending,
+                )
+                owned.resolved = reader_resolved
+                yield CheckpointReader(
+                    resolved=reader_resolved,
+                    _owned_step=owned,
+                    _run_descriptor=owned_run_descriptor,
+                    _checkpoints_descriptor=checkpoints_descriptor,
+                    _fs=fs,
+                )
+            except BaseException as error:
+                failure = error
+                raise
+            finally:
+                cleanup_error = _close_reader_resources(
+                    owned, checkpoints_descriptor, owned_run_descriptor
+                )
+                reader_resources_closed = True
+                if cleanup_error is not None:
+                    if failure is not None:
+                        raise failure from cleanup_error
+                    raise cleanup_error
+    except BaseException as error:
+        if not reader_resources_closed:
+            try:
+                os.close(owned_run_descriptor)
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+        raise
 
 
 def _resolve_step_from_descriptor(

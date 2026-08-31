@@ -746,7 +746,11 @@ def test_lock_probe_failure_closes_parent_descriptor(tmp_path, monkeypatch):
         probed_descriptors.append(descriptor)
         raise RuntimeError("probe failed")
 
-    monkeypatch.setattr(checkpoint, "_descriptor_is_local_apfs", failing_probe)
+    monkeypatch.setattr(
+        checkpoint,
+        "_descriptor_filesystem_capability",
+        failing_probe,
+    )
 
     with (
         pytest.raises(RuntimeError, match="probe failed"),

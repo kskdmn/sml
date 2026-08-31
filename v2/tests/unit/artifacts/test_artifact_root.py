@@ -10,12 +10,63 @@ from sml.artifacts import manifest as artifacts
 from sml.errors import SMLArtifactError
 
 
+class _FakeFstatfs:
+    def __init__(self, filesystem_type: bytes, flags: int) -> None:
+        self.argtypes = None
+        self.restype = None
+        self._filesystem_type = filesystem_type
+        self._flags = flags
+        self.descriptors: list[int] = []
+
+    def __call__(self, descriptor: int, filesystem_pointer) -> int:
+        self.descriptors.append(descriptor)
+        filesystem = filesystem_pointer._obj
+        filesystem.f_fstypename = self._filesystem_type
+        filesystem.f_flags = self._flags
+        return 0
+
+
+class _FakeLibc:
+    def __init__(self, fstatfs: _FakeFstatfs) -> None:
+        self.fstatfs = fstatfs
+
+
 def _payload_ref(logical_path: str, data: bytes) -> artifacts.PayloadRef:
     return artifacts.PayloadRef(
         logical_path=logical_path,
         identity=artifacts.file_identity(io.BytesIO(data)),
         byte_size=len(data),
     )
+
+
+@pytest.mark.parametrize(
+    ("filesystem_type", "flags", "expected"),
+    (
+        (b"apfs", artifacts._MNT_LOCAL, "local-apfs"),
+        (b"apfs", 0, "non-local"),
+        (b"hfs", artifacts._MNT_LOCAL, "local-other"),
+        (b"nfs", 0, "non-local"),
+    ),
+)
+def test_descriptor_filesystem_capability_distinguishes_locality_and_apfs(
+    monkeypatch: pytest.MonkeyPatch,
+    filesystem_type: bytes,
+    flags: int,
+    expected: str,
+) -> None:
+    """Collapsing type or MNT_LOCAL would misroute reader and writer protocols."""
+    fake_fstatfs = _FakeFstatfs(filesystem_type, flags)
+    monkeypatch.setattr(artifacts.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        artifacts.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: _FakeLibc(fake_fstatfs),
+    )
+
+    capability = artifacts._descriptor_filesystem_capability(37)
+
+    assert capability.value == expected
+    assert fake_fstatfs.descriptors == [37]
 
 
 def _open_payload_in_child(

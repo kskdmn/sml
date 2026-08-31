@@ -59,9 +59,15 @@ class _DarwinStatfs(ctypes.Structure):
     ]
 
 
-def _descriptor_is_local_apfs(descriptor: int) -> bool:
+class _FilesystemCapability(Enum):
+    LOCAL_APFS = "local-apfs"
+    LOCAL_OTHER = "local-other"
+    NON_LOCAL = "non-local"
+
+
+def _descriptor_filesystem_capability(descriptor: int) -> _FilesystemCapability:
     if sys.platform != "darwin":
-        return False
+        return _FilesystemCapability.NON_LOCAL
     filesystem = _DarwinStatfs()
     libc = ctypes.CDLL(None, use_errno=True)
     fstatfs = libc.fstatfs
@@ -71,7 +77,18 @@ def _descriptor_is_local_apfs(descriptor: int) -> bool:
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number))
     filesystem_type = bytes(filesystem.f_fstypename).split(b"\0", 1)[0]
-    return filesystem_type == b"apfs" and bool(filesystem.f_flags & _MNT_LOCAL)
+    if not filesystem.f_flags & _MNT_LOCAL:
+        return _FilesystemCapability.NON_LOCAL
+    if filesystem_type == b"apfs":
+        return _FilesystemCapability.LOCAL_APFS
+    return _FilesystemCapability.LOCAL_OTHER
+
+
+def _descriptor_is_local_apfs(descriptor: int) -> bool:
+    return (
+        _descriptor_filesystem_capability(descriptor)
+        is _FilesystemCapability.LOCAL_APFS
+    )
 
 
 def _validated_string(value: str) -> str:
