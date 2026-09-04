@@ -2,12 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Final execution status (2026-09-01):** Part 2, Task 6.4, the
-final-acceptance remediation, and the umbrella refactor are complete. The final
-production source/test commit is
+**Final execution status (2026-09-05):** Part 2, Task 6.4, and the umbrella
+refactor implementation are complete, but final acceptance has one test-only
+follow-up. The final production source/test commit is
 `d6a28498a33624ccb6e58b17b380c15c9f072211`; final SWAG evidence
 retirement/source-harness is `0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`;
-and reviewed pre-documentation evidence HEAD is
+and verified pre-documentation evidence HEAD is
 `da3dc9365503059bd0e2c1f60c3b2b3c257c3443`. The original Task 6
 documentation history remains: completion
 `34c7ba4f775ead472aa780a231e7475be1bd3831`, exact-SHA metadata
@@ -19,8 +19,14 @@ reported Critical 0, Important 0, Minor 0 after two fix rounds. The additional
 SDD final whole-branch review at `6dbc059` reported Critical 0, Important 1,
 Minor 0: a reduced-guarantee checkpoint-reader issue. The source/test wave at
 `d6a2849` fixed it, SWAG evidence was retired at `0f767cb`, and final evidence
-was refreshed at `da3dc93`. The sole scoped re-review of this complete fix wave
-is a later SDD process gate and is not claimed in this tracked plan.
+was refreshed at `da3dc93`. The sole scoped re-review at `099509f` confirmed
+the original Important was addressed but returned Critical 0, Important 1,
+Minor 1 and did not approve final closure. The Important is missing lasting
+regression coverage for authority failure after sidecar-protocol mutation. The
+Minor was the ambiguous word “reviewed” for `da3dc93`; this update replaces it
+with “verified.” The test gap does not invalidate the production correction or
+recorded SWAG evidence, but acceptance remains open until an authorized
+test-only correction and follow-up review pass.
 
 Final acceptance evidence at `da3dc93`: full V2 `1611 passed in 105.66s`;
 integration `252 passed in 23.10s`; CLI workflows `31 passed in 6.25s`; CLI

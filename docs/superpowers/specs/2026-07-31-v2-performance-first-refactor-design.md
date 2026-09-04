@@ -5,12 +5,12 @@
 Approved umbrella design for a clean replacement of the entire `v2` tree.
 This specification supersedes the former checkpoint/SWAG-only design and plan.
 
-**Final execution update (2026-09-01):** The umbrella refactor, Part 2,
-Task 6.4, and the final-acceptance remediation are complete. The final
-production source/test commit is
+**Final execution update (2026-09-05):** The umbrella refactor implementation,
+Part 2 implementation, and Task 6.4 behavior are complete, but final acceptance
+has one test-only follow-up. The final production source/test commit is
 `d6a28498a33624ccb6e58b17b380c15c9f072211`; final SWAG evidence
 retirement/source-harness is `0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`;
-and the reviewed pre-documentation evidence HEAD is
+and the verified pre-documentation evidence HEAD is
 `da3dc9365503059bd0e2c1f60c3b2b3c257c3443`. The original Task 6
 documentation history remains: completion
 `34c7ba4f775ead472aa780a231e7475be1bd3831`, exact-SHA metadata
@@ -24,9 +24,14 @@ Minor 0: checkpoint readers could not honor the documented reduced-guarantee
 mode when a shared lock sidecar was unavailable on supported read-only or
 non-APFS local storage. The source/test wave at `d6a2849` fixed that issue,
 SWAG evidence was retired against the complete source/harness at `0f767cb`,
-and final evidence was refreshed at `da3dc93`. The sole scoped re-review of
-this complete fix wave is a later SDD process gate and is not claimed in this
-tracked specification.
+and final evidence was refreshed at `da3dc93`. The sole scoped re-review at
+`099509f` confirmed the original Important was addressed but returned Critical
+0, Important 1, Minor 1 and did not approve final closure. The Important is
+missing lasting regression coverage for an authority failure after sidecar-
+protocol mutation. The Minor was the ambiguous word “reviewed” for `da3dc93`;
+this status update replaces it with “verified.” The test gap does not invalidate
+the production correction or recorded SWAG evidence, but acceptance remains
+open until an authorized test-only correction and follow-up review pass.
 
 Final gate evidence at `da3dc93` is exact: full V2 `1611 passed in 105.66s`;
 integration `252 passed in 23.10s`; CLI workflows `31 passed in 6.25s`; CLI

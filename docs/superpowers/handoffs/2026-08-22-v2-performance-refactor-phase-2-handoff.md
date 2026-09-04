@@ -1,23 +1,24 @@
-# V2 Refactor Handoff: Artifact Residual Corrections Complete
+# V2 Refactor Handoff: Final Test Follow-up Required
 
 **Recorded:** 2026-08-22 (Asia/Shanghai)
 
-**Last updated:** 2026-09-01 (Asia/Shanghai)
+**Last updated:** 2026-09-05 (Asia/Shanghai)
 
-**Purpose:** Record the exact final-acceptance closure and preserve the earlier
+**Purpose:** Record the exact final-acceptance state and preserve the earlier
 implementation history without requiring the prior conversation.
 
-## 2026-09-01 Final Acceptance Closure — Authoritative Status
+## 2026-09-05 Final Acceptance Follow-up — Authoritative Status
 
 This section supersedes every older current-status, takeover, next-action,
 deferred-finding, and completion statement below. Older sections are retained
-only as past-tense implementation history. No remediation task remains active.
+only as past-tense implementation history. One test-only acceptance task remains.
 
-Task 6.4, the final-acceptance remediation, Part 2, and the umbrella refactor
-are complete. The final production source/test commit is
+Task 6.4 behavior, the remediation implementation, Part 2 implementation, and
+the umbrella refactor implementation are complete, but final acceptance is not
+closed. The final production source/test commit is
 `d6a28498a33624ccb6e58b17b380c15c9f072211`; the final SWAG evidence
 retirement/source-harness commit is
-`0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`; and the final reviewed
+`0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`; and the final verified
 pre-documentation evidence HEAD is
 `da3dc9365503059bd0e2c1f60c3b2b3c257c3443`. The original Task 6
 documentation history remains: completion
@@ -30,8 +31,14 @@ reported Critical 0, Important 0, Minor 0 after two fix rounds. The additional
 SDD final whole-branch review at `6dbc059` reported Critical 0, Important 1,
 Minor 0: a reduced-guarantee checkpoint-reader issue. The source/test wave at
 `d6a2849` fixed it, SWAG evidence was retired at `0f767cb`, and final evidence
-was refreshed at `da3dc93`. The sole scoped re-review of this complete fix wave
-is a later SDD process gate and is not claimed in this tracked handoff.
+was refreshed at `da3dc93`. The sole scoped re-review at `099509f` confirmed
+the original Important was addressed but returned Critical 0, Important 1,
+Minor 1 and did not approve final closure. The Important is missing lasting
+regression coverage for an authority failure after sidecar-protocol mutation:
+the current tests would remain green if all four mutation-flag assignments in
+the fail-closed guard were disabled. The Minor was the ambiguous word
+“reviewed” for `da3dc93`; this update replaces it with “verified.” The test gap
+does not invalidate the production correction or recorded SWAG evidence.
 
 ### Final verified evidence
 
@@ -94,12 +101,16 @@ gate.
 
 ### Handoff
 
-There is no implementation continuation or performance gate. Preserve the
-original Task 6 completion, exact-SHA metadata, and review-scope clarification
-commits, keep the branch unpushed unless asked, and treat all following
-takeover procedures as historical records. The sole scoped re-review of the
-final whole-branch fix wave remains a later SDD process gate rather than a
-tracked-document completion claim.
+Preserve the production and evidence commits above; no SWAG regeneration is
+required for the remaining test-only correction. Before final closure, obtain
+explicit authorization for a follow-up correction/review budget, add lasting
+regressions that allow initial run-access sidecar mutation (and preferably a
+diagnostic write) before raising `EACCES`, `EPERM`, and `EROFS`, and assert that
+latest recovery is never entered and no reduced-mode reader is yielded. Run the
+focused artifact tests, Ruff, the full V2 suite outside the sandbox, both
+validators, the lightweight documentation gates, and an independent scoped
+review with zero findings. Keep the branch unpushed unless asked, and treat all
+following takeover procedures as historical records.
 
 ## 2026-08-30 Artifact Residual Closure — Current Takeover Point
 

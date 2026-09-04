@@ -3,11 +3,12 @@
 ## Status
 
 The repair direction was approved in conversation on 2026-08-25. The
-remediation, Task 6.4, Part 2, and the umbrella refactor are complete as of
-2026-09-01. The final production source/test commit is
+remediation implementation, Task 6.4 behavior, Part 2 implementation, and the
+umbrella refactor implementation are complete, but final acceptance has one
+test-only follow-up as of 2026-09-05. The final production source/test commit is
 `d6a28498a33624ccb6e58b17b380c15c9f072211`; final SWAG evidence
 retirement/source-harness is `0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`;
-and reviewed pre-documentation evidence HEAD is
+and verified pre-documentation evidence HEAD is
 `da3dc9365503059bd0e2c1f60c3b2b3c257c3443`. The original Task 6
 documentation history remains: completion
 `34c7ba4f775ead472aa780a231e7475be1bd3831`, exact-SHA metadata
@@ -19,8 +20,14 @@ reported Critical 0, Important 0, Minor 0 after two fix rounds. The additional
 SDD final whole-branch review at `6dbc059` reported Critical 0, Important 1,
 Minor 0: a reduced-guarantee checkpoint-reader issue. The source/test wave at
 `d6a2849` fixed it, SWAG evidence was retired at `0f767cb`, and final evidence
-was refreshed at `da3dc93`. The sole scoped re-review of this complete fix wave
-is a later SDD process gate and is not claimed in this tracked design.
+was refreshed at `da3dc93`. The sole scoped re-review at `099509f` confirmed
+the original Important was addressed but returned Critical 0, Important 1,
+Minor 1 and did not approve final closure. The Important is missing lasting
+regression coverage for authority failure after sidecar-protocol mutation. The
+Minor was the ambiguous word “reviewed” for `da3dc93`; this update replaces it
+with “verified.” The test gap does not invalidate the production correction or
+recorded SWAG evidence, but acceptance remains open until an authorized
+test-only correction and follow-up review pass.
 
 Final evidence at `da3dc93`: full V2 `1611 passed in 105.66s`;
 integration `252 passed in 23.10s`; CLI workflows `31 passed in 6.25s`;
@@ -66,7 +73,7 @@ compatibility layer.
 
 ## Context
 
-Task 6.4 acceptance at `807137d` established that the tracked checkout was
+Task 6.4 verification at `807137d` established that the tracked checkout was
 clean, Ruff passed, all 1,104 v2 tests passed, the unified CLI and integration
 workflows passed, both controlled-quality validators passed, canonical evidence
 was unchanged, and `uv.lock` was unchanged. A subsequent whole-scope
@@ -95,13 +102,12 @@ Passing tests were evidence about the implemented behavior; they did not
 override these stricter architectural requirements. At that review point,
 Task 6.4 was incomplete pending the repairs, quality recapture, gates, and
 the plan-required fresh whole-scope architecture review. Task 5 supplied that
-review and two scoped fix re-reviews; its acceptance review was complete at
-`6647282`. Those Task 6.4 acceptance requirements are complete under the final
-status above. The additional SDD final whole-branch review at `6dbc059`
+review and two scoped fix re-reviews; its plan-level acceptance review was
+complete at `6647282`. The additional SDD final whole-branch review at `6dbc059`
 subsequently found the single Important reduced-guarantee checkpoint-reader
 issue described above, and the complete fix/evidence refresh ended at
-`da3dc93`. Only the later scoped re-review of that final fix wave remains an
-unclaimed SDD process gate.
+`da3dc93`. Its sole scoped re-review at `099509f` addressed that runtime issue
+but left the test-only acceptance follow-up described in the status above.
 
 ## Goals
 
