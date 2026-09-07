@@ -1211,6 +1211,7 @@ def _validate_builder_result(
             temporary_descriptor,
             manifest,
             VerificationLevel.FULL,
+            load_array_groups=frozenset(),
         )
     return manifest
 
@@ -3120,6 +3121,9 @@ def _resolve_step_from_descriptor(
         step=step,
         verification=verification,
         fs=fs,
+        load_array_groups=(
+            frozenset() if verification is VerificationLevel.FULL else None
+        ),
         verify_contents=verify_contents,
     )
     try:
@@ -3773,6 +3777,7 @@ def publish_checkpoint(
             temporary_descriptor,
             committed_manifest,
             VerificationLevel.FULL,
+            load_array_groups=frozenset(),
         )
         _require_named_directory_inode(
             fs,
@@ -4162,6 +4167,7 @@ def prune_to_latest(
                         step=step,
                         verification=VerificationLevel.FULL,
                         fs=fs,
+                        load_array_groups=frozenset(),
                     )
                 )
 
@@ -4172,6 +4178,7 @@ def prune_to_latest(
                 step=latest.step,
                 verification=VerificationLevel.FULL,
                 fs=fs,
+                load_array_groups=frozenset(),
             )
             latest_proof = owned_latest.resolved
             if latest_proof.checkpoint.identity != latest.checkpoint.identity:

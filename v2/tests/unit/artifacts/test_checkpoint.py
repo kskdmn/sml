@@ -1846,6 +1846,81 @@ def test_retention_never_deletes_latest(valid_run: Path) -> None:
     ]
 
 
+@pytest.mark.parametrize("checkpoint_count", (2, 4))
+def test_checkpoint_maintenance_keeps_tensor_memory_bounded(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint_count: int,
+) -> None:
+    """Publication, resolution, and retention need proofs without full snapshots."""
+
+    def reject_tensor_load(*_args, **_kwargs):
+        pytest.fail("checkpoint maintenance materialized safetensors payloads")
+
+    monkeypatch.setattr(mx, "load", reject_tensor_load)
+    for step in range(2, checkpoint_count + 1):
+        _publish_step(valid_run, step)
+
+    real_delete = checkpoint._detach_and_delete_owned_step
+    deleted_steps: list[int] = []
+
+    def check_retained_contents(*args, candidate, latest, **kwargs):
+        for owned in (candidate, latest):
+            assert owned.contents is not None
+            assert owned.contents.array_groups == {}
+            assert owned.contents.payload_bytes == {}
+            assert owned.contents.boundary_state is not None
+        deleted_steps.append(candidate.resolved.step)
+        return real_delete(*args, candidate=candidate, latest=latest, **kwargs)
+
+    monkeypatch.setattr(
+        checkpoint,
+        "_detach_and_delete_owned_step",
+        check_retained_contents,
+    )
+    with checkpoint.run_writer_lock(valid_run):
+        retained = checkpoint.prune_to_latest(valid_run)
+
+    assert deleted_steps == list(range(1, checkpoint_count))
+    assert retained.step == checkpoint_count
+    assert retained.verification is VerificationLevel.FULL
+    assert sorted(path.name for path in (valid_run / "checkpoints").iterdir()) == [
+        f"step-{checkpoint_count:09d}"
+    ]
+
+
+@pytest.mark.parametrize("corrupt_step", (1, 2, 3))
+def test_streaming_retention_rejects_equal_size_payload_corruption(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corrupt_step: int,
+) -> None:
+    """Removing tensor materialization must preserve every candidate's full hash."""
+    _publish_step(valid_run, 2)
+    _publish_step(valid_run, 3)
+    payload = (
+        valid_run / "checkpoints" / f"step-{corrupt_step:09d}" / "optimizer.safetensors"
+    )
+    encoded = payload.read_bytes()
+    payload.write_bytes(encoded[:-1] + bytes([encoded[-1] ^ 1]))
+
+    def reject_tensor_load(*_args, **_kwargs):
+        pytest.fail("checkpoint retention materialized safetensors payloads")
+
+    monkeypatch.setattr(mx, "load", reject_tensor_load)
+    fs = RecordingFilesystemOps(valid_run)
+    with (
+        checkpoint.run_writer_lock(valid_run),
+        pytest.raises(SMLArtifactError, match="payload identity mismatch"),
+    ):
+        checkpoint.prune_to_latest(valid_run, fs=fs)
+
+    assert fs.delete_count == 0
+    assert all(
+        (valid_run / "checkpoints" / f"step-{step:09d}").is_dir() for step in (1, 2, 3)
+    )
+
+
 def test_retention_reports_persisted_latest_recovery(valid_run: Path) -> None:
     """Retention must preserve the recovery outcome returned by its first phase."""
     _publish_step(valid_run, 2)

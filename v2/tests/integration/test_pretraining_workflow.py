@@ -205,6 +205,39 @@ def _config(data: Path, run: Path, *, maximum_steps: int = 2) -> PretrainingConf
     )
 
 
+def test_pretraining_logs_update_metrics_at_configured_interval(
+    prepared_data, tmp_path, monkeypatch, capsys
+) -> None:
+    updates = []
+    original_step = pretrain.PretrainingKernels.optimizer_step
+
+    def record_step(kernels, *args):
+        updated = original_step(kernels, *args)
+        updates.append(updated.metrics)
+        return updated
+
+    monkeypatch.setattr(pretrain.PretrainingKernels, "optimizer_step", record_step)
+    trained = pretrain.train(
+        replace(
+            _config(prepared_data, tmp_path / "logs-run", maximum_steps=3),
+            log_interval=2,
+        )
+    )
+    output = capsys.readouterr()
+    assert trained.step == 3
+    lines = output.err.splitlines()
+    assert output.out == ""
+    assert len(lines) == 1
+    assert lines[0].startswith("pretrain step=2 epoch=0 rows=4 ")
+    metrics = dict(field.split("=", 1) for field in lines[0].split()[1:])
+    assert float(metrics["loss"]) == pytest.approx(
+        float(updates[1]["loss"].item()), abs=1e-6
+    )
+    assert float(metrics["learning_rate"]) == pytest.approx(
+        float(updates[1]["learning_rate"].item()), rel=1e-5
+    )
+
+
 def _loaded_groups(run: Path) -> tuple[dict, dict, dict, dict]:
     resolved = resolve_latest_step(
         run,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -12,6 +13,26 @@ from sml.errors import SMLConfigurationError
 from sml.model.config import ModelConfig
 
 _INT32_MAX = 2**31 - 1
+
+
+def log_training_progress(
+    phase: str,
+    *,
+    step: int,
+    epoch: int,
+    units: int,
+    unit_name: str,
+    loss: float,
+    learning_rate: float,
+    accuracy: float | None = None,
+) -> None:
+    message = (
+        f"{phase} step={step} epoch={epoch} {unit_name}={units} "
+        f"loss={loss:.6f} learning_rate={learning_rate:.6g}"
+    )
+    if accuracy is not None:
+        message += f" accuracy={accuracy:.6f}"
+    print(message, file=sys.stderr, flush=True)
 
 
 def _require_finite(value: object, field_name: str) -> float:

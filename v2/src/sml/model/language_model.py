@@ -221,6 +221,13 @@ class SMLLanguageModel(nn.Module):
         training: bool,
         key: mx.array | None,
     ) -> tuple[mx.array, KVArrayState | None, mx.array | None]:
+        """Run a prevalidated forward without host synchronization.
+
+        Cached inputs must append contiguously within the allocated capacity;
+        every slot below each cache length must already be populated. Direct
+        callers can use ``KVCache.validate_append`` before entering a compiled
+        region. The public model call performs that validation automatically.
+        """
         batch_size, query_length = input_ids.shape
         if attention_mask is None:
             attention_mask = mx.ones((batch_size, query_length), dtype=mx.bool_)
@@ -277,6 +284,12 @@ class SMLLanguageModel(nn.Module):
         key: mx.array | None = None,
     ) -> ForwardOutput:
         cache_state = None if cache is None else cache.state
+        if cache is not None:
+            if attention_mask is None:
+                attention_mask = mx.ones(input_ids.shape, dtype=mx.bool_)
+            elif attention_mask.shape != input_ids.shape:
+                raise ValueError("attention_mask must match the input shape")
+            positions = cache.validate_append(attention_mask, positions)
         logits, returned_cache_state, next_key = self.forward_arrays(
             self.parameters(),
             input_ids,

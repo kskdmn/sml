@@ -1280,13 +1280,18 @@ def test_compiled_scoring_uses_token_shaped_target_log_probabilities(
 
 
 @pytest.mark.parametrize("padding", ["left", "right"])
-def test_heterogeneous_batch_scoring_matches_independent_numeric_oracle(
+def test_heterogeneous_batch_scoring_matches_oracle_without_generation_buffers(
     tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
     padding: str,
 ) -> None:
     requests = heterogeneous_scoring_requests()
     expected = independent_scoring_oracle(tiny_session, requests)
 
+    def forbid_kv_allocation(*_args, **_kwargs):
+        pytest.fail("likelihood scoring must not allocate a generation KV cache")
+
+    monkeypatch.setattr(inference, "allocate_kv_state", forbid_kv_allocation)
     actual = score_loglikelihood_batch(tiny_session, requests, padding=padding)
 
     assert_loglikelihood_results_close(
@@ -1295,6 +1300,8 @@ def test_heterogeneous_batch_scoring_matches_independent_numeric_oracle(
         atol=1e-5,
         rtol=1e-5,
     )
+    assert tiny_session.buffer_pool.active_leases == 0
+    assert not tiny_session.buffer_pool._free
 
 
 def test_continuation_only_scoring_is_finite(tiny_session: InferenceSession) -> None:

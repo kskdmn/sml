@@ -65,6 +65,7 @@ from sml.training.common import (
     initialize_adam_state,
     initialize_base_parameter_state,
     learning_rate_at,
+    log_training_progress,
     normalize_and_clip,
 )
 from sml.training.random import counter_random_key
@@ -943,6 +944,16 @@ def _run_training(
             microsteps=scalar.microsteps + window_microsteps,
             cursor=pending_cursor,
         )
+        if scalar.step % config.log_interval == 0:
+            log_training_progress(
+                "pretrain",
+                step=scalar.step,
+                epoch=scalar.cursor.epoch,
+                units=scalar.rows,
+                unit_name="rows",
+                loss=float(updated.metrics["loss"].item()),
+                learning_rate=float(updated.metrics["learning_rate"].item()),
+            )
         window_microsteps = 0
         pending_cursor = None
         state = _RestoredTrainingState(parameters, optimizer, trainer, scalar)

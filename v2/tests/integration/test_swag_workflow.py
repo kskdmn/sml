@@ -787,7 +787,7 @@ def test_lora_microbatch_progress_supports_full_checkpoint_consumers(
     tiny_swag_bundle,
     tmp_path,
 ) -> None:
-    """One partial LoRA microbatch is a complete, verifiable optimizer step."""
+    """Accumulated LoRA microbatches form a complete, verifiable optimizer step."""
     trained = finetune(
         tiny_swag_training_config(
             tiny_base_run,
@@ -810,8 +810,8 @@ def test_lora_microbatch_progress_supports_full_checkpoint_consumers(
     )
     state = json.loads((resolved.step_directory / "state.json").read_text())
     assert state["step"] == 1
-    assert state["microsteps"] == 1
-    assert 1 <= state["examples"] <= 2
+    assert state["microsteps"] == 2
+    assert 2 <= state["examples"] <= 4
     verify_artifact(trained.run, full=True)
     InferenceSession.from_checkpoint(trained.run, full_verify=True)
 
@@ -832,6 +832,54 @@ def test_lora_microbatch_progress_supports_full_checkpoint_consumers(
     )
     assert resumed_resolved.step == resumed_state["step"] == 2
     verify_artifact(resumed.run, full=True)
+
+
+def test_swag_accumulates_microbatches_and_logs_tail_metrics(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch, capsys
+) -> None:
+    updates = []
+    original_step = swag_module.SwagKernels.optimizer_step
+
+    def record_step(kernels, adapters, optimizer, trainer):
+        updates.append(
+            (
+                int(trainer.valid_count.item()),
+                float((trainer.loss_numerator / trainer.valid_count).item()),
+                float((trainer.correct_count / trainer.valid_count).item()),
+                float(
+                    swag_module.learning_rate_at(
+                        optimizer.step, kernels.optimizer_config
+                    ).item()
+                ),
+            )
+        )
+        return original_step(kernels, adapters, optimizer, trainer)
+
+    monkeypatch.setattr(swag_module.SwagKernels, "optimizer_step", record_step)
+    capsys.readouterr()
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "accumulation-logs-run",
+            loader=LoaderConfig(microbatch_size=2, gradient_accumulation_steps=2),
+            maximum_steps=None,
+            maximum_epochs=1,
+            log_interval=2,
+        )
+    )
+    output = capsys.readouterr()
+    assert trained.step == 2
+    assert trained.examples == 5
+    assert [update[0] for update in updates] == [4, 1]
+    lines = output.err.splitlines()
+    assert output.out == ""
+    assert len(lines) == 1
+    assert lines[0].startswith("swag step=2 epoch=1 examples=5 ")
+    metrics = dict(field.split("=", 1) for field in lines[0].split()[1:])
+    assert float(metrics["loss"]) == pytest.approx(updates[-1][1], abs=1e-6)
+    assert float(metrics["accuracy"]) == pytest.approx(updates[-1][2], abs=1e-6)
+    assert float(metrics["learning_rate"]) == pytest.approx(updates[-1][3], rel=1e-5)
 
 
 def test_resume_rejects_mismatches_before_allocation(

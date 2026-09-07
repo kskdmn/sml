@@ -989,26 +989,15 @@ class InferenceSession:
             positions,
             mx.zeros(positions.shape, dtype=mx.int32),
         )
-        lease = None
-        try:
-            lease = self.buffer_pool.lease(
-                batch_size=batch_size_bucket,
-                capacity=length_bucket,
-                config=self._resolved.model_config,
-            )
-            lease.token_storage[:, :] = input_ids
-            log_likelihood, greedy_match = compiled(
-                self._parameters,
-                lease.token_storage,
-                attention_mask,
-                positions,
-                target_mask,
-                request_mask,
-            )
-            mx.eval(log_likelihood, greedy_match)
-        finally:
-            if lease is not None:
-                self.buffer_pool.release(lease)
+        log_likelihood, greedy_match = compiled(
+            self._parameters,
+            input_ids,
+            attention_mask,
+            positions,
+            target_mask,
+            request_mask,
+        )
+        mx.eval(log_likelihood, greedy_match)
 
         likelihoods = log_likelihood.tolist()
         matches = greedy_match.tolist()
@@ -1261,6 +1250,7 @@ class InferenceSession:
                 keys,
                 bucket.request_mask,
             )
+            all_finished = mx.all(finished)
             mx.eval(
                 tokens,
                 cache_state,
@@ -1269,7 +1259,10 @@ class InferenceSession:
                 generated,
                 finished,
                 keys,
+                all_finished,
             )
+            if bool(all_finished):
+                break
         lease.token_storage = tokens
         lease.cache_state = cache_state
         return self._host_results(bucket, tokens, generated)

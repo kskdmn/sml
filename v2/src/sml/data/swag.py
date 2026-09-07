@@ -2194,6 +2194,8 @@ class SwagBatchStream:
         self._state_lock = threading.Lock()
         self._committed_cursor = cursor
         self._initial_epoch = cursor.epoch
+        self._plan_epoch: int | None = None
+        self._plan: tuple[tuple[int, tuple[int, ...]], ...] = ()
         self._epoch_complete = False
         self._closed = False
         self._producer: threading.Thread | None = None
@@ -2235,11 +2237,14 @@ class SwagBatchStream:
     def _next_from_cursor(
         self, cursor: SwagCursor
     ) -> tuple[SwagBatchEnvelope, SwagCursor]:
-        plan = _epoch_bucket_plan(
-            self._bundle._owned_buckets(),
-            epoch_seed=self._loader.epoch_seed,
-            epoch=cursor.epoch,
-        )
+        if self._plan_epoch != cursor.epoch:
+            self._plan = _epoch_bucket_plan(
+                self._bundle._owned_buckets(),
+                epoch_seed=self._loader.epoch_seed,
+                epoch=cursor.epoch,
+            )
+            self._plan_epoch = cursor.epoch
+        plan = self._plan
         if not plan:
             raise SMLDataError("SWAG bundle does not contain any examples")
         if cursor.bucket_order_position >= len(plan):
@@ -2253,9 +2258,9 @@ class SwagBatchStream:
             else:
                 next_cursor = SwagCursor(cursor.epoch + 1, 0, 0)
             return self._next_from_cursor(next_cursor)
-        remaining = row_permutation[cursor.row_offset :]
-        take = min(self._loader.microbatch_size, len(remaining))
-        selected = remaining[:take]
+        remaining = len(row_permutation) - cursor.row_offset
+        take = min(self._loader.microbatch_size, remaining)
+        selected = row_permutation[cursor.row_offset : cursor.row_offset + take]
         bucket = self._bundle._owned_buckets()[plan[cursor.bucket_order_position][0]]
         arrays = _assemble_batch_arrays(
             bucket,
@@ -2266,7 +2271,7 @@ class SwagBatchStream:
         cursor_after = _advance_cursor(
             cursor,
             consumed=take,
-            remaining_in_bucket=len(remaining),
+            remaining_in_bucket=remaining,
             remaining_buckets=len(plan) - cursor.bucket_order_position - 1,
         )
         input_ids, valid_token_mask, score_mask, labels, example_mask = arrays

@@ -68,6 +68,8 @@ from sml.training.common import (
     accumulate_fp32,
     build_weight_decay_tree,
     initialize_adam_state,
+    learning_rate_at,
+    log_training_progress,
     normalize_and_clip,
 )
 from sml.training.lora import (
@@ -1151,6 +1153,55 @@ def _run_training(
     kernels = build_swag_kernels(model, config, weight_decay_tree)
     last_published_step = scalar.step
     accumulation_steps = config.loader.gradient_accumulation_steps
+    window_microsteps = 0
+    window_examples = 0
+    pending_cursor: SwagCursor | None = None
+
+    def complete_update(stream: SwagBatchStream) -> None:
+        nonlocal adapters, optimizer, trainer, scalar, last_published_step
+        nonlocal window_microsteps, window_examples, pending_cursor
+        if window_microsteps == 0 or pending_cursor is None:
+            return
+        metrics = None
+        if (scalar.step + 1) % config.log_interval == 0:
+            metrics = (
+                trainer.loss_numerator / trainer.valid_count,
+                learning_rate_at(optimizer.step, config.optimizer),
+                trainer.correct_count / trainer.valid_count,
+            )
+        adapters, optimizer, trainer = kernels.optimizer_step(
+            adapters,
+            optimizer,
+            trainer,
+        )
+        mx.eval(adapters, optimizer.to_tree(), trainer.to_tree())
+        stream.commit(pending_cursor)
+        scalar = ScalarSwagState(
+            step=scalar.step + 1,
+            examples=scalar.examples + window_examples,
+            microsteps=scalar.microsteps + window_microsteps,
+            cursor=pending_cursor,
+        )
+        if metrics is not None:
+            mx.eval(metrics)
+            loss, learning_rate, accuracy = (float(metric.item()) for metric in metrics)
+            log_training_progress(
+                "swag",
+                step=scalar.step,
+                epoch=scalar.cursor.epoch,
+                units=scalar.examples,
+                unit_name="examples",
+                loss=loss,
+                learning_rate=learning_rate,
+                accuracy=accuracy,
+            )
+        window_microsteps = 0
+        window_examples = 0
+        pending_cursor = None
+        state = _RestoredSwagState(adapters, frozen_base, optimizer, trainer, scalar)
+        if scalar.step % config.checkpoint.interval == 0:
+            _publish_training_state(run, manifest, state)
+            last_published_step = scalar.step
 
     while not _limit_reached(config, scalar):
         if (
@@ -1158,15 +1209,13 @@ def _run_training(
             and scalar.cursor.epoch >= config.maximum_epochs
         ):
             break
-        window_microsteps = 0
-        window_examples = 0
-        pending_cursor: SwagCursor | None = None
         with SwagBatchStream._borrowing_bundle(
             bundle, config.loader, cursor=scalar.cursor
         ) as stream:
             for envelope in stream:
                 if _limit_reached(config, scalar):
                     break
+                window_examples += int(envelope.example_mask.sum())
                 batch = SwagBatch.from_envelope(envelope)
                 microstep_index = scalar.microsteps + window_microsteps
                 if model.config.hidden_dropout > 0.0 or config.lora.dropout > 0.0:
@@ -1188,54 +1237,13 @@ def _run_training(
                 )
                 pending_cursor = batch.cursor_after
                 window_microsteps += 1
-                window_examples += int(batch.example_mask.astype(mx.int32).sum().item())
-                window_full = int(trainer.valid_count.item()) >= accumulation_steps
+                window_full = window_microsteps >= accumulation_steps
                 if not window_full:
                     continue
-                adapters, optimizer, trainer = kernels.optimizer_step(
-                    adapters,
-                    optimizer,
-                    trainer,
-                )
-                mx.eval(adapters, optimizer.to_tree(), trainer.to_tree())
-                stream.commit(pending_cursor)
-                scalar = ScalarSwagState(
-                    step=scalar.step + 1,
-                    examples=scalar.examples + window_examples,
-                    microsteps=scalar.microsteps + window_microsteps,
-                    cursor=pending_cursor,
-                )
-                window_microsteps = 0
-                window_examples = 0
-                pending_cursor = None
-                state = _RestoredSwagState(
-                    adapters, frozen_base, optimizer, trainer, scalar
-                )
-                if scalar.step % config.checkpoint.interval == 0:
-                    _publish_training_state(run, manifest, state)
-                    last_published_step = scalar.step
+                complete_update(stream)
                 if _limit_reached(config, scalar):
                     break
-            if window_microsteps and pending_cursor is not None:
-                adapters, optimizer, trainer = kernels.optimizer_step(
-                    adapters,
-                    optimizer,
-                    trainer,
-                )
-                mx.eval(adapters, optimizer.to_tree(), trainer.to_tree())
-                stream.commit(pending_cursor)
-                scalar = ScalarSwagState(
-                    step=scalar.step + 1,
-                    examples=scalar.examples + window_examples,
-                    microsteps=scalar.microsteps + window_microsteps,
-                    cursor=pending_cursor,
-                )
-                state = _RestoredSwagState(
-                    adapters, frozen_base, optimizer, trainer, scalar
-                )
-                if scalar.step % config.checkpoint.interval == 0:
-                    _publish_training_state(run, manifest, state)
-                    last_published_step = scalar.step
+            complete_update(stream)
 
     final_state = _RestoredSwagState(adapters, frozen_base, optimizer, trainer, scalar)
     if last_published_step != scalar.step:

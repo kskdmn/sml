@@ -239,10 +239,10 @@ def test_cache_reset_clears_logical_lengths_without_changing_capacity():
     _assert_array_equal(cache.state[2], mx.zeros((1,), dtype=mx.int32))
 
 
-def test_cache_reset_is_equivalent_to_fresh_allocation_before_sparse_write():
+def test_cache_reset_is_equivalent_to_fresh_allocation_before_contiguous_write():
     config = _cache_config()
     reused = KVCache.allocate(config, 1, 4, mx.bfloat16)
-    for layer_index, position, payload in ((0, 0, 5.0), (1, 1, 7.0)):
+    for layer_index, position, payload in ((0, 0, 5.0), (1, 0, 7.0)):
         populated, _view = append_kv_state(
             reused.state,
             layer_index,
@@ -255,23 +255,23 @@ def test_cache_reset_is_equivalent_to_fresh_allocation_before_sparse_write():
         reused.replace_state(populated)
     reused.reset()
 
-    sparse_keys = mx.full((1, 1, 1, 4), 9.0, dtype=mx.bfloat16)
-    sparse_values = mx.full((1, 1, 1, 4), 19.0, dtype=mx.bfloat16)
+    appended_keys = mx.full((1, 1, 1, 4), 9.0, dtype=mx.bfloat16)
+    appended_values = mx.full((1, 1, 1, 4), 19.0, dtype=mx.bfloat16)
     reused_state, reused_view = append_kv_state(
         reused.state,
         0,
-        sparse_keys,
-        sparse_values,
-        mx.array([[2]], dtype=mx.int32),
+        appended_keys,
+        appended_values,
+        mx.array([[0]], dtype=mx.int32),
         mx.array([[True]]),
     )
     fresh = KVCache.allocate(config, 1, 4, mx.bfloat16)
     fresh_state, fresh_view = append_kv_state(
         fresh.state,
         0,
-        sparse_keys,
-        sparse_values,
-        mx.array([[2]], dtype=mx.int32),
+        appended_keys,
+        appended_values,
+        mx.array([[0]], dtype=mx.int32),
         mx.array([[True]]),
     )
 

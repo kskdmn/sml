@@ -43,6 +43,12 @@ Start a new pretraining run from a prepared-data bundle:
 uv run python -m sml train --data v2/output/pretraining-data --output v2/output/base-run
 ```
 
+For both `train` and `finetune`, `gradient_accumulation_steps` counts microbatches
+per optimizer update. An incomplete accumulation window at the end of an epoch
+is still applied. Progress is printed to stderr every `log_interval` optimizer
+updates, including loss, learning rate, and processed rows or examples;
+fine-tuning also reports accuracy.
+
 Resume an existing run with only the allowed operational overrides:
 
 ```sh

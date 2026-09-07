@@ -212,6 +212,82 @@ def test_attention_mask_and_positions_make_padding_inert(
     _assert_close(padded[1, :2], serial[0], atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.parametrize(
+    "positions",
+    [[[2, 3]], [[0, 2]], [[0, 0]], [[1, 0]], [[-1, 0]]],
+)
+def test_cached_forward_rejects_noncontiguous_positions_without_mutating_cache(
+    positions,
+):
+    model = SMLLanguageModel(_tiny_model_config(), key=mx.random.key(19))
+    cache = KVCache.allocate(model.config, 1, 4, mx.bfloat16)
+    original_state = cache.state
+
+    with pytest.raises(ValueError, match="append contiguously"):
+        model(
+            mx.array([[1, 4]], dtype=mx.int32),
+            positions=mx.array(positions, dtype=mx.int32),
+            cache=cache,
+        )
+
+    assert cache.state is original_state
+    _assert_close(cache.state[2], mx.array([0], dtype=mx.int32))
+
+
+@pytest.mark.parametrize("prefill_length", [0, 2])
+@pytest.mark.parametrize("explicit_positions", [False, True])
+def test_cached_forward_rejects_capacity_overflow_before_mutating_cache(
+    prefill_length,
+    explicit_positions,
+):
+    model = SMLLanguageModel(_tiny_model_config(), key=mx.random.key(19))
+    cache = KVCache.allocate(model.config, 1, 2, mx.bfloat16)
+    input_ids = mx.array([[1, 4, 5]], dtype=mx.int32)
+    if prefill_length:
+        model(input_ids[:, :prefill_length], cache=cache)
+    original_state = cache.state
+    positions = (
+        mx.arange(prefill_length, 3, dtype=mx.int32)[None, :]
+        if explicit_positions
+        else None
+    )
+
+    with pytest.raises(ValueError, match="cache capacity 2 would be exceeded"):
+        model(input_ids[:, prefill_length:], positions=positions, cache=cache)
+
+    assert cache.state is original_state
+    _assert_close(cache.state[2], mx.array([prefill_length], dtype=mx.int32))
+
+
+@pytest.mark.parametrize("explicit_positions", [False, True])
+def test_cached_forward_appends_each_padded_row_from_its_own_logical_length(
+    explicit_positions,
+):
+    model = SMLLanguageModel(_tiny_model_config(), key=mx.random.key(19))
+    cache = KVCache.allocate(model.config, 2, 4, mx.bfloat16)
+    model(
+        mx.array([[3, 1, 4], [1, 3, 3]], dtype=mx.int32),
+        attention_mask=mx.array([[False, True, True], [True, False, False]]),
+        cache=cache,
+    )
+    positions = (
+        mx.array([[99, 2], [1, 2]], dtype=mx.int32) if explicit_positions else None
+    )
+
+    appended = model(
+        mx.array([[3, 6], [7, 8]], dtype=mx.int32),
+        attention_mask=mx.array([[False, True], [True, True]]),
+        positions=positions,
+        cache=cache,
+    ).logits
+    first = model(mx.array([[1, 4, 6]], dtype=mx.int32)).logits
+    second = model(mx.array([[1, 7, 8]], dtype=mx.int32)).logits
+
+    _assert_close(appended[0, 1], first[0, 2], atol=2e-2, rtol=2e-2)
+    _assert_close(appended[1], second[0, 1:], atol=2e-2, rtol=2e-2)
+    _assert_close(cache.state[2], mx.array([3, 3], dtype=mx.int32))
+
+
 def test_training_forward_splits_one_key_per_active_layer_dropout():
     config = _tiny_model_config(hidden_dropout=0.5)
     model = SMLLanguageModel(config, key=mx.random.key(23))

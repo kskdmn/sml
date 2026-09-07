@@ -458,6 +458,7 @@ class TinySwagRuntime:
         start = SwagCursor(epoch=0, bucket_order_position=0, row_offset=0)
         real_examples = 0
         optimizer_steps = 0
+        window_microsteps = 0
         cursor = start
         with SwagBatchStream._borrowing_bundle(
             self.bundle, loader, cursor=start
@@ -475,7 +476,8 @@ class TinySwagRuntime:
                 )
                 stream.commit(batch.cursor_after)
                 cursor = batch.cursor_after
-                window_full = int(np.array(trainer.valid_count)) >= (
+                window_microsteps += 1
+                window_full = window_microsteps >= (
                     kernels.kernel_config.accumulation_steps
                 )
                 epoch_ended = cursor.epoch > start.epoch
@@ -486,6 +488,7 @@ class TinySwagRuntime:
                         trainer,
                     )
                     optimizer_steps += 1
+                    window_microsteps = 0
                     if (
                         max_optimizer_steps is not None
                         and optimizer_steps >= max_optimizer_steps
@@ -1328,6 +1331,38 @@ def test_permutation_uses_loader_epoch_seed_not_training_seed():
     assert "SeedSequence" in stream_source
     assert "epoch_seed" in stream_source
     assert "sml.training" not in stream_source
+
+
+def test_stream_builds_one_permutation_per_epoch(tiny_swag_runtime, monkeypatch):
+    loader = replace(tiny_swag_runtime.config.loader, microbatch_size=1)
+    original_plan = swag_data._epoch_bucket_plan
+    buckets = tiny_swag_runtime.bundle._owned_buckets()
+    expected = [
+        int(buckets[bucket_index].labels[index])
+        for bucket_index, indices in original_plan(
+            buckets, epoch_seed=loader.epoch_seed, epoch=0
+        )
+        for index in indices
+    ]
+    planned_epochs = []
+
+    def record_plan(*args, **kwargs):
+        planned_epochs.append(kwargs["epoch"])
+        return original_plan(*args, **kwargs)
+
+    monkeypatch.setattr(swag_data, "_epoch_bucket_plan", record_plan)
+    labels = []
+    with SwagBatchStream._borrowing_bundle(
+        tiny_swag_runtime.bundle, loader, cursor=SwagCursor.initial()
+    ) as stream:
+        for envelope in stream:
+            with envelope:
+                labels.extend(envelope.labels[envelope.example_mask].tolist())
+                stream.commit(envelope.cursor_after)
+
+    assert labels == expected
+    assert planned_epochs.count(0) == 1
+    assert len(planned_epochs) == len(set(planned_epochs))
 
 
 def test_swag_batch_stream_accepts_structural_loader(tiny_swag_runtime):

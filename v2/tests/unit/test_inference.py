@@ -519,18 +519,69 @@ def test_session_compile_cache_reuses_shape_and_policy_key(
     ) in tiny_session._compiled
 
 
-def test_decode_chunk_does_not_call_item_and_returns_continuation(
-    tiny_pretraining_run: Path,
+@pytest.mark.parametrize(
+    ("stop_after", "expected_chunks"),
+    [((1,), 1), ((1, 5), 3), ((1, 8), 4)],
+)
+def test_decode_stops_when_all_real_requests_finish(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+    stop_after: tuple[int, ...],
+    expected_chunks: int,
 ) -> None:
-    source = inspect.getsource(InferenceSession._decode_chunk)
-    assert ".item(" not in source
-    session = InferenceSession.from_checkpoint(
-        tiny_pretraining_run,
-        runtime=InferenceRuntimeConfig(decode_chunk_size=2),
+    tiny_session._runtime = InferenceRuntimeConfig(
+        batch_size_buckets=(4,), decode_chunk_size=2
     )
-    result = session.generate("alpha", GenerationRequest(max_new_tokens=5))
-    assert result.token_ids
-    assert len(result.token_ids) <= 5
+    prompt = "alpha"
+    prompt_length = len(tiny_session._encode_prompt(prompt))
+    config = tiny_session.resolved_model.model_config
+    eos_id = config.eos_token_id
+    other_id = 4
+    thresholds = mx.array(
+        [prompt_length + count - 2 for count in stop_after]
+        + [0] * (4 - len(stop_after)),
+        dtype=mx.int32,
+    )
+    forward = tiny_session._model.forward_arrays
+
+    def controlled_forward(parameters, input_ids, **kwargs):
+        _logits, cache, key = forward(parameters, input_ids, **kwargs)
+        selected = mx.where(
+            kwargs["positions"] >= thresholds[:, None], eos_id, other_id
+        )
+        logits = mx.where(
+            mx.arange(config.vocab_size)[None, None, :] == selected[:, :, None],
+            0.0,
+            -100.0,
+        )
+        return logits, cache, key
+
+    chunks = 0
+    compiled_kernels = tiny_session._compiled_kernels
+
+    def counted_kernels(*args):
+        prefill, decode = compiled_kernels(*args)
+
+        def counted_decode(*values):
+            nonlocal chunks
+            chunks += 1
+            return decode(*values)
+
+        return prefill, counted_decode
+
+    monkeypatch.setattr(tiny_session._model, "forward_arrays", controlled_forward)
+    monkeypatch.setattr(tiny_session, "_compiled_kernels", counted_kernels)
+    results = tiny_session.generate_batch(
+        [(prompt, GenerationRequest(max_new_tokens=7)) for _ in stop_after]
+    )
+
+    assert chunks == expected_chunks
+    for result, count in zip(results, stop_after, strict=True):
+        expected = (other_id,) * min(count - 1, 7)
+        if count <= 7:
+            expected += (eos_id,)
+        assert result.token_ids == expected
+    assert tiny_session.buffer_pool.active_leases == 0
 
 
 def test_session_reuses_pooled_token_storage_for_same_bucket(

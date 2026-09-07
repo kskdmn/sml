@@ -54,6 +54,13 @@ def append_kv_state(
     positions: mx.array,
     valid_mask: mx.array,
 ) -> tuple[KVArrayState, KVView]:
+    """Update prevalidated state without synchronizing the compiled array path.
+
+    Every valid position must fit the allocated capacity, and every slot below
+    the resulting logical length must have been populated. Public model calls
+    enforce contiguous appends through ``KVCache.validate_append``; compiled
+    inference enforces these bounds while preparing its request buckets.
+    """
     key_layers, value_layers, lengths = state
     cached_keys = key_layers[layer_index]
     cached_values = value_layers[layer_index]
@@ -149,6 +156,37 @@ class KVCache:
 
     def replace_state(self, state: KVArrayState) -> None:
         self._state = state
+
+    def validate_append(
+        self,
+        attention_mask: mx.array,
+        positions: mx.array | None,
+    ) -> mx.array:
+        """Validate a public append and return its absolute token positions."""
+        key_layers, _value_layers, lengths = self._state
+        if attention_mask.ndim != 2 or attention_mask.shape[0] != lengths.shape[0]:
+            raise ValueError("attention_mask batch size must match the cache")
+        if positions is not None and positions.shape != attention_mask.shape:
+            raise ValueError("positions must match the input shape")
+        capacity = key_layers[0].shape[2]
+        attention_mask = attention_mask.astype(mx.bool_)
+        relative_positions = mx.cumsum(attention_mask.astype(mx.int32), axis=1) - 1
+        expected_positions = lengths[:, None] + relative_positions
+        if positions is None:
+            positions = mx.where(attention_mask, expected_positions, 0)
+        next_lengths = lengths + mx.sum(attention_mask, axis=1)
+        overflow = mx.any(next_lengths > capacity) | mx.any(
+            attention_mask & (positions >= capacity)
+        )
+        noncontiguous = mx.any(attention_mask & (positions != expected_positions))
+        overflow, noncontiguous = mx.stack((overflow, noncontiguous)).tolist()
+        if overflow:
+            raise ValueError(f"cache capacity {capacity} would be exceeded")
+        if noncontiguous:
+            raise ValueError(
+                "cache positions must append contiguously from each logical length"
+            )
+        return positions.astype(mx.int32)
 
     def reset(self) -> None:
         keys, values, lengths = self._state
