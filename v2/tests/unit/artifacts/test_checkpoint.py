@@ -1202,6 +1202,93 @@ def test_local_apfs_latest_reader_falls_back_before_nonwritable_sidecar_creation
 
 
 @pytest.mark.parametrize(
+    "mutation_stage",
+    ("lock-created", "diagnostic-created", "stale-owner-write", "new-owner-write"),
+)
+@pytest.mark.parametrize("sidecar_error", (errno.EACCES, errno.EPERM, errno.EROFS))
+def test_latest_reader_rejects_authority_failure_after_sidecar_mutation(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation_stage: str,
+    sidecar_error: int,
+) -> None:
+    """Partial lock setup must never be downgraded to an unlocked latest reader."""
+    run = _copy_portable_run(valid_run, parent_name="mutated-sidecar-parent")
+    lock_name = checkpoint._lock_name(run.name, "run-access")
+    diagnostic_name = checkpoint._diagnostic_name(run.name, "run-access")
+    lock_path = run.parent / lock_name
+    diagnostic_path = run.parent / diagnostic_name
+    if mutation_stage != "lock-created":
+        lock_path.write_bytes(b"")
+    if mutation_stage in {"stale-owner-write", "new-owner-write"}:
+        holders = (
+            [{"pid": 0, "protected_path": str(run), "token": "stale-owner"}]
+            if mutation_stage == "stale-owner-write"
+            else []
+        )
+        diagnostic_path.write_bytes(canonical_json_bytes({"holders": holders}))
+
+    class FailAfterSidecarMutation(RecordingFilesystemOps):
+        diagnostic_descriptor: int | None = None
+        fault_raised = False
+
+        def fail(self) -> None:
+            self.fault_raised = True
+            raise OSError(sidecar_error, os.strerror(sidecar_error))
+
+        def open(self, path, flags, mode=0o777, *, dir_fd=None):
+            if mutation_stage == "lock-created" and os.fspath(path) == diagnostic_name:
+                assert lock_path.is_file()
+                self.fail()
+            descriptor = super().open(path, flags, mode, dir_fd=dir_fd)
+            if os.fspath(path) == diagnostic_name:
+                self.diagnostic_descriptor = descriptor
+            return descriptor
+
+        def stat(self, path, *, dir_fd=None, follow_symlinks=False):
+            if (
+                mutation_stage == "diagnostic-created"
+                and self.diagnostic_descriptor is not None
+                and path == self.diagnostic_descriptor
+            ):
+                assert diagnostic_path.is_file()
+                self.fail()
+            return super().stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+        def write_all(self, descriptor, data):
+            if descriptor == self.diagnostic_descriptor:
+                # The real diagnostic writer has already truncated the file.
+                assert os.fstat(descriptor).st_size == 0
+                if mutation_stage == "stale-owner-write":
+                    assert data == b'{"holders":[]}'
+                else:
+                    assert mutation_stage == "new-owner-write"
+                    assert str(os.getpid()).encode() in data
+                self.fail()
+            super().write_all(descriptor, data)
+
+    fs = FailAfterSidecarMutation(run)
+    _force_filesystem_capability(monkeypatch, "local-apfs")
+    monkeypatch.setattr(checkpoint, "OS_FILESYSTEM", fs)
+
+    def forbidden_recovery(*_args, **_kwargs):
+        pytest.fail("latest recovery entered after sidecar mutation")
+
+    monkeypatch.setattr(checkpoint, "_recover_latest_open", forbidden_recovery)
+    with (
+        pytest.raises(SMLArtifactError, match="run-access lock") as caught,
+        checkpoint.open_latest_checkpoint_reader(run),
+    ):
+        pytest.fail("mutated sidecar protocol yielded a reduced-mode reader")
+
+    assert fs.fault_raised
+    assert isinstance(caught.value.__cause__, OSError)
+    assert caught.value.__cause__.errno == sidecar_error
+    if mutation_stage in {"stale-owner-write", "new-owner-write"}:
+        assert diagnostic_path.read_bytes() == b""
+
+
+@pytest.mark.parametrize(
     "operation",
     (
         "writable-recovery",
