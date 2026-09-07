@@ -3,12 +3,11 @@
 ## Status
 
 The repair direction was approved in conversation on 2026-08-25. The
-remediation implementation, Task 6.4 behavior, Part 2 implementation, and the
-umbrella refactor implementation are complete, but final acceptance has one
-test-only follow-up as of 2026-09-05. The final production source/test commit is
+remediation, Task 6.4, Part 2, and umbrella refactor are complete, including
+final acceptance, as of 2026-09-07. The final production correction is
 `d6a28498a33624ccb6e58b17b380c15c9f072211`; final SWAG evidence
 retirement/source-harness is `0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`;
-and verified pre-documentation evidence HEAD is
+and the verified SWAG evidence commit is
 `da3dc9365503059bd0e2c1f60c3b2b3c257c3443`. The original Task 6
 documentation history remains: completion
 `34c7ba4f775ead472aa780a231e7475be1bd3831`, exact-SHA metadata
@@ -20,20 +19,25 @@ reported Critical 0, Important 0, Minor 0 after two fix rounds. The additional
 SDD final whole-branch review at `6dbc059` reported Critical 0, Important 1,
 Minor 0: a reduced-guarantee checkpoint-reader issue. The source/test wave at
 `d6a2849` fixed it, SWAG evidence was retired at `0f767cb`, and final evidence
-was refreshed at `da3dc93`. The sole scoped re-review at `099509f` confirmed
-the original Important was addressed but returned Critical 0, Important 1,
-Minor 1 and did not approve final closure. The Important is missing lasting
-regression coverage for authority failure after sidecar-protocol mutation. The
-Minor was the ambiguous word “reviewed” for `da3dc93`; this update replaces it
-with “verified.” The test gap does not invalidate the production correction or
-recorded SWAG evidence, but acceptance remains open until an authorized
-test-only correction and follow-up review pass.
+was refreshed at `da3dc93`. The scoped re-review at `099509f` confirmed
+the runtime finding was addressed but left Critical 0, Important 1,
+Minor 1: missing post-mutation authority regressions and ambiguous review
+wording. The wording was corrected at `aa477d8`. The September 7 continuation
+added 12 lasting regression cases at
+`73df250e109785641e3966486f4e16c54f7d8f3a`, covering four mutation sites
+crossed with `EACCES`, `EPERM`, and `EROFS`. Disabling each guard assignment
+independently made its three cases fail at forbidden recovery; restoring the
+guards made all cases pass. Independent scoped review of that test revision
+and the wording correction returned Critical 0, Important 0, Minor 0. Both
+residual findings are addressed; no acceptance work remains. Production and
+quality evidence are unchanged by this follow-up.
 
-Final evidence at `da3dc93`: full V2 `1611 passed in 105.66s`;
-integration `252 passed in 23.10s`; CLI workflows `31 passed in 6.25s`;
-CLI config `13 passed in 1.38s`; source/package `9 passed in 0.63s`;
-Ruff clean and `104 files already formatted`; pretraining validator `pass`;
-SWAG validator `pass`. SWAG source/harness is
+Final verification of the test/source tree committed at `73df250`:
+full V2 `1623 passed in 95.99s`; integration `252 passed in 23.08s`;
+combined CLI workflows/config and source/package checks `53 passed in 5.63s`;
+Ruff clean with `104 files already formatted`; both pretraining and SWAG
+validators `pass`.
+SWAG source/harness is
 `0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6` with `harness_clean=true`; its
 manifest/raw/report SHA-256 values are respectively
 `5af2abb5200eba0a0faa3d7774bca16e129b7e5dcf9473c50c9b700a9ed8976f`,
@@ -107,7 +111,8 @@ complete at `6647282`. The additional SDD final whole-branch review at `6dbc059`
 subsequently found the single Important reduced-guarantee checkpoint-reader
 issue described above, and the complete fix/evidence refresh ended at
 `da3dc93`. Its sole scoped re-review at `099509f` addressed that runtime issue
-but left the test-only acceptance follow-up described in the status above.
+but left a test-only follow-up. The September 7 correction at `73df250` and
+its zero-finding scoped review closed that follow-up as recorded above.
 
 ## Goals
 

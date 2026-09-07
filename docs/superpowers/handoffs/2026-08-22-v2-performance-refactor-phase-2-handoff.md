@@ -1,25 +1,24 @@
-# V2 Refactor Handoff: Final Test Follow-up Required
+# V2 Refactor Handoff: Final Acceptance Complete
 
 **Recorded:** 2026-08-22 (Asia/Shanghai)
 
-**Last updated:** 2026-09-05 (Asia/Shanghai)
+**Last updated:** 2026-09-07 (Asia/Shanghai)
 
 **Purpose:** Record the exact final-acceptance state and preserve the earlier
 implementation history without requiring the prior conversation.
 
-## 2026-09-05 Final Acceptance Follow-up — Authoritative Status
+## 2026-09-07 Final Acceptance Complete — Authoritative Status
 
 This section supersedes every older current-status, takeover, next-action,
 deferred-finding, and completion statement below. Older sections are retained
-only as past-tense implementation history. One test-only acceptance task remains.
+only as past-tense implementation history. No acceptance task remains.
 
-Task 6.4 behavior, the remediation implementation, Part 2 implementation, and
-the umbrella refactor implementation are complete, but final acceptance is not
-closed. The final production source/test commit is
+Task 6.4, the remediation, Part 2, and the umbrella refactor are complete,
+including final acceptance. The final production correction is
 `d6a28498a33624ccb6e58b17b380c15c9f072211`; the final SWAG evidence
 retirement/source-harness commit is
-`0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`; and the final verified
-pre-documentation evidence HEAD is
+`0f767cb73715eb77bd54e5fd02d6b9bc13b9c0e6`; and the verified SWAG
+evidence commit is
 `da3dc9365503059bd0e2c1f60c3b2b3c257c3443`. The original Task 6
 documentation history remains: completion
 `34c7ba4f775ead472aa780a231e7475be1bd3831`, exact-SHA metadata
@@ -31,21 +30,26 @@ reported Critical 0, Important 0, Minor 0 after two fix rounds. The additional
 SDD final whole-branch review at `6dbc059` reported Critical 0, Important 1,
 Minor 0: a reduced-guarantee checkpoint-reader issue. The source/test wave at
 `d6a2849` fixed it, SWAG evidence was retired at `0f767cb`, and final evidence
-was refreshed at `da3dc93`. The sole scoped re-review at `099509f` confirmed
-the original Important was addressed but returned Critical 0, Important 1,
-Minor 1 and did not approve final closure. The Important is missing lasting
-regression coverage for an authority failure after sidecar-protocol mutation:
-the current tests would remain green if all four mutation-flag assignments in
-the fail-closed guard were disabled. The Minor was the ambiguous word
-“reviewed” for `da3dc93`; this update replaces it with “verified.” The test gap
-does not invalidate the production correction or recorded SWAG evidence.
+was refreshed at `da3dc93`. The scoped re-review at `099509f` confirmed
+the runtime finding was addressed but left Critical 0, Important 1,
+Minor 1: missing post-mutation authority regressions and ambiguous review
+wording. The wording was corrected at `aa477d8`. The September 7 continuation
+added 12 lasting regression cases at
+`73df250e109785641e3966486f4e16c54f7d8f3a`, covering four mutation sites
+crossed with `EACCES`, `EPERM`, and `EROFS`. Disabling each guard assignment
+independently made its three cases fail at forbidden recovery; restoring the
+guards made all cases pass. Independent scoped review of that test revision
+and the wording correction returned Critical 0, Important 0, Minor 0. Both
+residual findings are addressed; no acceptance work remains. Production and
+quality evidence are unchanged by this follow-up.
 
 ### Final verified evidence
 
-- Full V2: `1611 passed in 105.66s`.
-- Integration: `252 passed in 23.10s`.
-- CLI workflow: `31 passed in 6.25s`; CLI config: `13 passed in 1.38s`.
-- Source/package: `9 passed in 0.63s`.
+The following gates ran on the exact test/source tree committed at `73df250`:
+
+- Full V2: `1623 passed in 95.99s`.
+- Integration: `252 passed in 23.08s`.
+- Combined CLI workflows/config and source/package: `53 passed in 5.63s`.
 - Ruff: clean; format: `104 files already formatted`.
 - Pretraining validator: `pass`; SWAG validator: `pass`.
 - SWAG manifest source/harness:
@@ -101,16 +105,16 @@ gate.
 
 ### Handoff
 
-Preserve the production and evidence commits above; no SWAG regeneration is
-required for the remaining test-only correction. Before final closure, obtain
-explicit authorization for a follow-up correction/review budget, add lasting
-regressions that allow initial run-access sidecar mutation (and preferably a
-diagnostic write) before raising `EACCES`, `EPERM`, and `EROFS`, and assert that
-latest recovery is never entered and no reduced-mode reader is yielded. Run the
-focused artifact tests, Ruff, the full V2 suite outside the sandbox, both
-validators, the lightweight documentation gates, and an independent scoped
-review with zero findings. Keep the branch unpushed unless asked, and treat all
-following takeover procedures as historical records.
+Final acceptance is complete. Preserve the production and evidence commits
+above and the regression commit `73df250`; this test-only follow-up required
+no SWAG regeneration. The previously requested correction/review authorization
+was supplied by the September 7 continuation. All following takeover procedures
+are historical records. Do not push unless asked.
+
+The local review and mutation-proof records are preserved in
+`.superpowers/sdd/2026-08-25-v2-remediation-final-acceptance/`, particularly
+`followup-review-2026-09-07.md` and `followup-report-2026-09-07.md`. This tracked
+section records the essential results even when those ignored files are absent.
 
 ## 2026-08-30 Artifact Residual Closure — Current Takeover Point
 
