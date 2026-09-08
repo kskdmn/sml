@@ -1632,11 +1632,19 @@ def _ingest_and_write_buckets(
             parsed_rows.clear()
             return stop
 
+        parse_limit = _INGEST_CHUNK_SIZE
+        if config.maximum_examples is not None:
+            parse_limit = min(parse_limit, config.maximum_examples)
         try:
             for row in _iter_resolved_rows(config, base, resolved):
                 parsed_rows.append(_parse_row(row))
-                if len(parsed_rows) >= _INGEST_CHUNK_SIZE and flush_parsed():
-                    break
+                if len(parsed_rows) >= parse_limit:
+                    if flush_parsed():
+                        break
+                    if config.maximum_examples is not None:
+                        parse_limit = min(
+                            _INGEST_CHUNK_SIZE, config.maximum_examples - kept
+                        )
             else:
                 flush_parsed()
             if kept == 0:

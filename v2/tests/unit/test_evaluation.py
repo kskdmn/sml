@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import io
 import math
 import multiprocessing
 import os
@@ -16,12 +17,14 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
+import sentencepiece as spm
 from sml import inference
 from sml.errors import SMLRuntimeError
 from sml.evaluation import (
     EvaluationConfig,
     LoglikelihoodRequest,
     SMLEvalLM,
+    _encode_loglikelihood_request,
     evaluate,
     read_evaluation_result,
     score_loglikelihood_batch,
@@ -1312,6 +1315,103 @@ def test_continuation_only_scoring_is_finite(tiny_session: InferenceSession) -> 
     )[0]
     assert math.isfinite(result.log_likelihood)
     assert result.greedy_match in (True, False)
+
+
+@pytest.fixture(scope="module")
+def boundary_processor():
+    model = io.BytesIO()
+    spm.SentencePieceTrainer.train(
+        sentence_iterator=iter(
+            [
+                "alpha beta gamma delta epsilon",
+                "the quick brown fox jumps over the lazy dog",
+                "there is a person walking and running",
+            ]
+            * 100
+        ),
+        model_writer=model,
+        vocab_size=400,
+        hard_vocab_limit=False,
+        minloglevel=2,
+        model_type="bpe",
+        pad_id=3,
+        byte_fallback=True,
+        num_threads=1,
+    )
+    return spm.SentencePieceProcessor(model_proto=model.getvalue())
+
+
+@pytest.mark.parametrize(
+    ("context", "continuation", "start", "scored_pieces"),
+    [
+        ("the quick brow", "n fox", 2, ("▁brown", "▁fox")),
+        ("猫 the quick brow", "n fox", 6, ("▁brown", "▁fox")),
+        ("the quick ｂｒｏｗ", "ｎ fox", 2, ("▁brown", "▁fox")),
+        ("alph", "a", 0, ("▁alpha",)),
+        ("the quick brown", "🦊", 3, ("<0xF0>", "<0x9F>", "<0xA6>", "<0x8A>")),
+        ("a", "\u0301", 1, ("<0xC3>", "<0xA1>")),
+        ("the quick a", "\u0301", 3, ("<0xC3>", "<0xA1>")),
+        ("猫 a", "\u0301", 5, ("<0xC3>", "<0xA1>")),
+    ],
+)
+def test_continuation_boundary_uses_source_text(
+    boundary_processor, context, continuation, start, scored_pieces
+):
+    processor = boundary_processor
+    session = SimpleNamespace(
+        resolved_model=SimpleNamespace(
+            tokenizer=SimpleNamespace(processor=processor),
+            model_config=SimpleNamespace(bos_token_id=processor.bos_id()),
+        )
+    )
+    expected_ids = tuple(processor.encode(context + continuation))
+    if start == 0:
+        expected_ids = (processor.bos_id(), *expected_ids)
+        start = 1
+
+    token_ids, continuation_start = _encode_loglikelihood_request(
+        session, LoglikelihoodRequest(context, continuation)
+    )
+
+    assert token_ids == expected_ids
+    assert continuation_start == start
+    assert tuple(processor.id_to_piece(token) for token in token_ids[start:]) == (
+        scored_pieces
+    )
+
+
+def test_boundary_resegmentation_does_not_score_changed_context_tokens():
+    model = io.BytesIO()
+    spm.SentencePieceTrainer.train(
+        sentence_iterator=iter(
+            ["abcd"] * 10 + ["cd"] * 100 + ["bc"] * 50 + ["ab"] * 25
+        ),
+        model_writer=model,
+        vocab_size=271,
+        hard_vocab_limit=False,
+        minloglevel=2,
+        model_type="bpe",
+        pad_id=3,
+        byte_fallback=True,
+        num_threads=1,
+    )
+    processor = spm.SentencePieceProcessor(model_proto=model.getvalue())
+    assert processor.encode("abc", out_type=str) == ["▁", "a", "bc"]
+    assert processor.encode("abcd", out_type=str) == ["▁ab", "cd"]
+    session = SimpleNamespace(
+        resolved_model=SimpleNamespace(
+            tokenizer=SimpleNamespace(processor=processor),
+            model_config=SimpleNamespace(bos_token_id=processor.bos_id()),
+        )
+    )
+
+    token_ids, continuation_start = _encode_loglikelihood_request(
+        session, LoglikelihoodRequest("abc", "d")
+    )
+
+    assert token_ids == tuple(processor.encode("abcd"))
+    assert continuation_start == 1
+    assert processor.id_to_piece(token_ids[continuation_start]) == "cd"
 
 
 def test_greedy_match_is_boolean_and_stable(tiny_session: InferenceSession) -> None:

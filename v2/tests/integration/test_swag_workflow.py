@@ -23,6 +23,7 @@ from sml.artifacts.manifest import (
     LoRARunManifest,
     OpenedArtifact,
     PayloadRef,
+    TokenizerManifest,
     VerificationLevel,
     canonical_json_bytes,
     file_identity,
@@ -731,6 +732,60 @@ def test_uninterrupted_and_interrupted_adapter_state_match(
         )
         mx.eval(expected, state["trainer"]["next_key"])
         assert bool(mx.array_equal(state["trainer"]["next_key"], expected))
+
+
+@pytest.mark.parametrize("maximum_steps", (1, 2))
+@pytest.mark.parametrize("mutation", ("tokenizer.model", "tokenizer.vocab", "manifest"))
+def test_resume_rejects_invalid_tokenizer_before_restore_or_retention(
+    mutation,
+    maximum_steps,
+    tiny_base_run,
+    tiny_swag_bundle,
+    tmp_path,
+    monkeypatch,
+):
+    run = _run_with_unpruned_lora_history(
+        tiny_base_run,
+        tiny_swag_bundle,
+        tmp_path / "invalid-tokenizer-run",
+        monkeypatch,
+    )
+    tokenizer_path = run / "tokenizer"
+    if mutation == "manifest":
+        manifest = read_manifest(
+            tokenizer_path, TokenizerManifest, VerificationLevel.FULL
+        ).manifest
+        manifest = replace(manifest, training={**manifest.training, "num_threads": 2})
+        manifest = replace(manifest, identity=manifest.recompute_identity())
+        (tokenizer_path / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+        expected_error = "run tokenizer identity does not match run.json"
+    else:
+        payload_path = tokenizer_path / mutation
+        raw = payload_path.read_bytes()
+        payload_path.write_bytes(bytes((raw[0] ^ 1,)) + raw[1:])
+        expected_error = "payload identity mismatch"
+    before = {
+        path.relative_to(run): path.read_bytes()
+        for path in run.rglob("*")
+        if path.is_file()
+    }
+
+    def forbidden_restore(*_args, **_kwargs):
+        raise AssertionError("checkpoint restore reached before tokenizer validation")
+
+    monkeypatch.setattr(swag_module, "_restore_adapter_checkpoint", forbidden_restore)
+    with pytest.raises(SMLArtifactError, match=expected_error):
+        resume_finetune(
+            run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=maximum_steps),
+        )
+
+    assert {
+        path.relative_to(run): path.read_bytes()
+        for path in run.rglob("*")
+        if path.is_file()
+    } == before
 
 
 def test_resume_rejects_wrong_key_before_runtime_or_retention(

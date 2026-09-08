@@ -338,6 +338,64 @@ def test_chunk_with_multiple_rows_makes_one_tokenizer_encode_call(
     assert tuple(processor.calls[1:5]) == tuple(VALID_ROW["endings"])
 
 
+@pytest.mark.parametrize("maximum_examples", [1, 3])
+@pytest.mark.parametrize("tail", ["malformed_row", "provider_failure"])
+def test_maximum_examples_stops_before_reading_unused_rows(
+    tmp_path, monkeypatch, maximum_examples, tail
+):
+    from sml.data import swag
+    from sml.data.swag import prepare_swag_bundle
+
+    monkeypatch.setattr(swag, "_INGEST_CHUNK_SIZE", 2)
+    rows = tuple(replace_row(label=index) for index in range(maximum_examples))
+    provider = FakeSwagProvider(rows + (({},) if tail == "malformed_row" else ()))
+    provider.fail_iter_after_rows = tail == "provider_failure"
+    bundle = prepare_swag_bundle(
+        tiny_swag_config(provider, maximum_examples=maximum_examples),
+        tiny_base_model(),
+        tmp_path / "swag",
+    )
+    try:
+        assert bundle.manifest.example_count == maximum_examples
+        assert bundle.manifest.dropped_overlength_rows == 0
+        with bundle.borrow_buckets() as buckets:
+            labels = [int(label) for bucket in buckets for label in bucket.labels]
+        assert labels == list(range(maximum_examples))
+    finally:
+        bundle.close()
+
+
+def test_maximum_examples_counts_kept_rows_after_overlength_drops(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+    from sml.data.swag import prepare_swag_bundle
+
+    monkeypatch.setattr(swag, "_INGEST_CHUNK_SIZE", 2)
+    overlength = replace_row(context=" ".join(["word"] * 40))
+    rows = (
+        overlength,
+        replace_row(label=0),
+        overlength,
+        replace_row(label=1),
+        replace_row(label=2),
+        {},
+    )
+    bundle = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider(rows), maximum_examples=3),
+        tiny_base_model(),
+        tmp_path / "swag",
+    )
+    try:
+        assert bundle.manifest.example_count == 3
+        assert bundle.manifest.dropped_overlength_rows == 2
+        with bundle.borrow_buckets() as buckets:
+            labels = [int(label) for bucket in buckets for label in bucket.labels]
+        assert labels == [0, 1, 2]
+    finally:
+        bundle.close()
+
+
 def test_npy_identity_is_hashed_while_writing(tmp_path, monkeypatch):
     from sml.artifacts.manifest import file_identity
     from sml.data import swag

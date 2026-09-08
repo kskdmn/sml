@@ -1454,6 +1454,10 @@ def resume_finetune(
                         raise SMLArtifactError(
                             "run tokenizer identity does not match run.json"
                         )
+                    tokenizer.root.verify_payloads(
+                        (tokenizer.manifest.model, tokenizer.manifest.vocab),
+                        full=True,
+                    )
                     validate_full_run_semantics(reader, tokenizer.manifest)
                 with reader.open_run_child("base", (BaseSnapshotManifest,)) as base:
                     require_lora_base_snapshot(base.manifest, resolved.run)

@@ -822,16 +822,48 @@ def _encode_text(processor, text: str) -> list[int]:
     return [int(token) for token in processor.encode(text)]
 
 
+def _encode_token_offsets(processor, text: str) -> tuple[tuple[int, int], ...]:
+    # SentencePiece 0.2.2 replaced immutable protos with offset mappings.
+    encode_offsets = getattr(processor, "encode_as_offset_mapping", None)
+    if encode_offsets is not None:
+        return tuple(
+            (int(begin), int(end)) for begin, end in encode_offsets(text)["offsets"]
+        )
+    return tuple(
+        (int(piece.begin), int(piece.end))
+        for piece in processor.encode_as_immutable_proto(text).pieces
+    )
+
+
 def _encode_loglikelihood_request(
     session: InferenceSession,
     request: LoglikelihoodRequest,
 ) -> tuple[tuple[int, ...], int]:
     processor = session.resolved_model.tokenizer.processor
     context_ids = _encode_text(processor, request.context)
-    full_ids = _encode_text(processor, request.context + request.continuation)
+    full_text = request.context + request.continuation
+    full_ids = _encode_text(processor, full_text)
     if full_ids[: len(context_ids)] != context_ids:
-        continuation_ids = _encode_text(processor, request.continuation)
-        continuation_start = len(full_ids) - len(continuation_ids)
+        context_end = len(request.context)
+        offsets = _encode_token_offsets(processor, full_text)
+        continuation_start = next(
+            (
+                index
+                for index, (begin, end) in enumerate(offsets)
+                if begin >= context_end or end > context_end
+            ),
+            len(full_ids),
+        )
+        if continuation_start < len(offsets):
+            begin = offsets[continuation_start][0]
+            # Normalization can combine characters across the boundary. Include
+            # every byte-fallback piece belonging to that source character.
+            while (
+                continuation_start > 0
+                and offsets[continuation_start - 1] == (begin, begin)
+                and processor.is_byte(full_ids[continuation_start - 1])
+            ):
+                continuation_start -= 1
     else:
         continuation_start = len(context_ids)
 

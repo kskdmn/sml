@@ -1104,6 +1104,14 @@ def resume(
                     "tokenizer",
                     (TokenizerManifest,),
                 ) as tokenizer:
+                    if tokenizer.manifest.identity != resolved.run.tokenizer_identity:
+                        raise SMLArtifactError(
+                            "run tokenizer identity does not match run.json"
+                        )
+                    tokenizer.root.verify_payloads(
+                        (tokenizer.manifest.model, tokenizer.manifest.vocab),
+                        full=True,
+                    )
                     validate_full_run_semantics(reader, tokenizer.manifest)
                 restored = _restore_checkpoint(reader)
                 resolved = reader.resolved

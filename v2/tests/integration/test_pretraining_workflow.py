@@ -582,6 +582,55 @@ def test_interrupted_accumulation_replays_the_complete_window(
     _assert_run_states_equal(resumed.run, uninterrupted.run)
 
 
+@pytest.mark.parametrize("maximum_steps", (1, 2))
+@pytest.mark.parametrize("mutation", ("tokenizer.model", "tokenizer.vocab", "manifest"))
+def test_resume_rejects_invalid_tokenizer_before_restore_or_retention(
+    mutation: str,
+    maximum_steps: int,
+    prepared_data: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = tmp_path / "invalid-tokenizer-run"
+    _run_with_unpruned_latest(prepared_data, run, monkeypatch)
+    tokenizer_path = run / "tokenizer"
+    if mutation == "manifest":
+        manifest = read_manifest(
+            tokenizer_path, TokenizerManifest, VerificationLevel.FULL
+        ).manifest
+        manifest = replace(manifest, training={**manifest.training, "num_threads": 2})
+        manifest = replace(manifest, identity=manifest.recompute_identity())
+        (tokenizer_path / "manifest.json").write_bytes(canonical_json_bytes(manifest))
+        expected_error = "run tokenizer identity does not match run.json"
+    else:
+        payload_path = tokenizer_path / mutation
+        raw = payload_path.read_bytes()
+        payload_path.write_bytes(bytes((raw[0] ^ 1,)) + raw[1:])
+        expected_error = "payload identity mismatch"
+    before = {
+        path.relative_to(run): path.read_bytes()
+        for path in run.rglob("*")
+        if path.is_file()
+    }
+
+    def forbidden_restore(*_args, **_kwargs):
+        raise AssertionError("checkpoint restore reached before tokenizer validation")
+
+    monkeypatch.setattr(pretrain, "_restore_checkpoint", forbidden_restore)
+    with pytest.raises(SMLArtifactError, match=expected_error):
+        pretrain.resume(
+            run,
+            data=prepared_data,
+            overrides=_overrides(maximum_steps=maximum_steps),
+        )
+
+    assert {
+        path.relative_to(run): path.read_bytes()
+        for path in run.rglob("*")
+        if path.is_file()
+    } == before
+
+
 def test_resume_rejects_wrong_key_before_runtime_or_retention(
     prepared_data: Path,
     tmp_path: Path,
