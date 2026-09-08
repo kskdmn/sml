@@ -56,20 +56,17 @@ from v2.benchmarks.recovery import (
 from v2.benchmarks.schema import METRIC_NAMES, CanonicalWorkload, MetricName, RawTrial
 from v2.benchmarks.workload import (
     DEFAULT_MEASURED_UNITS,
-    LEGACY_PRECISION_POLICY,
+    PRECISION_POLICY,
     PREPARED_DATA_MEASURED_UNITS,
-    REPLACEMENT_PRECISION_POLICY,
     WARMUP_UNITS,
     build_canonical_workload,
     canonical_execution_order_identity,
     canonical_input_identity,
     canonical_metric_projection,
     canonical_workload_identity,
-    fixed_canonical_rows,
     harness_content_identity,
     post_exit_recovery_policy,
     structured_identity,
-    write_paired_pretraining_representations,
 )
 
 Side = Literal["reference", "candidate"]
@@ -95,9 +92,7 @@ class EnvironmentTrialRejected(RuntimeError):
         super().__init__(f"{slot.metric} pair {slot.pair_index}: {reason}")
 
 
-PINNED_BASELINE_SOURCE_COMMIT = "3687f8b3214a44c675ae67af52e4997762f6c634"
-BASELINE_VERSION_LEGACY = 1
-BASELINE_VERSION_PREPARED_DATA_100 = 2
+BASELINE_VERSION = 3
 COMPARISON_SCREEN = "screen"
 COMPARISON_FINAL = "final"
 SCREEN_PAIRS = 5
@@ -175,42 +170,28 @@ def _metric_report_dict(report) -> dict:
 
 
 def _baseline_identity_domain(version: int) -> str:
-    if type(version) is not int:
+    if type(version) is not int or version != BASELINE_VERSION:
         raise ValueError("unsupported baseline manifest kind or version")
-    if version == BASELINE_VERSION_LEGACY:
-        return "sml-performance-baseline-v1"
-    if version == BASELINE_VERSION_PREPARED_DATA_100:
-        return "sml-performance-baseline-v2"
-    raise ValueError("unsupported baseline manifest kind or version")
+    return "sml-performance-baseline-v3"
 
 
 def _baseline_workload(version: int) -> CanonicalWorkload:
-    if type(version) is not int:
-        raise ValueError("unsupported baseline manifest kind or version")
-    if version == BASELINE_VERSION_LEGACY:
-        return build_canonical_workload(prepared_data_measured_units=20)
-    if version == BASELINE_VERSION_PREPARED_DATA_100:
-        return build_canonical_workload()
-    raise ValueError("unsupported baseline manifest kind or version")
+    _baseline_identity_domain(version)
+    return build_canonical_workload()
 
 
 def _baseline_protocol(version: int, workload: CanonicalWorkload) -> dict:
-    if type(version) is not int:
-        raise ValueError("unsupported baseline manifest kind or version")
-    protocol = {
+    _baseline_identity_domain(version)
+    return {
         "pairs": SCREEN_PAIRS,
         "compilation_passes": 1,
         "warmup_units": WARMUP_UNITS,
         "measured_units": DEFAULT_MEASURED_UNITS,
+        "prepared_data_measured_units": PREPARED_DATA_MEASURED_UNITS,
         "bootstrap_seed": 1729,
         "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
         "synchronization_boundaries": list(workload.synchronization_boundaries),
     }
-    if version == BASELINE_VERSION_PREPARED_DATA_100:
-        protocol["prepared_data_measured_units"] = PREPARED_DATA_MEASURED_UNITS
-    elif version != BASELINE_VERSION_LEGACY:
-        raise ValueError("unsupported baseline manifest kind or version")
-    return protocol
 
 
 def build_baseline_manifest(
@@ -225,8 +206,6 @@ def build_baseline_manifest(
     pairs: int,
     warmup_units: int,
     measured_units: int,
-    paired_representations: dict,
-    baseline_version: int,
 ) -> dict:
     _validate_raw_trials_evidence(trials)
     if (
@@ -260,7 +239,7 @@ def build_baseline_manifest(
         }
     body = {
         "kind": "sml-performance-baseline",
-        "version": baseline_version,
+        "version": BASELINE_VERSION,
         "source": {"commit": source_commit, "clean": True},
         "harness": {
             "commit": harness_commit,
@@ -270,18 +249,17 @@ def build_baseline_manifest(
         "command": command,
         "canonical_workload": workload.to_dict(),
         "canonical_workload_identity": workload_identity,
-        "protocol": _baseline_protocol(baseline_version, workload),
+        "protocol": _baseline_protocol(BASELINE_VERSION, workload),
         "hardware": trials[0].hardware,
         "environment_status": trials[0].environment_status,
         "software_versions": trials[0].software_versions,
         "semantic_identities": workload.semantic_identities,
-        "paired_pretraining_representations": paired_representations,
         "metrics": metric_records,
     }
     return {
         **body,
         "identity": structured_identity(
-            _baseline_identity_domain(baseline_version), body
+            _baseline_identity_domain(BASELINE_VERSION), body
         ),
     }
 
@@ -301,7 +279,6 @@ def _validate_baseline_header(manifest: dict) -> CanonicalWorkload:
         "environment_status",
         "software_versions",
         "semantic_identities",
-        "paired_pretraining_representations",
         "metrics",
     }
     if set(manifest) != expected_fields:
@@ -337,10 +314,7 @@ def _validate_baseline_header(manifest: dict) -> CanonicalWorkload:
     ):
         if type(protocol[name]) is not int:
             raise ValueError("baseline protocol does not match the pinned protocol")
-    if (
-        version == BASELINE_VERSION_PREPARED_DATA_100
-        and type(protocol["prepared_data_measured_units"]) is not int
-    ):
+    if type(protocol["prepared_data_measured_units"]) is not int:
         raise ValueError("baseline protocol does not match the pinned protocol")
     return workload
 
@@ -436,50 +410,6 @@ def validate_baseline_manifest(
 ) -> None:
     _validate_raw_trials_evidence(trials)
     workload = _validate_baseline_header(manifest)
-    paired_representations = manifest["paired_pretraining_representations"]
-    if not isinstance(paired_representations, dict):
-        raise ValueError("paired pretraining representations must be an object")
-    if set(paired_representations) != {
-        "canonical_row_identity",
-        "row_count",
-        "row_width",
-        "legacy_format",
-        "legacy_dtype",
-        "legacy_file_identity",
-        "legacy_byte_size",
-        "replacement_format",
-        "replacement_dtype",
-        "replacement_file_identity",
-        "replacement_byte_size",
-    }:
-        raise ValueError("paired pretraining representations have invalid fields")
-    if (
-        paired_representations.get("canonical_row_identity")
-        != workload.semantic_identities["canonical_training_rows"]
-    ):
-        raise ValueError("paired representations have the wrong canonical rows")
-    if (
-        paired_representations.get("row_count") != workload.loader["row_count"]
-        or paired_representations.get("row_width")
-        != int(workload.loader["sequence_length"]) + 1
-        or paired_representations.get("legacy_format") != "npz"
-        or paired_representations.get("legacy_dtype") != "uint16"
-        or paired_representations.get("replacement_format") != "npy"
-        or paired_representations.get("replacement_dtype") != "int32"
-        or not isinstance(paired_representations.get("legacy_byte_size"), int)
-        or paired_representations["legacy_byte_size"] <= 0
-        or not isinstance(paired_representations.get("replacement_byte_size"), int)
-        or paired_representations["replacement_byte_size"] <= 0
-    ):
-        raise ValueError("paired representation metadata is invalid")
-    for identity_name in ("legacy_file_identity", "replacement_file_identity"):
-        if (
-            re.fullmatch(
-                r"sha256:[0-9a-f]{64}", str(paired_representations.get(identity_name))
-            )
-            is None
-        ):
-            raise ValueError("paired representation file identity is invalid")
     source = manifest["source"]
     harness = manifest["harness"]
     protocol = manifest["protocol"]
@@ -492,8 +422,8 @@ def validate_baseline_manifest(
         )
     if source.get("clean") is not True or harness.get("clean") is not True:
         raise ValueError("baseline checkouts must be clean")
-    if source.get("commit") != PINNED_BASELINE_SOURCE_COMMIT:
-        raise ValueError("baseline source must be the pinned 3687f8b commit")
+    if re.fullmatch(r"[0-9a-f]{40}", str(source.get("commit"))) is None:
+        raise ValueError("baseline source must be a full Git commit")
     pairs = protocol.get("pairs")
     if pairs != SCREEN_PAIRS:
         raise ValueError("baseline requires exactly five fresh-process trials")
@@ -569,21 +499,6 @@ def validate_baseline_manifest(
                 for trial in metric_trials
             ):
                 raise ValueError(f"baseline metric {metric} changed {identity_field}")
-    legacy_identity = paired_representations.get("legacy_file_identity")
-    pretraining_representation_metrics = {
-        "prepared-data",
-        "pretraining-compute",
-        "pretraining-end-to-end",
-        "checkpoint-pause",
-        "compile-cold-start",
-        "peak-metal-memory",
-    }
-    if any(
-        trial.native_representation_identity != legacy_identity
-        for trial in trials
-        if trial.metric in pretraining_representation_metrics
-    ):
-        raise ValueError("baseline training trials do not use the paired legacy rows")
     if manifest["semantic_identities"] != workload.semantic_identities:
         raise ValueError("baseline semantic identities do not match the workload")
     if manifest["hardware"] != trials[0].hardware:
@@ -875,9 +790,7 @@ def build_comparison_report(
                 }
             )
         baseline_analysis = attempts[-1]["analysis"]
-        previous_comparison = _normalize_previous_comparison(
-            previous_comparisons.get(metric)
-        )
+        previous_comparison = previous_comparisons.get(metric)
         result_body = {
             "metric": metric,
             "candidate_commit": candidate_commit,
@@ -885,15 +798,6 @@ def build_comparison_report(
             "baseline_comparison": baseline_analysis,
             "previous_comparison": previous_comparison,
             "attempts": attempts,
-            "precision_policy": (
-                {
-                    "reference": LEGACY_PRECISION_POLICY,
-                    "candidate": REPLACEMENT_PRECISION_POLICY,
-                    "trajectory_equivalent": False,
-                }
-                if metric == "pretraining-end-to-end"
-                else None
-            ),
             "raw_trial_identities": [
                 _raw_trial_identity(trial) for trial in all_paired_trials
             ],
@@ -932,12 +836,11 @@ def build_comparison_report(
         "maximum_dispersion": maximum_dispersion,
         "require_lower_bound": require_lower_bound,
     }
-    if baseline["version"] == BASELINE_VERSION_PREPARED_DATA_100:
-        protocol["prepared_data_measured_units"] = (
-            PREPARED_DATA_MEASURED_UNITS
-            if prepared_data_measured_units is None
-            else prepared_data_measured_units
-        )
+    protocol["prepared_data_measured_units"] = (
+        PREPARED_DATA_MEASURED_UNITS
+        if prepared_data_measured_units is None
+        else prepared_data_measured_units
+    )
     body = {
         "kind": "sml-performance-comparison",
         "version": 1,
@@ -999,24 +902,6 @@ def _select_trial_pairs(
     return reference, candidate
 
 
-def _normalize_previous_comparison(record: dict | None) -> dict | None:
-    if record is None or "attempts" in record:
-        return record
-    return {
-        "predecessor_result_identity": record["predecessor_result_identity"],
-        "predecessor_source_commit": record["predecessor_source_commit"],
-        "analysis": record["analysis"],
-        "raw_trial_identities": record["raw_trial_identities"],
-        "attempts": [
-            {
-                "attempt_index": record["attempt_index"],
-                "analysis": record["analysis"],
-                "raw_trial_identities": record["raw_trial_identities"],
-            }
-        ],
-    }
-
-
 def _validate_comparison_protocol(report: dict, baseline: dict | None = None) -> None:
     protocol = report.get("protocol")
     if not isinstance(protocol, dict):
@@ -1044,24 +929,20 @@ def _validate_comparison_protocol(report: dict, baseline: dict | None = None) ->
         if type(protocol.get(key)) is not int:
             raise ValueError(f"comparison protocol has invalid {key}")
     if baseline is not None:
-        version = baseline["version"]
+        _baseline_identity_domain(baseline["version"])
         expected_fields = set(common) | {
             "pairs",
             "maximum_dispersion",
             "require_lower_bound",
             "pretraining_minimum_ratio",
         }
-        if version == BASELINE_VERSION_PREPARED_DATA_100:
-            expected_fields.add("prepared_data_measured_units")
-            if type(protocol.get("prepared_data_measured_units")) is not int or (
-                protocol.get("prepared_data_measured_units")
-                != PREPARED_DATA_MEASURED_UNITS
-            ):
-                raise ValueError(
-                    "comparison protocol has invalid prepared_data_measured_units"
-                )
-        elif version != BASELINE_VERSION_LEGACY:
-            raise ValueError("unsupported baseline manifest kind or version")
+        expected_fields.add("prepared_data_measured_units")
+        if type(protocol.get("prepared_data_measured_units")) is not int or (
+            protocol.get("prepared_data_measured_units") != PREPARED_DATA_MEASURED_UNITS
+        ):
+            raise ValueError(
+                "comparison protocol has invalid prepared_data_measured_units"
+            )
         if set(protocol) != expected_fields:
             raise ValueError("comparison protocol has an invalid field set")
     if mode == COMPARISON_SCREEN:
@@ -1148,9 +1029,9 @@ def _validate_comparison_trial_pair(
         raise ValueError("comparison sides use different initial parameters")
     if (
         reference_trial.native_configuration.get("parameter_precision_policy")
-        != LEGACY_PRECISION_POLICY
+        != PRECISION_POLICY
         or candidate_trial.native_configuration.get("parameter_precision_policy")
-        != REPLACEMENT_PRECISION_POLICY
+        != PRECISION_POLICY
     ):
         raise ValueError("comparison precision-policy proof is invalid")
 
@@ -1200,7 +1081,7 @@ def _validate_predecessor_trial_pair(
             raise ValueError("direct predecessor canonical proof is invalid")
         if (
             trial.native_configuration.get("parameter_precision_policy")
-            != REPLACEMENT_PRECISION_POLICY
+            != PRECISION_POLICY
         ):
             raise ValueError("direct predecessor precision policy is invalid")
         _validate_acceptance_environment(workload, trial)
@@ -1553,17 +1434,6 @@ def validate_comparison_report(
             _raw_trial_identity(trial) for trial in all_baseline_trials
         ]:
             raise ValueError("comparison raw-trial identities do not match attempts")
-        expected_precision_policy = (
-            {
-                "reference": LEGACY_PRECISION_POLICY,
-                "candidate": REPLACEMENT_PRECISION_POLICY,
-                "trajectory_equivalent": False,
-            }
-            if metric == "pretraining-end-to-end"
-            else None
-        )
-        if metric_record.get("precision_policy") != expected_precision_policy:
-            raise ValueError("comparison precision annotation is invalid")
         predecessor = predecessor_metrics.get(metric)
         previous_comparison = metric_record.get("previous_comparison")
         if predecessor is None or predecessor["source_commit"] == baseline_commit:
@@ -1893,6 +1763,8 @@ def detect_competing_gpu_workload(
         "train_sml.py",
         "ft_swag.py",
         "v2.benchmarks.runner",
+        "v2.benchmarks.quality",
+        "v2.benchmarks.swag_quality",
         "ollama",
         "llama-server",
         "llama-cli",
@@ -1905,6 +1777,10 @@ def detect_competing_gpu_workload(
         if "mtlcompilerservice" in lowered:
             continue
         if any(signature in lowered for signature in gpu_signatures):
+            return True
+        if re.search(
+            r"(?:^|\s)-m\s+sml\s+(?:train|finetune|infer|evaluate)(?:\s|$)", lowered
+        ):
             return True
     return False
 
@@ -2136,13 +2012,9 @@ def _run_single_process(args: argparse.Namespace) -> int:
     if type(args.measure) is not int or args.measure != work_unit.measured_units:
         raise ValueError("child measured units do not match the canonical metric")
     measured_units = args.measure
-    if args.adapter == "legacy":
-        from v2.benchmarks.adapters import legacy as adapter
-    else:
-        from v2.benchmarks.adapters import replacement as adapter
+    from v2.benchmarks.adapters import runtime as adapter
+
     native = adapter.resolve_native_workload(args.metric, workload, source_root)
-    if type(native).__name__ == "UnavailableNativeWorkload":
-        raise RuntimeError(f"replacement metric unavailable: {native.reason}")
     start_hardware, start_status, start_software_versions = collect_environment()
     start_observation = {
         "observed_at_utc": _utc_now_iso(),
@@ -2315,7 +2187,6 @@ def _launch_trial(
     source_commit: str,
     harness_commit: str,
     harness_identity: str,
-    adapter: str,
     metric: MetricName,
     side: Side,
     attempt_index: int,
@@ -2350,8 +2221,6 @@ def _launch_trial(
         harness_commit,
         "--harness-identity",
         harness_identity,
-        "--adapter",
-        adapter,
         "--metric",
         metric,
         "--side",
@@ -2899,10 +2768,8 @@ def publish_baseline_from_journal(
     source_commit: str,
     harness_commit: str,
     harness_identity: str,
-    paired_representations: dict,
     manifest_path: Path,
     raw_output_path: Path,
-    baseline_version: int = BASELINE_VERSION_PREPARED_DATA_100,
 ) -> dict:
     _validate_raw_trials_evidence(trials)
     manifest_path, raw_output_path = _resolve_baseline_output_paths(
@@ -2910,8 +2777,6 @@ def publish_baseline_from_journal(
         manifest_path=manifest_path,
         raw_output_path=raw_output_path,
     )
-    if journal.session["paired_representations"] != paired_representations:
-        raise ValueError("publication paired representations do not match the session")
     if journal.session["manifest_path"] != str(manifest_path.resolve()):
         raise ValueError("publication manifest path does not match the session")
     if journal.session["raw_output_path"] != str(raw_output_path.resolve()):
@@ -2936,8 +2801,6 @@ def publish_baseline_from_journal(
         pairs=SCREEN_PAIRS,
         warmup_units=WARMUP_UNITS,
         measured_units=DEFAULT_MEASURED_UNITS,
-        paired_representations=paired_representations,
-        baseline_version=baseline_version,
     )
     validate_baseline_manifest(manifest, ordered_trials)
 
@@ -3025,8 +2888,6 @@ def _record_baseline_locked(
     harness_commit = _git_commit(harness_root)
     harness_identity = harness_content_identity(harness_root)
     source_commit = _git_commit(harness_root, args.source_commit)
-    if source_commit != PINNED_BASELINE_SOURCE_COMMIT:
-        raise ValueError("record-baseline requires the pinned 3687f8b source commit")
     if (
         tuple(args.metrics) != METRIC_NAMES
         or args.pairs != SCREEN_PAIRS
@@ -3039,15 +2900,12 @@ def _record_baseline_locked(
     workload_identity = canonical_workload_identity(workload)
     initial_environment = collect_environment()
     initial_hardware, _initial_status, initial_software_versions = initial_environment
-    protocol = _baseline_protocol(BASELINE_VERSION_PREPARED_DATA_100, workload)
+    protocol = _baseline_protocol(BASELINE_VERSION, workload)
     measured_units_by_metric = {
         unit.metric: unit.measured_units for unit in workload.work_units
     }
     with tempfile.TemporaryDirectory(prefix="sml-v2-baseline-") as temporary_name:
         temporary = Path(temporary_name)
-        paired_representations = write_paired_pretraining_representations(
-            fixed_canonical_rows(), temporary / "paired-representations"
-        )
         session = build_session_document(
             harness_commit=harness_commit,
             harness_identity=harness_identity,
@@ -3057,7 +2915,6 @@ def _record_baseline_locked(
             protocol=protocol,
             hardware=initial_hardware,
             software_versions=initial_software_versions,
-            paired_representations=paired_representations,
             manifest_path=manifest_path,
             raw_output_path=raw_output_path,
         )
@@ -3133,7 +2990,6 @@ def _record_baseline_locked(
                     source_commit=source_commit,
                     harness_commit=harness_commit,
                     harness_identity=harness_identity,
-                    adapter="legacy",
                     metric=slot.metric,
                     side="reference",
                     attempt_index=0,
@@ -3195,10 +3051,8 @@ def _record_baseline_locked(
         source_commit=source_commit,
         harness_commit=harness_commit,
         harness_identity=harness_identity,
-        paired_representations=paired_representations,
         manifest_path=manifest_path,
         raw_output_path=raw_output_path,
-        baseline_version=BASELINE_VERSION_PREPARED_DATA_100,
     )
     return 0
 
@@ -3227,8 +3081,8 @@ def _validate_baseline_document(manifest: dict) -> None:
         raise ValueError("baseline source proof is invalid")
     if not isinstance(harness, dict) or harness.get("clean") is not True:
         raise ValueError("baseline harness proof is invalid")
-    if source.get("commit") != PINNED_BASELINE_SOURCE_COMMIT:
-        raise ValueError("baseline source is not the pinned 3687f8b commit")
+    if re.fullmatch(r"[0-9a-f]{40}", str(source.get("commit"))) is None:
+        raise ValueError("baseline source must be a full Git commit")
     metrics = manifest.get("metrics")
     if not isinstance(metrics, dict) or set(metrics) != set(METRIC_NAMES):
         raise ValueError("baseline document does not contain every metric")
@@ -3379,7 +3233,6 @@ def _run_paired_trials(
     candidate_commit: str,
     harness_commit: str,
     harness_identity: str,
-    reference_adapter: str,
     metrics: Sequence[MetricName],
     pairs: int,
     warmup: int,
@@ -3420,7 +3273,6 @@ def _run_paired_trials(
                     ),
                     harness_commit=harness_commit,
                     harness_identity=harness_identity,
-                    adapter=reference_adapter if is_reference else "replacement",
                     metric=metric,
                     side=side,
                     attempt_index=attempt_index,
@@ -3558,7 +3410,6 @@ def _collect_comparison_attempt(
                 candidate_commit=candidate_commit,
                 harness_commit=harness_commit,
                 harness_identity=harness_identity,
-                reference_adapter="legacy",
                 metrics=args.metrics,
                 pairs=args.pairs,
                 warmup=args.warmup,
@@ -3595,7 +3446,6 @@ def _collect_comparison_attempt(
                         candidate_commit=candidate_commit,
                         harness_commit=harness_commit,
                         harness_identity=harness_identity,
-                        reference_adapter="replacement",
                         metrics=(metric,),
                         pairs=args.pairs,
                         warmup=args.warmup,
@@ -3771,7 +3621,7 @@ def _validate_phase(args: argparse.Namespace) -> int:
     expected_metrics = PHASE_METRICS.get(args.phase)
     if expected_metrics is None:
         raise ValueError("unsupported refactor phase")
-    if tuple(report["metrics"]) != expected_metrics:
+    if set(report["metrics"]) != set(expected_metrics):
         raise ValueError(f"phase {args.phase} measured the wrong metric set")
     required_predecessors = PHASE_PREDECESSOR_METRICS[args.phase]
     if {
@@ -3794,7 +3644,7 @@ def validate_final_report(
     if [trial.to_dict() for trial in raw_trials] != report.get("raw_trials"):
         raise ValueError("final raw input does not exactly match the complete report")
     metrics = report.get("metrics")
-    if not isinstance(metrics, dict) or tuple(metrics) != FINAL_METRICS:
+    if not isinstance(metrics, dict) or set(metrics) != set(FINAL_METRICS):
         raise ValueError("final acceptance measured the wrong metric set")
     if report.get("comparison_mode") != COMPARISON_FINAL:
         raise ValueError("final validation requires a final-mode report")
@@ -3896,10 +3746,7 @@ def _resolve_comparison_mode(
         "maximum_dispersion": args.maximum_dispersion,
         "require_lower_bound": not args.lower_bound_report_only,
     }
-    if (
-        baseline is not None
-        and baseline["version"] == BASELINE_VERSION_PREPARED_DATA_100
-    ):
+    if baseline is not None:
         protocol["prepared_data_measured_units"] = args.prepared_data_measure
     _validate_comparison_protocol(
         {"comparison_mode": mode, "protocol": protocol}, baseline
@@ -3954,7 +3801,16 @@ def measure_native_process(
         raise ValueError("measured_units must be positive")
 
     compilation_seconds: float | None = None
+    prepare_unit = (
+        getattr(
+            getattr(native_workload, "runtime", None), "prepare_measured_unit", None
+        )
+        if metric == "checkpoint-pause"
+        else None
+    )
     if metric != "compile-cold-start":
+        if prepare_unit is not None:
+            prepare_unit()
         synchronize()
         compilation_start = clock()
         adapter.run_warmup(metric, native_workload, 1)
@@ -3963,15 +3819,30 @@ def measure_native_process(
         if compilation_seconds <= 0:
             raise RuntimeError("benchmark compilation clock did not advance")
         for _ in range(warmup_units):
+            if prepare_unit is not None:
+                prepare_unit()
             adapter.run_warmup(metric, native_workload, 1)
             synchronize()
 
     reset_peak_memory()
     synchronize()
-    start = clock()
-    work_count = float(adapter.run_measured(metric, native_workload, measured_units))
-    synchronize()
-    elapsed = clock() - start
+    if prepare_unit is None:
+        start = clock()
+        work_count = float(
+            adapter.run_measured(metric, native_workload, measured_units)
+        )
+        synchronize()
+        elapsed = clock() - start
+    else:
+        elapsed = 0.0
+        work_count = 0.0
+        for _ in range(measured_units):
+            prepare_unit()
+            synchronize()
+            start = clock()
+            work_count += float(adapter.run_measured(metric, native_workload, 1))
+            synchronize()
+            elapsed += clock() - start
     if elapsed <= 0:
         raise RuntimeError("benchmark clock did not advance")
     peak = int(peak_memory())
@@ -4057,7 +3928,6 @@ def build_parser() -> argparse.ArgumentParser:
     process.add_argument("--source-commit", required=True)
     process.add_argument("--harness-commit", required=True)
     process.add_argument("--harness-identity", required=True)
-    process.add_argument("--adapter", choices=("legacy", "replacement"), required=True)
     process.add_argument("--metric", choices=METRIC_NAMES, required=True)
     process.add_argument("--side", choices=("reference", "candidate"), required=True)
     process.add_argument("--attempt-index", type=int, required=True)

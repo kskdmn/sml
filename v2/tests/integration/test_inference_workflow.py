@@ -607,18 +607,11 @@ def test_short_prompt_long_generation_seeded_batch_matches_serial(
     assert tiny_session.buffer_pool.active_leases == 0
 
 
-def test_resolve_rejects_direct_step_path(tmp_path: Path) -> None:
-    step_path = tmp_path / "checkpoints" / "step-000000001"
-    step_path.mkdir(parents=True)
-    with pytest.raises(SMLArtifactError, match="step"):
-        resolve_model_artifact(step_path, full_verify=False)
-
-
-def test_resolve_rejects_historical_selector_on_step_directory(
+def test_resolve_requires_artifact_root_manifest(
     tiny_pretraining_run: Path,
 ) -> None:
     step_path = next((tiny_pretraining_run / "checkpoints").glob("step-*"))
-    with pytest.raises(SMLArtifactError, match="step"):
+    with pytest.raises(SMLArtifactError, match="artifact root must contain"):
         resolve_model_artifact(step_path, full_verify=False)
 
 
@@ -633,5 +626,3 @@ def test_new_session_resolves_published_step_under_latest_only(
     step_dirs = list((tiny_pretraining_run / "checkpoints").glob("step-*"))
     assert len(step_dirs) == 1
     assert int(step_dirs[0].name.split("-")[1]) == original_step + 1
-    with pytest.raises(SMLArtifactError, match="step"):
-        InferenceSession.from_checkpoint(step_dirs[0])

@@ -209,6 +209,7 @@ def tiny_base_model(
     )
     return ResolvedModel(
         artifact_kind="pretraining-checkpoint",
+        artifact_identity=IDENTITY_B,
         run_identity=IDENTITY_B,
         step=1,
         checkpoint_identity=IDENTITY_C,
@@ -231,6 +232,103 @@ def tiny_swag_config(provider, **overrides):
     }
     values.update(overrides)
     return SwagPreparationConfig(**values)
+
+
+def test_bucket_growth_failure_preserves_existing_rows_and_can_retry(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+
+    writer = swag._BucketWriter(16, tmp_path)
+    ids = np.arange(64, dtype="<i4").reshape(4, 16)
+    mask = np.ones((4, 16), dtype=np.bool_)
+    for index in range(8):
+        writer.append(ids + index, mask, mask, index % 4)
+    writer.flush()
+    old_maps = dict(writer._maps)
+    old_values = {name: np.array(mm) for name, mm in old_maps.items()}
+    real_memmap = np.memmap
+    allocated = []
+    failure = OSError("disk full during bucket growth")
+
+    def fail_second_allocation(path, *args, **kwargs):
+        if len(allocated) == 1:
+            Path(path).write_bytes(b"partial allocation")
+            raise failure
+        mm = real_memmap(path, *args, **kwargs)
+        allocated.append(mm)
+        return mm
+
+    writer.append(ids + 8, mask, mask, 0)
+    monkeypatch.setattr(swag.np, "memmap", fail_second_allocation)
+    try:
+        with pytest.raises(OSError) as raised:
+            writer.flush()
+        assert raised.value is failure
+        assert writer.count == writer._capacity == 8
+        assert all(writer._maps[name] is mm for name, mm in old_maps.items())
+        assert all(not mm._mmap.closed for mm in old_maps.values())
+        assert all(mm._mmap.closed for mm in allocated)
+        assert not list(tmp_path.glob("*-16.dat"))
+        for name, values in old_values.items():
+            np.testing.assert_array_equal(writer._maps[name], values)
+
+        monkeypatch.setattr(swag.np, "memmap", real_memmap)
+        arrays = writer.arrays()
+        assert writer.count == 9
+        np.testing.assert_array_equal(arrays["input_ids"][-1], ids + 8)
+        assert all(mm._mmap.closed for mm in old_maps.values())
+    finally:
+        writer.close()
+
+
+def test_bucket_close_releases_every_mapping_when_flush_fails(tmp_path, monkeypatch):
+    from sml.data import swag
+
+    writer = swag._BucketWriter(16, tmp_path)
+    writer._ensure_capacity(1)
+    maps = list(writer._maps.values())
+    real_flush = np.memmap.flush
+    failure = OSError("flush failed")
+
+    def fail_first_flush(array):
+        if array is maps[0]:
+            raise failure
+        return real_flush(array)
+
+    monkeypatch.setattr(np.memmap, "flush", fail_first_flush)
+    with pytest.raises(OSError) as raised:
+        writer.close()
+    assert raised.value is failure
+    assert all(mm._mmap.closed for mm in maps)
+    writer.close()
+
+
+def test_ingest_preserves_provider_failure_and_closes_all_buckets(
+    tmp_path, monkeypatch
+):
+    from sml.data import swag
+
+    monkeypatch.setattr(swag, "_INGEST_CHUNK_SIZE", 1)
+    provider = FakeSwagProvider((VALID_ROW,))
+    provider.fail_iter_after_rows = True
+    real_close = swag._BucketWriter.close
+    closed = []
+    cleanup_error = OSError("bucket cleanup failed")
+
+    def failing_close(writer):
+        real_close(writer)
+        closed.append(writer.length)
+        if len(closed) == 1:
+            raise cleanup_error
+
+    monkeypatch.setattr(swag._BucketWriter, "close", failing_close)
+    with pytest.raises(SMLDataError, match="provider unavailable") as raised:
+        swag.prepare_swag_bundle(
+            tiny_swag_config(provider), tiny_base_model(), tmp_path / "swag"
+        )
+    assert raised.value.__cause__ is cleanup_error
+    assert closed == [16, 32]
 
 
 def change_identity_field(config, field: str):

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import shutil
+import weakref
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -1332,4 +1334,57 @@ def test_dropped_epoch_tail_does_not_publish_duplicate_progress_checkpoint(
 
     assert result.step == 1
     assert result.rows == 4
+    assert result.epoch == 1
     assert published == [0, 1]
+
+    def forbid_completed_runtime(*args, **kwargs):
+        raise AssertionError("completed epochs must return before allocating a runtime")
+
+    monkeypatch.setattr(pretrain, "_run_training", forbid_completed_runtime)
+    resumed = pretrain.resume(result.run, data=data, overrides=_overrides())
+    assert resumed == result
+    assert published == [0, 1]
+
+
+@pytest.mark.parametrize("compile", [False, True])
+def test_training_releases_initial_device_arrays_after_update(
+    tmp_path, monkeypatch, compile
+):
+    data = _prepared_bundle(tmp_path / "prepared")
+    config = replace(
+        _config(data, tmp_path / "run", maximum_steps=2),
+        compile=compile,
+        checkpoint=CheckpointPolicy(interval=1),
+    )
+    initial_arrays = []
+    real_initial_state = pretrain._initial_state
+    real_publish = pretrain._publish_training_state
+
+    def track_initial_state(config):
+        model, state = real_initial_state(config)
+        trees = (
+            model.parameters(),
+            state.parameters.master_parameters,
+            state.parameters.working_parameters,
+            state.optimizer.first_moments,
+            state.optimizer.second_moments,
+            state.trainer.accumulators,
+        )
+        initial_arrays.extend(
+            weakref.ref(tree["embed_tokens"]["weight"]) for tree in trees
+        )
+        return model, state
+
+    def check_published_state(run, manifest, state):
+        gc.collect()
+        assert [
+            index
+            for index, reference in enumerate(initial_arrays)
+            if reference() is not None
+        ] == []
+        return real_publish(run, manifest, state)
+
+    monkeypatch.setattr(pretrain, "_initial_state", track_initial_state)
+    monkeypatch.setattr(pretrain, "_publish_training_state", check_published_state)
+
+    assert pretrain.train(config).step == 2

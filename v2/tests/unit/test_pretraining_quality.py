@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import json
 import os
 import shutil
 import subprocess
@@ -46,14 +45,6 @@ from v2.benchmarks.quality import (
 )
 
 ROOT = Path(__file__).parents[3]
-
-
-def _canonical_validate_args() -> SimpleNamespace:
-    return SimpleNamespace(
-        manifest=ROOT / quality_module.CANONICAL_MANIFEST_PATH,
-        raw_input=ROOT / quality_module.CANONICAL_RAW_PATH,
-        report=ROOT / quality_module.CANONICAL_REPORT_PATH,
-    )
 
 
 @contextmanager
@@ -252,15 +243,15 @@ def test_recording_command_and_session_identity_are_checkout_portable(tmp_path):
     right_root = tmp_path / "a-much-longer-relocated-checkout"
     left_destinations = quality_module._canonical_evidence_destinations(
         left_root,
-        left_root / quality_module.CANONICAL_MANIFEST_PATH,
-        left_root / quality_module.CANONICAL_RAW_PATH,
-        left_root / quality_module.CANONICAL_REPORT_PATH,
+        left_root / quality_module.RECORD_MANIFEST_PATH,
+        left_root / quality_module.RECORD_RAW_PATH,
+        left_root / quality_module.RECORD_REPORT_PATH,
     )
     right_destinations = quality_module._canonical_evidence_destinations(
         right_root,
-        right_root / quality_module.CANONICAL_MANIFEST_PATH,
-        right_root / quality_module.CANONICAL_RAW_PATH,
-        right_root / quality_module.CANONICAL_REPORT_PATH,
+        right_root / quality_module.RECORD_MANIFEST_PATH,
+        right_root / quality_module.RECORD_RAW_PATH,
+        right_root / quality_module.RECORD_REPORT_PATH,
     )
 
     left = quality_module._recording_command_document(left_root, left_destinations)
@@ -331,9 +322,9 @@ def test_re_signed_descendant_cannot_reuse_evidence_after_artifact_source_change
 
     destinations = quality_module._canonical_evidence_destinations(
         tmp_path,
-        tmp_path / quality_module.CANONICAL_MANIFEST_PATH,
-        tmp_path / quality_module.CANONICAL_RAW_PATH,
-        tmp_path / quality_module.CANONICAL_REPORT_PATH,
+        tmp_path / quality_module.RECORD_MANIFEST_PATH,
+        tmp_path / quality_module.RECORD_RAW_PATH,
+        tmp_path / quality_module.RECORD_REPORT_PATH,
     )
     command = quality_module._recording_command_document(tmp_path, destinations)
     session_identity = quality_module._recording_session_identity(
@@ -371,9 +362,9 @@ def test_re_signed_descendant_cannot_reuse_evidence_after_artifact_source_change
 def _signed_quality_manifest(tmp_path, canonical_workload, source_commit):
     destinations = quality_module._canonical_evidence_destinations(
         tmp_path,
-        tmp_path / quality_module.CANONICAL_MANIFEST_PATH,
-        tmp_path / quality_module.CANONICAL_RAW_PATH,
-        tmp_path / quality_module.CANONICAL_REPORT_PATH,
+        tmp_path / quality_module.RECORD_MANIFEST_PATH,
+        tmp_path / quality_module.RECORD_RAW_PATH,
+        tmp_path / quality_module.RECORD_REPORT_PATH,
     )
     command = quality_module._recording_command_document(tmp_path, destinations)
     session_identity = quality_module._recording_session_identity(
@@ -471,72 +462,6 @@ def test_validate_rejects_recorded_source_bytes_that_do_not_match_the_manifest(
             tmp_path,
             command,
         )
-
-
-def test_canonical_evidence_validates_after_unrelated_checkpoint_source_edit():
-    path = ROOT / "v2/src/sml/artifacts/checkpoint.py"
-    recorded = json.loads((ROOT / quality_module.CANONICAL_MANIFEST_PATH).read_bytes())[
-        "production_dependency_identity"
-    ]
-    with _temporary_current_tree_bytes(
-        path,
-        path.read_bytes() + b"\n# unrelated current-tree checkpoint edit\n",
-    ):
-        assert production_dependency_content_identity(ROOT) != recorded
-        captured = []
-
-        def forbid(_root):
-            captured.append(True)
-            raise AssertionError("validate must not rebuild the current-tree workload")
-
-        original = quality_module.build_pretraining_quality_workload
-        quality_module.build_pretraining_quality_workload = forbid
-        try:
-            assert quality_module._validate(_canonical_validate_args()) == 0
-        finally:
-            quality_module.build_pretraining_quality_workload = original
-        assert captured == []
-
-
-def test_current_closure_excludes_bridge_and_recorded_evidence_still_validates():
-    assert Path("v2/src/sml.py") not in production_dependency_components(ROOT)
-    assert quality_module._validate(_canonical_validate_args()) == 0
-
-
-def test_recorded_validator_rejects_re_signed_bridge_omission():
-    manifest = json.loads(
-        (ROOT / quality_module.CANONICAL_MANIFEST_PATH).read_text(encoding="utf-8")
-    )
-    source_commit = manifest["source_commit"]
-    workload = PretrainingQualityWorkload.from_dict(manifest["workload"])
-    retained_components = tuple(
-        component
-        for component in workload.production_dependency_components
-        if component != quality_module.LEGACY_BRIDGE_COMPONENT.as_posix()
-    )
-    assert len(retained_components) + 1 == len(
-        workload.production_dependency_components
-    )
-    production_identity = quality_module._production_dependency_identity(
-        tuple(Path(component) for component in retained_components),
-        lambda component: quality_module._git_bytes(
-            ROOT, "show", f"{source_commit}:{component.as_posix()}"
-        ),
-    )
-    tampered = replace(
-        workload,
-        identity="sha256:" + "0" * 64,
-        production_dependency_components=retained_components,
-        production_dependency_identity=production_identity,
-    )
-    tampered = replace(tampered, identity=tampered.recompute_identity())
-
-    with pytest.raises(ValueError, match="component set changed"):
-        quality_module._validate_harness_commit(ROOT, source_commit, tampered)
-
-
-def test_canonical_standalone_validator_accepts_the_unchanged_evidence_set():
-    assert quality_module._validate(_canonical_validate_args()) == 0
 
 
 def test_workload_rejects_a_validation_row_copied_from_training(tmp_path):
@@ -1025,6 +950,14 @@ def test_multi_step_runtime_submits_each_optimizer_boundary(monkeypatch, tmp_pat
     config, model, parameters, optimizer, trainer, decay = _tiny_runtime(tmp_path)
     kernels = quality_module._build_candidate_kernels(model, config, decay)
     rows = np.asarray([[1, 4, 5, 2, 6]], dtype=np.int32)
+    received_keys = []
+    real_microstep = kernels.microstep_core
+
+    def record_microstep(working, trainer_tree, input_ids, labels):
+        received_keys.append(trainer_tree[2])
+        return real_microstep(working, trainer_tree, input_ids, labels)
+
+    kernels = replace(kernels, microstep_core=record_microstep)
     state = quality_module._RuntimeLoopState(
         masters=parameters.master_parameters,
         working=parameters.working_parameters,
@@ -1058,21 +991,27 @@ def test_multi_step_runtime_submits_each_optimizer_boundary(monkeypatch, tmp_pat
         start_step=0,
         stop_step=3,
         state=state,
+        training_seed=config.seed,
+        dropout_enabled=True,
     )
     mx.eval(result.masters, result.adam_tree, result.trainer_tree)
 
     assert len(submissions) == 3
     assert int(result.adam_tree[0].item()) == 3
     assert result.microstep_index == 3
+    for index, key in enumerate(received_keys):
+        assert bool(
+            mx.array_equal(key, quality_module.counter_random_key(config.seed, index))
+        )
     assert not bool(mx.array_equal(result.trainer_tree[2], trainer.next_key))
 
 
 def test_manifest_fields_and_output_paths_fail_closed(canonical_workload, tmp_path):
     destinations = quality_module._canonical_evidence_destinations(
         ROOT,
-        ROOT / "v2/benchmarks/manifests/pretraining-quality-v1.json",
-        ROOT / "v2/benchmarks/results/pretraining-quality-v1.jsonl",
-        ROOT / "v2/benchmarks/results/pretraining-quality-v1.json",
+        ROOT / quality_module.RECORD_MANIFEST_PATH,
+        ROOT / quality_module.RECORD_RAW_PATH,
+        ROOT / quality_module.RECORD_REPORT_PATH,
     )
     command = quality_module._recording_command_document(ROOT, destinations)
     session_identity = quality_module._recording_session_identity(
@@ -1170,9 +1109,9 @@ def test_manifest_fields_and_output_paths_fail_closed(canonical_workload, tmp_pa
 
 def _test_publication(tmp_path):
     destinations = quality_module._EvidenceDestinations(
-        manifest=tmp_path / "manifests" / "manifest.json",
-        raw_output=tmp_path / "results" / "raw.jsonl",
-        report=tmp_path / "results" / "report.json",
+        manifest=tmp_path / quality_module.RECORD_MANIFEST_PATH,
+        raw_output=tmp_path / quality_module.RECORD_RAW_PATH,
+        report=tmp_path / quality_module.RECORD_REPORT_PATH,
     )
     owner = quality_module._publication_owner_document(
         session_identity="sha256:" + "1" * 64,
@@ -1323,9 +1262,9 @@ def test_record_resumes_after_all_artifact_links_before_completed_fast_path(
     root = tmp_path
     destinations = quality_module._canonical_evidence_destinations(
         root,
-        root / quality_module.CANONICAL_MANIFEST_PATH,
-        root / quality_module.CANONICAL_RAW_PATH,
-        root / quality_module.CANONICAL_REPORT_PATH,
+        root / quality_module.RECORD_MANIFEST_PATH,
+        root / quality_module.RECORD_RAW_PATH,
+        root / quality_module.RECORD_REPORT_PATH,
     )
     source_commit = "a" * 40
     workload = SimpleNamespace(identity="sha256:" + "2" * 64)
@@ -1469,3 +1408,167 @@ def test_public_record_accepts_only_the_exact_canonical_step_count():
     for invalid in ("1", "10", "999", "1001"):
         with pytest.raises(SystemExit):
             parser.parse_args(["record", "--steps", invalid, *common])
+
+
+@pytest.fixture(scope="module")
+def current_recorded_evidence(tmp_path_factory, canonical_workload):
+    """Build validator inputs from current source and bounded synthetic records."""
+    root = tmp_path_factory.mktemp("pretraining-quality-current-evidence")
+    workload = canonical_workload
+    copied = {
+        *quality_module.HARNESS_COMPONENTS,
+        *(Path(path) for path in workload.production_dependency_components),
+        quality_module.TRAINING_FIXTURE,
+        quality_module.VALIDATION_FIXTURE,
+    }
+    for relative in copied:
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, destination)
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments], cwd=root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "--quiet")
+    git("config", "user.name", "Quality Evidence Test")
+    git("config", "user.email", "quality-evidence@example.invalid")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "current quality source")
+    commit = git("rev-parse", "HEAD")
+    destinations = quality_module._canonical_evidence_destinations(
+        root,
+        root / quality_module.RECORD_MANIFEST_PATH,
+        root / quality_module.RECORD_RAW_PATH,
+        root / quality_module.RECORD_REPORT_PATH,
+    )
+    command = quality_module._recording_command_document(root, destinations)
+    records = tuple(
+        _checkpoint(
+            workload,
+            runtime,
+            step,
+            validation_nll=2.01 if runtime == "candidate" else 2.0,
+        )
+        for runtime in ("candidate", "oracle")
+        for step in CHECKPOINT_STEPS
+    )
+    documents = [record.to_dict() for record in records]
+    raw = b"".join(
+        quality_module.canonical_json_bytes(document) + b"\n" for document in documents
+    )
+    raw_identity = quality_module.structured_identity(
+        "sml-pretraining-quality-raw-v1", documents
+    )
+    report = quality_module._report_document(
+        workload.identity,
+        raw_identity,
+        validate_pretraining_quality_records(workload, records),
+    )
+    report_bytes = quality_module.canonical_json_bytes(report)
+    manifest = quality_module._manifest_document(
+        workload=workload,
+        source_commit=commit,
+        recording_command=command,
+        phase_times={
+            "setup": 1.0,
+            "candidate": 1.0,
+            "oracle": 1.0,
+            "validation_serialization": 1.0,
+        },
+        peak_memory=1,
+        raw_identity=raw_identity,
+        raw_file_identity=quality_module._payload_identity(raw),
+        raw_bytes=len(raw),
+        report_identity=report["identity"],
+        report_file_identity=quality_module._payload_identity(report_bytes),
+        report_bytes=len(report_bytes),
+        recording_session_identity=quality_module._recording_session_identity(
+            commit, workload.identity, command
+        ),
+    )
+    for path in (destinations.manifest, destinations.raw_output, destinations.report):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    destinations.manifest.write_bytes(quality_module.canonical_json_bytes(manifest))
+    destinations.raw_output.write_bytes(raw)
+    destinations.report.write_bytes(report_bytes)
+    return root, destinations, manifest, workload
+
+
+def test_current_standalone_evidence_validation(current_recorded_evidence, monkeypatch):
+    root, destinations, manifest, _workload = current_recorded_evidence
+    assert manifest["recording_command"] == quality_module._recording_command_document(
+        root, destinations
+    )
+    monkeypatch.setattr(quality_module, "_root", lambda: root)
+    assert (
+        quality_module._validate(
+            SimpleNamespace(
+                manifest=destinations.manifest,
+                raw_input=destinations.raw_output,
+                report=destinations.report,
+            )
+        )
+        == 0
+    )
+
+
+def test_recorded_validator_rejects_required_component_omission(
+    current_recorded_evidence,
+):
+    root, _destinations, manifest, workload = current_recorded_evidence
+    retained = tuple(
+        path
+        for path in workload.production_dependency_components
+        if path != "v2/src/sml/model/layers.py"
+    )
+    assert len(retained) + 1 == len(workload.production_dependency_components)
+    identity = quality_module._production_dependency_identity(
+        tuple(Path(path) for path in retained),
+        lambda path: quality_module._git_bytes(
+            root, "show", f"{manifest['source_commit']}:{path.as_posix()}"
+        ),
+    )
+    tampered = replace(
+        workload,
+        production_dependency_components=retained,
+        production_dependency_identity=identity,
+    )
+    tampered = replace(tampered, identity=tampered.recompute_identity())
+    with pytest.raises(ValueError, match="component set changed"):
+        quality_module._validate_harness_commit(
+            root, manifest["source_commit"], tampered
+        )
+
+
+@pytest.mark.parametrize("unsupported_version", [0, 2, 4])
+def test_workload_accepts_only_current_version(canonical_workload, unsupported_version):
+    raw = canonical_workload.to_dict()
+    raw["version"] = unsupported_version
+    with pytest.raises(ValueError, match="unsupported"):
+        type(canonical_workload).from_dict(raw)
+
+
+def test_recorded_evidence_validation_uses_recorded_source(
+    current_recorded_evidence, monkeypatch
+):
+    root, destinations, manifest, _workload = current_recorded_evidence
+    path = root / "v2/src/sml/artifacts/checkpoint.py"
+    with _temporary_current_tree_bytes(
+        path, path.read_bytes() + b"\n# current unrecorded source edit\n"
+    ):
+        assert (
+            production_dependency_content_identity(root)
+            != manifest["production_dependency_identity"]
+        )
+
+        def forbid_current_workload(*args, **kwargs):
+            raise AssertionError("validation must use the recorded workload")
+
+        monkeypatch.setattr(
+            quality_module,
+            "build_pretraining_quality_workload",
+            forbid_current_workload,
+        )
+        assert quality_module._validate_evidence_files(root, destinations) == "pass"

@@ -38,7 +38,7 @@ def test_evaluation_result_pins_resolved_identity(
     fake_lm_eval,
     tmp_path: Path,
 ) -> None:
-    """Breaks if the current evaluation workflow keeps writing the legacy v1 schema."""
+    """The result binds the exact resolved model and current result schema."""
     config = tiny_evaluation_config(
         tiny_pretraining_run, tmp_path, tasks=("hellaswag",)
     )
@@ -46,7 +46,8 @@ def test_evaluation_result_pins_resolved_identity(
     pinned = result.model
     publish_new_valid_step(tiny_pretraining_run, step=pinned.step + 1)
     persisted = read_evaluation_result(config.output)
-    assert result.version == persisted.version == 2
+    assert result.version == persisted.version == 3
+    assert persisted.model.artifact_identity == pinned.run_identity
     assert persisted.model == pinned
     assert persisted.tasks[0].task_name == "hellaswag"
     assert persisted.tasks[0].metric_payload["acc,none"] == 0.5

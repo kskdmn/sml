@@ -32,6 +32,7 @@ from sml.artifacts.manifest import (
     PretrainingRunManifest,
     TokenizerManifest,
     VerificationLevel,
+    _require_identity,
 )
 from sml.artifacts.semantics import (
     validate_base_semantics,
@@ -63,14 +64,22 @@ _ADAPTER_GROUP = "adapters.safetensors"
 @dataclass(frozen=True, slots=True)
 class ModelIdentity:
     artifact_kind: str
+    artifact_identity: str
     run_identity: str | None
     step: int | None
     checkpoint_identity: str | None
     run_step_identity: str | None
     tokenizer_identity: str
     verification: VerificationLevel
-    latest_recovered: bool | None = False
-    pruning_pending: bool | None = False
+    latest_recovered: bool = False
+    pruning_pending: bool = False
+
+    def __post_init__(self) -> None:
+        _require_identity(self.artifact_identity, "artifact_identity")
+        if not isinstance(self.latest_recovered, bool):
+            raise TypeError("latest_recovered must be a bool")
+        if not isinstance(self.pruning_pending, bool):
+            raise TypeError("pruning_pending must be a bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +249,7 @@ def infer(config: InferenceConfig) -> GenerationResult:
 @dataclass(frozen=True, slots=True)
 class ResolvedModel:
     artifact_kind: str
+    artifact_identity: str
     run_identity: str | None
     step: int | None
     checkpoint_identity: str | None
@@ -252,6 +262,7 @@ class ResolvedModel:
     pruning_pending: bool = False
 
     def __post_init__(self) -> None:
+        _require_identity(self.artifact_identity, "artifact_identity")
         if not isinstance(self.latest_recovered, bool):
             raise TypeError("latest_recovered must be a bool")
         if not isinstance(self.pruning_pending, bool):
@@ -277,6 +288,7 @@ class ResolvedModel:
             verification=self.verification,
             latest_recovered=self.latest_recovered,
             pruning_pending=self.pruning_pending,
+            artifact_identity=self.artifact_identity,
         )
 
 
@@ -410,14 +422,6 @@ def _target_log_probabilities(
     )
 
 
-def _require_run_path(path: Path) -> Path:
-    if not isinstance(path, Path):
-        raise TypeError("path must be a Path")
-    if path.name.startswith("step-"):
-        raise SMLArtifactError("direct step-* paths are rejected")
-    return path
-
-
 def load_owned_model_arrays(
     run: Path,
     *,
@@ -510,6 +514,7 @@ def _resolve_pretraining_run(
             )
     return ResolvedModel(
         artifact_kind=resolved_step.run.kind,
+        artifact_identity=resolved_step.run.identity,
         run_identity=resolved_step.run.identity,
         step=resolved_step.step,
         checkpoint_identity=resolved_step.checkpoint.identity,
@@ -576,6 +581,7 @@ def _resolve_lora_run(
         mx.eval(*merged.values())
         return ResolvedModel(
             artifact_kind=recovered.run.kind,
+            artifact_identity=recovered.run.identity,
             run_identity=recovered.run.identity,
             step=resolved_step.step,
             checkpoint_identity=resolved_step.checkpoint.identity,
@@ -626,6 +632,7 @@ def _resolve_opened_export(artifact, *, full_verify: bool) -> ResolvedModel:
     manifest = artifact.manifest
     return ResolvedModel(
         artifact_kind=manifest.kind,
+        artifact_identity=manifest.identity,
         run_identity=None,
         step=manifest.diagnostic_source_step,
         checkpoint_identity=None,
@@ -638,7 +645,8 @@ def _resolve_opened_export(artifact, *, full_verify: bool) -> ResolvedModel:
 
 
 def resolve_model_artifact(path: Path, *, full_verify: bool) -> ResolvedModel:
-    path = _require_run_path(path)
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
     if not isinstance(full_verify, bool):
         raise TypeError("full_verify must be a bool")
     verification = (

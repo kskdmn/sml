@@ -42,6 +42,7 @@ from sml.training.common import (
     normalize_and_clip,
 )
 from sml.training.pretrain import build_pretraining_kernels
+from sml.training.random import counter_random_key
 
 from v2.benchmarks.workload import (
     canonical_json_bytes,
@@ -59,7 +60,6 @@ HARNESS_COMPONENTS = (
 )
 PRODUCTION_SOURCE_TREE = Path("v2/src/sml")
 PRODUCTION_MODULE_ROOT = Path("v2/src")
-LEGACY_BRIDGE_COMPONENT = Path("v2/src/sml.py")
 PRODUCTION_DEPENDENCY_FIXED_COMPONENTS = (
     Path("v2/benchmarks/schema.py"),
     Path("v2/benchmarks/workload.py"),
@@ -71,10 +71,10 @@ VALIDATION_FIXTURE = Path(
 )
 TRAINING_SHAPE = (32, 1_025)
 VALIDATION_SHAPE = (8, 1_025)
-CANONICAL_MANIFEST_PATH = Path("v2/benchmarks/manifests/pretraining-quality-v1.json")
-CANONICAL_RAW_PATH = Path("v2/benchmarks/results/pretraining-quality-v1.jsonl")
-CANONICAL_REPORT_PATH = Path("v2/benchmarks/results/pretraining-quality-v1.json")
-RECOVERY_PATH = Path("v2/benchmarks/results/.pretraining-quality-v1.recording")
+RECORD_MANIFEST_PATH = Path("v2/benchmarks/manifests/pretraining-quality-v3.json")
+RECORD_RAW_PATH = Path("v2/benchmarks/results/pretraining-quality-v3.jsonl")
+RECORD_REPORT_PATH = Path("v2/benchmarks/results/pretraining-quality-v3.json")
+RECOVERY_PATH = Path("v2/benchmarks/results/.pretraining-quality-v3.recording")
 MEASUREMENT_BOUNDARIES = {
     "clock": "time.monotonic",
     "start": "record-handler-entry-before-path-worktree-and-workload-setup",
@@ -259,11 +259,9 @@ def _local_module_components(
 def _production_dependency_closure(
     available: set[Path],
     read_component: Callable[[Path], bytes],
-    *,
-    fixed_components: Sequence[Path] = PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
 ) -> tuple[Path, ...]:
     required = {
-        *fixed_components,
+        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
         *PRODUCTION_IMPORT_ENTRYPOINTS,
     }
     missing_required = required - available
@@ -272,7 +270,7 @@ def _production_dependency_closure(
             "missing quality production entry components: "
             f"{sorted(path.as_posix() for path in missing_required)!r}"
         )
-    components = set(fixed_components)
+    components = set(PRODUCTION_DEPENDENCY_FIXED_COMPONENTS)
     pending = sorted(required, key=lambda path: path.as_posix())
     scanned: set[Path] = set()
     while pending:
@@ -497,8 +495,10 @@ class ParameterLeafSpec:
 
 @dataclass(frozen=True, slots=True)
 class PretrainingQualityWorkload:
+    """Version 3 uses the production seed/microstep counter RNG schedule."""
+
     kind: Literal["pretraining-quality-workload"]
-    version: Literal[2]
+    version: Literal[3]
     identity: str
     training_fixture: QualityFixture
     validation_fixture: QualityFixture
@@ -558,7 +558,7 @@ class PretrainingQualityWorkload:
         return {**self._body(), "identity": self.identity}
 
     def recompute_identity(self) -> str:
-        return structured_identity("sml-pretraining-quality-workload-v2", self._body())
+        return structured_identity("sml-pretraining-quality-workload-v3", self._body())
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> PretrainingQualityWorkload:
@@ -590,7 +590,11 @@ class PretrainingQualityWorkload:
         }
         if set(raw) != expected:
             raise ValueError("pretraining quality workload has an invalid field set")
-        if raw["kind"] != "pretraining-quality-workload" or raw["version"] != 2:
+        if (
+            raw["kind"] != "pretraining-quality-workload"
+            or type(raw["version"]) is not int
+            or raw["version"] != 3
+        ):
             raise ValueError("unsupported pretraining quality workload")
         training_raw = raw["training_fixture"]
         validation_raw = raw["validation_fixture"]
@@ -680,16 +684,13 @@ class PretrainingQualityWorkload:
         ):
             raise ValueError("quality production dependency order changed")
         for path in production_paths:
-            if path in (
-                *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
-                LEGACY_BRIDGE_COMPONENT,
-            ):
+            if path in PRODUCTION_DEPENDENCY_FIXED_COMPONENTS:
                 continue
             if path.suffix != ".py" or not path.is_relative_to(PRODUCTION_SOURCE_TREE):
                 raise ValueError("quality production import closure is incomplete")
         workload = cls(
             kind="pretraining-quality-workload",
-            version=2,
+            version=3,
             identity=_require_identity(raw["identity"], "workload identity"),
             training_fixture=QualityFixture.from_dict(training_raw),
             validation_fixture=QualityFixture.from_dict(validation_raw),
@@ -1256,7 +1257,7 @@ def build_pretraining_quality_workload(root: Path) -> PretrainingQualityWorkload
     production_components = production_dependency_components(root)
     workload = PretrainingQualityWorkload(
         kind="pretraining-quality-workload",
-        version=2,
+        version=3,
         identity=_PLACEHOLDER_IDENTITY,
         training_fixture=training_fixture,
         validation_fixture=validation_fixture,
@@ -2164,6 +2165,8 @@ def _execute_training_steps(
     start_step: int,
     stop_step: int,
     state: _RuntimeLoopState,
+    training_seed: int,
+    dropout_enabled: bool,
 ) -> _RuntimeLoopState:
     if runtime not in ("candidate", "oracle"):
         raise ValueError("quality runtime must be candidate or oracle")
@@ -2181,6 +2184,13 @@ def _execute_training_steps(
         for _microstep in range(gradient_accumulation_steps):
             batch_indices = ordered_batches[microstep_index]
             batch = mx.array(training_rows[list(batch_indices)], dtype=mx.int32)
+            if dropout_enabled:
+                trainer_tree = (
+                    trainer_tree[0],
+                    trainer_tree[1],
+                    counter_random_key(training_seed, microstep_index),
+                    trainer_tree[3],
+                )
             working, trainer_tree = kernels.microstep_core(
                 working,
                 trainer_tree,
@@ -2246,8 +2256,12 @@ def _run_runtime(
     validation_rows: np.ndarray,
 ) -> tuple[tuple[PretrainingQualityCheckpoint, ...], float]:
     started = time.monotonic()
+    if workload.version != 3:
+        raise ValueError(
+            "quality recording requires the counter-RNG workload version 3"
+        )
     config = _quality_config(root, workload)
-    model_key, trainer_key = mx.random.split(mx.random.key(workload.training_seed))
+    model_key, _unused_key = mx.random.split(mx.random.key(workload.training_seed))
     model = SMLLanguageModel(config.model, key=model_key)
     initial_working = model.parameters()
     mx.eval(initial_working)
@@ -2266,7 +2280,7 @@ def _run_runtime(
     trainer_tree = TrainerState(
         accumulators=tree_map(mx.zeros_like, masters),
         accumulation_count=mx.array(0, dtype=mx.int32),
-        next_key=trainer_key,
+        next_key=counter_random_key(workload.training_seed, 0),
         loss_numerator=mx.array(0.0, dtype=mx.float32),
     ).to_tree()
     decay = build_weight_decay_tree(
@@ -2324,6 +2338,8 @@ def _run_runtime(
             start_step=previous_step,
             stop_step=step,
             state=state,
+            training_seed=workload.training_seed,
+            dropout_enabled=config.model.hidden_dropout > 0.0,
         )
         mx.eval(
             state.masters,
@@ -2394,6 +2410,7 @@ def _manifest_document(
         raise ValueError("quality phase timing fields are invalid")
     measured_wall_time = math.fsum(normalized_phases.values())
     command = dict(recording_command)
+    _require_current_recording_command(workload, command)
     destinations = _destinations_from_recording_command(command)
     if recording_session_identity != _recording_session_identity(
         source_commit, workload.identity, command
@@ -2496,21 +2513,54 @@ def _report_document(
     }
 
 
+def _evidence_path_document() -> dict[str, str]:
+    return {
+        "manifest": RECORD_MANIFEST_PATH.as_posix(),
+        "raw_output": RECORD_RAW_PATH.as_posix(),
+        "report": RECORD_REPORT_PATH.as_posix(),
+    }
+
+
+def _relative_destination_document(
+    destinations: _EvidenceDestinations,
+) -> dict[str, str]:
+    document = _evidence_path_document()
+    roots = []
+    for name, relative in document.items():
+        parts = Path(relative).parts
+        actual = getattr(destinations, name).parts
+        if actual[-len(parts) :] != parts:
+            raise ValueError("requires the exact canonical evidence destinations")
+        roots.append(actual[: -len(parts)])
+    if len(set(roots)) != 1:
+        raise ValueError("requires the exact canonical evidence destinations")
+    return document
+
+
+def _require_current_recording_command(workload, command) -> None:
+    if (
+        workload.version != 3
+        or command.get("destinations") != _evidence_path_document()
+    ):
+        raise ValueError(
+            "quality recording requires the current workload and destinations"
+        )
+
+
 def _canonical_evidence_destinations(
     root: Path,
     manifest: Path,
     raw_output: Path,
     report: Path,
 ) -> _EvidenceDestinations:
-    expected = _EvidenceDestinations(
-        manifest=(root / CANONICAL_MANIFEST_PATH).resolve(),
-        raw_output=(root / CANONICAL_RAW_PATH).resolve(),
-        report=(root / CANONICAL_REPORT_PATH).resolve(),
-    )
     actual = _EvidenceDestinations(
         manifest=manifest.resolve(),
         raw_output=raw_output.resolve(),
         report=report.resolve(),
+    )
+    document = _relative_destination_document(actual)
+    expected = _EvidenceDestinations(
+        **{name: (root / path).resolve() for name, path in document.items()}
     )
     if actual != expected:
         raise ValueError("record requires the exact canonical evidence destinations")
@@ -2520,11 +2570,7 @@ def _canonical_evidence_destinations(
 def _recording_command_document(
     root: Path, destinations: _EvidenceDestinations
 ) -> dict[str, object]:
-    canonical_destinations = {
-        "manifest": CANONICAL_MANIFEST_PATH.as_posix(),
-        "raw_output": CANONICAL_RAW_PATH.as_posix(),
-        "report": CANONICAL_REPORT_PATH.as_posix(),
-    }
+    canonical_destinations = _relative_destination_document(destinations)
     resolved = {
         "manifest": destinations.manifest.resolve().as_posix(),
         "raw_output": destinations.raw_output.resolve().as_posix(),
@@ -2569,13 +2615,9 @@ def _destinations_from_recording_command(
     destinations = command["destinations"]
     if not isinstance(destinations, dict):
         raise ValueError("quality recording destinations must be an object")
-    expected_destinations = {
-        "manifest": CANONICAL_MANIFEST_PATH.as_posix(),
-        "raw_output": CANONICAL_RAW_PATH.as_posix(),
-        "report": CANONICAL_REPORT_PATH.as_posix(),
-    }
-    if destinations != expected_destinations:
+    if destinations != _evidence_path_document():
         raise ValueError("quality recording destinations are not canonical")
+    expected_destinations = destinations
     expected_argv = [
         "record",
         "--steps",
@@ -2627,6 +2669,9 @@ def _publication_owner_document(
     workload_identity: str,
     destinations: _EvidenceDestinations,
 ) -> dict[str, object]:
+    if not isinstance(destinations, _EvidenceDestinations):
+        raise TypeError("destinations must be evidence destinations")
+    relative_destinations = _relative_destination_document(destinations)
     body = {
         "kind": "pretraining-quality-publication-owner",
         "version": 2,
@@ -2638,15 +2683,13 @@ def _publication_owner_document(
             workload_identity, "publication workload identity"
         ),
         "destinations": {
-            "raw": CANONICAL_RAW_PATH.as_posix(),
-            "manifest": CANONICAL_MANIFEST_PATH.as_posix(),
-            "report": CANONICAL_REPORT_PATH.as_posix(),
+            "raw": relative_destinations["raw_output"],
+            "manifest": relative_destinations["manifest"],
+            "report": relative_destinations["report"],
         },
     }
     if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
         raise ValueError("publication source commit must be a full Git commit")
-    if not isinstance(destinations, _EvidenceDestinations):
-        raise TypeError("destinations must be evidence destinations")
     return _signed_document("sml-pretraining-quality-publication-owner-v2", body)
 
 
@@ -3385,6 +3428,7 @@ def _validate_manifest_fields(
     if not isinstance(command, dict):
         raise ValueError("quality recording command must be an object")
     _destinations_from_recording_command(command)
+    _require_current_recording_command(workload, command)
     if command != expected_command:
         raise ValueError("quality recording command or canonical destinations changed")
     if raw["measurement_boundaries"] != MEASUREMENT_BOUNDARIES:
@@ -3495,13 +3539,9 @@ def _git_production_dependency_components(
     root: Path,
     commit: str,
 ) -> tuple[Path, ...]:
-    possible_fixed_components = (
-        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
-        LEGACY_BRIDGE_COMPONENT,
-    )
     scopes = (
         PRODUCTION_SOURCE_TREE,
-        *possible_fixed_components,
+        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
         *PRODUCTION_IMPORT_ENTRYPOINTS,
     )
     entries = _git_bytes(
@@ -3524,19 +3564,15 @@ def _git_production_dependency_components(
         is_source = path.suffix == ".py" and path.is_relative_to(PRODUCTION_SOURCE_TREE)
         if (
             not is_source
-            and path not in possible_fixed_components
+            and path not in PRODUCTION_DEPENDENCY_FIXED_COMPONENTS
             and path not in PRODUCTION_IMPORT_ENTRYPOINTS
         ):
             continue
         available.add(path)
         modes[path] = (mode, object_type)
-    fixed_components = PRODUCTION_DEPENDENCY_FIXED_COMPONENTS
-    if LEGACY_BRIDGE_COMPONENT in available:
-        fixed_components = (*fixed_components, LEGACY_BRIDGE_COMPONENT)
     components = _production_dependency_closure(
         available,
         lambda component: _git_bytes(root, "show", f"{commit}:{component.as_posix()}"),
-        fixed_components=fixed_components,
     )
     if any(modes[component] != (b"100644", b"blob") for component in components):
         raise ValueError("recorded production import closure contains a non-file")

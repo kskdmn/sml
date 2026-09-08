@@ -478,7 +478,11 @@ def validate_post_exit_recovery_sample(
     }
     if set(document) != expected:
         raise ValueError("recovery sample has an invalid field set")
-    if document["kind"] != RECOVERY_SAMPLE_KIND or document["version"] != 1:
+    if (
+        document["kind"] != RECOVERY_SAMPLE_KIND
+        or type(document["version"]) is not int
+        or document["version"] != 1
+    ):
         raise ValueError("unsupported recovery sample kind or version")
     sample_index = document["sample_index"]
     if type(sample_index) is not int or sample_index < 0:
@@ -745,7 +749,11 @@ def validate_post_exit_recovery(
     }
     if set(document) != expected:
         raise ValueError("post-exit recovery has an invalid field set")
-    if document["kind"] != RECOVERY_KIND or document["version"] != 2:
+    if (
+        document["kind"] != RECOVERY_KIND
+        or type(document["version"]) is not int
+        or document["version"] != 2
+    ):
         raise ValueError("unsupported post-exit recovery kind or version")
     policy = document["policy"]
     if not isinstance(policy, dict):

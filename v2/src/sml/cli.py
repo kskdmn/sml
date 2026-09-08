@@ -496,6 +496,15 @@ def _load_command_table(path: Path, command: str) -> dict[str, object]:
     if not isinstance(table, dict):
         raise SMLConfigurationError(f"[{command}] must be a table")
     _validate_table(table, _SCHEMAS[command], command)
+    if command == "infer":
+        request = table.get("request", {})
+        duplicates = (
+            {"max_new_tokens", "include_prompt"} & table.keys() & request.keys()
+        )
+        if duplicates:
+            raise SMLConfigurationError(
+                "duplicate inference fields: " + ", ".join(sorted(duplicates))
+            )
     return dict(table)
 
 
@@ -552,15 +561,6 @@ def _require(values: Mapping[str, object], *names: str) -> None:
     missing = [name for name in names if name not in values]
     if missing:
         raise SMLConfigurationError(f"{', '.join(missing)} is required")
-
-
-def _reject_step_path(value: object, field_name: str) -> None:
-    if not isinstance(value, Path):
-        return
-    if any(part.startswith("step-") for part in value.parts):
-        raise SMLConfigurationError(
-            f"{field_name} must identify an artifact, not a step-* path"
-        )
 
 
 def _reject_existing_output(values: Mapping[str, object]) -> None:
@@ -1094,9 +1094,6 @@ def _validate_command(command: str, values: dict[str, object]) -> None:
                 )
         else:
             _require(values, "checkpoint", "data", "output")
-    for field_name in ("checkpoint", "resume"):
-        if field_name in values:
-            _reject_step_path(values[field_name], field_name)
     if command in {
         "tokenize",
         "prepare.pretraining",
@@ -1117,13 +1114,8 @@ def _validate_command(command: str, values: dict[str, object]) -> None:
 
 
 def parse_command(argv: Sequence[str]) -> _Command:
-    arguments = list(argv)
-    if any(
-        argument == "--step" or argument.startswith("--step=") for argument in arguments
-    ):
-        raise SMLConfigurationError("historical --step selection is not supported")
     parser = _build_parser()
-    namespace = parser.parse_args(arguments)
+    namespace = parser.parse_args(argv)
     command, values = _normalize_cli_values(namespace)
     _validate_command(command, values)
     dto = _DTO_TYPES[command](values)

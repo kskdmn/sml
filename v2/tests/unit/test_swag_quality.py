@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import shutil
+import subprocess
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
+import mlx.core as mx
 import numpy as np
 import pytest
+from mlx.utils import tree_map
 from sml.model.config import ModelConfig
-from sml.training.lora import LoRAConfig
+from sml.model.language_model import SMLLanguageModel
+from sml.training.lora import LoRAConfig, apply_lora, split_adapter_parameters
 
 from v2.benchmarks import swag_quality
 from v2.benchmarks.swag_quality import (
@@ -25,6 +30,103 @@ from v2.benchmarks.swag_quality import (
 from v2.benchmarks.workload import structured_identity
 
 ROOT = Path(__file__).parents[3]
+
+
+@pytest.fixture
+def tiny_quality_runtime():
+    config = ModelConfig(
+        vocab_size=300,
+        hidden_size=8,
+        num_layers=1,
+        num_q_heads=2,
+        num_kv_heads=1,
+        intermediate_size=16,
+        original_context_length=64,
+        hidden_dropout=0.5,
+    )
+    model = SMLLanguageModel(config, key=mx.random.key(3))
+    apply_lora(model, LoRAConfig(rank=2, dropout=0.5), key=mx.random.key(4))
+    adapters, frozen_base = split_adapter_parameters(model.parameters())
+    adapters = tree_map(lambda array: mx.ones_like(array) * 0.1, adapters)
+    encoded = {
+        name: value[:2]
+        for name, value in swag_quality._load_encoded_arrays(
+            ROOT / swag_quality.VALIDATION_FIXTURE
+        ).items()
+    }
+    return config, model, adapters, frozen_base, encoded
+
+
+def test_validation_disables_dropout_and_does_not_differentiate(
+    monkeypatch, tiny_quality_runtime
+):
+    config, model, adapters, frozen_base, encoded = tiny_quality_runtime
+    real_forward = SMLLanguageModel.forward_arrays
+    calls = []
+
+    def record_forward(self, *args, **kwargs):
+        calls.append((kwargs["training"], kwargs["key"]))
+        return real_forward(self, *args, **kwargs)
+
+    def forbid_gradients(*args, **kwargs):
+        raise AssertionError("quality validation must not compute gradients")
+
+    monkeypatch.setattr(SMLLanguageModel, "forward_arrays", record_forward)
+    monkeypatch.setattr(mx, "value_and_grad", forbid_gradients)
+    mx.random.seed(11)
+    first = swag_quality._evaluate_validation(
+        model, adapters, frozen_base, encoded, model_config=config
+    )
+    mx.random.seed(29)
+    second = swag_quality._evaluate_validation(
+        model, adapters, frozen_base, encoded, model_config=config
+    )
+
+    assert first == second
+    assert first[2] == 2
+    assert np.isfinite(first[0])
+    assert calls == [(False, None)] * 4
+
+
+def test_swag_quality_training_uses_production_counter_keys(
+    monkeypatch, tiny_quality_runtime, canonical_workload
+):
+    config, model, adapters, frozen_base, encoded = tiny_quality_runtime
+    real_build = swag_quality.build_swag_kernels
+    received_keys = []
+
+    def recording_kernels(*args, **kwargs):
+        kernels = real_build(*args, **kwargs)
+        real_microstep = kernels.compiled_ranking_microstep_core
+
+        def record_microstep(adapters, base, trainer_tree, *arrays):
+            received_keys.append(trainer_tree[2])
+            return real_microstep(adapters, base, trainer_tree, *arrays)
+
+        return replace(kernels, compiled_ranking_microstep_core=record_microstep)
+
+    monkeypatch.setattr(swag_quality, "build_swag_kernels", recording_kernels)
+    swag_quality._run_runtime(
+        runtime="candidate",
+        compile=False,
+        workload=replace(canonical_workload, ordered_batches=((0,), (1,))),
+        model=model,
+        frozen_base=frozen_base,
+        adapters=adapters,
+        trainer_key=mx.random.key(999),
+        training=encoded,
+        validation=encoded,
+        model_config=config,
+    )
+
+    assert len(received_keys) == 2
+    for index, key in enumerate(received_keys):
+        assert bool(
+            mx.array_equal(
+                key,
+                swag_quality.counter_random_key(canonical_workload.model_seed, index),
+            )
+        )
 
 
 def test_swag_quality_gate_enforces_loss_accuracy_and_example_count():
@@ -99,39 +201,6 @@ def test_harness_identity_hashes_only_the_two_reviewed_files_in_order():
         expected.update((ROOT / relative).read_bytes())
 
     assert harness_content_identity(ROOT) == f"sha256:{expected.hexdigest()}"
-
-
-def test_recorded_validator_rejects_re_signed_required_component_omission():
-    manifest = json.loads(
-        (ROOT / swag_quality.CANONICAL_MANIFEST_PATH).read_text(encoding="utf-8")
-    )
-    source_commit = manifest["source_commit"]
-    workload = SwagQualityWorkload.from_dict(manifest["workload"])
-    omitted_component = "v2/src/sml/model/layers.py"
-    retained_components = tuple(
-        component
-        for component in workload.production_dependency_components
-        if component != omitted_component
-    )
-    assert len(retained_components) + 1 == len(
-        workload.production_dependency_components
-    )
-    production_identity = swag_quality._production_dependency_identity(
-        tuple(Path(component) for component in retained_components),
-        lambda component: swag_quality._git_bytes(
-            ROOT, "show", f"{source_commit}:{component.as_posix()}"
-        ),
-    )
-    tampered = replace(
-        workload,
-        identity="sha256:" + "0" * 64,
-        production_dependency_components=retained_components,
-        production_dependency_identity=production_identity,
-    )
-    tampered = replace(tampered, identity=tampered.recompute_identity())
-
-    with pytest.raises(ValueError, match="component set changed"):
-        swag_quality._validate_harness_commit(ROOT, source_commit, tampered)
 
 
 def test_workload_pins_256_steps_disjoint_encoded_examples_and_identities(
@@ -340,9 +409,9 @@ def test_public_record_accepts_only_exactly_256_steps():
 def test_manifest_fields_and_output_paths_fail_closed(canonical_workload):
     destinations = swag_quality._canonical_evidence_destinations(
         ROOT,
-        ROOT / "v2/benchmarks/manifests/swag-quality-v1.json",
-        ROOT / "v2/benchmarks/results/swag-quality-v1.jsonl",
-        ROOT / "v2/benchmarks/results/swag-quality-v1.json",
+        ROOT / swag_quality.RECORD_MANIFEST_PATH,
+        ROOT / swag_quality.RECORD_RAW_PATH,
+        ROOT / swag_quality.RECORD_REPORT_PATH,
     )
     command = swag_quality._recording_command_document(ROOT, destinations)
     session_identity = swag_quality._recording_session_identity(
@@ -378,10 +447,25 @@ def test_manifest_fields_and_output_paths_fail_closed(canonical_workload):
     with pytest.raises(ValueError, match="canonical evidence destinations"):
         swag_quality._canonical_evidence_destinations(
             ROOT,
-            ROOT / "v2/benchmarks/manifests/swag-quality-v1.json",
-            ROOT / "v2/benchmarks/results/swag-quality-v1.jsonl",
+            ROOT / swag_quality.RECORD_MANIFEST_PATH,
+            ROOT / swag_quality.RECORD_RAW_PATH,
             ROOT / "v2/benchmarks/results/forged.json",
         )
+
+
+def test_swag_recording_accepts_only_current_complete_destination_triple():
+    destinations = swag_quality._canonical_evidence_destinations(
+        ROOT,
+        ROOT / swag_quality.RECORD_MANIFEST_PATH,
+        ROOT / swag_quality.RECORD_RAW_PATH,
+        ROOT / swag_quality.RECORD_REPORT_PATH,
+    )
+    command = swag_quality._recording_command_document(ROOT, destinations)
+    assert command["destinations"] == {
+        "manifest": swag_quality.RECORD_MANIFEST_PATH.as_posix(),
+        "raw_output": swag_quality.RECORD_RAW_PATH.as_posix(),
+        "report": swag_quality.RECORD_REPORT_PATH.as_posix(),
+    }
 
 
 def _recompute_manifest_identity(manifest: dict[str, object]) -> dict[str, object]:
@@ -397,9 +481,9 @@ def test_standalone_validation_rejects_over_budget_and_nonpositive_phases(
 ):
     destinations = swag_quality._canonical_evidence_destinations(
         ROOT,
-        ROOT / "v2/benchmarks/manifests/swag-quality-v1.json",
-        ROOT / "v2/benchmarks/results/swag-quality-v1.jsonl",
-        ROOT / "v2/benchmarks/results/swag-quality-v1.json",
+        ROOT / swag_quality.RECORD_MANIFEST_PATH,
+        ROOT / swag_quality.RECORD_RAW_PATH,
+        ROOT / swag_quality.RECORD_REPORT_PATH,
     )
     command = swag_quality._recording_command_document(ROOT, destinations)
     session_identity = swag_quality._recording_session_identity(
@@ -480,3 +564,141 @@ def test_verified_source_snapshot_fully_verifies_pretraining_checkpoint(
     with pytest.raises(RuntimeError, match="verified"):
         swag_quality._verified_source_snapshot(ModelConfig(), LoRAConfig(), MODEL_SEED)
     assert called == [(published, True)]
+
+
+@pytest.fixture(scope="module")
+def current_recorded_evidence(tmp_path_factory, canonical_workload):
+    """Build validator inputs from current source and bounded synthetic records."""
+    root = tmp_path_factory.mktemp("swag-quality-current-evidence")
+    workload = canonical_workload
+    copied = {
+        *swag_quality.HARNESS_COMPONENTS,
+        *(Path(path) for path in workload.production_dependency_components),
+        swag_quality.TRAINING_FIXTURE,
+        swag_quality.VALIDATION_FIXTURE,
+    }
+    for relative in copied:
+        destination = root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(ROOT / relative, destination)
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", *arguments], cwd=root, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    git("init", "--quiet")
+    git("config", "user.name", "Quality Evidence Test")
+    git("config", "user.email", "quality-evidence@example.invalid")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "current quality source")
+    commit = git("rev-parse", "HEAD")
+    destinations = swag_quality._canonical_evidence_destinations(
+        root,
+        root / swag_quality.RECORD_MANIFEST_PATH,
+        root / swag_quality.RECORD_RAW_PATH,
+        root / swag_quality.RECORD_REPORT_PATH,
+    )
+    command = swag_quality._recording_command_document(root, destinations)
+    records = tuple(
+        _record(
+            workload,
+            runtime,
+            validation_loss=1.005 if runtime == "candidate" else 1.0,
+            accuracy=0.75,
+            examples=workload.validation_fixture.example_count,
+        )
+        for runtime in ("candidate", "oracle")
+    )
+    documents = [record.to_dict() for record in records]
+    raw = b"".join(
+        swag_quality.canonical_json_bytes(document) + b"\n" for document in documents
+    )
+    raw_identity = swag_quality.structured_identity(
+        "sml-swag-quality-raw-v1", documents
+    )
+    report = swag_quality._report_document(
+        workload.identity,
+        raw_identity,
+        validate_swag_quality_records(workload, records),
+    )
+    report_bytes = swag_quality._canonical_json_file_bytes(report)
+    manifest = swag_quality._manifest_document(
+        workload=workload,
+        source_commit=commit,
+        recording_command=command,
+        phase_times={
+            "setup": 1.0,
+            "candidate": 1.0,
+            "oracle": 1.0,
+            "validation_serialization": 1.0,
+        },
+        peak_memory=1,
+        raw_identity=raw_identity,
+        raw_file_identity=swag_quality._payload_identity(raw),
+        raw_bytes=len(raw),
+        report_identity=report["identity"],
+        report_file_identity=swag_quality._payload_identity(report_bytes),
+        report_bytes=len(report_bytes),
+        recording_session_identity=swag_quality._recording_session_identity(
+            commit, workload.identity, command
+        ),
+    )
+    for path in (destinations.manifest, destinations.raw_output, destinations.report):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    destinations.manifest.write_bytes(swag_quality._canonical_json_file_bytes(manifest))
+    destinations.raw_output.write_bytes(raw)
+    destinations.report.write_bytes(report_bytes)
+    return root, destinations, manifest, workload
+
+
+def test_current_standalone_evidence_validation(current_recorded_evidence, monkeypatch):
+    root, destinations, manifest, _workload = current_recorded_evidence
+    assert manifest["recording_command"] == swag_quality._recording_command_document(
+        root, destinations
+    )
+    monkeypatch.setattr(swag_quality, "_root", lambda: root)
+    assert (
+        swag_quality._validate(
+            SimpleNamespace(
+                manifest=destinations.manifest,
+                raw_input=destinations.raw_output,
+                report=destinations.report,
+            )
+        )
+        == 0
+    )
+
+
+def test_recorded_validator_rejects_required_component_omission(
+    current_recorded_evidence,
+):
+    root, _destinations, manifest, workload = current_recorded_evidence
+    retained = tuple(
+        path
+        for path in workload.production_dependency_components
+        if path != "v2/src/sml/model/layers.py"
+    )
+    assert len(retained) + 1 == len(workload.production_dependency_components)
+    identity = swag_quality._production_dependency_identity(
+        tuple(Path(path) for path in retained),
+        lambda path: swag_quality._git_bytes(
+            root, "show", f"{manifest['source_commit']}:{path.as_posix()}"
+        ),
+    )
+    tampered = replace(
+        workload,
+        production_dependency_components=retained,
+        production_dependency_identity=identity,
+    )
+    tampered = replace(tampered, identity=tampered.recompute_identity())
+    with pytest.raises(ValueError, match="component set changed"):
+        swag_quality._validate_harness_commit(root, manifest["source_commit"], tampered)
+
+
+@pytest.mark.parametrize("unsupported_version", [0, 1, 3])
+def test_workload_accepts_only_current_version(canonical_workload, unsupported_version):
+    raw = canonical_workload.to_dict()
+    raw["version"] = unsupported_version
+    with pytest.raises(ValueError, match="unsupported"):
+        type(canonical_workload).from_dict(raw)

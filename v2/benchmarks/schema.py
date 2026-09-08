@@ -279,7 +279,7 @@ class CanonicalWorkload:
         }
         if set(raw) != expected:
             raise ValueError("canonical workload has an invalid field set")
-        if raw["schema_version"] != 1:
+        if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
             raise ValueError("unsupported canonical workload schema version")
         mappings: dict[str, dict[str, JsonValue]] = {}
         for field_name in (

@@ -125,6 +125,8 @@ class ModelConfig:
             raise ValueError("rope_theta must be positive")
         if _require_finite(self.rope_scaling_factor, "rope_scaling_factor") < 1.0:
             raise ValueError("rope_scaling_factor must be at least 1.0")
+        if self.rope_scaling_factor > 1.0 and self.rope_theta <= 1.0:
+            raise ValueError("rope_theta must be greater than 1.0 for scaled RoPE")
         for field_name in ("yarn_beta_fast", "yarn_beta_slow"):
             value = _require_finite(getattr(self, field_name), field_name)
             if value <= 0.0:

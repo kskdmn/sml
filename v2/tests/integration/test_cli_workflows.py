@@ -136,7 +136,7 @@ def _assert_complete_evaluation(
 ) -> None:
     result = read_evaluation_result(path)
     assert result.kind == "evaluation-result"
-    assert result.version == 2
+    assert result.version == 3
     assert result.identity.startswith("sha256:")
     assert result.model == expected_model
     assert result.model.artifact_kind == artifact_kind
@@ -1289,6 +1289,21 @@ def test_cli_resume_accepts_relocated_identity_matching_data(
     assert _latest_step(moved_lora_run) == 3
 
 
+def test_cli_accepts_complete_run_with_step_prefixed_name(
+    completed_cli_workspace: CLIWorkspace, tmp_path: Path
+) -> None:
+    workspace = completed_cli_workspace
+    renamed_run = tmp_path / "step-experiment"
+    shutil.copytree(workspace.base_run, renamed_run)
+
+    result = workspace.run(
+        "infer", "--checkpoint", renamed_run, "--max-new-tokens", 1, "alpha"
+    )
+
+    assert result.returncode == 0
+    assert "GenerationResult" in result.stdout
+
+
 def test_cli_expected_domain_errors_have_stable_exit_codes(
     completed_cli_workspace: CLIWorkspace,
 ) -> None:
@@ -1316,8 +1331,8 @@ def test_cli_expected_domain_errors_have_stable_exit_codes(
                 "alpha",
                 check=False,
             ),
-            2,
-            "SMLConfigurationError",
+            3,
+            "SMLArtifactError",
         ),
         (
             workspace.run("verify", workspace.root / "missing", check=False),

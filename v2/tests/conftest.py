@@ -77,16 +77,6 @@ def _load_legacy_model_state_fixture():
     return load_legacy_model_state
 
 
-def _package_lora_destination(name: str) -> str:
-    if name.endswith(".linear.weight"):
-        return f"{name[: -len('.linear.weight')]}.base.weight"
-    if name.endswith(".lora_A"):
-        return f"{name[: -len('.lora_A')]}.lora_a"
-    if name.endswith(".lora_B"):
-        return f"{name[: -len('.lora_B')]}.lora_b"
-    return name
-
-
 def load_legacy_lora_state(model, legacy_arrays, legacy_control) -> None:
     lora_state = legacy_control["lora_parameter_state"]
     mappings = [*lora_state["base_mapping"], *lora_state["adapter_mapping"]]
@@ -95,9 +85,7 @@ def load_legacy_lora_state(model, legacy_arrays, legacy_control) -> None:
     }
     expected = {}
     for mapping in mappings:
-        source_destination = str(mapping["destination"])
-        packaged = _package_lora_destination(source_destination)
-        expected[packaged] = (source_destination, mapping)
+        expected[str(mapping["destination"])] = mapping
     actual = dict(tree_flatten(model.parameters()))
     scale_leaves = {
         name: value for name, value in actual.items() if name.endswith(".scale")
@@ -115,11 +103,9 @@ def load_legacy_lora_state(model, legacy_arrays, legacy_control) -> None:
 
     weights = []
     for name in sorted(expected):
-        source_destination, record = expected[name]
-        namespace = (
-            "lora_state" if source_destination in adapter_sources else "lora_base_state"
-        )
-        array = legacy_arrays[f"{namespace}.{source_destination}"]
+        record = expected[name]
+        namespace = "lora_state" if name in adapter_sources else "lora_base_state"
+        array = legacy_arrays[f"{namespace}.{name}"]
         if list(actual[name].shape) != record["shape"]:
             raise ValueError(f"legacy LoRA shape mismatch for {name}")
         if str(actual[name].dtype) != record["dtype"]:

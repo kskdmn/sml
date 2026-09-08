@@ -373,16 +373,44 @@ def test_resume_rejects_fresh_only_configuration(command):
 
 
 @pytest.mark.parametrize(
-    "argv",
+    "option",
+    ["--step", "--step=1", "--unknown"],
+)
+def test_unsupported_options_use_argument_parser_errors(option):
+    with pytest.raises(SMLConfigurationError, match="unrecognized arguments"):
+        parse_command(["infer", "--checkpoint", "run", "prompt", option])
+
+
+@pytest.mark.parametrize("prompt", ["--step", "--step=1"])
+def test_prompt_after_option_terminator_is_preserved(prompt):
+    config = parse_command(["infer", "--checkpoint", "run", "--", prompt]).to_domain()
+    assert config.prompt == prompt
+
+
+@pytest.mark.parametrize(
+    "argv,field,expected",
     [
-        ["train", "--data", "data", "--output", "run", "--step", "1"],
-        ["infer", "--checkpoint", "run/step-1", "prompt"],
-        ["export", "--checkpoint", "step-2", "--output", "export"],
+        (
+            ["infer", "--checkpoint", "step-experiment", "prompt"],
+            "checkpoint",
+            "step-experiment",
+        ),
+        (
+            [
+                "export",
+                "--checkpoint",
+                "checkpoints/step-experiment/run",
+                "--output",
+                "export",
+            ],
+            "checkpoint",
+            "checkpoints/step-experiment/run",
+        ),
+        (["train", "--resume", "step-experiment"], "resume", "step-experiment"),
     ],
 )
-def test_historical_step_selection_is_rejected(argv):
-    with pytest.raises(SMLConfigurationError, match="step"):
-        parse_command(argv)
+def test_artifact_path_names_do_not_determine_their_kind(argv, field, expected):
+    assert parse_command(argv).values[field] == Path(expected)
 
 
 def test_train_rejects_non_unit_rope_scaling_factor(tmp_path):

@@ -126,7 +126,7 @@ def normalize_json_value(value: object, *, context: str) -> JsonValue:
     raise TypeError(f"{context} contains unsupported value {type(value).__name__}")
 
 
-def _validate_model_identity(model: ModelIdentity, *, result_version: int) -> None:
+def _validate_model_identity(model: ModelIdentity) -> None:
     _require_string(model.artifact_kind, "model artifact_kind")
     _require_optional_identity(model.run_identity, "model run_identity")
     if model.step is not None and (
@@ -138,15 +138,13 @@ def _validate_model_identity(model: ModelIdentity, *, result_version: int) -> No
     _require_optional_identity(model.checkpoint_identity, "model checkpoint_identity")
     _require_optional_identity(model.run_step_identity, "model run_step_identity")
     _require_identity(model.tokenizer_identity, "model tokenizer_identity")
+    _require_identity(model.artifact_identity, "model artifact_identity")
     if not isinstance(model.verification, VerificationLevel):
         raise TypeError("model verification must be a VerificationLevel")
     for name in ("latest_recovered", "pruning_pending"):
         value = getattr(model, name)
-        if result_version == 1:
-            if value is not None:
-                raise TypeError(f"v1 model {name} must be unavailable")
-        elif not isinstance(value, bool):
-            raise TypeError(f"v2 model {name} must be a bool")
+        if not isinstance(value, bool):
+            raise TypeError(f"model {name} must be a bool")
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,7 +239,7 @@ class EvaluationTaskRecord:
 @dataclass(frozen=True, slots=True)
 class EvaluationResult:
     kind: Literal["evaluation-result"]
-    version: Literal[1, 2]
+    version: Literal[3]
     identity: str
     model: ModelIdentity
     tasks: tuple[EvaluationTaskRecord, ...]
@@ -253,13 +251,13 @@ class EvaluationResult:
         if (
             not isinstance(self.version, int)
             or isinstance(self.version, bool)
-            or self.version not in (1, 2)
+            or self.version != 3
         ):
-            raise ValueError("version must be 1 or 2")
+            raise ValueError("version must be 3")
         _require_identity(self.identity, "identity")
         if not isinstance(self.model, ModelIdentity):
             raise TypeError("model must be a ModelIdentity")
-        _validate_model_identity(self.model, result_version=self.version)
+        _validate_model_identity(self.model)
         tasks = _require_tuple(self.tasks, "tasks")
         if not tasks:
             raise ValueError("tasks must contain at least one task")
@@ -295,34 +293,19 @@ def _source_projection(source: EvaluationSourceIdentity) -> dict[str, str]:
     }
 
 
-def _model_projection_v1(model: ModelIdentity) -> dict[str, object]:
+def _model_projection(model: ModelIdentity) -> dict[str, object]:
     return {
         "artifact_kind": model.artifact_kind,
+        "artifact_identity": model.artifact_identity,
         "run_identity": model.run_identity,
         "step": model.step,
         "checkpoint_identity": model.checkpoint_identity,
         "run_step_identity": model.run_step_identity,
         "tokenizer_identity": model.tokenizer_identity,
         "verification": model.verification.value,
-    }
-
-
-def _model_projection_v2(model: ModelIdentity) -> dict[str, object]:
-    return {
-        **_model_projection_v1(model),
         "latest_recovered": model.latest_recovered,
         "pruning_pending": model.pruning_pending,
     }
-
-
-def _model_projection(
-    model: ModelIdentity, *, result_version: int
-) -> dict[str, object]:
-    if result_version == 1:
-        return _model_projection_v1(model)
-    if result_version == 2:
-        return _model_projection_v2(model)
-    raise ValueError("unsupported evaluation result version")
 
 
 def _task_projection(
@@ -370,16 +353,12 @@ def evaluation_task_identity(record: EvaluationTaskRecord) -> str:
 def evaluation_result_identity(result: EvaluationResult) -> str:
     if not isinstance(result, EvaluationResult):
         raise TypeError("result must be an EvaluationResult")
-    domain = {
-        1: "sml-evaluation-result-v1",
-        2: "sml-evaluation-result-v2",
-    }[result.version]
     return structured_identity(
-        domain,
+        "sml-evaluation-result-v3",
         {
             "kind": result.kind,
             "version": result.version,
-            "model": _model_projection(result.model, result_version=result.version),
+            "model": _model_projection(result.model),
             "tasks": [
                 _task_projection(task, include_identity=True, include_metrics=True)
                 for task in result.tasks
@@ -432,7 +411,7 @@ def _result_payload(result: EvaluationResult) -> dict[str, object]:
         "kind": result.kind,
         "version": result.version,
         "identity": result.identity,
-        "model": _model_projection(result.model, result_version=result.version),
+        "model": _model_projection(result.model),
         "tasks": [_task_payload(task) for task in result.tasks],
         "provider_result": result.provider_result,
     }
@@ -493,26 +472,23 @@ def _provider_from_payload(payload: object) -> EvaluationProviderVersion:
     )
 
 
-def _model_from_payload(payload: object, *, result_version: int) -> ModelIdentity:
-    status_fields = (
-        frozenset()
-        if result_version == 1
-        else frozenset({"latest_recovered", "pruning_pending"})
-    )
+def _model_from_payload(payload: object) -> ModelIdentity:
     raw = _require_field_set(
         payload,
         frozenset(
             {
                 "artifact_kind",
+                "artifact_identity",
                 "run_identity",
                 "step",
                 "checkpoint_identity",
                 "run_step_identity",
                 "tokenizer_identity",
                 "verification",
+                "latest_recovered",
+                "pruning_pending",
             }
-        )
-        | status_fields,
+        ),
         "evaluation model",
     )
     verification = raw["verification"]
@@ -526,8 +502,9 @@ def _model_from_payload(payload: object, *, result_version: int) -> ModelIdentit
         run_step_identity=raw["run_step_identity"],  # type: ignore[arg-type]
         tokenizer_identity=raw["tokenizer_identity"],  # type: ignore[arg-type]
         verification=VerificationLevel(verification),
-        latest_recovered=(None if result_version == 1 else raw["latest_recovered"]),  # type: ignore[arg-type]
-        pruning_pending=(None if result_version == 1 else raw["pruning_pending"]),  # type: ignore[arg-type]
+        latest_recovered=raw["latest_recovered"],  # type: ignore[arg-type]
+        pruning_pending=raw["pruning_pending"],  # type: ignore[arg-type]
+        artifact_identity=raw["artifact_identity"],  # type: ignore[arg-type]
     )
 
 
@@ -599,17 +576,13 @@ def _result_from_payload(payload: object) -> EvaluationResult:
     if not isinstance(tasks, list):
         raise TypeError("evaluation tasks must be a JSON array")
     version = raw["version"]
-    if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
-        or version not in (1, 2)
-    ):
-        raise ValueError("evaluation result version must be 1 or 2")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 3:
+        raise ValueError("evaluation result version must be 3")
     return EvaluationResult(
         kind=raw["kind"],  # type: ignore[arg-type]
         version=version,
         identity=raw["identity"],  # type: ignore[arg-type]
-        model=_model_from_payload(raw["model"], result_version=version),
+        model=_model_from_payload(raw["model"]),
         tasks=tuple(_task_from_payload(task) for task in tasks),
         provider_result=raw["provider_result"],  # type: ignore[arg-type]
     )

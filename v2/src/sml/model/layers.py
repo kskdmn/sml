@@ -229,7 +229,8 @@ class GroupedQueryAttention(nn.Module):
             attended_keys = k
             attended_values = v
             key_mask = attention_mask
-            key_positions = positions
+            token_order = mx.arange(query_length, dtype=mx.int32)
+            causal_mask = token_order[None, :] <= token_order[:, None]
             updated_cache_state = None
         else:
             updated_cache_state, view = append_kv_state(
@@ -248,8 +249,8 @@ class GroupedQueryAttention(nn.Module):
                 mx.arange(capacity, dtype=mx.int32)[None, :],
                 (batch_size, capacity),
             )
+            causal_mask = key_positions[:, None, None, :] <= positions[:, None, :, None]
 
-        causal_mask = key_positions[:, None, None, :] <= positions[:, None, :, None]
         boolean_mask = causal_mask & key_mask[:, None, None, :]
         output = mx.fast.scaled_dot_product_attention(
             q,

@@ -644,6 +644,20 @@ def test_compiled_maximum_adam_step_preserves_every_optimizer_leaf():
     assert int(next_state_tree[0].item()) == 2**31 - 1
 
 
+@pytest.mark.parametrize("valid", [True, False])
+def test_master_cast_validation_matches_paths_independent_of_dict_order(valid):
+    masters = {"a": mx.array([1.0]), "nested": {"b": mx.array([2.0])}}
+    working = {
+        "nested": {"b": mx.array([2.0 if valid else 1.0], dtype=mx.bfloat16)},
+        "a": mx.array([1.0 if valid else 2.0], dtype=mx.bfloat16),
+    }
+    if valid:
+        assert BaseParameterState(masters, working).working_parameters is working
+    else:
+        with pytest.raises(SMLConfigurationError, match="exact bfloat16 casts"):
+            BaseParameterState(masters, working)
+
+
 def test_state_tree_validation_preserves_nested_containers_keys_shapes_and_random_key():
     """Flattened paths must not make malformed checkpoint trees appear equivalent."""
     master = {

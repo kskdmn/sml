@@ -10,6 +10,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from sml.artifacts import checkpoint as checkpoint_module
+from sml.artifacts import manifest as manifest_module
 from sml.artifacts.arrays import SafetensorsLayout, TensorSlice
 from sml.artifacts.checkpoint import (
     VerifiedCheckpointContents,
@@ -197,173 +198,118 @@ def _write_valid_checkpoint_run(tmp_path: Path) -> Path:
     return run
 
 
-def test_checkpoint_array_validation_uses_one_open_payload_through_posthash(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Descriptor reuse must not hide metadata access after payload close."""
-    payload_path = tmp_path / "arrays.safetensors"
-    payload_path.write_bytes(b"descriptor-owned checkpoint payload")
-    reference = ArrayPayloadRef(
-        payload=_payload_ref(payload_path, "arrays.safetensors"),
-        arrays=(
-            ArraySpec("z", (1,), "float32"),
-            ArraySpec("a", (1,), "float32"),
-        ),
-    )
-    real_file_identity = checkpoint_module.file_identity
-    payload_stream = None
-    events: list[tuple[str, int, tuple[int, int] | None, bool, tuple[str, ...]]] = []
-
-    def record(phase: str, stream, names: tuple[str, ...] = ()) -> None:
-        is_open = not stream.closed
-        inode = None
-        if is_open:
-            opened = os.fstat(stream.fileno())
-            inode = (opened.st_dev, opened.st_ino)
-        events.append((phase, id(stream), inode, is_open, names))
-
-    def recording_file_identity(stream):
-        record("hash", stream)
-        return real_file_identity(stream)
-
-    class MetadataSpy:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        @property
-        def shape(self):
-            assert payload_stream is not None
-            record("shape", payload_stream, (self.name,))
-            return (1,)
-
-        @property
-        def dtype(self):
-            assert payload_stream is not None
-            record("dtype", payload_stream, (self.name,))
-            return mx.float32
-
-    class RecordingMlx:
-        def __getattr__(self, name: str):
-            return getattr(mx, name)
-
-        def load(self, stream, *, format):
-            nonlocal payload_stream
-            assert format == "safetensors"
-            payload_stream = stream
-            record("load", stream)
-            return {"z": MetadataSpy("z"), "a": MetadataSpy("a")}
-
-        def eval(self, *values):
-            assert payload_stream is not None
-            record("eval", payload_stream, tuple(value.name for value in values))
-
-    monkeypatch.setattr(checkpoint_module, "file_identity", recording_file_identity)
-    monkeypatch.setattr(checkpoint_module, "_mlx_core", lambda: RecordingMlx())
-
-    with ArtifactRoot.open(tmp_path, writable=False) as root:
-        loaded = checkpoint_module._load_checkpoint_array_payload(
-            root,
-            reference,
-            full=True,
-        )
-
-    assert list(loaded) == ["a", "z"]
-    assert [event[0] for event in events] == [
-        "hash",
-        "load",
-        "shape",
-        "dtype",
-        "shape",
-        "dtype",
-        "eval",
-        "hash",
-    ]
-    assert [event[4] for event in events if event[0] in {"shape", "dtype"}] == [
-        ("a",),
-        ("a",),
-        ("z",),
-        ("z",),
-    ]
-    assert events[-2][4] == ("a", "z")
-    assert len({event[1] for event in events}) == 1
-    assert len({event[2] for event in events}) == 1
-    assert events[0][2] is not None
-    assert all(event[3] for event in events)
-    assert payload_stream is not None and payload_stream.closed
-
-
 @pytest.mark.parametrize("full", [False, True])
-def test_checkpoint_array_payload_materializes_bytes_on_its_one_open_fd(
+def test_active_checkpoint_reader_retains_one_payload_descriptor(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, full: bool
 ) -> None:
-    """Both verification levels retain one FD through load/eval/raw-byte capture."""
-    payload_path = tmp_path / "arrays.safetensors"
-    raw = b"original descriptor-owned checkpoint payload"
-    payload_path.write_bytes(raw)
-    reference = ArrayPayloadRef(
-        _payload_ref(payload_path, "arrays.safetensors"),
-        (ArraySpec("weight", (1,), "float32"),),
-    )
-    observed_fd: list[int] = []
+    """Hashing, header validation, loading, evaluation, and byte copy share one FD."""
+    run = _write_valid_checkpoint_run(tmp_path)
+    payload_path = run / "checkpoints" / "step-000000000" / "model.safetensors"
+    original = payload_path.read_bytes()
+    target_inode = payload_path.stat().st_ino
+    streams = []
+    events = []
+    loaded_values = ()
+    real_identity = manifest_module.file_identity
+    real_layout = checkpoint_module.read_safetensors_layout
+
+    def record(phase, stream):
+        opened = os.fstat(stream.fileno())
+        if opened.st_ino == target_inode:
+            assert not stream.closed
+            events.append((phase, id(stream), opened.st_dev, opened.st_ino))
+
+    def recording_identity(stream):
+        record("hash", stream)
+        return real_identity(stream)
+
+    def recording_layout(stream, reference):
+        record("layout", stream)
+        return real_layout(stream, reference)
 
     class RecordingMlx:
-        def __getattr__(self, name: str):
+        def __getattr__(self, name):
             return getattr(mx, name)
 
         def load(self, stream, *, format):
-            assert format == "safetensors"
-            observed_fd.append(stream.fileno())
-            return {"weight": mx.array([1.0], dtype=mx.float32)}
+            nonlocal loaded_values
+            result = mx.load(stream, format=format)
+            if os.fstat(stream.fileno()).st_ino == target_inode:
+                streams.append(stream)
+                loaded_values = tuple(result.values())
+                record("load", stream)
+            return result
 
         def eval(self, *values):
-            assert values
-            assert os.fstat(observed_fd[0]).st_size == len(raw)
+            if loaded_values and any(value is loaded_values[0] for value in values):
+                record("eval", streams[0])
+            return mx.eval(*values)
 
+    monkeypatch.setattr(manifest_module, "file_identity", recording_identity)
+    monkeypatch.setattr(checkpoint_module, "read_safetensors_layout", recording_layout)
     monkeypatch.setattr(checkpoint_module, "_mlx_core", lambda: RecordingMlx())
-    materialized: dict[str, bytes] = {}
-    with ArtifactRoot.open(tmp_path, writable=False) as root:
-        loaded = checkpoint_module._load_checkpoint_array_payload(
-            root, reference, full=full, payload_bytes=materialized
-        )
+    verification = (
+        VerificationLevel.FULL if full else VerificationLevel.MANIFEST_TRUSTED
+    )
+    with open_checkpoint_reader(
+        run,
+        step=0,
+        verification=verification,
+        load_array_groups=frozenset({"model.safetensors"}),
+        materialize_byte_groups=frozenset({"model.safetensors"}),
+    ) as reader:
+        contents = reader.read_contents()
+        assert list(contents.array_groups["model.safetensors"]) == ["weight"]
+        assert reader.read_payload_bytes("model.safetensors") == original
 
-    assert list(loaded) == ["weight"]
-    assert materialized == {"arrays.safetensors": raw}
-    with pytest.raises(OSError):
-        os.fstat(observed_fd[0])
+    assert [event[0] for event in events] == (
+        (["hash"] if full else []) + ["layout", "load", "eval"]
+    )
+    assert len({event[1:] for event in events}) == 1
+    assert len(streams) == 1 and streams[0].closed
 
 
-def test_checkpoint_array_payload_rejects_trusted_post_consumption_mutation(
+def test_active_checkpoint_reader_rejects_post_consumption_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Manifest-trusted loading still rejects a file changed during semantic use."""
-    payload_path = tmp_path / "arrays.safetensors"
-    payload_path.write_bytes(b"original descriptor-owned checkpoint payload")
-    reference = ArrayPayloadRef(
-        _payload_ref(payload_path, "arrays.safetensors"),
-        (ArraySpec("weight", (1,), "float32"),),
-    )
-    observed_fd: list[int] = []
+    """Manifest-trusted consumption must still reject mutation of the retained file."""
+    run = _write_valid_checkpoint_run(tmp_path)
+    payload_path = run / "checkpoints" / "step-000000000" / "model.safetensors"
+    target_inode = payload_path.stat().st_ino
+    streams = []
+    loaded_values = ()
 
     class MutatingMlx:
-        def __getattr__(self, name: str):
+        def __getattr__(self, name):
             return getattr(mx, name)
 
         def load(self, stream, *, format):
-            observed_fd.append(stream.fileno())
-            return {"weight": mx.array([1.0], dtype=mx.float32)}
+            nonlocal loaded_values
+            result = mx.load(stream, format=format)
+            if os.fstat(stream.fileno()).st_ino == target_inode:
+                streams.append(stream)
+                loaded_values = tuple(result.values())
+            return result
 
-        def eval(self, *_values):
-            payload_path.write_bytes(b"replacement")
+        def eval(self, *values):
+            mx.eval(*values)
+            if loaded_values and any(value is loaded_values[0] for value in values):
+                # A same-size rewrite preserves valid tensor contents but changes
+                # the retained descriptor's mutation counters.
+                payload_path.write_bytes(payload_path.read_bytes())
 
     monkeypatch.setattr(checkpoint_module, "_mlx_core", lambda: MutatingMlx())
     with (
-        ArtifactRoot.open(tmp_path, writable=False) as root,
-        pytest.raises(SMLArtifactError, match="checkpoint payload"),
+        pytest.raises(SMLArtifactError, match="payload changed"),
+        open_checkpoint_reader(
+            run,
+            step=0,
+            verification=VerificationLevel.MANIFEST_TRUSTED,
+            load_array_groups=frozenset({"model.safetensors"}),
+        ),
     ):
-        checkpoint_module._load_checkpoint_array_payload(root, reference, full=False)
-    with pytest.raises(OSError):
-        os.fstat(observed_fd[0])
+        pytest.fail("a changed payload was accepted")
+    assert len(streams) == 1 and streams[0].closed
 
 
 def test_reader_returns_materialized_payload_bytes_after_logical_name_replacement(

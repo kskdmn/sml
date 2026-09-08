@@ -120,7 +120,7 @@ def assert_complete_evaluation(
 ) -> None:
     result = read_evaluation_result(path)
     assert result.kind == "evaluation-result"
-    assert result.version == 2
+    assert result.version == 3
     assert result.identity.startswith("sha256:")
     if run_identity:
         run = read_run_manifest(checkpoint, VerificationLevel.MANIFEST_TRUSTED).manifest
@@ -142,6 +142,7 @@ def assert_complete_evaluation(
             ),
             tokenizer_identity=run.tokenizer_identity,
             verification=VerificationLevel.MANIFEST_TRUSTED,
+            artifact_identity=run.identity,
         )
     else:
         assert (

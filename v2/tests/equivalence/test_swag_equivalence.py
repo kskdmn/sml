@@ -48,33 +48,30 @@ def direct_fp32_mean_oracle(
     return mx.array(means.astype(np.float32), dtype=mx.float32)
 
 
-def test_mean_normalized_scores_match_fp32_oracle_and_differ_from_captured_legacy_sums(
-    legacy_arrays,
-    legacy_control,
-    load_legacy_model_state,
-):
+def test_mean_normalized_scores_match_fp32_oracle_for_unequal_endings():
     model = SMLLanguageModel(tiny_model_config(), key=mx.random.key(0))
-    load_legacy_model_state(model, legacy_arrays, legacy_control)
-    input_ids = legacy_arrays["swag_legacy_sum.input_ids"]
-    labels = legacy_arrays["swag_legacy_sum.labels"]
-    captured_sums = legacy_arrays["swag_legacy_sum.scores"]
+    input_ids = mx.array(
+        [
+            [1, 29, 30, 2, 3, 3],
+            [1, 29, 32, 33, 34, 2],
+            [1, 29, 35, 36, 2, 3],
+            [1, 29, 37, 38, 39, 2],
+        ],
+        dtype=mx.int32,
+    )
     pad = 3
-    flat_ids = input_ids.reshape((-1, input_ids.shape[-1]))
-    flat_labels = labels.reshape((-1, labels.shape[-1]))
-    score_mask = flat_labels != pad
+    score_mask = (input_ids != pad) & (mx.arange(input_ids.shape[-1])[None, :] >= 2)
     logits, _cache, _key = model.forward_arrays(
         model.parameters(),
-        flat_ids,
-        attention_mask=flat_ids != pad,
+        input_ids,
+        attention_mask=input_ids != pad,
         positions=None,
         cache_state=None,
         training=False,
         key=None,
     )
-    scores = score_candidates(logits, flat_ids, score_mask)
-    expected = direct_fp32_mean_oracle(logits, flat_ids, score_mask)
-    mx.eval(scores, expected, captured_sums)
+    scores = score_candidates(logits, input_ids, score_mask)
+    expected = direct_fp32_mean_oracle(logits, input_ids, score_mask)
+    mx.eval(scores, expected)
     assert scores.dtype == mx.float32
     assert_close(scores, expected, atol=1e-6, rtol=1e-6)
-    captured = captured_sums.reshape((-1,)).astype(mx.float32)
-    assert not bool(mx.allclose(scores, captured, atol=1e-5, rtol=1e-5).item())

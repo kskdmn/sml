@@ -26,8 +26,13 @@ HARNESS_COMPONENTS = (
     Path("v2/benchmarks/journal.py"),
     Path("v2/benchmarks/recovery.py"),
     Path("v2/benchmarks/analysis.py"),
-    Path("v2/benchmarks/adapters/legacy.py"),
-    Path("v2/benchmarks/adapters/replacement.py"),
+    Path("v2/benchmarks/adapters/runtime.py"),
+    Path("v2/benchmarks/adapters/native.py"),
+    Path("v2/benchmarks/adapters/prepared_data.py"),
+    Path("v2/benchmarks/adapters/native_training.py"),
+    Path("v2/benchmarks/adapters/native_inference.py"),
+    Path("v2/benchmarks/adapters/native_swag.py"),
+    Path("v2/benchmarks/parameters.py"),
     Path("v2/tests/unit/test_benchmark_analysis.py"),
 )
 
@@ -60,12 +65,8 @@ BENCHMARK_TOKENIZER = {
     "eos_token_id": 2,
     "unk_token_id": 3,
 }
-LEGACY_PRECISION_POLICY = (
-    "legacy BF16 persistent parameters and BF16 Adam moments without authoritative "
-    "master parameters"
-)
-REPLACEMENT_PRECISION_POLICY = (
-    "replacement FP32 authoritative master parameters and FP32 Adam moments with "
+PRECISION_POLICY = (
+    "FP32 authoritative master parameters and FP32 Adam moments with "
     "derived BF16 working parameters"
 )
 WARMUP_UNITS = 5
@@ -428,7 +429,7 @@ def build_canonical_workload(
         "num_q_heads": 12,
         "num_kv_heads": 3,
         "intermediate_size": 2_176,
-        "original_max_position_embeddings": 1_024,
+        "original_context_length": 1_024,
         "rope_theta": 10_000.0,
         "rope_scaling_factor": 1.0,
         "yarn_beta_fast": 32.0,
@@ -437,7 +438,7 @@ def build_canonical_workload(
         "yarn_mscale": None,
         "yarn_mscale_all_dim": None,
         "yarn_truncate": True,
-        "rms_norm_eps": 1e-6,
+        "rms_norm_epsilon": 1e-6,
         "hidden_dropout": 0.01,
         "initializer_range": 0.02,
         "pad_token_id": 0,
@@ -514,8 +515,7 @@ def build_canonical_workload(
         "microbatch_size": 1,
         "row_count": row_count,
         "canonical_dtype": "int32",
-        "legacy_dtype": "uint16",
-        "replacement_dtype": "int32",
+        "storage_dtype": "int32",
         "row_order": "fixed-canonical-order-v1",
         "swag": {
             "dataset_name": "allenai/swag",
@@ -549,10 +549,10 @@ def build_canonical_workload(
         or prepared_data_measured_units <= 0
     ):
         raise ValueError("prepared_data_measured_units must be a positive integer")
-    if "parameter_initializer_range" not in model:
+    if "initializers" not in model:
         initializer_range = float(model["initializer_range"])
         residual_range = initializer_range / (2 * int(model["num_layers"])) ** 0.5
-        model["parameter_initializer_range"] = {
+        model["initializers"] = {
             "embed_tokens": initializer_range,
             "lm_head": initializer_range,
             "q_proj": initializer_range,
@@ -578,11 +578,9 @@ def build_canonical_workload(
         optimizer=optimizer,
         precision={
             "compute_dtype": "bfloat16",
-            "legacy_parameter_dtype": "bfloat16",
-            "legacy_moment_dtype": "bfloat16",
-            "replacement_master_parameter_dtype": "float32",
-            "replacement_working_parameter_dtype": "bfloat16",
-            "replacement_moment_dtype": "float32",
+            "master_parameter_dtype": "float32",
+            "working_parameter_dtype": "bfloat16",
+            "moment_dtype": "float32",
         },
         loader=loader,
         compilation={
@@ -603,23 +601,11 @@ def build_canonical_workload(
             ),
         },
         native_representation_identities={
-            "legacy-prepared-data-schema": structured_identity(
-                "sml-benchmark-native-representation-v1",
-                {"format": "npz", "dtype": "uint16", "row_identity": row_identity},
-            ),
-            "replacement-prepared-data-schema": structured_identity(
+            "prepared-data-schema": structured_identity(
                 "sml-benchmark-native-representation-v1",
                 {"format": "npy", "dtype": "int32", "row_identity": row_identity},
             ),
-            "legacy-swag-cache-schema": structured_identity(
-                "sml-benchmark-native-representation-v1",
-                {
-                    "format": "npz",
-                    "dtype": "int32",
-                    "layout": "example,candidate,token",
-                },
-            ),
-            "replacement-swag-cache-schema": structured_identity(
+            "swag-cache-schema": structured_identity(
                 "sml-benchmark-native-representation-v1",
                 {
                     "format": "npy-buckets",
@@ -627,11 +613,7 @@ def build_canonical_workload(
                     "layout": "example,candidate,token",
                 },
             ),
-            "legacy-inference-request-schema": structured_identity(
-                "sml-benchmark-native-representation-v1",
-                {"format": "mlx-arrays", "dtype": "int32", "layout": "request,token"},
-            ),
-            "replacement-inference-request-schema": structured_identity(
+            "inference-request-schema": structured_identity(
                 "sml-benchmark-native-representation-v1",
                 {
                     "format": "request-batches",
@@ -822,41 +804,6 @@ def file_identity(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return f"sha256:{digest.hexdigest()}"
-
-
-def write_paired_pretraining_representations(
-    rows: np.ndarray,
-    output: Path,
-) -> dict[str, JsonValue]:
-    canonical = np.ascontiguousarray(rows, dtype=np.int32)
-    if canonical.ndim != 2:
-        raise ValueError("benchmark pretraining rows must be two-dimensional")
-    if canonical.size and (int(canonical.min()) < 0 or int(canonical.max()) > 65_535):
-        raise ValueError("legacy uint16 representation cannot encode token rows")
-    output.mkdir(parents=True, exist_ok=True)
-    legacy_path = output / "legacy-pretraining.npz"
-    replacement_path = output / "replacement-pretraining.npy"
-    np.savez(legacy_path, tokens=canonical.astype(np.uint16))
-    np.save(replacement_path, canonical, allow_pickle=False)
-    row_identity = semantic_row_content_identity(canonical)
-    with np.load(legacy_path) as archive:
-        if semantic_row_content_identity(archive["tokens"]) != row_identity:
-            raise RuntimeError("legacy representation changed canonical rows")
-    if semantic_row_content_identity(np.load(replacement_path)) != row_identity:
-        raise RuntimeError("replacement representation changed canonical rows")
-    return {
-        "canonical_row_identity": row_identity,
-        "row_count": int(canonical.shape[0]),
-        "row_width": int(canonical.shape[1]),
-        "legacy_format": "npz",
-        "legacy_dtype": "uint16",
-        "legacy_file_identity": file_identity(legacy_path),
-        "legacy_byte_size": legacy_path.stat().st_size,
-        "replacement_format": "npy",
-        "replacement_dtype": "int32",
-        "replacement_file_identity": file_identity(replacement_path),
-        "replacement_byte_size": replacement_path.stat().st_size,
-    }
 
 
 def ordered_file_identity(paths: Iterable[Path]) -> str:

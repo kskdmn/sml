@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import mmap
+import os
 import queue
 import threading
-from collections import deque
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections import OrderedDict, deque
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from traceback import clear_frames
@@ -24,7 +25,9 @@ from sml.artifacts.manifest import (
     TokenizerManifest,
     VerificationLevel,
     VerifiedPayload,
+    _open_verified_payload,
     _read_manifest_from_root,
+    _stable_stat_fields,
     canonical_json_bytes,
     file_identity,
     open_artifact,
@@ -42,6 +45,7 @@ _TOKENIZER_MODEL = "tokenizer.model"
 _TOKENIZER_VOCAB = "tokenizer.vocab"
 _INT32 = np.dtype("<i4")
 _PREPARED_ROW_SCAN_SIZE = 1_024
+_PREPARED_OPEN_SHARDS = 4
 
 
 def _require_plain_int(value: object, name: str, *, minimum: int = 0) -> int:
@@ -443,7 +447,7 @@ def _close_prepared_resources(
 
 
 def _validated_prepared_rows(
-    shards: Sequence[np.ndarray],
+    shards: Iterable[np.ndarray],
     *,
     vocab_size: int,
 ) -> Iterator[np.ndarray]:
@@ -459,35 +463,145 @@ def _validated_prepared_rows(
             yield from chunk
 
 
+class _PreparedShardStore:
+    """A bounded cache whose reopened descriptors retain their initial FULL proof."""
+
+    def __init__(self, artifact: OpenedArtifact[PretrainingDataManifest]) -> None:
+        self.artifact = artifact
+        self._proofs: dict[int, os.stat_result] = {}
+        self._cache: OrderedDict[int, tuple[VerifiedPayload, mmap.mmap, np.ndarray]] = (
+            OrderedDict()
+        )
+        self._closed = False
+
+    def _open_payload(self, index: int) -> VerifiedPayload:
+        reference = self.artifact.manifest.shards[index]
+        proof = self._proofs.get(index)
+        if proof is None:
+            return self.artifact.open_payload(reference)
+        payload = _open_verified_payload(
+            self.artifact.root, reference, VerificationLevel.MANIFEST_TRUSTED
+        )
+        if _stable_stat_fields(payload.opened_stat) != _stable_stat_fields(proof):
+            error = SMLArtifactError(
+                f"prepared shard changed during use: {reference.logical_path}"
+            )
+            try:
+                payload.close()
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise error
+        return payload
+
+    def _evict(self) -> None:
+        _index, (payload, mapping, array) = self._cache.popitem(last=False)
+        del array
+        _close_prepared_resources(None, [payload], [mapping], [])
+
+    def get(self, index: int) -> np.ndarray:
+        if self._closed:
+            raise SMLDataError("prepared shard store is closed")
+        if index in self._cache:
+            self._cache.move_to_end(index)
+            return self._cache[index][2]
+        if len(self._cache) >= _PREPARED_OPEN_SHARDS:
+            self._evict()
+        manifest = self.artifact.manifest
+        payload = self._open_payload(index)
+        mapping = None
+        array = None
+        try:
+            mapping, array = _map_npy_payload(
+                payload,
+                manifest.shards[index],
+                declared_rows=manifest.shard_row_counts[index],
+                row_width=manifest.row_width,
+            )
+            self._proofs[index] = payload.opened_stat
+            self._cache[index] = (payload, mapping, array)
+            return array
+        except BaseException as error:
+            if error.__traceback__ is not None:
+                clear_frames(error.__traceback__)
+            array = None
+            try:
+                _close_prepared_resources(
+                    None, [payload], [] if mapping is None else [mapping], []
+                )
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+
+    def rows(self, *, vocab_size: int) -> Iterator[np.ndarray]:
+        return _validated_prepared_rows(
+            (self.get(index) for index in range(len(self.artifact.manifest.shards))),
+            vocab_size=vocab_size,
+        )
+
+    def close(self, *, close_root: bool = True, check_evicted: bool = True) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        errors: list[BaseException] = []
+        # Evicted descriptors were checked when closed. Check their proven inode
+        # and timestamps once more at stream shutdown, without rehashing payloads.
+        for index in self._proofs:
+            if check_evicted and index not in self._cache:
+                try:
+                    with self._open_payload(index):
+                        pass
+                except BaseException as error:  # noqa: BLE001 - cleanup continues
+                    errors.append(error)
+        while self._cache:
+            try:
+                self._evict()
+            except BaseException as error:  # noqa: BLE001 - cleanup continues
+                errors.append(error)
+        if close_root:
+            try:
+                self.artifact.close()
+            except BaseException as error:  # noqa: BLE001 - cleanup completes
+                errors.append(error)
+        if errors:
+            raise errors[0]
+
+
+def _validate_prepared_store(
+    store: _PreparedShardStore,
+    tokenizer_manifest: TokenizerManifest,
+    *,
+    batch_size: int,
+) -> None:
+    manifest = store.artifact.manifest
+    _validate_prepared_tokenizer_binding(manifest, tokenizer_manifest)
+    if not manifest.shards:
+        raise SMLDataError("prepared bundle contains no shards")
+    row_count = sum(manifest.shard_row_counts)
+    if row_count < batch_size:
+        raise SMLDataError("prepared bundle does not contain one full runtime batch")
+    actual_identity = row_content_identity(
+        store.rows(vocab_size=tokenizer_manifest.vocab_size),
+        row_count,
+        manifest.row_width,
+    )
+    if actual_identity != manifest.row_content_identity:
+        raise SMLArtifactError("prepared bundle row-content identity mismatch")
+
+
 def _open_validated_prepared_resources(
     bundle: PreparedDataBundle,
-) -> tuple[
-    ArtifactRoot,
-    list[VerifiedPayload],
-    list[mmap.mmap],
-    list[np.ndarray],
-    PretrainingDataManifest,
-]:
+    *,
+    batch_size: int = 1,
+) -> _PreparedShardStore:
     artifact: OpenedArtifact[PretrainingDataManifest] = open_artifact(
         bundle.path, (PretrainingDataManifest,), bundle.verification
     )
-    if artifact.manifest != bundle.manifest:
-        error = SMLArtifactError(
-            "supplied prepared bundle manifest does not match the verified manifest"
-        )
-        try:
-            artifact.close()
-        except BaseException as cleanup_error:
-            raise error from cleanup_error
-        raise error
-    manifest = artifact.manifest
-    shard_files: list[VerifiedPayload] = []
-    mappings: list[mmap.mmap] = []
-    shard_arrays: list[np.ndarray] = []
-    payload: VerifiedPayload | None = None
-    mapping: mmap.mmap | None = None
-    array: np.ndarray | None = None
+    store = _PreparedShardStore(artifact)
     try:
+        if artifact.manifest != bundle.manifest:
+            raise SMLArtifactError(
+                "supplied prepared bundle manifest does not match the verified manifest"
+            )
         tokenizer_root = artifact.root.open_child("tokenizer")
         try:
             tokenizer_manifest = _read_manifest_from_root(
@@ -503,76 +617,21 @@ def _open_validated_prepared_resources(
             raise
         else:
             tokenizer_root.close()
-        _validate_prepared_tokenizer_binding(manifest, tokenizer_manifest)
-
-        for reference in (manifest.tokenizer_model, manifest.tokenizer_vocab):
+        for reference in (
+            artifact.manifest.tokenizer_model,
+            artifact.manifest.tokenizer_vocab,
+        ):
             with artifact.open_payload(reference):
                 pass
-
-        for reference, row_count in zip(
-            manifest.shards,
-            manifest.shard_row_counts,
-            strict=True,
-        ):
-            payload = artifact.open_payload(reference)
-            try:
-                shard_files.append(payload)
-            except BaseException as error:
-                try:
-                    payload.close()
-                except BaseException as cleanup_error:
-                    raise error from cleanup_error
-                raise
-            mapping, array = _map_npy_payload(
-                payload,
-                reference,
-                declared_rows=row_count,
-                row_width=manifest.row_width,
-            )
-            try:
-                mappings.append(mapping)
-            except BaseException as error:
-                if error.__traceback__ is not None:
-                    clear_frames(error.__traceback__)
-                array = None
-                try:
-                    mapping.close()
-                except BaseException as cleanup_error:
-                    raise error from cleanup_error
-                raise
-            shard_arrays.append(array)
-            payload = None
-            mapping = None
-            array = None
-
-        if not shard_arrays:
-            raise SMLDataError("prepared bundle contains no shards")
-        deque(
-            _validated_prepared_rows(
-                shard_arrays,
-                vocab_size=tokenizer_manifest.vocab_size,
-            ),
-            maxlen=0,
-        )
-        root = artifact.detach_root()
-        return root, shard_files, mappings, shard_arrays, manifest
+        _validate_prepared_store(store, tokenizer_manifest, batch_size=batch_size)
+        return store
     except BaseException as error:
         if error.__traceback__ is not None:
             clear_frames(error.__traceback__)
-        payload = None
-        mapping = None
-        array = None
-        cleanup_errors: list[BaseException] = []
         try:
-            _close_prepared_resources(None, shard_files, mappings, shard_arrays)
-        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
-            cleanup_errors.append(cleanup_error)
-        try:
-            artifact.close()
-        except BaseException as cleanup_error:  # noqa: BLE001 - cleanup completes
-            cleanup_errors.append(cleanup_error)
-        if cleanup_errors:
-            raise error from cleanup_errors[0]
+            store.close(check_evicted=False)
+        except BaseException as cleanup_error:
+            raise error from cleanup_error
         raise
 
 
@@ -587,29 +646,11 @@ def preflight_pretraining_bundle(
     _require_plain_int(batch_size, "batch_size", minimum=1)
     if bundle.verification is not VerificationLevel.FULL:
         raise SMLArtifactError("prepared bundle must have FULL verification")
-    root = None
-    shard_files: list[VerifiedPayload] = []
-    mappings: list[mmap.mmap] = []
-    shard_arrays: list[np.ndarray] = []
-    try:
-        root, shard_files, mappings, shard_arrays, manifest = (
-            _open_validated_prepared_resources(bundle)
-        )
-        row_count = sum(manifest.shard_row_counts)
-        if row_count < batch_size:
-            raise SMLDataError(
-                "prepared bundle does not contain one full runtime batch"
-            )
-        result = PreparedDataPreflight(bundle, row_count, batch_size)
-    except BaseException as error:
-        try:
-            _close_prepared_resources(root, shard_files, mappings, shard_arrays)
-        except BaseException as cleanup_error:
-            raise error from cleanup_error
-        raise
-    else:
-        _close_prepared_resources(root, shard_files, mappings, shard_arrays)
-        return result
+    store = _open_validated_prepared_resources(bundle, batch_size=batch_size)
+    store.close(check_evicted=False)
+    return PreparedDataPreflight(
+        bundle, sum(bundle.manifest.shard_row_counts), batch_size
+    )
 
 
 def _verify_opened_pretraining_bundle(
@@ -628,82 +669,19 @@ def _verify_opened_pretraining_bundle(
     if not isinstance(tokenizer_manifest, TokenizerManifest):
         raise TypeError("tokenizer_manifest must be a TokenizerManifest")
     _require_plain_int(batch_size, "batch_size", minimum=1)
-
-    manifest = artifact.manifest
-    _validate_prepared_tokenizer_binding(manifest, tokenizer_manifest)
-    shard_files: list[VerifiedPayload] = []
-    mappings: list[mmap.mmap] = []
-    shard_arrays: list[np.ndarray] = []
-    payload: VerifiedPayload | None = None
-    mapping: mmap.mmap | None = None
-    array: np.ndarray | None = None
+    store = _PreparedShardStore(artifact)
     try:
-        for reference, row_count in zip(
-            manifest.shards,
-            manifest.shard_row_counts,
-            strict=True,
-        ):
-            payload = artifact.open_payload(reference)
-            try:
-                shard_files.append(payload)
-            except BaseException as error:
-                try:
-                    payload.close()
-                except BaseException as cleanup_error:
-                    raise error from cleanup_error
-                raise
-            mapping, array = _map_npy_payload(
-                payload,
-                reference,
-                declared_rows=row_count,
-                row_width=manifest.row_width,
-            )
-            try:
-                mappings.append(mapping)
-            except BaseException as error:
-                if error.__traceback__ is not None:
-                    clear_frames(error.__traceback__)
-                array = None
-                try:
-                    mapping.close()
-                except BaseException as cleanup_error:
-                    raise error from cleanup_error
-                raise
-            shard_arrays.append(array)
-            payload = None
-            mapping = None
-            array = None
-
-        if not shard_arrays:
-            raise SMLDataError("prepared bundle contains no shards")
-        row_count = sum(manifest.shard_row_counts)
-        actual_identity = row_content_identity(
-            _validated_prepared_rows(
-                shard_arrays,
-                vocab_size=tokenizer_manifest.vocab_size,
-            ),
-            row_count,
-            manifest.row_width,
-        )
-        if actual_identity != manifest.row_content_identity:
-            raise SMLArtifactError("prepared bundle row-content identity mismatch")
-        if row_count < batch_size:
-            raise SMLDataError(
-                "prepared bundle does not contain one full runtime batch"
-            )
+        _validate_prepared_store(store, tokenizer_manifest, batch_size=batch_size)
     except BaseException as error:
         if error.__traceback__ is not None:
             clear_frames(error.__traceback__)
-        payload = None
-        mapping = None
-        array = None
         try:
-            _close_prepared_resources(None, shard_files, mappings, shard_arrays)
+            store.close(close_root=False, check_evicted=False)
         except BaseException as cleanup_error:
             raise error from cleanup_error
         raise
     else:
-        _close_prepared_resources(None, shard_files, mappings, shard_arrays)
+        store.close(close_root=False, check_evicted=False)
 
 
 class PretrainingBatchStream(Iterator[BatchEnvelope]):
@@ -737,10 +715,7 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         self._batch_size = batch_size
         self._seed = seed
         self._prefetch_depth = prefetch_depth
-        self._artifact_root: ArtifactRoot | None = None
-        self._shard_files: list[VerifiedPayload] = []
-        self._mappings: list[mmap.mmap] = []
-        self._shard_arrays: list[np.ndarray] = []
+        self._shards: _PreparedShardStore | None = None
         self._manifest = bundle.manifest
         self._stop = threading.Event()
         self._queue: queue.Queue[BatchEnvelope | _ProducerFailure | object] = (
@@ -800,13 +775,10 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
             return self._committed_cursor
 
     def _open_and_validate_bundle(self, bundle: PreparedDataBundle) -> None:
-        (
-            self._artifact_root,
-            self._shard_files,
-            self._mappings,
-            self._shard_arrays,
-            self._manifest,
-        ) = _open_validated_prepared_resources(bundle)
+        self._shards = _open_validated_prepared_resources(
+            bundle, batch_size=self._batch_size
+        )
+        self._manifest = self._shards.artifact.manifest
 
     def _shard_order(self, epoch: int) -> tuple[int, ...]:
         if epoch == self._order_cache_epoch:
@@ -871,36 +843,39 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         if remaining < self._batch_size:
             return None, PretrainingCursor(cursor.epoch + 1, 0, 0)
 
+        pool = self._pool
+        shards = self._shards
+        if pool is None or shards is None:
+            raise _ProducerStopped
+        rows, pool_index, generation = pool.lease()
+        pool_lease = (pool_index, generation)
         needed = self._batch_size
         position = cursor.shard_order_position
         offset = cursor.row_offset
-        segments: list[np.ndarray] = []
-        while needed:
-            shard_index = order[position]
-            shard = self._shard_arrays[shard_index]
-            copied = min(needed, shard.shape[0] - offset)
-            segments.append(shard[offset : offset + copied])
-            needed -= copied
-            offset += copied
-            if offset == shard.shape[0]:
-                position += 1
-                offset = 0
+        destination = 0
+        try:
+            while needed:
+                shard = shards.get(order[position])
+                copied = min(needed, shard.shape[0] - offset)
+                rows[destination : destination + copied] = shard[
+                    offset : offset + copied
+                ]
+                needed -= copied
+                destination += copied
+                offset += copied
+                if offset == shard.shape[0]:
+                    position += 1
+                    offset = 0
+                shard = None
+        except BaseException:
+            pool.release(*pool_lease)
+            raise
 
-        if position == len(order):
+        # Dropping the unusable tail is part of committing this last full batch.
+        if remaining - self._batch_size < self._batch_size:
             cursor_after = PretrainingCursor(cursor.epoch + 1, 0, 0)
         else:
             cursor_after = PretrainingCursor(cursor.epoch, position, offset)
-
-        pool = self._pool
-        if pool is None:
-            raise _ProducerStopped
-        rows, pool_index, generation = pool.lease()
-        destination = 0
-        for segment in segments:
-            next_destination = destination + segment.shape[0]
-            rows[destination:next_destination] = segment
-            destination = next_destination
-        pool_lease = (pool_index, generation)
 
         return (
             self._make_envelope(
@@ -1047,15 +1022,10 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
             }
 
     def _close_open_resources(self) -> None:
-        shard_arrays = self._shard_arrays
-        self._shard_arrays = []
-        mappings = self._mappings
-        self._mappings = []
-        files = self._shard_files
-        self._shard_files = []
-        root = self._artifact_root
-        self._artifact_root = None
-        _close_prepared_resources(root, files, mappings, shard_arrays)
+        shards = self._shards
+        self._shards = None
+        if shards is not None:
+            shards.close()
 
     def _drain_consumer_items(self) -> None:
         pending = self._pending_envelope
@@ -1440,15 +1410,6 @@ def prepare_pretraining_bundle(
     )
 
 
-def build_benchmark_workload(metric: str, canonical_workload: object) -> object:
-    """Build the production prepared-data path for the pinned benchmark ABI."""
-    from sml.data._pretraining_benchmark import (
-        build_prepared_data_benchmark_workload,
-    )
-
-    return build_prepared_data_benchmark_workload(metric, canonical_workload)
-
-
 __all__ = [
     "WINDOWED_ROW_SHUFFLE_V1",
     "BatchEnvelope",
@@ -1457,7 +1418,6 @@ __all__ = [
     "PretrainingBatchStream",
     "PretrainingCursor",
     "PretrainingPreparationConfig",
-    "build_benchmark_workload",
     "canonicalize_pretraining_cursor",
     "pack_token_ranges",
     "preflight_pretraining_bundle",

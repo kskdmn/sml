@@ -1506,16 +1506,9 @@ def resume_finetune(
             )
 
 
-def _reject_direct_step_path(path: Path) -> Path:
-    if not isinstance(path, Path):
-        raise TypeError("path must be a Path")
-    if path.name.startswith("step-") or (path / "checkpoint.json").exists():
-        raise SMLArtifactError("direct checkpoint step paths are rejected")
-    return path
-
-
 def export_merged(checkpoint: Path, output: Path) -> ExportResult:
-    checkpoint = _reject_direct_step_path(checkpoint)
+    if not isinstance(checkpoint, Path):
+        raise TypeError("checkpoint must be a Path")
     if not isinstance(output, Path):
         raise TypeError("output must be a Path")
     with open_latest_checkpoint_reader(

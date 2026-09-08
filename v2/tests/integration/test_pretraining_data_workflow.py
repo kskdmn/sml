@@ -237,8 +237,8 @@ def prepared_bundle(prepared_sources, tmp_path) -> PreparedDataBundle:
 def test_benchmark_adapter_runs_real_prepared_data_workflow(monkeypatch):
     source_root = Path(__file__).resolve().parents[3]
     monkeypatch.syspath_prepend(str(source_root))
-    from v2.benchmarks.adapters.replacement import (
-        ReplacementNativeWorkload,
+    from v2.benchmarks.adapters.runtime import (
+        NativeWorkload,
         resolve_native_workload,
         run_measured,
         run_warmup,
@@ -252,7 +252,7 @@ def test_benchmark_adapter_runs_real_prepared_data_workflow(monkeypatch):
     )
     native = resolve_native_workload("prepared-data", workload, source_root)
 
-    assert isinstance(native, ReplacementNativeWorkload)
+    assert isinstance(native, NativeWorkload)
     recorder = _CountingMX(native.runtime._mx)
     native.runtime._mx = recorder
     try:
@@ -633,9 +633,9 @@ def test_dropped_tail_stream_retains_commit_and_does_not_consume_next_epoch(
                 envelope.release()
 
         assert epoch_zero_rows == [10, 11, 20, 21, 22, 0]
-        assert stream.committed_cursor == PretrainingCursor(0, 2, 1)
+        assert stream.committed_cursor == PretrainingCursor(1, 0, 0)
         with pytest.raises(SMLDataError, match="delivered"):
-            stream.commit(PretrainingCursor(1, 0, 0))
+            stream.commit(PretrainingCursor(2, 0, 0))
         resume_cursor = stream.committed_cursor
 
     resumed = PretrainingBatchStream(
@@ -659,7 +659,7 @@ def test_dropped_tail_stream_retains_commit_and_does_not_consume_next_epoch(
     assert resumed_rows == [[0, 1, 20], [21, 22, 10], [0, 1, 10]]
     assert resumed_cursors == [
         PretrainingCursor(1, 1, 1),
-        PretrainingCursor(1, 2, 1),
+        PretrainingCursor(2, 0, 0),
         PretrainingCursor(2, 1, 1),
     ]
 
@@ -1095,14 +1095,14 @@ def test_preflight_preserves_semantic_error_when_cleanup_fails(
         "prepared bundle does not contain one full runtime batch"
     )
     cleanup_error = RuntimeError("injected preflight postcheck failure")
-    original_close = pretraining_module._close_prepared_resources
+    original_close = pretraining_module._PreparedShardStore.close
 
     def fail_after_close(*args, **kwargs):
         original_close(*args, **kwargs)
         raise cleanup_error
 
     monkeypatch.setattr(
-        pretraining_module, "_close_prepared_resources", fail_after_close
+        pretraining_module._PreparedShardStore, "close", fail_after_close
     )
 
     with pytest.raises(SMLDataError) as raised:
@@ -1383,12 +1383,13 @@ def _instrument_real_prepared_cleanup(
 
 
 def _assert_real_prepared_cleanup(events, mappings, payloads, roots):
-    assert events == [
-        ("root", 0),
-        *(("mmap", index) for index in reversed(range(len(mappings)))),
-        *(("payload", index) for index in reversed(range(len(payloads)))),
-        ("root", 1),
-    ]
+    assert events[0] == ("root", 0)
+    assert events[-1] == ("root", 1)
+    for index in range(len(mappings)):
+        assert events.count(("mmap", index)) == 1
+        assert events.index(("mmap", index)) < events.index(("payload", index))
+    for index in range(len(payloads)):
+        assert events.count(("payload", index)) == 1
     assert mappings
     assert all(mapping.closed for mapping in mappings)
     assert all(payload.closed for payload in payloads)
@@ -1480,19 +1481,118 @@ def test_full_prepared_reduction_operands_are_bounded_to_1024_rows(
     assert max(shape[0] for shape in row_operands) <= 1_024
 
 
-def test_prepared_detach_failure_closes_real_mappings_payloads_and_root(
+def test_prepared_row_identity_failure_closes_real_mappings_payloads_and_root(
     prepared_bundle, monkeypatch
 ):
+    prepared_bundle = _replace_manifest(
+        prepared_bundle, row_content_identity="sha256:" + "0" * 64
+    )
     events, mappings, payloads, roots = _instrument_real_prepared_cleanup(monkeypatch)
 
-    def fail_detach(_artifact):
-        raise RuntimeError("injected prepared detach failure")
-
-    monkeypatch.setattr(OpenedArtifact, "detach_root", fail_detach)
-    with pytest.raises(RuntimeError, match="injected prepared detach failure"):
+    with pytest.raises(SMLArtifactError, match="row-content identity mismatch"):
         pretraining_module._open_validated_prepared_resources(prepared_bundle)
 
     _assert_real_prepared_cleanup(events, mappings, payloads, roots)
+
+
+@pytest.mark.parametrize("entry_point", ["preflight", "stream", "verify"])
+def test_all_full_prepared_consumers_reject_inconsistent_row_identity(
+    prepared_bundle, entry_point
+):
+    prepared_bundle = _replace_manifest(
+        prepared_bundle, row_content_identity="sha256:" + "0" * 64
+    )
+    with pytest.raises(SMLArtifactError, match="row-content identity mismatch"):
+        if entry_point == "preflight":
+            preflight_pretraining_bundle(prepared_bundle, batch_size=1)
+        elif entry_point == "verify":
+            verify_artifact(prepared_bundle.path, full=True)
+        else:
+            PretrainingBatchStream(
+                prepared_bundle,
+                batch_size=1,
+                seed=5,
+                prefetch_depth=1,
+                cursor=PretrainingCursor.initial(),
+            )
+
+
+def test_many_shards_fit_small_descriptor_limit_without_rehashing_epochs(
+    prepared_bundle,
+):
+    width = prepared_bundle.manifest.row_width
+    prepared_bundle = _replace_shards(
+        prepared_bundle, tuple(_rows(width, index, index) for index in range(64))
+    )
+    program = r"""
+import resource
+import sys
+from pathlib import Path
+from sml.artifacts import manifest as manifests
+from sml.artifacts.manifest import PretrainingDataManifest, VerificationLevel, read_manifest
+from sml.artifacts.verify import verify_artifact
+from sml.data.pretraining import (
+    PreparedDataBundle, PretrainingBatchStream, PretrainingCursor,
+    preflight_pretraining_bundle,
+)
+path = Path(sys.argv[1])
+manifest = read_manifest(path, PretrainingDataManifest, VerificationLevel.FULL).manifest
+bundle = PreparedDataBundle(path, manifest, VerificationLevel.FULL)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
+assert preflight_pretraining_bundle(bundle, batch_size=7).row_count == 128
+verify_artifact(path, full=True)
+hash_calls = 0
+real_identity = manifests.file_identity
+def identity(stream):
+    global hash_calls
+    hash_calls += 1
+    return real_identity(stream)
+manifests.file_identity = identity
+with PretrainingBatchStream(
+    bundle, batch_size=7, seed=5, prefetch_depth=2, cursor=PretrainingCursor.initial()
+) as stream:
+    preflight_hashes = hash_calls
+    assert preflight_hashes >= 64
+    for epoch in range(2):
+        identifiers = []
+        for envelope in stream.iter_epoch(epoch):
+            with envelope:
+                assert envelope.rows.shape == (7, manifest.row_width)
+                identifiers.extend(envelope.rows[:, 0].tolist())
+                stream.commit(envelope.cursor_after)
+        assert len(identifiers) == 126
+        assert len(set(identifiers)) >= 63
+        assert stream.committed_cursor == PretrainingCursor(epoch + 1, 0, 0)
+assert hash_calls == preflight_hashes
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(prepared_bundle.path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_reopening_evicted_shard_rejects_changes_to_fully_verified_bytes(
+    prepared_bundle,
+):
+    width = prepared_bundle.manifest.row_width
+    prepared_bundle = _replace_shards(
+        prepared_bundle, tuple(_rows(width, index) for index in range(8))
+    )
+    store = pretraining_module._open_validated_prepared_resources(prepared_bundle)
+    assert 0 not in store._cache
+    path = prepared_bundle.path / prepared_bundle.manifest.shards[0].logical_path
+    with path.open("r+b") as payload:
+        payload.seek(-4, 2)
+        payload.write((1).to_bytes(4, "little"))
+    with pytest.raises(SMLArtifactError, match="changed during use"):
+        store.get(0)
+    with pytest.raises(SMLArtifactError, match="changed during use"):
+        store.close()
+    store.close()
 
 
 def test_prepared_resource_cleanup_releases_views_mappings_payloads_then_root():
@@ -1853,10 +1953,12 @@ def test_stream_retains_nonwriteable_descriptor_mapped_shards(prepared_bundle):
         cursor=PretrainingCursor.initial(),
     )
     try:
-        assert stream._shard_arrays
-        assert all(not array.flags.writeable for array in stream._shard_arrays)
+        assert stream._shards is not None
+        arrays = [resource[2] for resource in stream._shards._cache.values()]
+        assert arrays
+        assert all(not array.flags.writeable for array in arrays)
         with pytest.raises(ValueError, match="read-only"):
-            stream._shard_arrays[0][0, 0] = 7
+            arrays[0][0, 0] = 7
     finally:
         stream.close()
 

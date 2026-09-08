@@ -90,6 +90,20 @@ def test_base_precision_boundaries():
     assert model.layers[0].self_attn.rope.cos_cached.dtype == mx.float32
 
 
+@pytest.mark.parametrize("positions", [[[0, 0, 0]], [[2, 1, 0]]])
+def test_uncached_causality_follows_token_order_with_custom_rotary_positions(positions):
+    model = SMLLanguageModel(_tiny_model_config(), key=mx.random.key(9))
+    before = model(
+        mx.array([[1, 4, 5]]), positions=mx.array(positions), training=False
+    ).logits
+    after = model(
+        mx.array([[1, 7, 8]]), positions=mx.array(positions), training=False
+    ).logits
+
+    _assert_close(before[:, :1], after[:, :1])
+    assert not bool(mx.array_equal(before[:, 1:], after[:, 1:]))
+
+
 def test_untied_model_registers_an_independent_vocabulary_head():
     model = SMLLanguageModel(
         _tiny_model_config(tie_word_embeddings=False),

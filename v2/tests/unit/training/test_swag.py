@@ -133,6 +133,7 @@ def tiny_model_config(*, hidden_dropout: float = 0.0) -> ModelConfig:
 def tiny_base_model() -> ResolvedModel:
     return ResolvedModel(
         artifact_kind="pretraining-checkpoint",
+        artifact_identity=IDENTITY_B,
         run_identity=IDENTITY_B,
         step=1,
         checkpoint_identity=IDENTITY_C,

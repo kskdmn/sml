@@ -47,7 +47,6 @@ SESSION_FIELDS = {
     "protocol",
     "hardware",
     "software_versions",
-    "paired_representations",
     "manifest_path",
     "raw_output_path",
 }
@@ -428,7 +427,6 @@ def build_session_document(
     protocol: dict[str, JsonValue],
     hardware: dict[str, JsonValue],
     software_versions: dict[str, str],
-    paired_representations: dict[str, JsonValue],
     manifest_path: Path,
     raw_output_path: Path,
 ) -> dict:
@@ -445,7 +443,6 @@ def build_session_document(
         "protocol": protocol,
         "hardware": hardware,
         "software_versions": software_versions,
-        "paired_representations": paired_representations,
         "manifest_path": str(manifest_path.resolve()),
         "raw_output_path": str(raw_output_path.resolve()),
     }
@@ -1613,6 +1610,11 @@ class BaselineJournal:
                     )
                     if path != self._thermal_wait_path(slot, index):
                         raise ValueError("thermal recovery has a non-canonical path")
+                    # The episode directory is durable before its first trigger.
+                    # An empty directory has no committed evidence and its index
+                    # may be reused after interrupted publication.
+                    if not any(path.iterdir()):
+                        continue
                     trigger_path = path / "trigger.json"
                     _require_file(trigger_path, label="thermal recovery trigger")
                     self._validate_trigger_source(

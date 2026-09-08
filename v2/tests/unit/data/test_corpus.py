@@ -130,3 +130,41 @@ def test_filtered_texts_replace_invalid_utf8_and_ignore_non_string_text(tmp_path
     assert list(texts) == ["abc�def"]
     assert texts.object_rows_read == 3
     assert texts.texts_used == 1
+
+
+@pytest.mark.parametrize("missing_bytes", [1, 4, 12])
+def test_full_corpus_read_rejects_truncated_frame(tmp_path, missing_bytes):
+    shard = tmp_path / "truncated.jsonl.zst"
+    compressed = zstd.ZstdCompressor(write_checksum=True).compress(
+        b'{"text":"first"}\n{"text":"second"}\n'
+    )
+    shard.write_bytes(compressed[:-missing_bytes])
+    config = CorpusConfig(input_root=tmp_path, min_text_bytes=1, max_rows_per_file=None)
+
+    with pytest.raises(RuntimeError, match="truncated.*incomplete zstd frame"):
+        list(iter_filtered_texts(config, (shard,)))
+
+
+def test_corpus_reads_concatenated_frames_and_checks_final_frame(tmp_path):
+    shard = tmp_path / "concatenated.jsonl.zst"
+    compressor = zstd.ZstdCompressor(write_checksum=True)
+    first = compressor.compress(b'{"text":"first"}\n')
+    second = compressor.compress(b'{"text":"second"}\n')
+    config = CorpusConfig(input_root=tmp_path, min_text_bytes=1, max_rows_per_file=None)
+    shard.write_bytes(first + second)
+    assert list(iter_filtered_texts(config, (shard,))) == ["first", "second"]
+
+    shard.write_bytes(first + second[:-1])
+    with pytest.raises(RuntimeError, match="incomplete zstd frame"):
+        list(iter_filtered_texts(config, (shard,)))
+
+
+def test_corpus_row_limit_does_not_require_consuming_later_frames(tmp_path):
+    shard = tmp_path / "limited.jsonl.zst"
+    compressor = zstd.ZstdCompressor(write_checksum=True)
+    first = compressor.compress(b'{"text":"first"}\n')
+    second = compressor.compress(b'{"text":"second"}\n')
+    shard.write_bytes(first + second[:-1])
+    config = CorpusConfig(input_root=tmp_path, min_text_bytes=1, max_rows_per_file=1)
+
+    assert list(iter_filtered_texts(config, (shard,))) == ["first"]

@@ -8,7 +8,7 @@ import mmap
 import queue
 import tempfile
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from math import prod
 from pathlib import Path
@@ -1464,10 +1464,35 @@ def _iter_resolved_rows(
 
 
 def _close_memmap(array: np.memmap) -> None:
-    array.flush()
     mmap_obj = getattr(array, "_mmap", None)
-    if mmap_obj is not None:
+    if mmap_obj is None or mmap_obj.closed:
+        return
+    try:
+        array.flush()
+    except BaseException as error:
+        try:
+            mmap_obj.close()
+        except BaseException as cleanup_error:
+            raise error from cleanup_error
+        raise
+    else:
         mmap_obj.close()
+
+
+def _close_writer_maps(maps: Mapping[str, np.memmap], *, unlink: bool) -> None:
+    errors: list[BaseException] = []
+    for mm in maps.values():
+        try:
+            _close_memmap(mm)
+        except BaseException as error:  # noqa: BLE001 - cleanup continues
+            errors.append(error)
+        if unlink:
+            try:
+                Path(str(mm.filename)).unlink(missing_ok=True)
+            except BaseException as error:  # noqa: BLE001 - cleanup continues
+                errors.append(error)
+    if errors:
+        raise errors[0]
 
 
 class _BucketWriter:
@@ -1531,17 +1556,34 @@ class _BucketWriter:
             ("labels", _INT32, ()),
         )
         new_maps: dict[str, np.memmap] = {}
-        for name, dtype, extra in specs:
-            path = self.scratch / f"length-{self.length:04d}-{name}-{capacity}.dat"
-            mm = np.memmap(path, mode="w+", dtype=dtype, shape=(capacity, *extra))
-            if self._maps is not None:
-                mm[: self.count] = self._maps[name][: self.count]
-                old_path = Path(str(self._maps[name].filename))
-                _close_memmap(self._maps[name])
-                old_path.unlink(missing_ok=True)
-            new_maps[name] = mm
+        paths: list[Path] = []
+        try:
+            for name, dtype, extra in specs:
+                path = self.scratch / f"length-{self.length:04d}-{name}-{capacity}.dat"
+                paths.append(path)
+                mm = np.memmap(path, mode="w+", dtype=dtype, shape=(capacity, *extra))
+                new_maps[name] = mm
+                if self._maps is not None:
+                    mm[: self.count] = self._maps[name][: self.count]
+        except BaseException as error:
+            cleanup_errors: list[BaseException] = []
+            try:
+                _close_writer_maps(new_maps, unlink=False)
+            except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
+                cleanup_errors.append(cleanup_error)
+            for path in paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise error from cleanup_errors[0]
+            raise
+        old_maps = self._maps
         self._maps = new_maps
         self._capacity = capacity
+        if old_maps is not None:
+            _close_writer_maps(old_maps, unlink=True)
 
     def arrays(self) -> dict[str, np.ndarray] | None:
         self.flush()
@@ -1550,11 +1592,21 @@ class _BucketWriter:
         return {name: mm[: self.count] for name, mm in self._maps.items()}
 
     def close(self) -> None:
-        if self._maps is None:
-            return
-        for mm in self._maps.values():
-            _close_memmap(mm)
+        maps = self._maps
         self._maps = None
+        if maps is not None:
+            _close_writer_maps(maps, unlink=False)
+
+
+def _close_bucket_writers(writers: Iterable[_BucketWriter]) -> None:
+    errors: list[BaseException] = []
+    for writer in writers:
+        try:
+            writer.close()
+        except BaseException as error:  # noqa: BLE001 - cleanup continues
+            errors.append(error)
+    if errors:
+        raise errors[0]
 
 
 def _ingest_and_write_buckets(
@@ -1668,10 +1720,16 @@ def _ingest_and_write_buckets(
                 example_count += writer.count
             if example_count == 0:
                 raise SMLDataError("no usable SWAG examples were produced")
-            return tuple(references), example_count, dropped
-        finally:
-            for writer in writers.values():
-                writer.close()
+            result = tuple(references), example_count, dropped
+        except BaseException as error:
+            try:
+                _close_bucket_writers(writers.values())
+            except BaseException as cleanup_error:
+                raise error from cleanup_error
+            raise
+        else:
+            _close_bucket_writers(writers.values())
+            return result
 
 
 def prepare_swag_bundle(

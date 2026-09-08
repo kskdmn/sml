@@ -71,7 +71,7 @@ def _require_plain_int(value: object, name: str, *, minimum: int = 0) -> int:
 
 @dataclass(frozen=True, slots=True)
 class TokenizerTrainingConfig:
-    """Complete, immutable configuration for the legacy SentencePiece BPE run."""
+    """Complete, immutable configuration for the SentencePiece BPE run."""
 
     corpus: CorpusConfig
     algorithm: str = "bpe"
@@ -136,7 +136,7 @@ class TokenizerTrainingConfig:
         if len(set(self.conversation_user_symbols)) != 3:
             raise ValueError("conversation user symbols must be unique")
         if self.conversation_user_symbols != CONVERSATION_USER_SYMBOLS:
-            raise ValueError("conversation user symbols must preserve legacy ordering")
+            raise ValueError("conversation user symbols must preserve fixed ordering")
         expected_ids = {"unk_id": 0, "bos_id": 1, "eos_id": 2, "pad_id": 3}
         for name, expected in expected_ids.items():
             value = _require_plain_int(getattr(self, name), name)

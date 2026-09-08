@@ -184,9 +184,9 @@ def test_compiled_cores_use_only_builtin_array_trees(tiny_runtime):
             "mx.compile(AdamState",
             "mx.compile(TrainerState",
             "mx.compile(KVCache",
-            "model.update(",
         ],
     )
+    assert source_has_none_of(build_pretraining_kernels, ["model.update("])
 
 
 def _reference_partial_window_update(runtime: TinyRuntime, trainer_tree: tuple):

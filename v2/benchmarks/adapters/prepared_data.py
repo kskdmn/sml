@@ -11,7 +11,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import numpy as np
-
 from sml.artifacts.checkpoint import publish_immutable_bundle
 from sml.artifacts.manifest import (
     PayloadRef,
@@ -30,9 +29,10 @@ from sml.data.pretraining import (
     _write_shard,
 )
 from sml.errors import SMLArtifactError
+
 from v2.benchmarks.schema import CanonicalWorkload
 from v2.benchmarks.workload import (
-    REPLACEMENT_PRECISION_POLICY,
+    PRECISION_POLICY,
     canonical_execution_order_identity,
     canonical_input_identity,
     canonical_metric_projection,
@@ -216,8 +216,8 @@ def _materialize_bundle(
         raise TypeError("prepared-data projection loader must be an object")
     if loader.get("canonical_dtype") != "int32":
         raise ValueError("prepared-data canonical_dtype must be int32")
-    if loader.get("replacement_dtype") != "int32":
-        raise ValueError("prepared-data replacement_dtype must be int32")
+    if loader.get("storage_dtype") != "int32":
+        raise ValueError("prepared-data storage_dtype must be int32")
     if loader.get("row_order") != "fixed-canonical-order-v1":
         raise ValueError("prepared-data row_order must be fixed-canonical-order-v1")
 
@@ -477,7 +477,7 @@ def build_prepared_data_benchmark_workload(
                 canonical_metric_projection("prepared-data", canonical_workload),
             ),
             "canonical_execution_order_identity": execution_identity,
-            "parameter_precision_policy": REPLACEMENT_PRECISION_POLICY,
+            "parameter_precision_policy": PRECISION_POLICY,
         }
         runtime.native_representation_identity = runtime.bundle.manifest.identity
         runtime.canonical_row_identity = canonical_row_identity

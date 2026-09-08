@@ -487,15 +487,15 @@ class BaseParameterState:
             raise SMLConfigurationError(
                 "working_parameters leaves must have dtype bfloat16"
             )
-        for master, working in zip(
-            _array_leaves(self.master_parameters, "master_parameters"),
-            _array_leaves(self.working_parameters, "working_parameters"),
-            strict=True,
-        ):
+
+        def require_cast(master: mx.array, working: mx.array) -> mx.array:
             if not bool(mx.array_equal(working, master.astype(mx.bfloat16))):
                 raise SMLConfigurationError(
                     "working_parameters leaves must be exact bfloat16 casts of masters"
                 )
+            return working
+
+        tree_map(require_cast, self.master_parameters, self.working_parameters)
 
     def to_tree(self) -> tuple[dict, dict]:
         return self.master_parameters, self.working_parameters

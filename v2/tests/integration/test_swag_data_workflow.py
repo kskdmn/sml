@@ -110,6 +110,7 @@ def tokenizer_manifest() -> TokenizerManifest:
 def tiny_base_model() -> ResolvedModel:
     return ResolvedModel(
         artifact_kind="pretraining-checkpoint",
+        artifact_identity=IDENTITY_B,
         run_identity=IDENTITY_B,
         step=1,
         checkpoint_identity=IDENTITY_C,

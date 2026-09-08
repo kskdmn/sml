@@ -85,6 +85,10 @@ immutable JSON artifact preserves complete provider metrics plus resolved
 task, model, dataset, and ordered-request provenance; its destination path is
 intentionally excluded from the artifact and its identity.
 
+Results use schema version 3 and bind each model to its complete artifact
+identity, so different exported weights remain distinguishable even when the
+tokenizer and source step match.
+
 ### SWAG data
 
 Resolve an immutable Hugging Face revision, encode SWAG candidates with the
@@ -235,9 +239,9 @@ swag-export/
 ## Latest-only model selection
 
 Model-consuming commands accept a complete pretraining run, LoRA run, or merged
-export directory. A run always resolves through its recovered `latest.json`;
-historical step selectors are unsupported. Passing a `checkpoints/step-*`
-directory directly is rejected. Writable resume and export operations recover
-and prune crash leftovers only after full verification, while read-only
+export directory. A run always resolves through its recovered `latest.json`.
+Artifact manifests determine the accepted directory kind. Writable resume and
+export operations recover and prune crash leftovers only after full verification,
+while read-only
 inference and evaluation can recover a stale latest index in memory without
 mutating the artifact.

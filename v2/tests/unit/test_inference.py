@@ -178,18 +178,16 @@ def test_session_runtime_config_rejects_non_positive_batch_buckets() -> None:
         InferenceRuntimeConfig(batch_size_buckets=(1, 0, 4))
 
 
-def test_resolve_rejects_direct_step_path(tmp_path: Path) -> None:
-    step_path = tmp_path / "checkpoints" / "step-000000001"
-    step_path.mkdir(parents=True)
-    with pytest.raises(SMLArtifactError, match="step"):
-        resolve_model_artifact(step_path, full_verify=False)
+def test_resolve_rejects_directory_without_artifact_manifest(tmp_path: Path) -> None:
+    with pytest.raises(SMLArtifactError):
+        resolve_model_artifact(tmp_path, full_verify=False)
 
 
-def test_resolve_rejects_historical_selector_on_step_directory(
+def test_resolve_rejects_checkpoint_manifest_as_model_artifact(
     tiny_pretraining_run: Path,
 ) -> None:
     step_path = next((tiny_pretraining_run / "checkpoints").glob("step-*"))
-    with pytest.raises(SMLArtifactError, match="step"):
+    with pytest.raises(SMLArtifactError):
         resolve_model_artifact(step_path, full_verify=False)
 
 

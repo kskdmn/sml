@@ -64,6 +64,8 @@ def test_model_config_normalizes_initializer_mapping_but_preserves_explicit_conf
         ({"num_q_heads": 4, "num_kv_heads": 3}, "divisible", ValueError),
         ({"rope_theta": math.inf}, "rope_theta", ValueError),
         ({"rope_scaling_factor": 0.5}, "rope_scaling_factor", ValueError),
+        ({"rope_theta": 1.0, "rope_scaling_factor": 2.0}, "scaled RoPE", ValueError),
+        ({"rope_theta": 0.5, "rope_scaling_factor": 2.0}, "scaled RoPE", ValueError),
         ({"yarn_mscale": 1.0}, "both be set", ValueError),
         ({"pad_token_id": 64, "vocab_size": 64}, "pad_token_id", ValueError),
         ({"pad_token_id": 1, "bos_token_id": 1}, "unique", ValueError),

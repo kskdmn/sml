@@ -6,6 +6,39 @@ from sml.errors import SMLConfigurationError
 
 
 @pytest.mark.parametrize(
+    "field, first, second",
+    [("max_new_tokens", "7", "19"), ("include_prompt", "false", "true")],
+)
+def test_inference_rejects_duplicate_semantic_config_fields(
+    tmp_path, field, first, second
+):
+    config = tmp_path / "infer.toml"
+    config.write_text(
+        f'[infer]\ncheckpoint="run"\nprompt="hello"\n{field}={first}\n'
+        f"[infer.request]\n{field}={second}\n"
+    )
+    with pytest.raises(SMLConfigurationError, match="duplicate inference"):
+        parse_command(["infer", "--config", str(config)])
+
+
+def test_inference_cli_overrides_nested_request_config(tmp_path):
+    config = tmp_path / "infer.toml"
+    config.write_text(
+        '[infer]\ncheckpoint="run"\nprompt="hello"\n[infer.request]\nmax_new_tokens=19\n'
+    )
+    command = parse_command(["infer", "--config", str(config), "--max-new-tokens", "7"])
+    assert command.to_domain().request.max_new_tokens == 7
+
+
+def test_inference_accepts_step_named_ancestors_and_literal_prompt():
+    command = parse_command(
+        ["infer", "--checkpoint", "step-experiments/run", "--", "--step"]
+    )
+    assert command.to_domain().prompt == "--step"
+    assert command.to_domain().checkpoint == Path("step-experiments/run")
+
+
+@pytest.mark.parametrize(
     ("argv", "contents"),
     [
         (

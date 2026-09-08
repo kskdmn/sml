@@ -525,6 +525,45 @@ def test_conflicting_writer_reports_owner(tmp_path):
     assert str(run) in message
 
 
+@pytest.mark.parametrize("category", ("run-writer", "publication", "run-access"))
+@pytest.mark.parametrize("existing", (False, True))
+def test_case_aliases_share_artifact_locks(tmp_path, category, existing):
+    """Creation and existing-artifact locks follow the parent's name semantics."""
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        if os.fpathconf(descriptor, 11):
+            pytest.skip("requires a case-insensitive APFS volume")
+    finally:
+        os.close(descriptor)
+    target = tmp_path / "Run"
+    alias = tmp_path / "run"
+    if existing:
+        target.mkdir()
+        assert target.samefile(alias)
+    with (
+        checkpoint._protected_lock(target, category=category, exclusive=True),
+        pytest.raises(SMLArtifactError, match="held by"),
+        checkpoint._protected_lock(alias, category=category, exclusive=True),
+    ):
+        pytest.fail("a case alias bypassed the protected artifact lock")
+
+
+def test_case_sensitive_volume_keeps_distinct_creation_locks(tmp_path, monkeypatch):
+    """Names that can denote separate artifacts must remain independently lockable."""
+    monkeypatch.setattr(checkpoint.os, "fpathconf", lambda _fd, _key: 1)
+    with publication_lock(tmp_path / "Run"), publication_lock(tmp_path / "run"):
+        pass
+
+
+def test_unicode_aliases_share_creation_lock(tmp_path):
+    with (
+        publication_lock(tmp_path / "caf\u00e9"),
+        pytest.raises(SMLArtifactError, match="held by"),
+        publication_lock(tmp_path / "cafe\u0301"),
+    ):
+        pytest.fail("a normalization alias bypassed the publication lock")
+
+
 def test_conflicting_process_reports_live_owner(tmp_path):
     """Conflict diagnostics must identify the live holder in another process."""
     run = tmp_path / "run-0001"

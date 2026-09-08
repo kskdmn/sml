@@ -618,6 +618,44 @@ def test_export_materializes_only_adapter_group(
     assert exported.path.is_dir()
 
 
+@pytest.mark.parametrize("full_verify", (False, True))
+def test_export_model_identity_distinguishes_changed_weights(
+    tiny_lora_run: Path,
+    tmp_path: Path,
+    full_verify: bool,
+) -> None:
+    first = export_merged(tiny_lora_run, tmp_path / "first-export").path
+    second = tmp_path / "second-export"
+    shutil.copytree(first, second)
+    first_manifest = read_manifest(
+        first, ExportManifest, VerificationLevel.FULL
+    ).manifest
+    weights_path = second / "model.safetensors"
+    arrays = dict(mx.load(weights_path))
+    arrays["norm.weight"] = (arrays["norm.weight"] + 1.0).astype(mx.bfloat16)
+    mx.save_safetensors(weights_path, arrays)
+    second_manifest = replace(
+        first_manifest,
+        model_weights=replace(
+            first_manifest.model_weights,
+            payload=_payload_ref(weights_path, "model.safetensors"),
+        ),
+    )
+    second_manifest = replace(
+        second_manifest, identity=second_manifest.recompute_identity()
+    )
+    (second / "manifest.json").write_bytes(canonical_json_bytes(second_manifest))
+
+    first_identity = resolve_model_artifact(first, full_verify=full_verify).identity()
+    second_identity = resolve_model_artifact(second, full_verify=full_verify).identity()
+
+    assert first_identity.tokenizer_identity == second_identity.tokenizer_identity
+    assert first_identity.step == second_identity.step
+    assert first_identity.artifact_identity == first_manifest.identity
+    assert second_identity.artifact_identity == second_manifest.identity
+    assert first_identity != second_identity
+
+
 def test_full_export_resolve_applies_exact_export_semantics(
     tiny_lora_run: Path,
     tmp_path: Path,
@@ -1375,14 +1413,14 @@ def test_resume_uses_manifest_data_locator_when_data_is_omitted(
     assert result == completed
 
 
-def test_export_uses_recovered_latest_and_rejects_direct_step_paths(
+def test_export_uses_manifest_kind_and_recovered_latest(
     tiny_base_run, tiny_swag_bundle, tmp_path
 ):
     trained = finetune(
         tiny_swag_training_config(
             tiny_base_run,
             tiny_swag_bundle,
-            tmp_path / "export-run",
+            tmp_path / "step-export-run",
             maximum_steps=2,
         )
     )

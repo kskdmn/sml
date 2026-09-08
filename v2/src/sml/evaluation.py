@@ -823,15 +823,9 @@ def _encode_text(processor, text: str) -> list[int]:
 
 
 def _encode_token_offsets(processor, text: str) -> tuple[tuple[int, int], ...]:
-    # SentencePiece 0.2.2 replaced immutable protos with offset mappings.
-    encode_offsets = getattr(processor, "encode_as_offset_mapping", None)
-    if encode_offsets is not None:
-        return tuple(
-            (int(begin), int(end)) for begin, end in encode_offsets(text)["offsets"]
-        )
     return tuple(
-        (int(piece.begin), int(piece.end))
-        for piece in processor.encode_as_immutable_proto(text).pieces
+        (int(begin), int(end))
+        for begin, end in processor.encode_as_offset_mapping(text)["offsets"]
     )
 
 
@@ -1167,7 +1161,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
     )
     result = EvaluationResult(
         kind="evaluation-result",
-        version=2,
+        version=3,
         identity="sha256:" + "0" * 64,
         model=session.model_identity,
         tasks=task_records,

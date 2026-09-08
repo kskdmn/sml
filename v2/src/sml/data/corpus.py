@@ -10,6 +10,7 @@ import re
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 import zstandard as zstd
 
@@ -104,6 +105,37 @@ def _normalize_text(text: str) -> str:
     return _WHITESPACE.sub(" ", text.replace("\x00", " ")).strip()
 
 
+class _CompleteZstdReader(io.RawIOBase):
+    """Stream concatenated frames, checking the last frame at physical EOF."""
+
+    def __init__(self, source: BinaryIO) -> None:
+        self._source = source
+        self._decoder = zstd.ZstdDecompressor().decompressobj()
+        self._compressed = b""
+        self._output = memoryview(b"")
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: bytearray) -> int:
+        while not self._output:
+            # Bound the output of one decompress() call even for highly
+            # compressible blocks; the streaming object exposes no output limit.
+            compressed = self._compressed or self._source.read(1_024)
+            if not compressed:
+                if not self._decoder.eof:
+                    raise zstd.ZstdError("incomplete zstd frame")
+                return 0
+            if self._decoder.eof:
+                self._decoder = zstd.ZstdDecompressor().decompressobj()
+            self._output = memoryview(self._decoder.decompress(compressed))
+            self._compressed = self._decoder.unused_data
+        size = min(len(buffer), len(self._output))
+        buffer[:size] = self._output[:size]
+        self._output = self._output[size:]
+        return size
+
+
 class FilteredTexts:
     """Single-pass-style lazy iterable with deterministic diagnostic counters."""
 
@@ -116,19 +148,14 @@ class FilteredTexts:
         self.object_rows_read = 0
         self.texts_used = 0
 
-    @property
-    def rows_read(self) -> int:
-        """Compatibility name for JSON object rows presented to text filtering."""
-        return self.object_rows_read
-
     def __iter__(self) -> Iterator[str]:
         config = self.config
         for path in self.files:
             try:
                 with (
                     path.open("rb") as compressed_stream,
-                    zstd.ZstdDecompressor().stream_reader(
-                        compressed_stream
+                    io.BufferedReader(
+                        _CompleteZstdReader(compressed_stream)
                     ) as decompressed_stream,
                     io.TextIOWrapper(
                         decompressed_stream,

@@ -18,6 +18,7 @@ from sml.data.pretraining import (
     pack_token_ranges,
 )
 
+from v2.benchmarks.adapters.prepared_data import build_prepared_data_benchmark_workload
 from v2.benchmarks.workload import (
     build_canonical_workload,
     fixed_canonical_rows,
@@ -246,14 +247,14 @@ def test_benchmark_factory_rejects_non_prepared_metric_before_runtime_start():
     threads_before = _prefetch_threads()
 
     with pytest.raises(ValueError, match="prepared-data"):
-        pretraining_module.build_benchmark_workload("pretraining-compute", workload)
+        build_prepared_data_benchmark_workload("pretraining-compute", workload)
 
     assert _prefetch_threads() == threads_before
 
 
 def test_benchmark_runtime_proves_both_row_identity_domains():
     workload = _small_benchmark_workload()
-    runtime = pretraining_module.build_benchmark_workload("prepared-data", workload)
+    runtime = build_prepared_data_benchmark_workload("prepared-data", workload)
     try:
         canonical = fixed_canonical_rows(
             row_count=32,
@@ -280,7 +281,7 @@ def test_benchmark_runtime_proves_both_row_identity_domains():
 
 def test_benchmark_runtime_runs_real_stream_and_resets_canonical_order():
     workload = _small_benchmark_workload(row_count=4)
-    runtime = pretraining_module.build_benchmark_workload("prepared-data", workload)
+    runtime = build_prepared_data_benchmark_workload("prepared-data", workload)
     try:
         recorder = _RecordingMX(runtime._mx)
         runtime._mx = recorder
@@ -303,7 +304,7 @@ def test_benchmark_runtime_runs_real_stream_and_resets_canonical_order():
 
 def test_benchmark_runtime_closes_stream_and_temporary_tree_idempotently():
     threads_before = _prefetch_threads()
-    runtime = pretraining_module.build_benchmark_workload(
+    runtime = build_prepared_data_benchmark_workload(
         "prepared-data", _small_benchmark_workload()
     )
     temporary_root = runtime.temporary_root
@@ -321,7 +322,7 @@ def test_benchmark_runtime_closes_stream_and_temporary_tree_idempotently():
 
 def test_benchmark_runtime_closes_taken_stream_after_consumer_transfer_failure():
     threads_before = _prefetch_threads()
-    runtime = pretraining_module.build_benchmark_workload(
+    runtime = build_prepared_data_benchmark_workload(
         "prepared-data", _small_benchmark_workload()
     )
     temporary_root = runtime.temporary_root

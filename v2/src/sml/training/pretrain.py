@@ -307,8 +307,10 @@ class TrainingResult:
     rows: int
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _RestoredTrainingState:
+    """The current runtime state, shared with its orchestration owner."""
+
     parameters: BaseParameterState
     optimizer: AdamState
     trainer: TrainerState
@@ -504,6 +506,7 @@ def _checkpoint_builder(
     run_manifest: PretrainingRunManifest,
     state: _RestoredTrainingState,
 ):
+    scalar = state.scalar
     parameters = BaseParameterState(
         state.parameters.master_parameters,
         state.parameters.working_parameters,
@@ -520,7 +523,7 @@ def _checkpoint_builder(
         state.trainer.loss_numerator,
     )
     _require_empty_trainer_state(trainer)
-    if int(optimizer.step.item()) != state.scalar.step:
+    if int(optimizer.step.item()) != scalar.step:
         raise SMLArtifactError("Adam step must match the checkpoint step")
     groups = _flatten_checkpoint_groups(
         parameters,
@@ -567,7 +570,7 @@ def _checkpoint_builder(
         state_path.write_bytes(
             canonical_json_bytes(
                 _scalar_document(
-                    state.scalar,
+                    scalar,
                     owning_run_identity=run_manifest.identity,
                 )
             )
@@ -582,7 +585,7 @@ def _checkpoint_builder(
             version=1,
             identity=_PLACEHOLDER_IDENTITY,
             owning_run_identity=run_manifest.identity,
-            step=state.scalar.step,
+            step=scalar.step,
             scalar_state=PayloadRef(
                 "state.json",
                 state_identity,
@@ -918,6 +921,7 @@ def _run_training(
     optimizer = restored.optimizer
     trainer = restored.trainer
     scalar = restored.scalar
+    model.update(parameters.working_parameters)
     weight_decay_tree = build_weight_decay_tree(
         parameters.working_parameters,
         config.optimizer.weight_decay,
@@ -937,6 +941,7 @@ def _run_training(
         parameters = updated.parameters
         optimizer = updated.optimizer
         trainer = updated.trainer
+        model.update(parameters.working_parameters)
         stream.commit(pending_cursor)
         scalar = ScalarTrainingState(
             step=scalar.step + 1,
@@ -944,6 +949,10 @@ def _run_training(
             microsteps=scalar.microsteps + window_microsteps,
             cursor=pending_cursor,
         )
+        restored.parameters = parameters
+        restored.optimizer = optimizer
+        restored.trainer = trainer
+        restored.scalar = scalar
         if scalar.step % config.log_interval == 0:
             log_training_progress(
                 "pretrain",
@@ -979,10 +988,14 @@ def _run_training(
                             trainer_tree[3],
                         )
                     )
+                    del trainer_tree
                 microstep = kernels.microstep(parameters, trainer, envelope.rows)
                 pending_cursor = envelope.cursor_after
             parameters = microstep.parameters
             trainer = microstep.trainer
+            restored.parameters = parameters
+            restored.trainer = trainer
+            del microstep
             window_microsteps += 1
             if window_microsteps == config.loader.gradient_accumulation_steps:
                 complete_update()

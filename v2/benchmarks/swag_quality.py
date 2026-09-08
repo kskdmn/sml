@@ -48,11 +48,15 @@ from sml.training.common import (
 )
 from sml.training.lora import LoRAConfig, apply_lora, split_adapter_parameters
 from sml.training.pretrain import train
+from sml.training.random import counter_random_key
 from sml.training.swag import (
+    SwagTrainerState,
     SwagTrainingConfig,
+    _merge_adapter_parameters,
     build_swag_kernels,
     default_swag_optimizer_config,
     initial_swag_trainer_state,
+    score_candidates,
 )
 
 from v2.benchmarks.workload import (
@@ -71,7 +75,6 @@ HARNESS_COMPONENTS = (
 )
 PRODUCTION_SOURCE_TREE = Path("v2/src/sml")
 PRODUCTION_MODULE_ROOT = Path("v2/src")
-LEGACY_BRIDGE_COMPONENT = Path("v2/src/sml.py")
 PRODUCTION_DEPENDENCY_FIXED_COMPONENTS = (
     Path("v2/benchmarks/schema.py"),
     Path("v2/benchmarks/workload.py"),
@@ -79,9 +82,9 @@ PRODUCTION_DEPENDENCY_FIXED_COMPONENTS = (
 PRODUCTION_IMPORT_ENTRYPOINTS = (HARNESS_COMPONENTS[0],)
 TRAINING_FIXTURE = Path("v2/benchmarks/fixtures/swag-quality-train-v1.npz")
 VALIDATION_FIXTURE = Path("v2/benchmarks/fixtures/swag-quality-validation-v1.npz")
-CANONICAL_MANIFEST_PATH = Path("v2/benchmarks/manifests/swag-quality-v1.json")
-CANONICAL_RAW_PATH = Path("v2/benchmarks/results/swag-quality-v1.jsonl")
-CANONICAL_REPORT_PATH = Path("v2/benchmarks/results/swag-quality-v1.json")
+RECORD_MANIFEST_PATH = Path("v2/benchmarks/manifests/swag-quality-v2.json")
+RECORD_RAW_PATH = Path("v2/benchmarks/results/swag-quality-v2.jsonl")
+RECORD_REPORT_PATH = Path("v2/benchmarks/results/swag-quality-v2.json")
 TRAINING_EXAMPLE_COUNT = 255
 VALIDATION_EXAMPLE_COUNT = 16
 SEQUENCE_LENGTH = 64
@@ -89,7 +92,6 @@ MICROBATCH_SIZE = 2
 QUALITY_VOCAB_SIZE = 300
 SCORE_POLICY = "fp32-mean-continuation-including-eos-v1"
 MODEL_SEED = 42
-VALIDATION_SEED = 7
 ARRAY_NAMES = ("input_ids", "valid_token_mask", "score_mask", "labels")
 ENDINGS = ("on the mat", "in the car", "by the door", "near a tree")
 MEASUREMENT_BOUNDARIES = {
@@ -279,11 +281,9 @@ def _local_module_components(
 def _production_dependency_closure(
     available: set[Path],
     read_component: Callable[[Path], bytes],
-    *,
-    fixed_components: Sequence[Path] = PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
 ) -> tuple[Path, ...]:
     required = {
-        *fixed_components,
+        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
         *PRODUCTION_IMPORT_ENTRYPOINTS,
     }
     missing_required = required - available
@@ -292,7 +292,7 @@ def _production_dependency_closure(
             "missing quality production entry components: "
             f"{sorted(path.as_posix() for path in missing_required)!r}"
         )
-    components = set(fixed_components)
+    components = set(PRODUCTION_DEPENDENCY_FIXED_COMPONENTS)
     pending = sorted(required, key=lambda path: path.as_posix())
     scanned: set[Path] = set()
     while pending:
@@ -447,8 +447,10 @@ class SwagQualityFixture:
 
 @dataclass(frozen=True, slots=True)
 class SwagQualityWorkload:
+    """Version 2 uses counter RNG training and dropout-free forward validation."""
+
     kind: Literal["swag-quality-workload"]
-    version: Literal[1]
+    version: Literal[2]
     identity: str
     training_fixture: SwagQualityFixture
     validation_fixture: SwagQualityFixture
@@ -463,7 +465,6 @@ class SwagQualityWorkload:
     ordered_batches: tuple[tuple[int, ...], ...]
     optimizer_steps: int
     model_seed: int
-    validation_seed: int
     loader_seed: int
     harness_components: tuple[str, ...]
     harness_identity: str
@@ -487,7 +488,6 @@ class SwagQualityWorkload:
             "ordered_batches": [list(batch) for batch in self.ordered_batches],
             "optimizer_steps": self.optimizer_steps,
             "model_seed": self.model_seed,
-            "validation_seed": self.validation_seed,
             "loader_seed": self.loader_seed,
             "harness_components": list(self.harness_components),
             "harness_identity": self.harness_identity,
@@ -501,14 +501,18 @@ class SwagQualityWorkload:
         return {**self._body(), "identity": self.identity}
 
     def recompute_identity(self) -> str:
-        return structured_identity("sml-swag-quality-workload-v1", self._body())
+        return structured_identity("sml-swag-quality-workload-v2", self._body())
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, object]) -> SwagQualityWorkload:
         expected = {field.name for field in dataclasses.fields(cls)}
         if set(raw) != expected:
             raise ValueError("swag quality workload has an invalid field set")
-        if raw["kind"] != "swag-quality-workload" or raw["version"] != 1:
+        if (
+            raw["kind"] != "swag-quality-workload"
+            or type(raw["version"]) is not int
+            or raw["version"] != 2
+        ):
             raise ValueError("unsupported swag quality workload")
         training_raw = raw["training_fixture"]
         validation_raw = raw["validation_fixture"]
@@ -533,7 +537,7 @@ class SwagQualityWorkload:
             raise ValueError("quality configuration mappings must be objects")
         workload = cls(
             kind="swag-quality-workload",
-            version=1,
+            version=2,
             identity=_require_identity(raw["identity"], "workload identity"),
             training_fixture=SwagQualityFixture.from_dict(training_raw),
             validation_fixture=SwagQualityFixture.from_dict(validation_raw),
@@ -559,9 +563,6 @@ class SwagQualityWorkload:
                 raw["optimizer_steps"], "optimizer steps", minimum=1
             ),
             model_seed=_require_plain_int(raw["model_seed"], "model seed"),
-            validation_seed=_require_plain_int(
-                raw["validation_seed"], "validation seed"
-            ),
             loader_seed=_require_plain_int(raw["loader_seed"], "loader seed"),
             harness_components=tuple(
                 _require_string(item, "harness component") for item in components
@@ -1178,7 +1179,8 @@ def _verified_source_snapshot(
         mx.eval(working, fp32_master)
         _require_tree_dtype(fp32_master, mx.float32, "fp32 master")
         _require_tree_dtype(working, mx.bfloat16, "bf16 working")
-        model_key, trainer_key = mx.random.split(mx.random.key(seed))
+        model_key, _unused_key = mx.random.split(mx.random.key(seed))
+        trainer_key = counter_random_key(seed, 0)
         _model_key, adapter_key = mx.random.split(model_key)
         model = SMLLanguageModel(resolved.model_config, key=mx.random.key(0))
         model.update(working)
@@ -1233,7 +1235,7 @@ def build_swag_quality_workload(
     production_components = production_dependency_components(root)
     workload = SwagQualityWorkload(
         kind="swag-quality-workload",
-        version=1,
+        version=2,
         identity=_PLACEHOLDER_IDENTITY,
         training_fixture=training_fixture,
         validation_fixture=validation_fixture,
@@ -1250,7 +1252,6 @@ def build_swag_quality_workload(
         ),
         optimizer_steps=CANONICAL_STEPS,
         model_seed=MODEL_SEED,
-        validation_seed=VALIDATION_SEED,
         loader_seed=loader_config.epoch_seed,
         harness_components=tuple(path.as_posix() for path in HARNESS_COMPONENTS),
         harness_identity=harness_content_identity(root),
@@ -1406,28 +1407,47 @@ def _training_config(*, compile: bool) -> SwagTrainingConfig:
 
 
 def _evaluate_validation(
-    kernels,
+    model,
     adapters: dict,
     frozen_base: dict,
     encoded: Mapping[str, np.ndarray],
     *,
     model_config: ModelConfig,
-    key: mx.array,
 ) -> tuple[float, float, int]:
-    trainer = initial_swag_trainer_state(adapters, key=key)
+    parameters = _merge_adapter_parameters(adapters, frozen_base)
+    loss_sum = mx.array(0.0, dtype=mx.float32)
+    correct_count = mx.array(0, dtype=mx.int32)
     example_count = int(encoded["input_ids"].shape[0])
     for index in range(example_count):
         batch = _assemble_batch(
             encoded, (index,), batch_size=1, model_config=model_config
         )
-        trainer = kernels.ranking_microstep(adapters, frozen_base, trainer, batch)
-    mx.eval(trainer.to_tree())
-    valid = int(trainer.valid_count.item())
-    if valid != example_count:
-        raise ValueError("validation real-example count does not match the fixture")
-    loss = float(trainer.loss_numerator.item()) / float(valid)
-    accuracy = float(trainer.correct_count.item()) / float(valid)
-    return loss, accuracy, valid
+        _, candidate_count, length = batch.input_ids.shape
+        flat_ids = batch.input_ids.reshape((candidate_count, length))
+        logits, _cache, _key = model.forward_arrays(
+            parameters,
+            flat_ids,
+            attention_mask=batch.valid_token_mask.reshape((candidate_count, length)),
+            positions=None,
+            cache_state=None,
+            training=False,
+            key=None,
+        )
+        scores = score_candidates(
+            logits, flat_ids, batch.score_mask.reshape((candidate_count, length))
+        )
+        label_score = mx.take(scores, batch.labels[0])
+        loss_sum = loss_sum + mx.logsumexp(scores) - label_score
+        correct_count = correct_count + (mx.argmax(scores) == batch.labels[0])
+        mx.async_eval(loss_sum, correct_count)
+    if example_count == 0:
+        raise ValueError("validation fixture must contain real examples")
+    mx.eval(loss_sum, correct_count)
+    return (
+        float(loss_sum.item()) / example_count,
+        int(correct_count.item()) / example_count,
+        example_count,
+    )
 
 
 def _make_record(
@@ -1473,6 +1493,10 @@ def _run_runtime(
     validation: Mapping[str, np.ndarray],
     model_config: ModelConfig,
 ) -> SwagQualityRecord:
+    if workload.version != 2:
+        raise ValueError(
+            "quality recording requires the inference-validation workload version 2"
+        )
     config = _training_config(compile=compile)
     weight_decay_tree = build_weight_decay_tree(adapters, config.optimizer.weight_decay)
     kernels = build_swag_kernels(model, config, weight_decay_tree)
@@ -1487,6 +1511,18 @@ def _run_runtime(
             batch_size=MICROBATCH_SIZE,
             model_config=model_config,
         )
+        if model_config.hidden_dropout > 0.0 or config.lora.dropout > 0.0:
+            trainer_tree = trainer.to_tree()
+            trainer = SwagTrainerState.from_compiled_tree(
+                (
+                    trainer_tree[0],
+                    trainer_tree[1],
+                    counter_random_key(workload.model_seed, step - 1),
+                    trainer_tree[3],
+                    trainer_tree[4],
+                )
+            )
+            del trainer_tree
         trainer = kernels.ranking_microstep(adapters, frozen_base, trainer, batch)
         last_train_numerator = trainer.loss_numerator
         last_train_valid = trainer.valid_count
@@ -1505,12 +1541,11 @@ def _run_runtime(
         last_train_valid.item()
     )
     val_loss, val_accuracy, val_examples = _evaluate_validation(
-        kernels,
+        model,
         adapters,
         frozen_base,
         validation,
         model_config=model_config,
-        key=mx.random.key(workload.validation_seed),
     )
     frozen_identity = _array_tree_identity(
         "sml-swag-quality-frozen-bf16-base-v1", frozen_base
@@ -1564,21 +1599,54 @@ def _root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _evidence_path_document() -> dict[str, str]:
+    return {
+        "manifest": RECORD_MANIFEST_PATH.as_posix(),
+        "raw_output": RECORD_RAW_PATH.as_posix(),
+        "report": RECORD_REPORT_PATH.as_posix(),
+    }
+
+
+def _relative_destination_document(
+    destinations: _EvidenceDestinations,
+) -> dict[str, str]:
+    document = _evidence_path_document()
+    roots = []
+    for name, relative in document.items():
+        parts = Path(relative).parts
+        actual = getattr(destinations, name).parts
+        if actual[-len(parts) :] != parts:
+            raise ValueError("requires the exact canonical evidence destinations")
+        roots.append(actual[: -len(parts)])
+    if len(set(roots)) != 1:
+        raise ValueError("requires the exact canonical evidence destinations")
+    return document
+
+
+def _require_current_recording_command(workload, command) -> None:
+    if (
+        workload.version != 2
+        or command.get("destinations") != _evidence_path_document()
+    ):
+        raise ValueError(
+            "quality recording requires the current workload and destinations"
+        )
+
+
 def _canonical_evidence_destinations(
     root: Path,
     manifest: Path,
     raw_output: Path,
     report: Path,
 ) -> _EvidenceDestinations:
-    expected = _EvidenceDestinations(
-        manifest=(root / CANONICAL_MANIFEST_PATH).resolve(),
-        raw_output=(root / CANONICAL_RAW_PATH).resolve(),
-        report=(root / CANONICAL_REPORT_PATH).resolve(),
-    )
     actual = _EvidenceDestinations(
         manifest=manifest.resolve(),
         raw_output=raw_output.resolve(),
         report=report.resolve(),
+    )
+    document = _relative_destination_document(actual)
+    expected = _EvidenceDestinations(
+        **{name: (root / path).resolve() for name, path in document.items()}
     )
     if actual != expected:
         raise ValueError("record requires the exact canonical evidence destinations")
@@ -1588,11 +1656,7 @@ def _canonical_evidence_destinations(
 def _recording_command_document(
     root: Path, destinations: _EvidenceDestinations
 ) -> dict[str, object]:
-    canonical_destinations = {
-        "manifest": CANONICAL_MANIFEST_PATH.as_posix(),
-        "raw_output": CANONICAL_RAW_PATH.as_posix(),
-        "report": CANONICAL_REPORT_PATH.as_posix(),
-    }
+    canonical_destinations = _relative_destination_document(destinations)
     resolved = {
         "manifest": destinations.manifest.resolve().as_posix(),
         "raw_output": destinations.raw_output.resolve().as_posix(),
@@ -1658,6 +1722,7 @@ def _manifest_document(
     if measured_wall_time > QUALITY_WALL_TIME_BUDGET_SECONDS:
         raise ValueError("quality measured wall time exceeds the 4-hour budget")
     command = dict(recording_command)
+    _require_current_recording_command(workload, command)
     if recording_session_identity != _recording_session_identity(
         source_commit, workload.identity, command
     ):
@@ -1793,6 +1858,7 @@ def _validate_manifest_fields(
     workload = SwagQualityWorkload.from_dict(workload_raw)
     if workload != expected_workload or raw["workload_identity"] != workload.identity:
         raise ValueError("swag quality manifest workload mismatch")
+    _require_current_recording_command(workload, expected_command)
     if raw["harness_identity"] != workload.harness_identity:
         raise ValueError("swag quality manifest harness identity mismatch")
     if raw["production_dependency_identity"] != workload.production_dependency_identity:
@@ -1837,13 +1903,9 @@ def _git_production_dependency_components(
     root: Path,
     commit: str,
 ) -> tuple[Path, ...]:
-    possible_fixed_components = (
-        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
-        LEGACY_BRIDGE_COMPONENT,
-    )
     scopes = (
         PRODUCTION_SOURCE_TREE,
-        *possible_fixed_components,
+        *PRODUCTION_DEPENDENCY_FIXED_COMPONENTS,
         *PRODUCTION_IMPORT_ENTRYPOINTS,
     )
     entries = _git_bytes(
@@ -1866,19 +1928,15 @@ def _git_production_dependency_components(
         is_source = path.suffix == ".py" and path.is_relative_to(PRODUCTION_SOURCE_TREE)
         if (
             not is_source
-            and path not in possible_fixed_components
+            and path not in PRODUCTION_DEPENDENCY_FIXED_COMPONENTS
             and path not in PRODUCTION_IMPORT_ENTRYPOINTS
         ):
             continue
         available.add(path)
         modes[path] = (mode, object_type)
-    fixed_components = PRODUCTION_DEPENDENCY_FIXED_COMPONENTS
-    if LEGACY_BRIDGE_COMPONENT in available:
-        fixed_components = (*fixed_components, LEGACY_BRIDGE_COMPONENT)
     components = _production_dependency_closure(
         available,
         lambda component: _git_bytes(root, "show", f"{commit}:{component.as_posix()}"),
-        fixed_components=fixed_components,
     )
     if any(modes[component] != (b"100644", b"blob") for component in components):
         raise ValueError("recorded production import closure contains a non-file")

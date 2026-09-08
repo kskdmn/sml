@@ -12,6 +12,7 @@ import re
 import stat
 import sys
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -58,7 +59,6 @@ from sml.artifacts.manifest import (
     _parse_manifest,
     _reject_json_constant,
     canonical_json_bytes,
-    file_identity,
     parse_logical_path,
     structured_identity,
 )
@@ -379,6 +379,17 @@ def _name_digest(name: str) -> str:
     return hashlib.sha256(name.encode("utf-8")).hexdigest()
 
 
+def _filesystem_lock_key(name: str, parent_descriptor: int) -> str:
+    """Match APFS name equivalence before a protected child exists."""
+    # Darwin exposes this pathconf selector even though Python does not list its
+    # symbolic name. Query the retained parent, since APFS volumes can differ.
+    case_sensitive = os.fpathconf(parent_descriptor, 11)  # _PC_CASE_SENSITIVE
+    if case_sensitive not in (0, 1):
+        raise SMLArtifactError("artifact parent case sensitivity is unavailable")
+    normalized = unicodedata.normalize("NFD", name)
+    return normalized if case_sensitive else normalized.casefold()
+
+
 def _lock_name(protected_name: str, category: str) -> str:
     return f".sml-{category}-lock-{_name_digest(protected_name)}"
 
@@ -513,6 +524,7 @@ def _protected_lock(
     owner_token = uuid.uuid4().hex
     try:
         parent_descriptor = _open_writable_parent(parent, OS_FILESYSTEM)
+        protected_name = _filesystem_lock_key(protected_name, parent_descriptor)
         sidecar = _lock_name(protected_name, category)
         lock_descriptor, created = _open_lock_sidecar(sidecar, parent_descriptor)
         sidecar_protocol_mutated = created
@@ -2026,105 +2038,6 @@ def verify_checkpoint_current_state(
         raise SMLArtifactError("checkpoint trainer next RNG key is incorrect")
 
 
-def _checkpoint_dtype_name(array: mx.array) -> str:
-    mx = _mlx_core()
-    names = {
-        mx.bfloat16: "bfloat16",
-        mx.float32: "float32",
-        mx.int32: "int32",
-        mx.uint32: "uint32",
-        mx.bool_: "bool",
-    }
-    try:
-        return names[array.dtype]
-    except KeyError as error:
-        raise SMLArtifactError(
-            f"unsupported checkpoint array dtype: {array.dtype}"
-        ) from error
-
-
-def _load_checkpoint_array_payload(
-    root: ArtifactRoot,
-    reference: ArrayPayloadRef,
-    *,
-    full: bool,
-    payload_bytes: dict[str, bytes] | None = None,
-) -> dict[str, mx.array]:
-    mx = _mlx_core()
-    logical_path = reference.payload.logical_path
-    try:
-        with root.open_payload(logical_path) as payload:
-            opened = os.fstat(payload.fileno())
-            if opened.st_size != reference.payload.byte_size:
-                raise SMLArtifactError(
-                    f"checkpoint payload byte size mismatch: {logical_path}"
-                )
-            if full:
-                payload.seek(0)
-                if file_identity(payload) != reference.payload.identity:
-                    raise SMLArtifactError(
-                        f"checkpoint payload identity mismatch: {logical_path}"
-                    )
-            payload.seek(0)
-            arrays = mx.load(payload, format="safetensors")
-            if not isinstance(arrays, dict):
-                raise SMLArtifactError(
-                    f"checkpoint array payload must be a mapping: {logical_path}"
-                )
-            expected = {spec.name: spec for spec in reference.arrays}
-            if set(arrays) != set(expected):
-                raise SMLArtifactError(
-                    f"checkpoint array keys mismatch: {logical_path}"
-                )
-            names = sorted(expected)
-            for name in names:
-                array = arrays[name]
-                spec = expected[name]
-                if (
-                    tuple(array.shape) != spec.shape
-                    or _checkpoint_dtype_name(array) != spec.dtype
-                ):
-                    raise SMLArtifactError(
-                        f"checkpoint array metadata mismatch: {logical_path}:{name}"
-                    )
-            result = {name: arrays[name] for name in names}
-            mx.eval(*result.values())
-            if payload_bytes is not None:
-                payload.seek(0)
-                raw_bytes = payload.read()
-                if len(raw_bytes) != reference.payload.byte_size:
-                    raise SMLArtifactError(
-                        f"checkpoint payload byte size mismatch: {logical_path}"
-                    )
-            if full:
-                payload.seek(0)
-                if file_identity(payload) != reference.payload.identity:
-                    raise SMLArtifactError(
-                        "checkpoint payload changed while being consumed: "
-                        f"{logical_path}"
-                    )
-            consumed = os.fstat(payload.fileno())
-            if (
-                opened.st_dev != consumed.st_dev
-                or opened.st_ino != consumed.st_ino
-                or opened.st_size != consumed.st_size
-                or opened.st_mtime_ns != consumed.st_mtime_ns
-                or opened.st_ctime_ns != consumed.st_ctime_ns
-            ):
-                raise SMLArtifactError(
-                    f"checkpoint payload changed while being consumed: {logical_path}"
-                )
-            if payload_bytes is not None:
-                payload_bytes[logical_path] = raw_bytes
-    except SMLArtifactError:
-        raise
-    except (OSError, TypeError, ValueError, RuntimeError) as error:
-        raise SMLArtifactError(
-            f"invalid checkpoint safetensors payload: {logical_path}"
-        ) from error
-    return result
-
-
 def _load_checkpoint_array_stream(
     stream: BinaryIO,
     reference: ArrayPayloadRef,
@@ -2372,79 +2285,6 @@ def _read_checkpoint_scalar_payload(
         RuntimeError,
     ) as error:
         raise SMLArtifactError("invalid checkpoint scalar state") from error
-
-
-def _require_array_contract(
-    array: mx.array,
-    *,
-    shape: tuple[int, ...],
-    dtype: str,
-    context: str,
-) -> None:
-    if tuple(array.shape) != shape or _checkpoint_dtype_name(array) != dtype:
-        raise SMLArtifactError(f"checkpoint {context} has invalid shape or dtype")
-
-
-def _verify_optimizer_and_trainer_groups(
-    trainable: Mapping[str, mx.array],
-    optimizer: Mapping[str, mx.array],
-    trainer: Mapping[str, mx.array],
-    *,
-    step: int,
-) -> None:
-    names = set(trainable)
-    expected_optimizer = {
-        "step",
-        *(f"first_moments.{name}" for name in names),
-        *(f"second_moments.{name}" for name in names),
-    }
-    expected_trainer = {
-        "accumulation_count",
-        "next_key",
-        "loss_numerator",
-        *(f"accumulators.{name}" for name in names),
-    }
-    if set(optimizer) != expected_optimizer:
-        raise SMLArtifactError("checkpoint optimizer keys do not match trainable state")
-    if set(trainer) != expected_trainer:
-        raise SMLArtifactError("checkpoint trainer keys do not match trainable state")
-    _require_array_contract(
-        optimizer["step"], shape=(), dtype="int32", context="optimizer step"
-    )
-    if int(optimizer["step"].item()) != step:
-        raise SMLArtifactError("checkpoint optimizer step does not match manifest")
-    _require_array_contract(
-        trainer["accumulation_count"],
-        shape=(),
-        dtype="int32",
-        context="trainer accumulation count",
-    )
-    _require_array_contract(
-        trainer["next_key"], shape=(2,), dtype="uint32", context="trainer PRNG key"
-    )
-    _require_array_contract(
-        trainer["loss_numerator"],
-        shape=(),
-        dtype="float32",
-        context="trainer loss numerator",
-    )
-    for name, array in trainable.items():
-        if _checkpoint_dtype_name(array) != "float32":
-            raise SMLArtifactError("checkpoint trainable state must be float32")
-        shape = tuple(array.shape)
-        for prefix in ("first_moments.", "second_moments."):
-            _require_array_contract(
-                optimizer[f"{prefix}{name}"],
-                shape=shape,
-                dtype="float32",
-                context=f"optimizer state for {name}",
-            )
-        _require_array_contract(
-            trainer[f"accumulators.{name}"],
-            shape=shape,
-            dtype="float32",
-            context=f"trainer accumulator for {name}",
-        )
 
 
 def _array_specs_by_name(reference: ArrayPayloadRef) -> dict[str, object]:
