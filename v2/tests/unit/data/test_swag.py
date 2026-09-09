@@ -514,17 +514,23 @@ def test_npy_identity_is_hashed_while_writing(tmp_path, monkeypatch):
         assert file_identity(payload) == reference.payload.identity
 
 
-def test_every_preprocessing_field_changes_bundle_identity(tmp_path, monkeypatch):
-    from sml.data import swag
+def test_every_configurable_preprocessing_field_changes_bundle_identity(tmp_path):
     from sml.data.swag import SWAG_IDENTITY_FIELDS, prepare_swag_bundle
 
     provider = FakeSwagProvider((VALID_ROW,))
     base = tiny_base_model()
     config = tiny_swag_config(provider)
-    monkeypatch.setattr(swag, "_validate_recorded_projections", lambda _manifest: None)
     first = prepare_swag_bundle(config, base, tmp_path / "first")
     try:
         for field in SWAG_IDENTITY_FIELDS:
+            if field in {
+                "preprocessing_schema_version",
+                "join_policy",
+                "overlength_policy",
+                "bos_policy",
+                "eos_policy",
+            }:
+                continue
             changed = prepare_swag_bundle(
                 change_identity_field(config, field),
                 base,
@@ -2028,20 +2034,31 @@ def test_load_swag_bundle_rejects_unsupported_schema_before_opening_arrays(
 
 @pytest.mark.parametrize(
     ("field", "message"),
-    (("join_policy", "join"), ("preprocessing_schema_version", "schema")),
+    (
+        ("join_policy", "join"),
+        ("overlength_policy", "overlength"),
+        ("bos_policy", "bos"),
+        ("eos_policy", "eos"),
+        ("preprocessing_schema_version", "schema"),
+    ),
 )
-def test_prepare_swag_bundle_validates_newly_published_projections(
+def test_unsupported_preprocessing_is_rejected_before_publication(
     tmp_path, field, message
 ):
     from sml.data.swag import prepare_swag_bundle
 
     provider = FakeSwagProvider((VALID_ROW,))
-    with pytest.raises(SMLArtifactError, match=message):
+    output = tmp_path / "swag"
+    with pytest.raises(ValueError, match=message):
         prepare_swag_bundle(
             change_identity_field(tiny_swag_config(provider), field),
             tiny_base_model(),
-            tmp_path / field,
+            output,
         )
+    assert provider.resolve_calls == provider.iter_calls == 0
+    assert not output.exists()
+    with prepare_swag_bundle(tiny_swag_config(provider), tiny_base_model(), output):
+        assert output.is_dir()
 
 
 def test_load_swag_bundle_rejects_bucket_policy_that_misses_maximum_length(

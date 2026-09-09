@@ -735,6 +735,11 @@ class InferenceSession:
         *,
         padding: str,
     ) -> tuple[tuple[float, bool], ...]:
+        """Score tokens from each continuation index, using BOS for empty context.
+
+        An index of zero prepends the model's BOS token as the predictor context;
+        that prefix counts toward the model's context capacity.
+        """
         if padding not in ("left", "right"):
             raise ValueError("padding must be 'left' or 'right'")
         if not items:
@@ -915,10 +920,21 @@ class InferenceSession:
         padding: str,
     ) -> tuple[tuple[float, bool], ...]:
         prepared: list[tuple[int, tuple[int, ...], int, int]] = []
+        results: list[tuple[float, bool] | None] = [None] * len(items)
         for caller_index, (token_ids, continuation_start) in enumerate(items):
-            if continuation_start < 0 or continuation_start > len(token_ids):
+            if (
+                isinstance(continuation_start, bool)
+                or not isinstance(continuation_start, int)
+                or not 0 <= continuation_start <= len(token_ids)
+            ):
                 raise SMLRuntimeError("invalid continuation start")
+            if continuation_start == 0:
+                token_ids = (self._resolved.model_config.bos_token_id, *token_ids)
+                continuation_start = 1
             length_bucket = self._select_length_bucket(len(token_ids))
+            if continuation_start == len(token_ids):
+                results[caller_index] = (0.0, True)
+                continue
             prepared.append(
                 (caller_index, token_ids, continuation_start, length_bucket)
             )
@@ -932,7 +948,6 @@ class InferenceSession:
                 group_order.append(length_bucket)
             groups[length_bucket].append(item)
 
-        results: list[tuple[float, bool] | None] = [None] * len(items)
         max_batch = self._runtime.batch_size_buckets[-1]
         for length_bucket in group_order:
             members = groups[length_bucket]

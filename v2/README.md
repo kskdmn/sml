@@ -52,7 +52,7 @@ fine-tuning also reports accuracy.
 Resume an existing run with only the allowed operational overrides:
 
 ```sh
-uv run python -m sml train --resume v2/output/base-run --data v2/output/pretraining-data --maximum-steps 2000 --checkpoint-interval 100
+uv run python -m sml train --resume v2/output/base-run --data v2/output/pretraining-data --maximum-epochs 2 --checkpoint-interval 100
 ```
 
 Resume accepts `maximum_steps`, `maximum_epochs`, `log_interval`, and
@@ -60,6 +60,12 @@ Resume accepts `maximum_steps`, `maximum_epochs`, `log_interval`, and
 `--data`, but its recorded identity must match the run. Model, optimizer,
 precision, loader, seed, compile, and output settings are immutable run
 semantics and are rejected on resume.
+
+Step and epoch limits are absolute totals, and training stops when either limit
+is reached. The default base run has a one-epoch limit and no step limit, so the
+example adds a second epoch. Set any active limits beyond the saved progress when
+continuing a completed run; increasing only the step limit leaves a reached epoch
+limit in effect.
 
 ### Inference
 
@@ -112,7 +118,7 @@ Resume uses the same override rules as base training. A moved SWAG bundle can be
 supplied through `--data` only when its identity matches the run:
 
 ```sh
-uv run python -m sml finetune --resume v2/output/swag-run --data /new/location/swag-data --maximum-steps 4000
+uv run python -m sml finetune --resume v2/output/swag-run --data /new/location/swag-data --maximum-steps 16000 --maximum-epochs 6
 ```
 
 ### Merged export

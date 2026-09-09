@@ -44,6 +44,12 @@ from sml.training.common import (
 from sml.training.pretrain import build_pretraining_kernels
 from sml.training.random import counter_random_key
 
+from v2.benchmarks.journal import (
+    _atomic_temporary_destination,
+    atomic_write_text,
+    baseline_output_lock,
+    cleanup_orphaned_atomic_temporaries,
+)
 from v2.benchmarks.workload import (
     canonical_json_bytes,
     file_identity,
@@ -57,6 +63,9 @@ QUALITY_WALL_TIME_BUDGET_SECONDS = 12 * 60 * 60
 HARNESS_COMPONENTS = (
     Path("v2/benchmarks/quality.py"),
     Path("v2/tests/unit/test_pretraining_quality.py"),
+    Path("v2/benchmarks/journal.py"),
+    Path("v2/benchmarks/evidence.py"),
+    Path("v2/benchmarks/recovery.py"),
 )
 PRODUCTION_SOURCE_TREE = Path("v2/src/sml")
 PRODUCTION_MODULE_ROOT = Path("v2/src")
@@ -2748,22 +2757,7 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _durable_create(path: Path, payload: bytes) -> None:
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    descriptor = os.open(path, flags, 0o600)
-    try:
-        with os.fdopen(descriptor, "wb", closefd=False) as destination:
-            destination.write(payload)
-            destination.flush()
-            os.fsync(destination.fileno())
-    finally:
-        os.close(descriptor)
-    _fsync_directory(path.parent)
+    atomic_write_text(path, payload.decode("utf-8"), create_only=True)
 
 
 def _read_publication_payload(path: Path, *, label: str) -> bytes:
@@ -2967,8 +2961,34 @@ def _prepare_evidence_publication(
     if recovery_directory.exists() or recovery_directory.is_symlink():
         if recovery_directory.is_symlink() or not recovery_directory.is_dir():
             raise FileExistsError("quality recovery path is not an owned directory")
-        _validate_publication_owner(
-            _read_publication_document(recovery_directory / "owner.json"), owner
+        owner_path = recovery_directory / "owner.json"
+        if not owner_path.exists() and not owner_path.is_symlink():
+            # A crash before the initial atomic link can leave only its temporary
+            # file, or an empty directory. Never adopt other unowned contents.
+            if any(
+                path.exists() or path.is_symlink()
+                for _name, path in destinations.ordered()
+            ) or any(
+                _atomic_temporary_destination(path) != owner_path
+                or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode)
+                for path in recovery_directory.iterdir()
+            ):
+                raise ValueError("quality recovery directory has no durable owner")
+            cleanup_orphaned_atomic_temporaries((owner_path,))
+            _durable_create(owner_path, canonical_json_bytes(owner))
+        _validate_publication_owner(_read_publication_document(owner_path), owner)
+        cleanup_orphaned_atomic_temporaries(
+            tuple(
+                recovery_directory / name
+                for name in (
+                    "owner.json",
+                    "plan.payload",
+                    "raw.payload",
+                    "manifest.payload",
+                    "report.payload",
+                    "completion.payload",
+                )
+            )
         )
         plan_path = recovery_directory / "plan.payload"
         if plan_path.is_file():
@@ -3201,6 +3221,15 @@ def _record(args: argparse.Namespace) -> int:
         Path(args.raw_output),
         Path(args.output),
     )
+    with baseline_output_lock(destinations.manifest, destinations.raw_output):
+        return _record_locked(root, destinations, recording_started)
+
+
+def _record_locked(
+    root: Path,
+    destinations: _EvidenceDestinations,
+    recording_started: float,
+) -> int:
     recovery_directory = (root / RECOVERY_PATH).resolve()
     _require_clean_recording_checkout(root, destinations, recovery_directory)
     source_commit = _git(root, "rev-parse", "HEAD")
@@ -3221,6 +3250,24 @@ def _record(args: argparse.Namespace) -> int:
     )
     all_destinations, any_destination = _all_or_no_destinations(destinations)
     publication: _EvidencePublication | None = None
+    if all_destinations:
+        decision = _validate_evidence_files(
+            root, destinations, recorded_workload=workload
+        )
+        if recovery_directory.exists() or recovery_directory.is_symlink():
+            if recovery_directory.is_symlink() or not recovery_directory.is_dir():
+                raise FileExistsError("quality recovery path is not an owned directory")
+            if any(recovery_directory.iterdir()):
+                _remove_owned_recovery(
+                    _EvidencePublication(recovery_directory, destinations, owner)
+                )
+            else:
+                # The final owner unlink can precede a crash before rmdir. The
+                # independently verified final artifacts need no staged copy.
+                recovery_directory.rmdir()
+                _fsync_directory(recovery_directory.parent)
+        print(decision)
+        return 0 if decision == "pass" else 1
     if recovery_directory.exists() or recovery_directory.is_symlink():
         publication = _prepare_evidence_publication(
             recovery_directory, destinations, owner
@@ -3232,12 +3279,6 @@ def _record(args: argparse.Namespace) -> int:
             )
             print(decision)
             return 0 if decision == "pass" else 1
-    elif all_destinations:
-        decision = _validate_evidence_files(
-            root, destinations, recorded_workload=workload
-        )
-        print(decision)
-        return 0 if decision == "pass" else 1
     elif any_destination:
         raise FileExistsError(
             "partial quality evidence exists without an owned recovery directory"

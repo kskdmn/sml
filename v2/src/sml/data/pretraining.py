@@ -696,6 +696,54 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         prefetch_depth: int,
         cursor: PretrainingCursor,
     ) -> None:
+        self._initialize(
+            bundle,
+            batch_size=batch_size,
+            seed=seed,
+            prefetch_depth=prefetch_depth,
+            cursor=cursor,
+            validated_shards=None,
+        )
+
+    @classmethod
+    def _from_validated_shards(
+        cls,
+        bundle: PreparedDataBundle,
+        shards: _PreparedShardStore,
+        *,
+        batch_size: int,
+        seed: int,
+        prefetch_depth: int,
+        cursor: PretrainingCursor,
+    ) -> PretrainingBatchStream:
+        """Take ownership of the retained FULL proof used by training preflight."""
+        if shards._closed or shards.artifact.manifest != bundle.manifest:
+            raise SMLArtifactError(
+                "prepared preflight does not match the stream bundle"
+            )
+        if shards.artifact.verification is not VerificationLevel.FULL:
+            raise SMLArtifactError("prepared preflight must have FULL verification")
+        stream = cls.__new__(cls)
+        stream._initialize(
+            bundle,
+            batch_size=batch_size,
+            seed=seed,
+            prefetch_depth=prefetch_depth,
+            cursor=cursor,
+            validated_shards=shards,
+        )
+        return stream
+
+    def _initialize(
+        self,
+        bundle: PreparedDataBundle,
+        *,
+        batch_size: int,
+        seed: int,
+        prefetch_depth: int,
+        cursor: PretrainingCursor,
+        validated_shards: _PreparedShardStore | None,
+    ) -> None:
         if not isinstance(bundle, PreparedDataBundle):
             raise TypeError("bundle must be a PreparedDataBundle")
         _require_plain_int(batch_size, "batch_size", minimum=1)
@@ -738,7 +786,10 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
         self._closed = False
 
         try:
-            self._open_and_validate_bundle(bundle)
+            if validated_shards is None:
+                self._open_and_validate_bundle(bundle)
+            else:
+                self._shards = validated_shards
             total_rows = sum(self._manifest.shard_row_counts)
             if total_rows < batch_size:
                 raise SMLDataError(

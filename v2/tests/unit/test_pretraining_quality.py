@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -158,11 +159,14 @@ def test_workload_binds_checked_in_source_disjoint_rows_and_exact_work(
         assert int(rows.max()) < ModelConfig().vocab_size
 
 
-def test_harness_identity_hashes_only_the_two_reviewed_files_in_order():
+def test_harness_identity_binds_quality_and_publication_implementation_in_order():
     expected = hashlib.sha256()
     for relative in (
         Path("v2/benchmarks/quality.py"),
         Path("v2/tests/unit/test_pretraining_quality.py"),
+        Path("v2/benchmarks/journal.py"),
+        Path("v2/benchmarks/evidence.py"),
+        Path("v2/benchmarks/recovery.py"),
     ):
         expected.update((ROOT / relative).read_bytes())
 
@@ -1255,9 +1259,155 @@ def test_interrupted_staging_prefix_is_identity_bound_and_safely_retryable(
     assert not publication.recovery_directory.exists()
 
 
-def test_record_resumes_after_all_artifact_links_before_completed_fast_path(
+@pytest.mark.parametrize(
+    "interrupted_name",
+    [
+        "owner.json",
+        "plan.payload",
+        "raw.payload",
+        "report.payload",
+        "manifest.payload",
+        "completion.payload",
+    ],
+)
+def test_partial_staging_write_recovers_after_process_exit(tmp_path, interrupted_name):
+    publication, payloads, owner = _test_publication(tmp_path)
+    quality_module._remove_owned_recovery(publication)
+    arguments = {
+        "recovery": str(publication.recovery_directory),
+        "destinations": {
+            "manifest": str(publication.destinations.manifest),
+            "raw_output": str(publication.destinations.raw_output),
+            "report": str(publication.destinations.report),
+        },
+        "owner": owner,
+        "payloads": {
+            name: payload.decode("utf-8") for name, payload in payloads.items()
+        },
+        "interrupted_name": interrupted_name,
+    }
+    completed = subprocess.run(
+        [
+            "uv",
+            "run",
+            "python",
+            "-c",
+            """
+import json
+import os
+import sys
+from pathlib import Path
+from unittest.mock import patch
+from v2.benchmarks import quality
+
+arguments = json.loads(sys.argv[1])
+atomic_write = quality.atomic_write_text
+real_fdopen = os.fdopen
+
+class InterruptedOutput:
+    def __init__(self, descriptor, *args, **kwargs):
+        self.output = real_fdopen(descriptor, *args, **kwargs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return self.output.__exit__(*args)
+
+    def write(self, text):
+        self.output.write(text[:max(1, len(text) // 2)])
+        self.output.flush()
+        os.fsync(self.output.fileno())
+        os._exit(73)
+
+def interrupt_write(path, text, *, create_only=False):
+    if path.name != arguments['interrupted_name']:
+        return atomic_write(path, text, create_only=create_only)
+    with patch('v2.benchmarks.journal.os.fdopen', InterruptedOutput):
+        return atomic_write(path, text, create_only=create_only)
+
+quality.atomic_write_text = interrupt_write
+publication = quality._prepare_evidence_publication(
+    Path(arguments['recovery']),
+    quality._EvidenceDestinations(**{
+        name: Path(value) for name, value in arguments['destinations'].items()
+    }),
+    arguments['owner'],
+)
+quality._stage_evidence_publication(
+    publication,
+    {name: value.encode('utf-8') for name, value in arguments['payloads'].items()},
+)
+""",
+            json.dumps(arguments),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 73, completed.stdout + completed.stderr
+    assert not (publication.recovery_directory / interrupted_name).exists()
+    temporaries = list(publication.recovery_directory.glob(".*.sml-atomic-*.tmp"))
+    assert len(temporaries) == 1
+    assert temporaries[0].stat().st_size > 0
+    assert not any(path.exists() for _name, path in publication.destinations.ordered())
+
+    resumed = quality_module._prepare_evidence_publication(
+        publication.recovery_directory, publication.destinations, owner
+    )
+    staged = quality_module._stage_evidence_publication(resumed, payloads)
+    quality_module._publish_staged_evidence(staged)
+    for name, destination in publication.destinations.ordered():
+        assert destination.read_bytes() == payloads[name]
+    assert not publication.recovery_directory.exists()
+
+
+@pytest.mark.parametrize("entry_kind", ["unknown", "symlink"])
+def test_ownerless_recovery_preserves_unrecognized_or_nonregular_entries(
+    tmp_path, entry_kind
+):
+    publication, _payloads, owner = _test_publication(tmp_path)
+    quality_module._remove_owned_recovery(publication)
+    publication.recovery_directory.mkdir()
+    if entry_kind == "unknown":
+        entry = publication.recovery_directory / "unrelated"
+        entry.write_bytes(b"unrelated")
+    else:
+        entry = publication.recovery_directory / (
+            ".owner.json.sml-atomic-" + "1" * 32 + ".tmp"
+        )
+        target = tmp_path / "external-owner"
+        target.write_bytes(b"unrelated")
+        entry.symlink_to(target)
+
+    with pytest.raises(ValueError, match="no durable owner"):
+        quality_module._prepare_evidence_publication(
+            publication.recovery_directory, publication.destinations, owner
+        )
+    assert entry.read_bytes() == b"unrelated"
+    assert entry.is_symlink() is (entry_kind == "symlink")
+    assert not (publication.recovery_directory / "owner.json").exists()
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    [
+        "before_completion_link",
+        "completed.json",
+        "completion.payload",
+        "report.payload",
+        "manifest.payload",
+        "raw.payload",
+        "plan.payload",
+        "owner.json",
+    ],
+)
+def test_record_resumes_completed_evidence_after_publication_or_cleanup_interruption(
     tmp_path,
     monkeypatch,
+    interruption,
 ):
     root = tmp_path
     destinations = quality_module._canonical_evidence_destinations(
@@ -1289,19 +1439,31 @@ def test_record_resumes_after_all_artifact_links_before_completed_fast_path(
     }
     publication = quality_module._stage_evidence_publication(publication, payloads)
     real_link = os.link
+    real_unlink = Path.unlink
 
     def interrupt_completion(source, destination, **kwargs):
-        if Path(destination).name == "completed.json":
+        if (
+            interruption == "before_completion_link"
+            and Path(destination).name == "completed.json"
+        ):
             raise RuntimeError("interrupted before completion link")
         return real_link(source, destination, **kwargs)
 
+    def interrupt_cleanup(path, *args, **kwargs):
+        result = real_unlink(path, *args, **kwargs)
+        if path == recovery / interruption:
+            raise RuntimeError("interrupted after cleanup unlink")
+        return result
+
     monkeypatch.setattr(os, "link", interrupt_completion)
-    with pytest.raises(RuntimeError, match="before completion link"):
+    monkeypatch.setattr(Path, "unlink", interrupt_cleanup)
+    with pytest.raises(RuntimeError, match="interrupted"):
         quality_module._publish_staged_evidence(publication)
     assert all(path.is_file() for _name, path in destinations.ordered())
     assert recovery.is_dir()
 
     monkeypatch.setattr(os, "link", real_link)
+    monkeypatch.setattr(Path, "unlink", real_unlink)
     monkeypatch.setattr(quality_module, "_root", lambda: root)
     monkeypatch.setattr(
         quality_module, "_require_clean_recording_checkout", lambda *_args: None
@@ -1310,14 +1472,16 @@ def test_record_resumes_after_all_artifact_links_before_completed_fast_path(
     monkeypatch.setattr(
         quality_module, "build_pretraining_quality_workload", lambda _root: workload
     )
-    validated_after_cleanup = []
+    validated_before_cleanup = []
 
-    def validate_after_cleanup(_root, _destinations, **_kwargs):
-        validated_after_cleanup.append(not recovery.exists())
+    def validate_before_cleanup(_root, _destinations, **_kwargs):
+        validated_before_cleanup.append(recovery.exists())
+        for name, destination in destinations.ordered():
+            assert destination.read_bytes() == payloads[name]
         return "pass"
 
     monkeypatch.setattr(
-        quality_module, "_validate_evidence_files", validate_after_cleanup
+        quality_module, "_validate_evidence_files", validate_before_cleanup
     )
     result = quality_module._record(
         SimpleNamespace(
@@ -1329,7 +1493,9 @@ def test_record_resumes_after_all_artifact_links_before_completed_fast_path(
     )
 
     assert result == 0
-    assert validated_after_cleanup == [True]
+    assert validated_before_cleanup == [True]
+    for name, destination in destinations.ordered():
+        assert destination.read_bytes() == payloads[name]
     assert not recovery.exists()
 
 

@@ -552,8 +552,13 @@ def _normalize_cli_values(
         "verify": ("path",),
     }[command]
     for name in path_fields:
-        if isinstance(configured.get(name), str):
-            configured[name] = Path(configured[name])
+        if name not in configured:
+            continue
+        value = configured[name]
+        if isinstance(value, str):
+            configured[name] = Path(value)
+        elif not isinstance(value, Path):
+            raise SMLConfigurationError(f"{command}.{name} must be a path string")
     return command, configured
 
 
@@ -1040,6 +1045,8 @@ _DTO_TYPES: dict[str, type[_Command]] = {
 
 
 def _validate_command(command: str, values: dict[str, object]) -> None:
+    if "full" in values and not isinstance(values["full"], bool):
+        raise SMLConfigurationError(f"{command}.full must be a boolean")
     required = {
         "tokenize": ("input", "output"),
         "prepare.pretraining": ("input", "tokenizer", "output"),
@@ -1107,7 +1114,10 @@ def _validate_command(command: str, values: dict[str, object]) -> None:
         tasks = values.get("tasks")
         if not isinstance(tasks, (list, tuple)) or not tasks:
             raise SMLConfigurationError("at least one evaluation task is required")
-        if any(task not in {"hellaswag", "winogrande"} for task in tasks):
+        if any(
+            not isinstance(task, str) or task not in {"hellaswag", "winogrande"}
+            for task in tasks
+        ):
             raise SMLConfigurationError(
                 "evaluation task must be hellaswag or winogrande"
             )
@@ -1141,7 +1151,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = command.dispatch()
     except _DOMAIN_ERRORS as error:
         print(f"{type(error).__name__}: {error}", file=sys.stderr)
-        return _EXIT_CODES[type(error)]
+        return next(
+            code
+            for error_type, code in _EXIT_CODES.items()
+            if isinstance(error, error_type)
+        )
     close = getattr(result, "close", None)
     if close is not None and not callable(close):
         close = None

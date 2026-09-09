@@ -117,6 +117,29 @@ def test_model_initializer_defaults_use_final_overlay_values(tmp_path):
     assert model.initializers == InitializerConfig.depth_scaled(0.03, 6)
 
 
+def test_integer_rope_scale_in_toml_produces_a_valid_run_manifest(tmp_path):
+    from sml.training.pretrain import _run_manifest
+
+    config = tmp_path / "train.toml"
+    config.write_text(
+        '[train]\ndata = "data"\noutput = "run"\n'
+        "[train.model]\nrope_scaling_factor = 1\n",
+        encoding="utf-8",
+    )
+    domain = parse_command(["train", "--config", str(config)]).to_domain()
+    data = SimpleNamespace(
+        manifest=SimpleNamespace(
+            tokenizer_identity="sha256:" + "1" * 64,
+            identity="sha256:" + "2" * 64,
+        )
+    )
+
+    manifest = _run_manifest(domain, data)
+
+    assert manifest.model["rope_scaling_factor"] == 1.0
+    assert manifest.identity == manifest.recompute_identity()
+
+
 @pytest.mark.parametrize(
     ("argv", "module_name", "workflow"),
     [
@@ -440,6 +463,87 @@ def test_focused_domain_errors_are_concise(error_type, monkeypatch, capsys):
     assert main(["verify", "run"]) != 0
     captured = capsys.readouterr()
     assert "focused failure" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_writer_lock_contention_returns_artifact_exit_code(tmp_path, capsys):
+    from sml.artifacts.checkpoint import run_writer_lock
+
+    output = tmp_path / "run"
+    with run_writer_lock(output):
+        assert main(["train", "--data", "unused-data", "--output", str(output)]) == 3
+
+    captured = capsys.readouterr()
+    assert "run-writer lock" in captured.err
+    assert "Traceback" not in captured.err
+
+
+@pytest.mark.parametrize(
+    ("argv", "contents", "message"),
+    [
+        (
+            ["tokenize"],
+            '[tokenize]\ninput = "corpus"\noutput = 123\n',
+            "tokenize.output must be a path string",
+        ),
+        (
+            ["prepare", "pretraining"],
+            (
+                '[prepare.pretraining]\ninput = "corpus"\ntokenizer = "tok"\n'
+                "output = false\n"
+            ),
+            "prepare.pretraining.output must be a path string",
+        ),
+        (
+            ["prepare", "swag"],
+            (
+                '[prepare.swag]\ncheckpoint = []\nrevision = "0123456789abcdef"\n'
+                'output = "swag"\n'
+            ),
+            "prepare.swag.checkpoint must be a path string",
+        ),
+        (
+            ["export"],
+            '[export]\ncheckpoint = "run"\noutput = true\n',
+            "export.output must be a path string",
+        ),
+        (
+            ["verify"],
+            "[verify]\npath = 42\n",
+            "verify.path must be a path string",
+        ),
+        (
+            ["verify"],
+            '[verify]\npath = "run"\nfull = "yes"\n',
+            "verify.full must be a boolean",
+        ),
+        (
+            ["evaluate"],
+            (
+                '[evaluate]\ncheckpoint = "run"\noutput = "result.json"\n'
+                'tasks = [["hellaswag"]]\n'
+            ),
+            "evaluation task must be hellaswag or winogrande",
+        ),
+    ],
+)
+def test_malformed_toml_values_fail_before_dispatch(
+    tmp_path, monkeypatch, capsys, argv, contents, message
+):
+    import sml.cli
+
+    config = tmp_path / "invalid.toml"
+    config.write_text(contents, encoding="utf-8")
+
+    def unexpected_dispatch(_command):
+        pytest.fail("invalid TOML values reached workflow dispatch")
+
+    for command_type in sml.cli._DTO_TYPES.values():
+        monkeypatch.setattr(command_type, "dispatch", unexpected_dispatch)
+
+    assert main([*argv, "--config", str(config)]) == 2
+    captured = capsys.readouterr()
+    assert message in captured.err
     assert "Traceback" not in captured.err
 
 

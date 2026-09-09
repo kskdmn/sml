@@ -345,6 +345,11 @@ class _WritableFilesystemUnavailable(SMLArtifactError):
 def _path_parts(protected: Path) -> tuple[Path, str]:
     if not isinstance(protected, Path):
         raise TypeError("protected path must be a Path")
+    # Bare current/parent-directory aliases have no basename to lock. Only
+    # normalize those aliases: collapsing a named symlink followed by '..'
+    # could otherwise make the lock protect a different directory than open().
+    if not protected.is_absolute() and all(part == ".." for part in protected.parts):
+        protected = Path(os.path.abspath(protected))
     name = protected.name
     if not name or name in {".", ".."} or "/" in name or "\0" in name:
         raise SMLArtifactError("protected path must have one direct-child name")

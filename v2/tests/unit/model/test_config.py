@@ -26,6 +26,14 @@ def test_model_config_is_frozen_and_derives_context():
         config.hidden_size = 32
 
 
+@pytest.mark.parametrize("scale", [1, 2])
+def test_model_config_normalizes_integer_rope_scale_for_artifact_metadata(scale):
+    config = ModelConfig(rope_scaling_factor=scale)
+
+    assert config.rope_scaling_factor == float(scale)
+    assert isinstance(dataclasses.asdict(config)["rope_scaling_factor"], float)
+
+
 def test_model_config_derives_residual_initializers_from_its_depth():
     """A stale residual scale after changing depth would destabilize residual paths."""
     config = ModelConfig(num_layers=8, initializer_range=0.04)

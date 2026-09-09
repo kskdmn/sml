@@ -181,8 +181,17 @@ class SwagPreparationConfig:
             "preprocessing_schema_version",
             minimum=1,
         )
-        for name in ("join_policy", "overlength_policy", "bos_policy", "eos_policy"):
+        if self.preprocessing_schema_version != 1:
+            raise ValueError("unsupported SWAG preprocessing schema")
+        for name, expected in (
+            ("join_policy", JOIN_POLICY_V1),
+            ("overlength_policy", OVERLENGTH_POLICY_V1),
+            ("bos_policy", BOS_POLICY_V1),
+            ("eos_policy", EOS_POLICY_V1),
+        ):
             _require_string(getattr(self, name), name)
+            if getattr(self, name) != expected:
+                raise ValueError(f"unsupported SWAG {name}")
         _require_plain_int(self.maximum_length, "maximum_length", minimum=1)
         if not isinstance(self.bucket_boundaries, tuple) or not self.bucket_boundaries:
             raise TypeError("bucket_boundaries must be a nonempty tuple")

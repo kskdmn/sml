@@ -3533,6 +3533,13 @@ def _compare(args: argparse.Namespace) -> int:
             raise ValueError("final acceptance has the wrong predecessor mapping")
     harness_commit = baseline["harness"]["commit"]
     harness_identity = baseline["harness"]["content_identity"]
+    if (
+        harness_content_identity(Path(__file__).resolve().parents[2])
+        != harness_identity
+    ):
+        raise ValueError(
+            "executing comparison harness differs from the baseline; record a new baseline"
+        )
     baseline_commit = baseline["source"]["commit"]
     candidate_commit = _git_commit(repository, args.candidate)
     workload = CanonicalWorkload.from_dict(baseline["canonical_workload"])

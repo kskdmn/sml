@@ -59,6 +59,7 @@ from sml.training.swag import (
     score_candidates,
 )
 
+from v2.benchmarks.journal import atomic_write_text, baseline_output_lock
 from v2.benchmarks.workload import (
     BENCHMARK_CORPUS,
     canonical_json_bytes,
@@ -72,6 +73,9 @@ QUALITY_WALL_TIME_BUDGET_SECONDS = 4 * 60 * 60
 HARNESS_COMPONENTS = (
     Path("v2/benchmarks/swag_quality.py"),
     Path("v2/tests/unit/test_swag_quality.py"),
+    Path("v2/benchmarks/journal.py"),
+    Path("v2/benchmarks/evidence.py"),
+    Path("v2/benchmarks/recovery.py"),
 )
 PRODUCTION_SOURCE_TREE = Path("v2/src/sml")
 PRODUCTION_MODULE_ROOT = Path("v2/src")
@@ -2106,22 +2110,28 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _durable_create(path: Path, payload: bytes) -> None:
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    descriptor = os.open(path, flags, 0o600)
+    atomic_write_text(path, payload.decode("utf-8"), create_only=True)
+
+
+def _publish_evidence(
+    destinations: _EvidenceDestinations, payloads: Mapping[str, bytes]
+) -> None:
+    created: list[tuple[Path, tuple[int, int]]] = []
     try:
-        with os.fdopen(descriptor, "wb", closefd=False) as destination:
-            destination.write(payload)
-            destination.flush()
-            os.fsync(destination.fileno())
-    finally:
-        os.close(descriptor)
-    _fsync_directory(path.parent)
+        for name, path in destinations.ordered():
+            _durable_create(path, payloads[name])
+            metadata = path.stat(follow_symlinks=False)
+            created.append((path, (metadata.st_dev, metadata.st_ino)))
+    except BaseException:
+        for path, identity in reversed(created):
+            try:
+                metadata = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if (metadata.st_dev, metadata.st_ino) == identity:
+                path.unlink()
+                _fsync_directory(path.parent)
+        raise
 
 
 def _require_clean_recording_checkout(
@@ -2175,6 +2185,15 @@ def _record(args: argparse.Namespace) -> int:
         Path(args.raw_output),
         Path(args.output),
     )
+    with baseline_output_lock(destinations.manifest, destinations.raw_output):
+        return _record_locked(root, destinations, recording_started)
+
+
+def _record_locked(
+    root: Path,
+    destinations: _EvidenceDestinations,
+    recording_started: float,
+) -> int:
     _require_clean_recording_checkout(root, destinations)
     source_commit = _git(root, "rev-parse", "HEAD")
     if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
@@ -2186,6 +2205,8 @@ def _record(args: argparse.Namespace) -> int:
         return 0 if decision == "pass" else 1
     if any_destination:
         raise FileExistsError("partial quality evidence exists; discard it and retry")
+    for _name, path in destinations.ordered():
+        path.parent.mkdir(parents=True, exist_ok=True)
     mx.clear_cache()
     mx.reset_peak_memory()
     training = _load_encoded_arrays(root / TRAINING_FIXTURE)
@@ -2261,14 +2282,10 @@ def _record(args: argparse.Namespace) -> int:
         recording_session_identity=session_identity,
     )
     manifest_bytes = _canonical_json_file_bytes(manifest)
-    try:
-        _durable_create(destinations.raw_output, raw_bytes)
-        _durable_create(destinations.manifest, manifest_bytes)
-        _durable_create(destinations.report, report_bytes)
-    except Exception:
-        for _name, path in destinations.ordered():
-            path.unlink(missing_ok=True)
-        raise
+    _publish_evidence(
+        destinations,
+        {"raw": raw_bytes, "manifest": manifest_bytes, "report": report_bytes},
+    )
     validated_decision = _validate_evidence_files(
         root, destinations, recorded_workload=workload
     )

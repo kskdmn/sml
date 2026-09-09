@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -42,8 +43,9 @@ from sml.data.pretraining import (
     PreparedDataBundle,
     PretrainingBatchStream,
     PretrainingCursor,
+    _open_validated_prepared_resources,
+    _PreparedShardStore,
     canonicalize_pretraining_cursor,
-    preflight_pretraining_bundle,
 )
 from sml.errors import SMLArtifactError, SMLConfigurationError, SMLDataError
 from sml.model.config import ModelConfig
@@ -693,17 +695,18 @@ def _copy_run_tokenizer(data: Path, private_run: Path) -> None:
                 destination.joinpath(Path(name).name).write_bytes(payload.read())
 
 
+@contextmanager
 def _verified_data(
     path: Path,
     *,
     expected_identity: str | None,
     model: ModelConfig,
     loader: LoaderConfig,
-) -> PreparedDataBundle:
+) -> Iterator[tuple[PreparedDataBundle, _PreparedShardStore]]:
     verified = read_manifest(
         path,
         PretrainingDataManifest,
-        VerificationLevel.FULL,
+        VerificationLevel.MANIFEST_TRUSTED,
     )
     manifest = verified.manifest
     if expected_identity is not None and manifest.identity != expected_identity:
@@ -732,8 +735,19 @@ def _verified_data(
     ):
         raise SMLArtifactError("prepared-data tokenizer metadata does not match model")
     bundle = PreparedDataBundle(path, manifest, VerificationLevel.FULL)
-    preflight_pretraining_bundle(bundle, batch_size=loader.microbatch_size)
-    return bundle
+    shards = _open_validated_prepared_resources(
+        bundle, batch_size=loader.microbatch_size
+    )
+    try:
+        yield bundle, shards
+    except BaseException as error:
+        try:
+            shards.close()
+        except BaseException as cleanup_error:
+            raise error from cleanup_error
+        raise
+    else:
+        shards.close()
 
 
 def _resolved_fresh_config(config: PretrainingConfig) -> PretrainingConfig:
@@ -1017,20 +1031,23 @@ def train(config: PretrainingConfig) -> TrainingResult:
     config = _resolved_fresh_config(config)
     stream: PretrainingBatchStream | None = None
     runtime: tuple[SMLLanguageModel, _RestoredTrainingState] | None = None
-    with run_writer_lock(config.output_run):
+    with run_writer_lock(config.output_run), ExitStack() as resources:
         try:
             if config.output_run.exists() or config.output_run.is_symlink():
                 raise SMLArtifactError(
                     f"fresh run target already exists: {config.output_run}"
                 )
-            data = _verified_data(
-                config.data,
-                expected_identity=None,
-                model=config.model,
-                loader=config.loader,
+            data, shards = resources.enter_context(
+                _verified_data(
+                    config.data,
+                    expected_identity=None,
+                    model=config.model,
+                    loader=config.loader,
+                )
             )
-            stream = PretrainingBatchStream(
+            stream = PretrainingBatchStream._from_validated_shards(
                 data,
+                shards,
                 batch_size=config.loader.microbatch_size,
                 seed=config.loader.epoch_seed,
                 prefetch_depth=config.loader.prefetch_depth,
@@ -1083,7 +1100,7 @@ def resume(
     if not isinstance(overrides, ResumeOverrides):
         raise TypeError("overrides must be ResumeOverrides")
     stream: PretrainingBatchStream | None = None
-    with run_writer_lock(run):
+    with run_writer_lock(run), ExitStack() as resources:
         try:
             resolved = resolve_latest_step(
                 run,
@@ -1101,11 +1118,13 @@ def resume(
                     "resume requires a prepared-data bundle location"
                 )
             config = _config_from_run(run, data_path, resolved.run, overrides)
-            prepared = _verified_data(
-                data_path,
-                expected_identity=resolved.run.data_identity,
-                model=config.model,
-                loader=config.loader,
+            prepared, shards = resources.enter_context(
+                _verified_data(
+                    data_path,
+                    expected_identity=resolved.run.data_identity,
+                    model=config.model,
+                    loader=config.loader,
+                )
             )
             with open_checkpoint_reader(
                 run,
@@ -1152,8 +1171,9 @@ def resume(
             if _limit_reached(config, scalar):
                 return _training_result(run, scalar)
 
-            stream = PretrainingBatchStream(
+            stream = PretrainingBatchStream._from_validated_shards(
                 prepared,
+                shards,
                 batch_size=config.loader.microbatch_size,
                 seed=config.loader.epoch_seed,
                 prefetch_depth=config.loader.prefetch_depth,

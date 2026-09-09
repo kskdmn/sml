@@ -3,8 +3,10 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+import os
 import shutil
 import weakref
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +17,7 @@ import pytest
 import zstandard as zstd
 from mlx.utils import tree_unflatten
 from sml.artifacts import checkpoint as checkpoint_module
+from sml.artifacts import manifest as manifest_module
 from sml.artifacts.checkpoint import (
     publish_immutable_bundle,
     resolve_latest_step,
@@ -38,6 +41,7 @@ from sml.artifacts.manifest import (
 )
 from sml.artifacts.semantics import expected_next_key
 from sml.artifacts.verify import verify_artifact
+from sml.data import pretraining as data_module
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
     PretrainingCursor,
@@ -205,6 +209,85 @@ def _config(data: Path, run: Path, *, maximum_steps: int = 2) -> PretrainingConf
         log_interval=1,
         seed=19,
     )
+
+
+@pytest.mark.parametrize(
+    "mode", ("fresh", "resume", "complete", "restore-failure", "initial-state-failure")
+)
+def test_training_retains_one_full_data_proof_and_closes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    data = _prepared_bundle(
+        tmp_path / "prepared",
+        partitions=tuple(tuple(range(start, start + 3)) for start in range(0, 18, 3)),
+    )
+    run = tmp_path / "run"
+    if mode not in {"fresh", "initial-state-failure"}:
+        pretrain.train(_config(data, run, maximum_steps=1))
+
+    hashes = Counter()
+    scans = 0
+    stores = []
+    descriptors = []
+    real_open = manifest_module._open_verified_payload
+    real_identity = data_module.row_content_identity
+    real_preflight = pretrain._open_validated_prepared_resources
+
+    def record_open(root, reference, verification):
+        if (
+            reference.logical_path.startswith("shards/")
+            and verification is VerificationLevel.FULL
+        ):
+            hashes[reference.logical_path] += 1
+        return real_open(root, reference, verification)
+
+    def record_identity(*args, **kwargs):
+        nonlocal scans
+        scans += 1
+        return real_identity(*args, **kwargs)
+
+    def record_preflight(*args, **kwargs):
+        store = real_preflight(*args, **kwargs)
+        stores.append(store)
+        descriptors.append(store.artifact.root.fileno())
+        return store
+
+    def fail_restore(*_args, **_kwargs):
+        raise InjectedFailure("restore failed")
+
+    def fail_initial_state(*_args, **_kwargs):
+        raise InjectedFailure("initial state failed")
+
+    monkeypatch.setattr(manifest_module, "_open_verified_payload", record_open)
+    monkeypatch.setattr(data_module, "row_content_identity", record_identity)
+    monkeypatch.setattr(
+        pretrain, "_open_validated_prepared_resources", record_preflight
+    )
+    if mode == "initial-state-failure":
+        monkeypatch.setattr(pretrain, "_initial_state", fail_initial_state)
+        with pytest.raises(InjectedFailure, match="initial state failed"):
+            pretrain.train(_config(data, run))
+    elif mode == "restore-failure":
+        monkeypatch.setattr(pretrain, "_restore_checkpoint", fail_restore)
+        with pytest.raises(InjectedFailure, match="restore failed"):
+            pretrain.resume(run, data=data, overrides=_overrides(maximum_steps=2))
+    elif mode == "fresh":
+        assert pretrain.train(_config(data, run)).step == 2
+    else:
+        limit = 1 if mode == "complete" else 2
+        assert (
+            pretrain.resume(
+                run, data=data, overrides=_overrides(maximum_steps=limit)
+            ).step
+            == limit
+        )
+
+    assert hashes == {f"shards/train-{index:06d}.npy": 1 for index in range(6)}
+    assert scans == 1
+    assert len(stores) == 1 and stores[0]._closed
+    for descriptor in descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
 
 
 def test_pretraining_logs_update_metrics_at_configured_interval(

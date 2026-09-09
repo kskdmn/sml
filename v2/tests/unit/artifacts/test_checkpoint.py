@@ -652,6 +652,42 @@ def valid_run(tmp_path: Path) -> Path:
     return run
 
 
+@pytest.mark.parametrize("alias", [".", "..", "../.."])
+def test_current_and_parent_aliases_share_run_locks_and_read_latest(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alias: str,
+) -> None:
+    working_directory = valid_run
+    for index, _parent in enumerate(Path(alias).parts):
+        working_directory /= f"child-{index}"
+    working_directory.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(working_directory)
+
+    with (
+        checkpoint.run_writer_lock(valid_run),
+        pytest.raises(SMLArtifactError, match="run-writer lock"),
+        checkpoint.run_writer_lock(Path(alias)),
+    ):
+        pytest.fail("directory alias bypassed the existing run writer lock")
+
+    with checkpoint.open_latest_checkpoint_reader(
+        Path(alias), verification=VerificationLevel.MANIFEST_TRUSTED
+    ) as reader:
+        assert reader.resolved.step == 1
+
+
+def test_latest_reader_still_rejects_a_symlink_run(valid_run: Path) -> None:
+    alias = valid_run.with_name("linked-run")
+    alias.symlink_to(valid_run, target_is_directory=True)
+
+    with (
+        pytest.raises(SMLArtifactError, match="run directory"),
+        checkpoint.open_latest_checkpoint_reader(alias),
+    ):
+        pytest.fail("latest reader followed a symlink run")
+
+
 def _copy_portable_run(valid_run: Path, *, parent_name: str) -> Path:
     parent = valid_run.parent / parent_name
     parent.mkdir()

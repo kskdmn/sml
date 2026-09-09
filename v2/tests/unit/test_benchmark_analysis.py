@@ -2648,6 +2648,75 @@ def _resign_comparison(report):
     report["identity"] = structured_identity("sml-performance-comparison-v1", body)
 
 
+@pytest.mark.parametrize("matching_harness", [False, True])
+def test_compare_requires_the_executing_parent_harness_identity(
+    tmp_path, monkeypatch, matching_harness
+):
+    _workload, baseline, original_report = _valid_prepared_comparison()
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(baseline))
+    output = tmp_path / "report.json"
+    args = build_parser().parse_args(
+        [
+            "compare",
+            "--baseline",
+            str(baseline_path),
+            "--candidate",
+            "HEAD",
+            "--metrics",
+            "prepared-data",
+            "--mode",
+            "screen",
+            "--lower-bound-report-only",
+            "--predecessors",
+            '{"prepared-data":null}',
+            "--output",
+            str(output),
+        ]
+    )
+    monkeypatch.setattr(benchmark_runner, "_git_root", lambda _path: tmp_path)
+    monkeypatch.setattr(
+        benchmark_runner, "_require_clean_checkout", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_git_commit",
+        lambda *_args: original_report["candidate_commit"],
+    )
+    verified_roots = []
+
+    def parent_harness_identity(path):
+        verified_roots.append(path)
+        return (
+            baseline["harness"]["content_identity"]
+            if matching_harness
+            else "sha256:" + "0" * 64
+        )
+
+    monkeypatch.setattr(
+        benchmark_runner, "harness_content_identity", parent_harness_identity
+    )
+    captures = []
+
+    def capture(**_kwargs):
+        captures.append(True)
+        return [RawTrial.from_dict(raw) for raw in original_report["raw_trials"]], {}
+
+    monkeypatch.setattr(benchmark_runner, "_collect_comparison_attempt", capture)
+    if matching_harness:
+        assert benchmark_runner._compare(args) == 0
+        assert captures == [True]
+        validate_comparison_report(json.loads(output.read_text()), baseline, None)
+    else:
+        with pytest.raises(
+            ValueError, match="executing comparison harness.*new baseline"
+        ):
+            benchmark_runner._compare(args)
+        assert not captures
+        assert not output.exists()
+    assert verified_roots == [Path(benchmark_runner.__file__).resolve().parents[2]]
+
+
 @pytest.mark.parametrize("version", (True, 1.0))
 def test_comparison_validator_rejects_boolean_and_float_version_aliases(version):
     _workload, baseline, report = _valid_prepared_comparison()

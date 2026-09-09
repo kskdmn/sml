@@ -178,6 +178,57 @@ def test_session_runtime_config_rejects_non_positive_batch_buckets() -> None:
         InferenceRuntimeConfig(batch_size_buckets=(1, 0, 4))
 
 
+@pytest.mark.parametrize("token_ids", [(), (4,), (4, 5), (4, 5, 6)])
+def test_zero_context_scoring_uses_bos_independently_of_padding(
+    tiny_session: InferenceSession, token_ids: tuple[int, ...]
+) -> None:
+    bos_id = tiny_session.resolved_model.model_config.bos_token_id
+    expected = tiny_session.score_encoded_loglikelihoods(
+        (((bos_id, *token_ids), 1),), padding="right"
+    )[0]
+
+    for padding in ("left", "right"):
+        actual = tiny_session.score_encoded_loglikelihoods(
+            ((token_ids, 0),), padding=padding
+        )[0]
+        assert actual[0] == pytest.approx(expected[0], abs=1e-6)
+        assert actual[1] == expected[1]
+    if not token_ids:
+        assert expected == (0.0, True)
+
+
+def test_zero_context_scoring_counts_bos_toward_capacity(
+    tiny_session: InferenceSession,
+) -> None:
+    capacity = tiny_session.resolved_model.model_config.effective_context_length
+    with pytest.raises(SMLRuntimeError, match="context length"):
+        tiny_session.score_encoded_loglikelihoods(
+            (((4,) * capacity, 0),), padding="right"
+        )
+
+
+@pytest.mark.parametrize("padding", ["left", "right"])
+def test_empty_continuations_preserve_mixed_batch_order(
+    tiny_session: InferenceSession, padding: str
+) -> None:
+    nonempty = (((4, 5), 1), ((4, 5, 6), 1))
+    expected = tiny_session.score_encoded_loglikelihoods(nonempty, padding=padding)
+    actual = tiny_session.score_encoded_loglikelihoods(
+        (nonempty[0], ((4,), 1), nonempty[1], ((), 0)), padding=padding
+    )
+    assert actual == (expected[0], (0.0, True), expected[1], (0.0, True))
+
+
+@pytest.mark.parametrize("continuation_start", [-1, 4, True, 0.5])
+def test_encoded_scoring_rejects_invalid_continuation_indices(
+    tiny_session: InferenceSession, continuation_start: object
+) -> None:
+    with pytest.raises(SMLRuntimeError, match="invalid continuation start"):
+        tiny_session.score_encoded_loglikelihoods(
+            (((4, 5, 6), continuation_start),), padding="right"
+        )
+
+
 def test_resolve_rejects_directory_without_artifact_manifest(tmp_path: Path) -> None:
     with pytest.raises(SMLArtifactError):
         resolve_model_artifact(tmp_path, full_verify=False)
