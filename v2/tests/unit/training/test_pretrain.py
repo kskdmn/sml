@@ -152,6 +152,7 @@ def test_microstep_transfers_rows_once_and_keeps_state_on_device(tiny_runtime):
         tiny_runtime.parameters, tiny_runtime.trainer, tiny_runtime.rows
     )
 
+    assert state.parameters is tiny_runtime.parameters
     assert state.trainer.accumulation_count.dtype == mx.int32
     assert state.trainer.loss_numerator.dtype == mx.float32
     assert state.trainer.accumulators["embed_tokens"]["weight"].dtype == mx.float32

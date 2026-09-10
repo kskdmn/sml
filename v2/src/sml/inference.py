@@ -1102,6 +1102,12 @@ class InferenceSession:
         ngram_size = kernel_key.no_repeat_ngram_size
 
         def _forward(parameters, input_ids, attention_mask, positions, cache_state):
+            logits_positions = None
+            if input_ids.shape[1] > 1:
+                token_order = mx.arange(input_ids.shape[1], dtype=mx.int32)[None, :]
+                logits_positions = mx.max(
+                    mx.where(attention_mask, token_order, 0), axis=1, keepdims=True
+                )
             logits, cache_state, _next_key = model.forward_arrays(
                 parameters,
                 input_ids,
@@ -1110,6 +1116,7 @@ class InferenceSession:
                 cache_state=cache_state,
                 training=False,
                 key=None,
+                logits_positions=logits_positions,
             )
             return logits, cache_state
 
@@ -1227,12 +1234,7 @@ class InferenceSession:
             positions,
             lease.cache_state,
         )
-        last_index = mx.clip(bucket.prompt_lengths - 1, 0, prefill_length - 1)
-        gather_index = mx.broadcast_to(
-            last_index[:, None, None],
-            (batch_size, 1, logits.shape[-1]),
-        )
-        next_logits = mx.take_along_axis(logits, gather_index, axis=1)[:, 0, :]
+        next_logits = logits[:, 0, :]
         lengths = bucket.prompt_lengths.astype(mx.int32)
         generated = mx.zeros((batch_size,), dtype=mx.int32)
         finished = ~bucket.request_mask

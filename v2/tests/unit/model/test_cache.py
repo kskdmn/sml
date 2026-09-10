@@ -104,6 +104,50 @@ def test_invalid_duplicate_position_cannot_overwrite_a_valid_cache_write():
     _assert_array_equal(updated[2], mx.array([1], dtype=mx.int32))
 
 
+def test_compiled_single_token_append_preserves_inactive_and_out_of_bounds_rows():
+    shape = (4, 2, 3, 4)
+    original = (
+        (mx.full(shape, 5.0, dtype=mx.bfloat16),),
+        (mx.full(shape, 7.0, dtype=mx.bfloat16),),
+        mx.array([1, 1, 1, 3], dtype=mx.int32),
+    )
+    keys = mx.full((4, 2, 1, 4), 9.0, dtype=mx.bfloat16)
+    values = mx.full((4, 2, 1, 4), 11.0, dtype=mx.bfloat16)
+
+    @mx.compile
+    def append_core(state, keys, values, positions, valid_mask):
+        updated, view = append_kv_state(state, 0, keys, values, positions, valid_mask)
+        return updated, view.valid_mask
+
+    updated, valid_slots = append_core(
+        original,
+        keys,
+        values,
+        mx.array([[1], [1], [-1], [3]], dtype=mx.int32),
+        mx.array([[True], [False], [True], [True]]),
+    )
+
+    expected_keys = mx.full(shape, 5.0, dtype=mx.bfloat16)
+    expected_values = mx.full(shape, 7.0, dtype=mx.bfloat16)
+    expected_keys[0, :, 1, :] = 9.0
+    expected_values[0, :, 1, :] = 11.0
+    _assert_array_equal(updated[0][0], expected_keys)
+    _assert_array_equal(updated[1][0], expected_values)
+    _assert_array_equal(updated[2], mx.array([2, 1, 1, 3], dtype=mx.int32))
+    _assert_array_equal(
+        valid_slots,
+        mx.array(
+            [
+                [True, True, False],
+                [True, False, False],
+                [True, False, False],
+                [True, True, True],
+            ]
+        ),
+    )
+    _assert_array_equal(original[0][0], mx.full(shape, 5.0, dtype=mx.bfloat16))
+
+
 def test_invalid_duplicates_cannot_change_last_valid_write_in_compiled_cache():
     config = replace(_cache_config(), num_layers=1)
     original = allocate_kv_state(config, 1, 2, mx.bfloat16)

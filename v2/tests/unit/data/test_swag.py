@@ -1220,6 +1220,73 @@ def test_swag_stream_closes_owned_bundle_on_exhaustion(tmp_path):
         next(stream)
 
 
+def test_swag_prefetch_finishes_after_the_requested_epoch(tmp_path):
+    from sml.data.swag import SwagBatchStream, SwagCursor
+
+    bundle = _one_example_bundle(tmp_path)
+    loader = SimpleNamespace(
+        microbatch_size=1,
+        prefetch_depth=4,
+        epoch_seed=11,
+    )
+    with SwagBatchStream(bundle, loader, cursor=SwagCursor.initial()) as stream:
+        stream._producer.join(timeout=5)
+        assert not stream._producer.is_alive()
+        envelopes = list(stream)
+        assert len(envelopes) == 1
+        assert envelopes[0].cursor_after == SwagCursor(1, 0, 0)
+        envelopes[0].release()
+
+
+@pytest.mark.parametrize("row_indices", [(3,), (3, 0, 2, 1), (3, 0, 2), (3, 1)])
+def test_swag_batch_gather_preserves_order_owned_storage_and_synthetic_tails(
+    row_indices,
+):
+    from sml.data.swag import SwagBucket, _assemble_batch_arrays
+
+    length = 8
+    batch_size = 4
+    ids = np.arange(4 * 4 * length, dtype=np.int32).reshape(4, 4, length)
+    bucket = SwagBucket(
+        length=length,
+        input_ids=ids,
+        valid_token_mask=ids % 2 == 0,
+        score_mask=ids % 3 == 0,
+        labels=np.array([1, 3, 0, 2], dtype=np.int32),
+    )
+    manifest = SimpleNamespace(pad_token_id=3, bos_token_id=1, eos_token_id=2)
+    arrays = _assemble_batch_arrays(
+        bucket, row_indices, batch_size=batch_size, manifest=manifest
+    )
+    real_count = len(row_indices)
+    indices = np.asarray(row_indices, dtype=np.intp)
+    for actual, source in zip(
+        arrays[:4],
+        (bucket.input_ids, bucket.valid_token_mask, bucket.score_mask, bucket.labels),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(actual[:real_count], source[indices])
+        assert not np.shares_memory(actual, source)
+    for array in arrays:
+        assert array.flags.owndata
+        assert array.flags.c_contiguous
+        assert not array.flags.writeable
+
+    input_ids, valid_token_mask, score_mask, labels, example_mask = arrays
+    np.testing.assert_array_equal(example_mask, np.arange(batch_size) < real_count)
+    for slot in range(real_count, batch_size):
+        np.testing.assert_array_equal(input_ids[slot], [[1, 2, 3, 3, 3, 3, 3, 3]] * 4)
+        np.testing.assert_array_equal(
+            valid_token_mask[slot],
+            [[True, True, False, False, False, False, False, False]] * 4,
+        )
+        np.testing.assert_array_equal(
+            score_mask[slot],
+            [[False, True, False, False, False, False, False, False]] * 4,
+        )
+        assert labels[slot] == 0
+
+
 def test_swag_stream_uses_owned_arrays_without_public_bucket_lease(tmp_path):
     """Internal zero-copy iteration must not enter the public borrow protocol."""
     from sml.data.swag import SwagBatchStream, SwagCursor

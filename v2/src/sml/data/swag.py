@@ -1942,20 +1942,39 @@ def _assemble_batch_arrays(
     score_mask = np.empty((batch_size, 4, length), dtype=_BOOL)
     labels = np.empty((batch_size,), dtype=_INT32)
     example_mask = np.zeros((batch_size,), dtype=_BOOL)
-    for slot, row_index in enumerate(row_indices):
-        input_ids[slot] = bucket.input_ids[row_index]
-        valid_token_mask[slot] = bucket.valid_token_mask[row_index]
-        score_mask[slot] = bucket.score_mask[row_index]
-        labels[slot] = int(bucket.labels[row_index])
-        example_mask[slot] = True
-    if len(row_indices) < batch_size:
+    real_count = len(row_indices)
+    if real_count <= 2:
+        for slot, row_index in enumerate(row_indices):
+            input_ids[slot] = bucket.input_ids[row_index]
+            valid_token_mask[slot] = bucket.valid_token_mask[row_index]
+            score_mask[slot] = bucket.score_mask[row_index]
+            labels[slot] = bucket.labels[row_index]
+            example_mask[slot] = True
+    else:
+        indices = np.asarray(row_indices, dtype=np.intp)
+        # Epoch permutations already contain valid indices. Clipping mode lets
+        # NumPy gather directly into staging without its bounds-checking buffer.
+        np.take(
+            bucket.input_ids, indices, axis=0, out=input_ids[:real_count], mode="clip"
+        )
+        np.take(
+            bucket.valid_token_mask,
+            indices,
+            axis=0,
+            out=valid_token_mask[:real_count],
+            mode="clip",
+        )
+        np.take(
+            bucket.score_mask, indices, axis=0, out=score_mask[:real_count], mode="clip"
+        )
+        np.take(bucket.labels, indices, axis=0, out=labels[:real_count], mode="clip")
+        example_mask[:real_count] = True
+    if real_count < batch_size:
         syn_ids, syn_valid, syn_score = _synthetic_candidates(length, manifest)
-        for slot in range(len(row_indices), batch_size):
-            input_ids[slot] = syn_ids
-            valid_token_mask[slot] = syn_valid
-            score_mask[slot] = syn_score
-            labels[slot] = 0
-            example_mask[slot] = False
+        input_ids[real_count:] = syn_ids
+        valid_token_mask[real_count:] = syn_valid
+        score_mask[real_count:] = syn_score
+        labels[real_count:] = 0
     for array in (input_ids, valid_token_mask, score_mask, labels, example_mask):
         array.setflags(write=False)
     return (
@@ -2377,6 +2396,8 @@ class SwagBatchStream:
                 envelope, cursor = self._next_from_cursor(cursor)
                 if not self._put(envelope):
                     envelope.release()
+                    return
+                if cursor.epoch > self._initial_epoch:
                     return
         except BaseException as error:  # noqa: BLE001 - cross-thread error boundary
             failure = SMLDataError("SWAG batch producer failed")

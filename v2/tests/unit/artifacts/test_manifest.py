@@ -1197,6 +1197,34 @@ def test_row_content_identity_pins_shape_count_order_and_little_endian_int32():
     )
 
 
+@pytest.mark.parametrize("dtype", ["<i4", ">i4", "i2", "u2", "u4", "i8", "u8"])
+def test_row_content_identity_preserves_encoding_for_strided_integer_rows(dtype):
+    values = np.array([[0, 99, 1, 99], [123, 99, 32767, 99]], dtype=dtype)
+    rows = values[:, ::2]
+    expected = np.array([[0, 1], [123, 32767]], dtype="<i4")
+
+    assert not rows.flags.c_contiguous
+    assert row_content_identity(rows, 2, 2) == row_content_identity(expected, 2, 2)
+
+
+@pytest.mark.parametrize("dtype", ["<i4", ">i4", "i8"])
+def test_row_content_identity_accepts_signed_int32_bounds(dtype):
+    rows = np.array([[-(2**31), 2**31 - 1]], dtype=dtype)
+
+    assert row_content_identity(rows, 1, 2) == row_content_identity(
+        rows.astype("<i4"), 1, 2
+    )
+
+
+@pytest.mark.parametrize("dtype", ["u4", "u8"])
+def test_row_content_identity_accepts_unsigned_values_within_int32(dtype):
+    rows = np.array([[0, 2**31 - 1]], dtype=dtype)
+
+    assert row_content_identity(rows, 1, 2) == row_content_identity(
+        rows.astype("<i4"), 1, 2
+    )
+
+
 @pytest.mark.parametrize(
     ("rows", "row_count", "row_width", "message"),
     [
@@ -1204,7 +1232,11 @@ def test_row_content_identity_pins_shape_count_order_and_little_endian_int32():
         ([np.array([1, 2], dtype=np.int32)], 1, 3, "row width|shape"),
         ([np.array([[1, 2]], dtype=np.int32)], 1, 2, "shape"),
         ([np.array([1.0, 2.0])], 1, 2, "integer"),
+        ([np.array([True, False])], 1, 2, "integer"),
         ([np.array([0, 2**31], dtype=np.int64)], 1, 2, "int32"),
+        ([np.array([0, -(2**31) - 1], dtype=np.int64)], 1, 2, "int32"),
+        ([np.array([0, 2**31], dtype=np.uint32)], 1, 2, "int32"),
+        ([np.array([0, 2**63], dtype=np.uint64)], 1, 2, "int32"),
     ],
 )
 def test_row_content_identity_rejects_count_width_shape_dtype_and_range_mismatches(

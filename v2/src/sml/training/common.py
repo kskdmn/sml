@@ -78,7 +78,6 @@ def _array_leaves(tree: object, name: str) -> list[mx.array]:
     leaves: list[mx.array] = []
 
     def visit(node: object, path: tuple[object, ...]) -> None:
-        location = ".".join(str(part) for part in path)
         if isinstance(node, dict):
             for key, value in node.items():
                 visit(value, (*path, key))
@@ -88,6 +87,7 @@ def _array_leaves(tree: object, name: str) -> list[mx.array]:
                 visit(value, (*path, index))
             return
         if not isinstance(node, mx.array):
+            location = ".".join(str(part) for part in path)
             raise SMLConfigurationError(f"{name}.{location} must be an MLX array")
         leaves.append(node)
 

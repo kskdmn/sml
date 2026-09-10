@@ -421,13 +421,15 @@ def test_prefill_uses_prompt_bucket_while_lease_uses_capacity_bucket(
             storage_rows.extend(
                 leased_storage[0][:, : bucket.prefill_length_bucket].tolist()
             )
-            return prefill(
+            logits, returned_cache = prefill(
                 parameters,
                 input_ids,
                 attention_mask,
                 positions,
                 cache_state,
             )
+            captured["prefill_logit_rows"] = int(logits.shape[1])
+            return logits, returned_cache
 
         return prefill_shape_spy, decode
 
@@ -444,6 +446,7 @@ def test_prefill_uses_prompt_bucket_while_lease_uses_capacity_bucket(
         "prefill_tokens": bucket.prefill_length_bucket,
         "prefill_mask": bucket.prefill_length_bucket,
         "prefill_positions": bucket.prefill_length_bucket,
+        "prefill_logit_rows": 1,
         "cache_capacity": bucket.cache_capacity_bucket,
     }
     expected_rows = [
@@ -603,6 +606,10 @@ def test_decode_stops_when_all_real_requests_finish(
             0.0,
             -100.0,
         )
+        if kwargs.get("logits_positions") is not None:
+            logits = mx.take_along_axis(
+                logits, kwargs["logits_positions"][:, :, None], axis=1
+            )
         return logits, cache, key
 
     chunks = 0

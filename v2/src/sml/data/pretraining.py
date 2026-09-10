@@ -881,12 +881,8 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
     def _next_produced(
         self, cursor: PretrainingCursor
     ) -> tuple[BatchEnvelope | None, PretrainingCursor]:
-        cursor = canonicalize_pretraining_cursor(
-            cursor,
-            shard_row_counts=self._manifest.shard_row_counts,
-            seed=self._seed,
-            shard_order=self._shard_order(cursor.epoch),
-        )
+        # Initialization validates the external cursor; every producer advance
+        # below preserves that canonical form without rescanning all shards.
         order = self._shard_order(cursor.epoch)
         remaining = (
             self._order_suffix_rows[cursor.shard_order_position] - cursor.row_offset

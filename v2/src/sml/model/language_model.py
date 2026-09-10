@@ -220,6 +220,7 @@ class SMLLanguageModel(nn.Module):
         cache_state: KVArrayState | None,
         training: bool,
         key: mx.array | None,
+        logits_positions: mx.array | None = None,
     ) -> tuple[mx.array, KVArrayState | None, mx.array | None]:
         """Run a prevalidated forward without host synchronization.
 
@@ -227,6 +228,8 @@ class SMLLanguageModel(nn.Module):
         every slot below each cache length must already be populated. Direct
         callers can use ``KVCache.validate_append`` before entering a compiled
         region. The public model call performs that validation automatically.
+        ``logits_positions``, when given, selects query rows per batch before the
+        vocabulary projection and must have shape ``(batch_size, output_length)``.
         """
         batch_size, query_length = input_ids.shape
         if attention_mask is None:
@@ -266,6 +269,8 @@ class SMLLanguageModel(nn.Module):
             hidden,
             self.norm.epsilon,
         )
+        if logits_positions is not None:
+            hidden = mx.take_along_axis(hidden, logits_positions[:, :, None], axis=1)
         if self.config.tie_word_embeddings:
             logits = hidden @ parameters["embed_tokens"]["weight"].T
         else:

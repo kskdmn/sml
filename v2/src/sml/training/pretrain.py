@@ -120,16 +120,16 @@ class PretrainingKernels:
         rows: object,
     ) -> MicrostepState:
         rows_array = mx.array(rows)
-        next_working, next_trainer_tree = self.compiled_microstep_core(
+        _working_parameters, next_trainer_tree = self.compiled_microstep_core(
             parameters.working_parameters,
             trainer.to_tree(),
             rows_array[:, :-1],
             rows_array[:, 1:],
         )
         return MicrostepState(
-            parameters=BaseParameterState.from_compiled_tree(
-                (parameters.master_parameters, next_working)
-            ),
+            # Microsteps only accumulate gradients; parameters change at the
+            # optimizer boundary, so their validated state can be reused.
+            parameters=parameters,
             trainer=TrainerState.from_compiled_tree(next_trainer_tree),
         )
 

@@ -246,14 +246,18 @@ def row_content_identity(
             raise ValueError(
                 f"row shape mismatch: expected ({row_width},), got {array.shape}"
             )
-        if not np.issubdtype(array.dtype, np.integer):
+        if array.dtype.kind not in "iu":
             raise TypeError("row dtype must be an integer dtype")
-        if array.size and (
+        # Narrow integer dtypes already prove the range without scanning each row.
+        needs_range_check = array.dtype.itemsize > 4 or (
+            array.dtype.kind == "u" and array.dtype.itemsize == 4
+        )
+        if needs_range_check and (
             int(array.min()) < int32.min or int(array.max()) > int32.max
         ):
             raise ValueError("row values must fit int32")
         canonical = np.ascontiguousarray(array, dtype=np.dtype("<i4"))
-        digest.update(canonical.tobytes(order="C"))
+        digest.update(canonical)
         actual_count += 1
 
     if actual_count != row_count:

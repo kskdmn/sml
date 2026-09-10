@@ -69,37 +69,45 @@ def append_kv_state(
     in_bounds = (positions >= 0) & (positions < capacity)
     write_mask = valid_mask & in_bounds
     batch_size, query_length = positions.shape
-    safe_positions = mx.where(in_bounds, positions, mx.zeros_like(positions))
-    batch_indices = mx.broadcast_to(
-        mx.arange(batch_size, dtype=mx.int32)[:, None],
-        positions.shape,
-    )
-    token_indices = mx.broadcast_to(
-        mx.arange(query_length, dtype=mx.int32)[None, :],
-        positions.shape,
-    )
-    priorities = mx.where(
-        write_mask,
-        token_indices,
-        mx.full(positions.shape, -1, dtype=mx.int32),
-    )
-    last_valid_token = (
-        mx.full(
-            (batch_size, capacity),
-            -1,
-            dtype=mx.int32,
+    slot_indices = mx.arange(capacity, dtype=mx.int32)[None, :]
+    if query_length == 1:
+        # Decode has one candidate per row, so no duplicate-write arbitration
+        # or capacity-sized payload gathers are needed.
+        written_slots = ((slot_indices == positions) & write_mask)[:, None, :, None]
+        selected_keys = keys
+        selected_values = values
+    else:
+        safe_positions = mx.where(in_bounds, positions, mx.zeros_like(positions))
+        batch_indices = mx.broadcast_to(
+            mx.arange(batch_size, dtype=mx.int32)[:, None],
+            positions.shape,
         )
-        .at[batch_indices, safe_positions]
-        .maximum(priorities)
-    )
-    selected_token = mx.maximum(last_valid_token, 0)
-    selected_indices = mx.broadcast_to(
-        selected_token[:, None, :, None],
-        cached_keys.shape,
-    )
-    selected_keys = mx.take_along_axis(keys, selected_indices, axis=2)
-    selected_values = mx.take_along_axis(values, selected_indices, axis=2)
-    written_slots = last_valid_token[:, None, :, None] >= 0
+        token_indices = mx.broadcast_to(
+            mx.arange(query_length, dtype=mx.int32)[None, :],
+            positions.shape,
+        )
+        priorities = mx.where(
+            write_mask,
+            token_indices,
+            mx.full(positions.shape, -1, dtype=mx.int32),
+        )
+        last_valid_token = (
+            mx.full(
+                (batch_size, capacity),
+                -1,
+                dtype=mx.int32,
+            )
+            .at[batch_indices, safe_positions]
+            .maximum(priorities)
+        )
+        selected_token = mx.maximum(last_valid_token, 0)
+        selected_indices = mx.broadcast_to(
+            selected_token[:, None, :, None],
+            cached_keys.shape,
+        )
+        selected_keys = mx.take_along_axis(keys, selected_indices, axis=2)
+        selected_values = mx.take_along_axis(values, selected_indices, axis=2)
+        written_slots = last_valid_token[:, None, :, None] >= 0
     updated_keys = mx.where(
         written_slots,
         selected_keys,
@@ -123,7 +131,6 @@ def append_kv_state(
         value_layers[:layer_index] + (updated_values,) + value_layers[layer_index + 1 :]
     )
     returned_state = updated_key_layers, updated_value_layers, updated_lengths
-    slot_indices = mx.arange(capacity, dtype=mx.int32)[None, :]
     view = KVView(
         keys=updated_keys,
         values=updated_values,

@@ -183,6 +183,51 @@ def test_forward_arrays_uses_explicit_parameters_without_installing_them():
     _assert_close(logits, mx.zeros_like(logits))
 
 
+@pytest.mark.parametrize("tie_word_embeddings", [True, False])
+def test_selective_logits_match_full_projection_and_preserve_cached_state(
+    tie_word_embeddings,
+):
+    model = SMLLanguageModel(
+        _tiny_model_config(tie_word_embeddings=tie_word_embeddings),
+        key=mx.random.key(17),
+    )
+    input_ids = mx.array([[1, 4, 5, 3], [1, 6, 3, 3]], dtype=mx.int32)
+    attention_mask = mx.array([[True, True, True, False], [True, True, False, False]])
+    selected_positions = mx.array([[2], [1]], dtype=mx.int32)
+    cache = KVCache.allocate(model.config, 2, 8, mx.bfloat16)
+
+    def forward(parameters, selected_positions):
+        return model.forward_arrays(
+            parameters,
+            input_ids,
+            attention_mask=attention_mask,
+            positions=None,
+            cache_state=cache.state,
+            training=False,
+            key=None,
+            logits_positions=selected_positions,
+        )
+
+    full_logits, full_cache, _key = mx.compile(forward)(model.parameters(), None)
+    selected_logits, selected_cache, _key = mx.compile(forward)(
+        model.parameters(), selected_positions
+    )
+
+    assert selected_logits.shape == (2, 1, model.config.vocab_size)
+    _assert_close(
+        selected_logits,
+        mx.take_along_axis(full_logits, selected_positions[:, :, None], axis=1),
+        atol=2e-3,
+        rtol=2e-3,
+    )
+    for actual, expected in zip(
+        (*selected_cache[0], *selected_cache[1], selected_cache[2]),
+        (*full_cache[0], *full_cache[1], full_cache[2]),
+        strict=True,
+    ):
+        _assert_close(actual, expected)
+
+
 def test_forward_arrays_rejects_lora_policy_entry_for_plain_projection():
     model = SMLLanguageModel(_tiny_model_config(), key=mx.random.key(17))
     model.lora_forward_policy = LoRAForwardPolicy(
