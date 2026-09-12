@@ -370,6 +370,7 @@ def test_harness_identity_hashes_every_component_in_fixed_order(tmp_path: Path):
         Path("v2/benchmarks/analysis.py"),
         Path("v2/benchmarks/adapters/runtime.py"),
         Path("v2/benchmarks/adapters/native.py"),
+        Path("v2/benchmarks/adapters/execution_order.py"),
         Path("v2/benchmarks/adapters/prepared_data.py"),
         Path("v2/benchmarks/adapters/native_training.py"),
         Path("v2/benchmarks/adapters/native_inference.py"),

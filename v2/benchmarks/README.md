@@ -11,7 +11,13 @@ Both sides receive identical deterministic parameters, inputs, and logical work
 order. Training uses FP32 authoritative parameters and Adam moments with BF16
 working parameters. The harness verifies parameter values, canonical projections,
 input identities, native representations, and execution order before accepting
-measurements. Its content identity covers the ordered source files listed in
+measurements. Execution order is checked after timing against the inputs actually
+delivered to each operation, including every transferred row, SWAG label and mask,
+inference request, completed optimizer update, and published checkpoint step.
+The timed path retains input references and delivered cursors or IDs; input
+comparisons and identity hashing run after timing and peak-memory sampling. A
+reordered, duplicated, or missing unit rejects the measurement before publication.
+Its content identity covers the ordered source files listed in
 `workload.HARNESS_COMPONENTS`; changing them requires a new baseline.
 
 All nine metrics execute real production operations:
@@ -35,7 +41,11 @@ matching the production kernels and quality runs. Changes to this harness requir
 fresh baseline and quality evidence under their updated content identities.
 Inference measures encoded model primitives; tokenization and
 public-session scheduling are outside its timing boundaries. Decode uses a fixed
-transition count without early EOS termination. Each checkpoint publication
+transition count without early EOS termination. Prefill projects only the final
+prompt position to vocabulary logits, matching production generation. These
+prefill and observed-order changes require fresh baseline measurements under the
+new harness content identity; they do not change the raw-trial schema.
+Each checkpoint publication
 follows a real optimizer update, which is outside the timed pause. Checkpoints
 carry the fixed benchmark tokenizer specification; this metric does not load
 SentencePiece. Prepared-data setup lives in `adapters/prepared_data.py` and calls

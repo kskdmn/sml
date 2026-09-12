@@ -225,6 +225,8 @@ def test_every_native_metric_measurement_satisfies_trial_validators(metric):
     )
     native = replacement.resolve_native_workload(metric, workload, Path.cwd())
     assert isinstance(native, replacement.NativeWorkload)
+    with pytest.raises(RuntimeError, match="not been verified"):
+        _ = native.execution_order_identity
     expected_work = {
         "prepared-data": 2.0,
         "pretraining-compute": 32.0,

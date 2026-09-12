@@ -468,6 +468,75 @@ def test_preparation_rejects_invalid_processor_token_ids_before_publication(
     assert not output.exists()
 
 
+@pytest.mark.parametrize("failure", ["invalid-zstd", "truncated-zstd", "invalid-json"])
+def test_preparation_reports_corpus_failures_as_cli_data_errors(
+    prepared_sources, tmp_path, capsys, failure
+):
+    from sml.cli import main
+
+    tokenizer, _corpus = prepared_sources
+    corpus = tmp_path / "invalid-source"
+    corpus.mkdir()
+    source = corpus / "tiny-0000.jsonl.zst"
+    payload = (
+        json.dumps({"text": "alpha beta gamma delta epsilon " * 8}) + "\n"
+    ).encode()
+    compressor = zstd.ZstdCompressor(write_checksum=True)
+    if failure == "invalid-zstd":
+        source.write_bytes(b"not a zstd frame")
+    elif failure == "truncated-zstd":
+        source.write_bytes(compressor.compress(payload)[:-1])
+    else:
+        source.write_bytes(compressor.compress(payload + b"not-json\n"))
+    output = tmp_path / "prepared"
+    code = main(
+        [
+            "prepare",
+            "pretraining",
+            "--input",
+            str(corpus),
+            "--tokenizer",
+            str(tokenizer.path),
+            "--output",
+            str(output),
+            "--sequence-length",
+            "8",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 4
+    assert "SMLDataError:" in captured.err
+    assert str(source) in captured.err
+    assert "invalid token IDs" not in captured.err
+    assert "Traceback" not in captured.err
+    if failure == "invalid-json":
+        assert "at line 2" in captured.err
+    assert not output.exists()
+
+
+def test_preparation_hashes_shard_payloads_during_write(
+    prepared_sources, tmp_path, monkeypatch
+):
+    original_payload_ref = pretraining_module._payload_ref
+
+    def copied_tokenizer_reference(path, logical_path):
+        assert path.suffix != ".npy", (
+            "completed shards must not be reopened for hashing"
+        )
+        return original_payload_ref(path, logical_path)
+
+    monkeypatch.setattr(pretraining_module, "_payload_ref", copied_tokenizer_reference)
+    bundle = prepare_pretraining_bundle(
+        _config(prepared_sources), tmp_path / "prepared"
+    )
+    for reference in bundle.manifest.shards:
+        path = bundle.path / reference.logical_path
+        with path.open("rb") as stream:
+            assert file_identity(stream) == reference.identity
+        assert path.stat().st_size == reference.byte_size
+    verify_artifact(bundle.path, full=True)
+
+
 def test_public_pretraining_rows_remain_safe_after_stream_close_in_subprocess(
     prepared_bundle,
 ):

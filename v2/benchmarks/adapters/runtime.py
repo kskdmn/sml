@@ -12,9 +12,10 @@ from pathlib import Path
 from v2.benchmarks.schema import CanonicalWorkload, JsonValue, MetricName
 from v2.benchmarks.workload import (
     PRECISION_POLICY,
-    canonical_execution_order_identity,
+    canonical_execution_order,
     canonical_input_identity,
     canonical_metric_projection,
+    execution_order_identity,
 )
 
 
@@ -28,10 +29,18 @@ class NativeWorkload:
     canonical_row_identity: str
     canonical_input_identity: str
     canonical_projection: dict[str, JsonValue]
-    execution_order_identity: str
     initial_parameter_identity: str
     startup_verification_seconds: float
     runtime: object
+
+    @property
+    def execution_order_identity(self) -> str:
+        identity = self.runtime.execution_order_identity
+        if identity is None:
+            raise RuntimeError(
+                "benchmark execution order has not been verified after measurement"
+            )
+        return identity
 
 
 def resolve_native_workload(metric, canonical_workload, source_root):
@@ -58,12 +67,13 @@ def resolve_native_workload(metric, canonical_workload, source_root):
             metric, canonical_workload
         ),
         "canonical_projection": canonical_metric_projection(metric, canonical_workload),
-        "execution_order_identity": canonical_execution_order_identity(
-            metric, canonical_workload
-        ),
         "verification_level": "full",
     }
     try:
+        if runtime.execution_order_identity is not None:
+            raise RuntimeError(
+                "benchmark runtime claims execution order before measurement"
+            )
         for name, value in expected.items():
             if getattr(runtime, name) != value:
                 raise RuntimeError(f"benchmark runtime has invalid {name}")
@@ -84,7 +94,6 @@ def resolve_native_workload(metric, canonical_workload, source_root):
             canonical_row_identity=runtime.canonical_row_identity,
             canonical_input_identity=runtime.canonical_input_identity,
             canonical_projection=runtime.canonical_projection,
-            execution_order_identity=runtime.execution_order_identity,
             initial_parameter_identity=runtime.initial_parameter_identity,
             startup_verification_seconds=elapsed,
             runtime=runtime,
@@ -106,7 +115,26 @@ def run_warmup(metric, native_workload, units):
 def run_measured(metric, native_workload, units):
     if metric != native_workload.metric:
         raise ValueError("metric does not match native workload")
-    reset = getattr(native_workload.runtime, "reset_measured_order", None)
-    if reset is not None:
-        reset()
     return float(native_workload.runtime.run(units))
+
+
+def begin_measured_order(metric, native_workload):
+    if metric != native_workload.metric:
+        raise ValueError("metric does not match native workload")
+    native_workload.runtime.execution_order_identity = None
+    native_workload.runtime.reset_measured_order()
+
+
+def verify_measured_order(metric, native_workload):
+    if metric != native_workload.metric:
+        raise ValueError("metric does not match native workload")
+    native_workload.runtime.execution_order_identity = None
+    observed = native_workload.runtime.observed_execution_order()
+    expected = canonical_execution_order(metric, native_workload.canonical_workload)
+    if observed != expected:
+        raise RuntimeError(
+            "benchmark observed execution order differs from canonical work"
+        )
+    native_workload.runtime.execution_order_identity = execution_order_identity(
+        metric, native_workload.canonical_workload, observed
+    )

@@ -30,6 +30,7 @@ from sml.data.pretraining import (
 )
 from sml.errors import SMLArtifactError
 
+from v2.benchmarks.adapters.execution_order import ObservedBatch, verify_input_batches
 from v2.benchmarks.schema import CanonicalWorkload
 from v2.benchmarks.workload import (
     PRECISION_POLICY,
@@ -303,6 +304,12 @@ class _PreparedDataBenchmarkRuntime:
         batch_size: int,
     ) -> None:
         self._batch_size = _require_plain_positive_int(batch_size, "batch_size")
+        self._observed_batches: list[ObservedBatch] = []
+        self._canonical_rows = fixed_canonical_rows(
+            row_count=int(canonical_workload.loader["row_count"]),
+            row_width=int(canonical_workload.loader["sequence_length"]) + 1,
+            vocab_size=int(canonical_workload.model["vocab_size"]),
+        )
         self._operation_lock = threading.RLock()
         self._state_lock = threading.Lock()
         self._closed = False
@@ -369,17 +376,22 @@ class _PreparedDataBenchmarkRuntime:
                         ) from error
                     try:
                         device_rows = self._mx.array(envelope.rows)
+                        cursor = envelope.cursor_after
                     finally:
                         envelope.release()
                     input_ids = device_rows[:, :-1]
                     labels = device_rows[:, 1:]
                     self._mx.eval(input_ids, labels)
+                    self._observed_batches.append(
+                        ObservedBatch({"rows": device_rows}, cursor=cursor)
+                    )
                 return float(units)
             finally:
                 stream.close()
 
     def reset_after_warmup(self) -> None:
         with self._operation_lock:
+            self._observed_batches.clear()
             with self._state_lock:
                 if self._closed:
                     raise RuntimeError("prepared-data benchmark runtime is closed")
@@ -403,6 +415,14 @@ class _PreparedDataBenchmarkRuntime:
                 raise RuntimeError(
                     "prepared-data measured stream is not ready at canonical order"
                 )
+            self._observed_batches.clear()
+
+    def observed_execution_order(self) -> tuple[int, ...]:
+        return verify_input_batches(
+            self._observed_batches,
+            {"rows": self._canonical_rows},
+            batch_size=self._batch_size,
+        )
 
     def close(self) -> None:
         with self._operation_lock:
@@ -485,7 +505,7 @@ def build_prepared_data_benchmark_workload(
         runtime.canonical_projection = canonical_metric_projection(
             _BENCHMARK_METRIC, workload
         )
-        runtime.execution_order_identity = execution_identity
+        runtime.execution_order_identity = None
         runtime.initial_parameter_identity = workload.semantic_identities[
             "initial_bf16_parameters"
         ]

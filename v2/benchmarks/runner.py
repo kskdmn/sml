@@ -3870,6 +3870,9 @@ def measure_native_process(
             adapter.run_warmup(metric, native_workload, 1)
             synchronize()
 
+    begin_order = getattr(adapter, "begin_measured_order", None)
+    if begin_order is not None:
+        begin_order(metric, native_workload)
     reset_peak_memory()
     synchronize()
     if prepare_unit is None:
@@ -3892,6 +3895,9 @@ def measure_native_process(
     if elapsed <= 0:
         raise RuntimeError("benchmark clock did not advance")
     peak = int(peak_memory())
+    verify_order = getattr(adapter, "verify_measured_order", None)
+    if verify_order is not None:
+        verify_order(metric, native_workload)
 
     if metric == "peak-metal-memory":
         value = float(peak)

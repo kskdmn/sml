@@ -1390,22 +1390,62 @@ def test_swag_stream_thread_constructor_failure_closes_owned_bundle(
         bundle.close()
 
 
-def test_swag_stream_past_end_cursor_closes_on_later_epoch_exhaustion(tmp_path):
+@pytest.mark.parametrize("position,offset", [(1, 0), (99, 0), (0, 1), (0, 99)])
+def test_swag_stream_rejects_noncanonical_cursor_before_thread_start(
+    tmp_path, monkeypatch, position, offset
+):
     from sml.data.swag import SwagBatchStream, SwagCursor
 
     bundle = _one_example_bundle(tmp_path)
-    stream = SwagBatchStream(
-        bundle,
-        _one_example_loader(),
-        cursor=SwagCursor(epoch=0, bucket_order_position=99, row_offset=0),
-    )
+
+    def forbidden_thread(*_args, **_kwargs):
+        raise AssertionError("thread created before cursor validation")
+
+    monkeypatch.setattr("sml.data.swag.threading.Thread", forbidden_thread)
     try:
-        with pytest.raises(StopIteration):
-            next(stream)
-        assert stream._closed
+        with pytest.raises(SMLDataError, match="SWAG cursor.*beyond"):
+            SwagBatchStream(
+                bundle,
+                _one_example_loader(),
+                cursor=SwagCursor(
+                    epoch=0, bucket_order_position=position, row_offset=offset
+                ),
+            )
         assert bundle._closed
     finally:
-        stream.close()
+        bundle.close()
+
+
+def test_swag_stream_commits_only_delivered_monotonic_cursors(tmp_path):
+    from sml.data.swag import SwagBatchStream, SwagCursor, prepare_swag_bundle
+
+    bundle = prepare_swag_bundle(
+        tiny_swag_config(FakeSwagProvider((VALID_ROW,) * 3)),
+        tiny_base_model(),
+        tmp_path / "swag",
+    )
+    with SwagBatchStream(
+        bundle, _one_example_loader(), cursor=SwagCursor.initial()
+    ) as stream:
+        stream.commit(SwagCursor.initial())
+        with pytest.raises(SMLDataError, match="not delivered"):
+            stream.commit(SwagCursor(1, 0, 0))
+        first = next(stream)
+        second = next(stream)
+        first_cursor, second_cursor = first.cursor_after, second.cursor_after
+        first.release()
+        second.release()
+        stream.commit(second_cursor)
+        stream.commit(second_cursor)
+        with pytest.raises(SMLDataError, match="regress"):
+            stream.commit(first_cursor)
+        with pytest.raises(SMLDataError, match="not delivered"):
+            stream.commit(SwagCursor(1, 0, 0))
+        final = next(stream)
+        final_cursor = final.cursor_after
+        final.release()
+        stream.commit(final_cursor)
+        assert stream.committed_cursor == SwagCursor(1, 0, 0)
 
 
 def test_swag_stream_rejects_an_already_closed_bundle(tmp_path):

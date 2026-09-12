@@ -59,6 +59,7 @@ from sml.artifacts.manifest import (
     _parse_manifest,
     _reject_json_constant,
     _same_stable_entry,
+    _validated_payload_references,
     canonical_json_bytes,
     parse_logical_path,
     structured_identity,
@@ -1080,6 +1081,32 @@ def _verify_pretraining_nested_tokenizer(
         raise SMLArtifactError("nested tokenizer vocab does not match parent manifest")
 
 
+class _PublicationPayloadProofs:
+    """Reuse hashes only within publication of one retained APFS directory."""
+
+    def __init__(self, descriptor: int) -> None:
+        self._directory_stat = os.fstat(descriptor)
+        self._payload_stats: dict[PayloadRef, os.stat_result] = {}
+
+    def verify(self, root: ArtifactRoot, references: Sequence[PayloadRef]) -> None:
+        if not _same_inode(self._directory_stat, os.fstat(root.fileno())):
+            raise SMLArtifactError(
+                "publication payload proof belongs to another directory"
+            )
+        for reference in _validated_payload_references(references):
+            previous = self._payload_stats.get(reference)
+            if previous is not None:
+                with _open_stable_payload(root, reference.logical_path) as payload:
+                    unchanged = _same_stable_entry(previous, payload.opened_stat)
+                if unchanged:
+                    continue
+            with _open_verified_payload(
+                root, reference, VerificationLevel.FULL
+            ) as payload:
+                verified_stat = payload.opened_stat
+            self._payload_stats[reference] = verified_stat
+
+
 def _verify_closed_world(
     fs: FilesystemOps,
     temporary_descriptor: int,
@@ -1088,6 +1115,7 @@ def _verify_closed_world(
     manifest_present: bool,
     full: bool = True,
     verify_contents: bool = True,
+    payload_proofs: _PublicationPayloadProofs | None = None,
 ) -> None:
     if not isinstance(verify_contents, bool):
         raise TypeError("verify_contents must be a bool")
@@ -1139,7 +1167,10 @@ def _verify_closed_world(
             os.dup(temporary_descriptor), local_apfs=True
         ) as artifact_root:
             if verify_contents:
-                artifact_root.verify_payloads(references, full=full)
+                if full and payload_proofs is not None:
+                    payload_proofs.verify(artifact_root, references)
+                else:
+                    artifact_root.verify_payloads(references, full=full)
             if manifest_present:
                 with artifact_root.open_payload(
                     manifest.MANIFEST_FILENAME
@@ -1206,6 +1237,7 @@ def _validate_builder_result(
     fs: FilesystemOps,
     *,
     defer_checkpoint_proof: bool = False,
+    payload_proofs: _PublicationPayloadProofs | None = None,
 ) -> object:
     if type(manifest) not in _MANIFEST_TYPES:
         raise SMLArtifactError("builder returned an unsupported artifact manifest")
@@ -1228,6 +1260,7 @@ def _validate_builder_result(
         manifest_present=False,
         # Checkpoint semantic verification owns the full payload proof below.
         verify_contents=not checkpoint_manifest,
+        payload_proofs=payload_proofs,
     )
     if checkpoint_manifest and not defer_checkpoint_proof:
         _verify_checkpoint_semantics(
@@ -1342,8 +1375,12 @@ def _publish_with_lock[M](
             dir_fd=parent_descriptor,
         )
         temporary_path = parent / temporary_name
+        payload_proofs = _PublicationPayloadProofs(temporary_descriptor)
         manifest = _validate_builder_result(
-            build(temporary_path), temporary_descriptor, fs
+            build(temporary_path),
+            temporary_descriptor,
+            fs,
+            payload_proofs=payload_proofs,
         )
         _make_payload_tree_durable(fs, temporary_descriptor)
         _write_manifest_last(fs, temporary_descriptor, manifest)
@@ -1358,6 +1395,7 @@ def _publish_with_lock[M](
                 temporary_descriptor,
                 manifest,
                 manifest_present=True,
+                payload_proofs=payload_proofs,
             )
             return _accept_existing(
                 target,
@@ -1372,6 +1410,7 @@ def _publish_with_lock[M](
             temporary_descriptor,
             manifest,
             manifest_present=True,
+            payload_proofs=payload_proofs,
         )
         _require_named_directory_inode(
             fs,
@@ -1405,6 +1444,7 @@ def _publish_with_lock[M](
             temporary_descriptor,
             manifest,
             manifest_present=True,
+            payload_proofs=payload_proofs,
         )
         _require_named_directory_inode(
             fs,

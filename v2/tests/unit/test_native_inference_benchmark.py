@@ -69,9 +69,10 @@ def test_native_prefill_matches_public_cached_model(workload, tmp_path):
         mx.array(runtime.prompts[0][None, :], dtype=mx.int32), cache=cache
     )
     runtime.run(1)
+    assert runtime.last_output[0].shape == (1, 1, runtime.config.vocab_size)
     np.testing.assert_allclose(
         np.asarray(runtime.last_output[0].astype(mx.float32)),
-        np.asarray(expected.logits.astype(mx.float32)),
+        np.asarray(expected.logits[:, -1:, :].astype(mx.float32)),
         rtol=0.02,
         atol=0.002,
     )

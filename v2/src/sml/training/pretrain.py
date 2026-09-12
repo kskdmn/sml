@@ -454,6 +454,7 @@ def read_scalar_state(resolved: ResolvedStep) -> ScalarTrainingState:
         resolved.step_directory.parent.parent,
         step=resolved.step,
         expected_checkpoint_identity=resolved.checkpoint.identity,
+        load_array_groups=frozenset(),
     ) as reader:
         contents = reader.read_contents()
         return _parse_scalar_document(
@@ -521,14 +522,23 @@ def _flatten_checkpoint_groups(
 
 
 def _require_empty_trainer_state(trainer: TrainerState) -> None:
-    mx.eval(trainer.to_tree())
-    if int(trainer.accumulation_count.item()) != 0:
+    empty_accumulators = mx.all(
+        mx.stack(
+            [mx.all(value == 0) for _, value in tree_flatten(trainer.accumulators)]
+        )
+    )
+    empty_count, empty_loss, empty_gradients = mx.stack(
+        (
+            trainer.accumulation_count == 0,
+            trainer.loss_numerator == 0,
+            empty_accumulators,
+        )
+    ).tolist()
+    if not empty_count:
         raise SMLArtifactError("checkpoint trainer accumulation must be empty")
-    if float(trainer.loss_numerator.item()) != 0.0:
+    if not empty_loss:
         raise SMLArtifactError("checkpoint trainer loss numerator must be empty")
-    if any(
-        bool(mx.any(value != 0)) for _name, value in tree_flatten(trainer.accumulators)
-    ):
+    if not empty_gradients:
         raise SMLArtifactError("checkpoint trainer accumulators must be empty")
 
 
@@ -1164,6 +1174,9 @@ def resume(
                     validate_full_run_semantics(reader, tokenizer.manifest)
                 restored = _restore_checkpoint(reader)
                 resolved = reader.resolved
+            # The closed reader still owns its loaded arrays. Release it before
+            # updates replace the restored weights and optimizer moments.
+            del reader
             scalar = restored.scalar
             try:
                 canonical_cursor = canonicalize_pretraining_cursor(

@@ -8,7 +8,6 @@ from tempfile import TemporaryDirectory
 
 from v2.benchmarks.workload import (
     PRECISION_POLICY,
-    canonical_execution_order_identity,
     canonical_input_identity,
     canonical_metric_projection,
     structured_identity,
@@ -61,9 +60,7 @@ class NativeRuntime:
             self.canonical_input_identity = canonical_input_identity(metric, workload)
             if self._runtime.canonical_input_identity != self.canonical_input_identity:
                 raise ValueError("native benchmark input verification failed")
-            self.execution_order_identity = canonical_execution_order_identity(
-                metric, workload
-            )
+            self.execution_order_identity = None
             self.verification_level = "full"
         except BaseException:
             self.close()

@@ -34,6 +34,7 @@ from sml.training.pretrain import (
 )
 from sml.training.random import counter_random_key
 
+from v2.benchmarks.adapters.execution_order import ObservedBatch, verify_input_batches
 from v2.benchmarks.adapters.prepared_data import _materialize_bundle
 from v2.benchmarks.parameters import initialize_parameters
 from v2.benchmarks.workload import fixed_canonical_rows
@@ -90,6 +91,7 @@ class PretrainingRuntime:
         if set(workload.loader) != expected_loader:
             raise ValueError("native training loader has unsupported fields")
         self.workload = workload
+        self.metric = metric
         self.bundle = _materialize_bundle(workload, directory / "data")
         self.native_representation_identity = self.bundle.manifest.identity
         self.canonical_input_identity = workload.semantic_identities[
@@ -153,20 +155,31 @@ class PretrainingRuntime:
         self.stream = None
         self.epoch = 0
         self.row_index = 0
+        self._observed_batches: list[ObservedBatch] = []
+        self._completed_steps: list[mx.array] = []
+        self._starting_step = 0
+        self._canonical_rows = fixed_canonical_rows(
+            row_count=int(workload.loader["row_count"]),
+            row_width=self.sequence_length + 1,
+            vocab_size=int(workload.model["vocab_size"]),
+        )
         # Compute-only measurements start with inputs already resident on device.
         self.device_batches = []
+        self._device_batch_ids: dict[int, tuple[int, ...]] = {}
         if not self.include_loader:
-            rows = fixed_canonical_rows(
-                row_count=int(workload.loader["row_count"]),
-                row_width=self.sequence_length + 1,
-                vocab_size=int(workload.model["vocab_size"]),
-            )
+            rows = self._canonical_rows
             if len(rows) % self.batch_size:
                 raise ValueError("canonical compute rows must form complete batches")
             self.device_batches = [
                 mx.array(np.ascontiguousarray(rows[index : index + self.batch_size]))
                 for index in range(0, len(rows), self.batch_size)
             ]
+            self._device_batch_ids = {
+                id(batch): tuple(
+                    range(index * self.batch_size, (index + 1) * self.batch_size)
+                )
+                for index, batch in enumerate(self.device_batches)
+            }
             mx.eval(self.device_batches)
         else:
             self._open_stream(PretrainingCursor.initial())
@@ -207,6 +220,13 @@ class PretrainingRuntime:
                 result = self.kernels.microstep(
                     self.state.parameters, self.state.trainer, rows
                 )
+                self._observed_batches.append(
+                    ObservedBatch(
+                        {"rows": rows},
+                        work_ids=self._device_batch_ids.get(id(rows)),
+                        cursor=cursor if self.include_loader else None,
+                    )
+                )
                 self.state.parameters = result.parameters
                 self.state.trainer = result.trainer
                 del result
@@ -218,6 +238,7 @@ class PretrainingRuntime:
             self.state.trainer = updated.trainer
             self.model.update(updated.parameters.working_parameters)
             self.last_metrics = updated.metrics
+            self._completed_steps.append(updated.optimizer.step)
             del updated
             self.state.scalar = ScalarTrainingState(
                 self.state.scalar.step + 1,
@@ -234,12 +255,33 @@ class PretrainingRuntime:
     def reset_measured_order(self):
         consumed = self.row_index > 0
         self.row_index = 0
+        self._observed_batches.clear()
+        self._completed_steps.clear()
+        self._starting_step = self.state.scalar.step
         if self.stream is not None and consumed:
             self.stream.close()
             self._open_stream(PretrainingCursor.initial())
 
     def reset_after_warmup(self):
         self.reset_measured_order()
+
+    def observed_execution_order(self) -> tuple[int, ...]:
+        rows = verify_input_batches(
+            self._observed_batches,
+            {"rows": self._canonical_rows},
+            batch_size=self.batch_size,
+        )
+        steps = tuple(
+            int(step.item()) - self._starting_step - 1 for step in self._completed_steps
+        )
+        if (
+            steps != tuple(range(len(steps)))
+            or len(rows) != len(steps) * self.accumulation_steps * self.batch_size
+        ):
+            raise RuntimeError(
+                "benchmark observed optimizer updates differ from canonical work"
+            )
+        return steps if self.metric == "compile-cold-start" else rows
 
     def close(self):
         if self.stream is not None:
@@ -278,6 +320,8 @@ class CheckpointRuntime:
 
         publish_run(self.path, build)
         self.prepared = False
+        self._published_steps: list[int] = []
+        self._starting_step = self.training.state.scalar.step
 
     def prepare_measured_unit(self):
         if self.prepared:
@@ -289,9 +333,35 @@ class CheckpointRuntime:
         for _ in range(units):
             if not self.prepared:
                 self.prepare_measured_unit()
-            _publish_training_state(self.path, self.manifest, self.training.state)
+            published = _publish_training_state(
+                self.path, self.manifest, self.training.state
+            )
+            self._published_steps.append(published.step)
             self.prepared = False
         return float(units)
+
+    def reset_measured_order(self):
+        if self.prepared:
+            raise RuntimeError("cannot reset a prepared checkpoint unit")
+        self.training.reset_measured_order()
+        self._published_steps.clear()
+        self._starting_step = self.training.state.scalar.step
+
+    def reset_after_warmup(self):
+        self.reset_measured_order()
+
+    def observed_execution_order(self) -> tuple[int, ...]:
+        rows = self.training.observed_execution_order()
+        if (
+            len(rows)
+            != len(self._published_steps)
+            * self.training.accumulation_steps
+            * self.training.batch_size
+        ):
+            raise RuntimeError(
+                "benchmark observed checkpoint inputs differ from published work"
+            )
+        return tuple(step - self._starting_step - 1 for step in self._published_steps)
 
     def close(self):
         self.training.close()

@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import io
 import itertools
-import json
 import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
-
-import zstandard as zstd
 
 from sml.artifacts.checkpoint import publish_immutable_bundle
 from sml.artifacts.manifest import (
@@ -234,13 +231,10 @@ class _TokenizerCorpusTexts:
         try:
             files = discover_corpus_files(config)
             yield from iter_filtered_texts(config, files)
-        except (OSError, ValueError, RuntimeError) as error:
-            # The corpus reader preserves JSON/zstd format errors as their
-            # causes. Keep unrelated programming errors visible.
-            if not isinstance(error, OSError) and not isinstance(
-                error.__cause__, (json.JSONDecodeError, zstd.ZstdError)
-            ):
-                raise
+        except SMLDataError as error:
+            self.error = error
+            raise
+        except OSError as error:
             self.error = SMLDataError(f"Could not read tokenizer corpus: {error}")
             raise self.error from error
 

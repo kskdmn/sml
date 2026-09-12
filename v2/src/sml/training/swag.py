@@ -51,8 +51,14 @@ from sml.data.swag import (
     SwagCursor,
     SwagDataBundle,
     load_swag_bundle,
+    validate_swag_cursor,
 )
-from sml.errors import SMLArtifactError, SMLConfigurationError, SMLRuntimeError
+from sml.errors import (
+    SMLArtifactError,
+    SMLConfigurationError,
+    SMLDataError,
+    SMLRuntimeError,
+)
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
 from sml.model.layers import LoRAForwardPolicy
@@ -922,7 +928,14 @@ def _flatten_checkpoint_groups(
 
 
 def _require_empty_trainer_state(trainer: SwagTrainerState) -> None:
-    mx.eval(trainer.to_tree())
+    empty = (
+        trainer.valid_count == 0,
+        trainer.loss_numerator == 0.0,
+        trainer.correct_count == 0,
+        *(mx.all(value == 0) for _name, value in tree_flatten(trainer.accumulators)),
+    )
+    if bool(mx.all(mx.stack(empty))):
+        return
     if int(trainer.valid_count.item()) != 0:
         raise SMLArtifactError("checkpoint trainer accumulation must be empty")
     if float(trainer.loss_numerator.item()) != 0.0:
@@ -1222,6 +1235,7 @@ def _run_training(
             and scalar.cursor.epoch >= config.maximum_epochs
         ):
             break
+        initial_cursor = scalar.cursor
         with SwagBatchStream._borrowing_bundle(
             bundle, config.loader, cursor=scalar.cursor
         ) as stream:
@@ -1259,6 +1273,8 @@ def _run_training(
                 if _limit_reached(config, scalar):
                     break
             complete_update(stream)
+        if scalar.cursor == initial_cursor:
+            raise SMLRuntimeError("SWAG training stream made no progress")
 
     final_state = _RestoredSwagState(adapters, frozen_base, optimizer, trainer, scalar)
     if last_published_step != scalar.step:
@@ -1475,6 +1491,15 @@ def resume_finetune(
                         full=True,
                     )
                     validate_full_run_semantics(reader, tokenizer.manifest)
+                scalar = _read_scalar_state(reader)
+                try:
+                    validate_swag_cursor(
+                        scalar.cursor, bundle, epoch_seed=config.loader.epoch_seed
+                    )
+                except SMLDataError as error:
+                    raise SMLArtifactError(
+                        f"invalid checkpoint SWAG cursor: {error}"
+                    ) from error
                 with reader.open_run_child("base", (BaseSnapshotManifest,)) as base:
                     require_lora_base_snapshot(base.manifest, resolved.run)
                     base_arrays = _load_base_snapshot_arrays(base)

@@ -78,6 +78,7 @@ def test_model_config_normalizes_initializer_mapping_but_preserves_explicit_conf
         ({"pad_token_id": 64, "vocab_size": 64}, "pad_token_id", ValueError),
         ({"pad_token_id": 1, "bos_token_id": 1}, "unique", ValueError),
         ({"use_cache": 1}, "use_cache", TypeError),
+        ({"use_cache": False}, "use_cache=False is unsupported", ValueError),
     ],
 )
 def test_model_config_rejects_invalid_geometry_scales_and_special_tokens(

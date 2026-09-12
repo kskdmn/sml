@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import zstandard as zstd
 from sml.data.corpus import CorpusConfig, discover_corpus_files, iter_filtered_texts
+from sml.errors import SMLDataError
 
 
 def _write_zstd_jsonl(path: Path, lines: list[bytes]) -> None:
@@ -107,7 +108,7 @@ def test_filtered_texts_is_lazy_and_reports_one_based_malformed_json_line(tmp_pa
         (shard,),
     )
 
-    with pytest.raises(ValueError, match=r"broken\.jsonl\.zst at line 3"):
+    with pytest.raises(SMLDataError, match=r"broken\.jsonl\.zst at line 3"):
         list(texts)
 
 
@@ -141,7 +142,7 @@ def test_full_corpus_read_rejects_truncated_frame(tmp_path, missing_bytes):
     shard.write_bytes(compressed[:-missing_bytes])
     config = CorpusConfig(input_root=tmp_path, min_text_bytes=1, max_rows_per_file=None)
 
-    with pytest.raises(RuntimeError, match="truncated.*incomplete zstd frame"):
+    with pytest.raises(SMLDataError, match="truncated.*incomplete zstd frame"):
         list(iter_filtered_texts(config, (shard,)))
 
 
@@ -155,7 +156,7 @@ def test_corpus_reads_concatenated_frames_and_checks_final_frame(tmp_path):
     assert list(iter_filtered_texts(config, (shard,))) == ["first", "second"]
 
     shard.write_bytes(first + second[:-1])
-    with pytest.raises(RuntimeError, match="incomplete zstd frame"):
+    with pytest.raises(SMLDataError, match="incomplete zstd frame"):
         list(iter_filtered_texts(config, (shard,)))
 
 

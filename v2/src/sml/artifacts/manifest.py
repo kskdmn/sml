@@ -159,6 +159,30 @@ def file_identity(file: BinaryIO) -> str:
     return f"sha256:{digest.hexdigest()}"
 
 
+class _HashingWriter:
+    """Hash the exact bytes written without reopening the completed payload."""
+
+    def __init__(self, raw: BinaryIO) -> None:
+        self._raw = raw
+        self._digest = hashlib.sha256()
+        self.byte_size = 0
+
+    def write(self, data: bytes | bytearray | memoryview) -> int:
+        view = memoryview(data).cast("B")
+        written = self._raw.write(view)
+        if written != len(view):
+            raise OSError("payload writer did not write the complete buffer")
+        self._digest.update(view)
+        self.byte_size += written
+        return written
+
+    def flush(self) -> None:
+        self._raw.flush()
+
+    def identity(self) -> str:
+        return f"sha256:{self._digest.hexdigest()}"
+
+
 def structured_identity(domain_tag: str, value: object) -> str:
     if not isinstance(domain_tag, str):
         raise TypeError("domain_tag must be a string")
@@ -228,6 +252,23 @@ def row_content_identity(
     rows: Iterable[np.ndarray], row_count: int, row_width: int
 ) -> str:
     """Hash ordered token rows independently of their shard representation."""
+
+    def blocks() -> Iterator[np.ndarray]:
+        for row in rows:
+            array = np.asarray(row)
+            if array.ndim != 1 or array.shape != (row_width,):
+                raise ValueError(
+                    f"row shape mismatch: expected ({row_width},), got {array.shape}"
+                )
+            yield array[None, :]
+
+    return _row_content_identity_blocks(blocks(), row_count, row_width)
+
+
+def _row_content_identity_blocks(
+    blocks: Iterable[np.ndarray], row_count: int, row_width: int
+) -> str:
+    """Apply the same row identity to bounded blocks without per-row dispatch."""
     _require_plain_int(row_count, "row count")
     _require_plain_int(row_width, "row width", minimum=1)
     if row_count >= 2**64 or row_width >= 2**64:
@@ -240,11 +281,11 @@ def row_content_identity(
 
     actual_count = 0
     int32 = np.iinfo(np.int32)
-    for row in rows:
-        array = np.asarray(row)
-        if array.ndim != 1 or array.shape != (row_width,):
+    for block in blocks:
+        array = np.asarray(block)
+        if array.ndim != 2 or array.shape[1] != row_width:
             raise ValueError(
-                f"row shape mismatch: expected ({row_width},), got {array.shape}"
+                f"row block shape mismatch: expected (*, {row_width}), got {array.shape}"
             )
         if array.dtype.kind not in "iu":
             raise TypeError("row dtype must be an integer dtype")
@@ -252,13 +293,15 @@ def row_content_identity(
         needs_range_check = array.dtype.itemsize > 4 or (
             array.dtype.kind == "u" and array.dtype.itemsize == 4
         )
-        if needs_range_check and (
-            int(array.min()) < int32.min or int(array.max()) > int32.max
+        if (
+            array.size
+            and needs_range_check
+            and (int(array.min()) < int32.min or int(array.max()) > int32.max)
         ):
             raise ValueError("row values must fit int32")
         canonical = np.ascontiguousarray(array, dtype=np.dtype("<i4"))
         digest.update(canonical)
-        actual_count += 1
+        actual_count += array.shape[0]
 
     if actual_count != row_count:
         raise ValueError(

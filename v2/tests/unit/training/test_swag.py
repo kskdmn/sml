@@ -18,7 +18,7 @@ from sml.data.swag import (
     SwagCursor,
     prepare_swag_bundle,
 )
-from sml.errors import SMLConfigurationError, SMLRuntimeError
+from sml.errors import SMLArtifactError, SMLConfigurationError, SMLRuntimeError
 from sml.inference import ResolvedModel
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
@@ -49,6 +49,36 @@ VALID_ROW: dict[str, object] = {
     "endings": ("on the mat", "in the car", "by the door", "near a tree"),
     "label": 1,
 }
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("valid_count", 1, "accumulation must be empty"),
+        ("loss_numerator", float("nan"), "loss numerator must be empty"),
+        ("correct_count", 1, "correct count must be empty"),
+        ("accumulators", float("nan"), "accumulators must be empty"),
+        ("accumulators", 1.0, "accumulators must be empty"),
+    ],
+)
+def test_checkpoint_boundary_rejects_nonempty_or_nonfinite_trainer_state(
+    field, value, message
+):
+    trainer = swag_module.initial_swag_trainer_state(
+        {"first": mx.zeros((2,)), "nested": {"last": mx.zeros((3,))}},
+        key=mx.random.key(3),
+    )
+    swag_module._require_empty_trainer_state(trainer)
+    changed = (
+        {
+            "first": trainer.accumulators["first"],
+            "nested": {"last": mx.full((3,), value)},
+        }
+        if field == "accumulators"
+        else mx.array(value, dtype=getattr(trainer, field).dtype)
+    )
+    with pytest.raises(SMLArtifactError, match=message):
+        swag_module._require_empty_trainer_state(replace(trainer, **{field: changed}))
 
 
 class RecordingProcessor:

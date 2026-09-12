@@ -6,12 +6,14 @@ import multiprocessing
 import os
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from sml.artifacts import checkpoint
+from sml.artifacts import manifest as manifest_module
 from sml.artifacts.checkpoint import (
     Published,
     publication_lock,
@@ -222,6 +224,80 @@ def _bundle_builder(model_bytes: bytes = b"model bytes"):
         return replace(manifest, identity=manifest.recompute_identity())
 
     return build
+
+
+def test_publication_reuses_payload_hashes_only_within_its_transaction(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "bundle"
+    hashes = Counter()
+    real_identity = manifest_module.file_identity
+
+    def count_identity(stream):
+        info = os.fstat(stream.fileno())
+        hashes[info.st_dev, info.st_ino] += 1
+        return real_identity(stream)
+
+    monkeypatch.setattr(manifest_module, "file_identity", count_identity)
+    published = publish_immutable_bundle(target, _bundle_builder())
+    assert published.verification is VerificationLevel.FULL
+    for name in ("tokenizer.model", "tokenizer.vocab"):
+        info = (target / name).stat()
+        assert hashes[info.st_dev, info.st_ino] == 1
+
+    # A later publication must independently prove an existing destination.
+    publish_immutable_bundle(target, _bundle_builder())
+    for name in ("tokenizer.model", "tokenizer.vocab"):
+        info = (target / name).stat()
+        assert hashes[info.st_dev, info.st_ino] > 1
+
+
+@pytest.mark.parametrize("stage", ("durability", "rename"))
+@pytest.mark.parametrize("replace_inode", (False, True))
+def test_publication_revalidates_same_size_payload_changes(
+    tmp_path, stage, replace_inode
+):
+    target = tmp_path / "bundle"
+    private_paths = []
+    build_bundle = _bundle_builder()
+
+    def build(private):
+        private_paths.append(private)
+        return build_bundle(private)
+
+    class MutatingFilesystem(_ForwardingFilesystemOps):
+        mutated = False
+
+        def mutate(self, path):
+            original = path.stat()
+            changed = path.with_suffix(".replacement") if replace_inode else path
+            changed.write_bytes(b"MODEL BYTES")
+            os.utime(changed, ns=(original.st_atime_ns, original.st_mtime_ns))
+            if replace_inode:
+                changed.replace(path)
+            self.mutated = True
+
+        def fsync_file(self, descriptor):
+            super().fsync_file(descriptor)
+            if stage == "durability" and not self.mutated and private_paths:
+                self.mutate(private_paths[0] / "tokenizer.model")
+
+        def rename(self, source, destination, *, source_dir_fd, destination_dir_fd):
+            super().rename(
+                source,
+                destination,
+                source_dir_fd=source_dir_fd,
+                destination_dir_fd=destination_dir_fd,
+            )
+            if stage == "rename" and not self.mutated:
+                self.mutate(target / "tokenizer.model")
+
+    fs = MutatingFilesystem(checkpoint.OS_FILESYSTEM)
+    with pytest.raises(SMLArtifactError, match="payload identity"):
+        publish_immutable_bundle(target, build, fs=fs)
+    assert fs.mutated
+    if stage == "durability":
+        assert not target.exists()
 
 
 def _prepared_bundle_builder(*, mutation: str | None = None):

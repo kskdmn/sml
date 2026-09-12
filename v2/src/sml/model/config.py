@@ -198,6 +198,10 @@ class ModelConfig:
         for field_name in ("yarn_truncate", "tie_word_embeddings", "use_cache"):
             if not isinstance(getattr(self, field_name), bool):
                 raise TypeError(f"{field_name} must be a bool")
+        if not self.use_cache:
+            raise ValueError(
+                "use_cache=False is unsupported; v2 inference requires a KV cache"
+            )
 
     @property
     def head_dim(self) -> int:

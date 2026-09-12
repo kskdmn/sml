@@ -488,14 +488,17 @@ class BaseParameterState:
                 "working_parameters leaves must have dtype bfloat16"
             )
 
-        def require_cast(master: mx.array, working: mx.array) -> mx.array:
-            if not bool(mx.array_equal(working, master.astype(mx.bfloat16))):
-                raise SMLConfigurationError(
-                    "working_parameters leaves must be exact bfloat16 casts of masters"
-                )
-            return working
-
-        tree_map(require_cast, self.master_parameters, self.working_parameters)
+        cast_checks = tree_map(
+            lambda master, working: mx.array_equal(working, master.astype(mx.bfloat16)),
+            self.master_parameters,
+            self.working_parameters,
+        )
+        if not bool(
+            mx.all(mx.stack([check for _, check in tree_flatten(cast_checks)]))
+        ):
+            raise SMLConfigurationError(
+                "working_parameters leaves must be exact bfloat16 casts of masters"
+            )
 
     def to_tree(self) -> tuple[dict, dict]:
         return self.master_parameters, self.working_parameters

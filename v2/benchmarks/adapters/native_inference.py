@@ -15,6 +15,7 @@ from sml.model.generation import (
 )
 from sml.model.language_model import SMLLanguageModel
 
+from v2.benchmarks.adapters.execution_order import ObservedBatch, verify_input_batches
 from v2.benchmarks.parameters import initialize_parameters
 from v2.benchmarks.schema import CanonicalWorkload
 from v2.benchmarks.workload import (
@@ -82,6 +83,7 @@ class _InferenceRuntime:
             )
         self.native_representation_identity = file_identity(path)
         self.prompts = arrays["prompt_ids"]
+        self._canonical_prompts = requests.prompt_ids
         self.request_ids = tuple(int(value) for value in arrays["request_ids"])
         self.prompt_tokens = int(workload.generation["prompt_tokens"])
         self.chunk_size = requests.decode_tokens
@@ -93,6 +95,7 @@ class _InferenceRuntime:
         self._decode = mx.compile(self._decode_arrays)
         self.request_index = 0
         self.ordered_request_ids: list[int] = []
+        self._observed_requests: list[tuple[int, object]] = []
         # All measured decode requests start at the same logical boundary as the
         # reference: a filled prompt cache and its already selected first token.
         self._states = (
@@ -110,6 +113,9 @@ class _InferenceRuntime:
             cache_state=cache_state,
             training=False,
             key=None,
+            logits_positions=mx.full(
+                (input_ids.shape[0], 1), input_ids.shape[1] - 1, dtype=mx.int32
+            ),
         )
         return logits, state
 
@@ -167,16 +173,18 @@ class _InferenceRuntime:
             raise ValueError("inference work units must be nonnegative integers")
         for _ in range(units):
             index = self.request_index % len(self.request_ids)
-            self.ordered_request_ids.append(self.request_ids[index])
             self.request_index += 1
             if self.metric == "inference-prefill":
-                prompt = mx.array(self.prompts[index][None, :], dtype=mx.int32)
+                inputs = mx.array(self.prompts[index][None, :], dtype=mx.int32)
                 self.last_output = self._prefill(
-                    self.parameters, prompt, self._new_cache()
+                    self.parameters, inputs, self._new_cache()
                 )
             else:
-                self.last_output = self._decode(self.parameters, *self._states[index])
+                inputs = self._states[index]
+                self.last_output = self._decode(self.parameters, *inputs)
             mx.eval(self.last_output)
+            self.ordered_request_ids.append(self.request_ids[index])
+            self._observed_requests.append((self.request_ids[index], inputs))
         tokens = (
             self.prompt_tokens
             if self.metric == "inference-prefill"
@@ -187,6 +195,23 @@ class _InferenceRuntime:
     def reset_measured_order(self) -> None:
         self.request_index = 0
         self.ordered_request_ids.clear()
+        self._observed_requests.clear()
+
+    def observed_execution_order(self) -> tuple[int, ...]:
+        batches = [
+            ObservedBatch(
+                {
+                    "prompt_ids": inputs
+                    if self.metric == "inference-prefill"
+                    else inputs[2][:, : self.prompt_tokens]
+                },
+                work_ids=(request_id,),
+            )
+            for request_id, inputs in self._observed_requests
+        ]
+        return verify_input_batches(
+            batches, {"prompt_ids": self._canonical_prompts}, batch_size=1
+        )
 
     def reset_after_warmup(self) -> None:
         self.reset_measured_order()

@@ -36,6 +36,7 @@ from sml.training.swag import (
     initial_swag_trainer_state,
 )
 
+from v2.benchmarks.adapters.execution_order import ObservedBatch, verify_input_batches
 from v2.benchmarks.parameters import initialize_parameters
 from v2.benchmarks.schema import CanonicalWorkload
 from v2.benchmarks.workload import fixed_swag_examples, semantic_array_identity
@@ -97,7 +98,9 @@ class SwagRuntime:
         self.accumulation_steps = optimizer["gradient_accumulation_steps"]
         self.example_index = 0
         self.microstep_index = 0
-        self.measured_work_ids: list[int] = []
+        self._observed_batches: list[ObservedBatch] = []
+        self._completed_steps: list[mx.array] = []
+        self._starting_step = 0
         lora = LoRAConfig(**optimizer["lora"])
         config = SwagTrainingConfig(
             base_checkpoint=directory / "base",
@@ -163,6 +166,10 @@ class SwagRuntime:
             "valid_token_mask": examples.input_ids != model_config.pad_token_id,
             "score_mask": examples.labels != model_config.pad_token_id,
             "labels": examples.candidate_labels,
+        }
+        self._canonical_arrays = {
+            **arrays,
+            "example_mask": np.ones((len(examples.example_ids),), dtype=np.bool_),
         }
         references = []
         mapped = {}
@@ -236,7 +243,6 @@ class SwagRuntime:
         )
         source_epoch = self.example_index // count
         self.example_index += self.batch_size
-        self.measured_work_ids.extend(self.example_ids[index] for index in indices)
         inputs, valid, score, labels, real = _assemble_batch_arrays(
             self.bucket, indices, batch_size=self.batch_size, manifest=self.manifest
         )
@@ -272,11 +278,18 @@ class SwagRuntime:
                 self.trainer = self.kernels.ranking_microstep(
                     self.adapters, self.frozen_base, self.trainer, batch
                 )
+                self._observed_batches.append(
+                    ObservedBatch(
+                        {name: getattr(batch, name) for name in self._canonical_arrays},
+                        cursor=batch.cursor_after,
+                    )
+                )
                 self.microstep_index += 1
             self.adapters, self.optimizer, self.trainer = self.kernels.optimizer_step(
                 self.adapters, self.optimizer, self.trainer
             )
             mx.eval(self.adapters, self.optimizer.to_tree(), self.trainer.to_tree())
+            self._completed_steps.append(self.optimizer.step)
             self.model.update(
                 _merge_adapter_parameters(self.adapters, self.frozen_base)
             )
@@ -284,7 +297,32 @@ class SwagRuntime:
 
     def reset_measured_order(self) -> None:
         self.example_index = 0
-        self.measured_work_ids = []
+        self._observed_batches.clear()
+        self._completed_steps.clear()
+        self._starting_step = int(self.optimizer.step.item())
+
+    def reset_after_warmup(self) -> None:
+        self.reset_measured_order()
+
+    def observed_execution_order(self) -> tuple[int, ...]:
+        examples = verify_input_batches(
+            self._observed_batches, self._canonical_arrays, batch_size=self.batch_size
+        )
+        steps = tuple(
+            int(step.item()) - self._starting_step - 1 for step in self._completed_steps
+        )
+        if (
+            steps != tuple(range(len(steps)))
+            or len(examples) != len(steps) * self.accumulation_steps * self.batch_size
+        ):
+            raise RuntimeError(
+                "benchmark observed optimizer updates differ from canonical work"
+            )
+        return examples
+
+    @property
+    def measured_work_ids(self) -> list[int]:
+        return list(self.observed_execution_order())
 
     def close(self) -> None:
         self.bucket = None

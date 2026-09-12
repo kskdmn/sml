@@ -28,6 +28,7 @@ HARNESS_COMPONENTS = (
     Path("v2/benchmarks/analysis.py"),
     Path("v2/benchmarks/adapters/runtime.py"),
     Path("v2/benchmarks/adapters/native.py"),
+    Path("v2/benchmarks/adapters/execution_order.py"),
     Path("v2/benchmarks/adapters/prepared_data.py"),
     Path("v2/benchmarks/adapters/native_training.py"),
     Path("v2/benchmarks/adapters/native_inference.py"),
@@ -743,12 +744,20 @@ def canonical_execution_order(
 
 
 def canonical_execution_order_identity(metric: str, workload: CanonicalWorkload) -> str:
+    return execution_order_identity(
+        metric, workload, canonical_execution_order(metric, workload)
+    )
+
+
+def execution_order_identity(
+    metric: str, workload: CanonicalWorkload, ordered_work_ids: tuple[int, ...]
+) -> str:
     return structured_identity(
         "sml-benchmark-execution-order-v1",
         {
             "metric": metric,
             "canonical_input_identity": canonical_input_identity(metric, workload),
-            "ordered_work_ids": list(canonical_execution_order(metric, workload)),
+            "ordered_work_ids": list(ordered_work_ids),
         },
     )
 

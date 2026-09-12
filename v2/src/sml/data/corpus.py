@@ -14,6 +14,8 @@ from typing import BinaryIO
 
 import zstandard as zstd
 
+from sml.errors import SMLDataError
+
 DEFAULT_FILENAME_PATTERN = r".*-00[0-9][0-9]\.jsonl\.zst\Z"
 DEFAULT_FILE_ORDER_SEED = 42
 DEFAULT_TEXT_FIELD = "text"
@@ -176,7 +178,7 @@ class FilteredTexts:
                         try:
                             row = json.loads(stripped)
                         except json.JSONDecodeError as error:
-                            raise ValueError(
+                            raise SMLDataError(
                                 f"Invalid JSON in {path} at line {line_number}"
                             ) from error
                         if not isinstance(row, dict):
@@ -197,7 +199,11 @@ class FilteredTexts:
                         self.texts_used += 1
                         yield text
             except zstd.ZstdError as error:
-                raise RuntimeError(f"zstd failed for {path}: {error}") from error
+                raise SMLDataError(f"zstd failed for {path}: {error}") from error
+            except OSError as error:
+                raise SMLDataError(
+                    f"Could not read corpus file {path}: {error}"
+                ) from error
 
 
 def iter_filtered_texts(

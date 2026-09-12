@@ -15,7 +15,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 import zstandard as zstd
-from mlx.utils import tree_unflatten
+from mlx.utils import tree_flatten, tree_unflatten
 from sml.artifacts import checkpoint as checkpoint_module
 from sml.artifacts import manifest as manifest_module
 from sml.artifacts.checkpoint import (
@@ -230,7 +230,7 @@ def test_training_retains_one_full_data_proof_and_closes_it(
     stores = []
     descriptors = []
     real_open = manifest_module._open_verified_payload
-    real_identity = data_module.row_content_identity
+    real_identity = data_module._row_content_identity_blocks
     real_preflight = pretrain._open_validated_prepared_resources
 
     def record_open(root, reference, verification):
@@ -259,7 +259,7 @@ def test_training_retains_one_full_data_proof_and_closes_it(
         raise InjectedFailure("initial state failed")
 
     monkeypatch.setattr(manifest_module, "_open_verified_payload", record_open)
-    monkeypatch.setattr(data_module, "row_content_identity", record_identity)
+    monkeypatch.setattr(data_module, "_row_content_identity_blocks", record_identity)
     monkeypatch.setattr(
         pretrain, "_open_validated_prepared_resources", record_preflight
     )
@@ -1570,3 +1570,80 @@ def test_training_releases_initial_device_arrays_after_update(
     monkeypatch.setattr(pretrain, "_publish_training_state", check_published_state)
 
     assert pretrain.train(config).step == 2
+
+
+@pytest.mark.parametrize("compile", [False, True])
+def test_resume_releases_restored_device_arrays_after_update(
+    tmp_path, monkeypatch, compile
+):
+    data = _prepared_bundle(tmp_path / "prepared")
+    config = replace(
+        _config(data, tmp_path / "run", maximum_steps=1),
+        compile=compile,
+        checkpoint=CheckpointPolicy(interval=1),
+    )
+    pretrain.train(config)
+    restored_arrays = []
+    real_restore = pretrain._restore_checkpoint
+    real_publish = pretrain._publish_training_state
+
+    def track_restore(reader):
+        state = real_restore(reader)
+        trees = (
+            state.parameters.master_parameters,
+            state.parameters.working_parameters,
+            state.optimizer.first_moments,
+            state.optimizer.second_moments,
+            state.trainer.accumulators,
+        )
+        restored_arrays.extend(
+            weakref.ref(array) for tree in trees for _, array in tree_flatten(tree)
+        )
+        return state
+
+    def check_published_state(run, manifest, state):
+        gc.collect()
+        assert restored_arrays
+        assert all(reference() is None for reference in restored_arrays)
+        return real_publish(run, manifest, state)
+
+    monkeypatch.setattr(pretrain, "_restore_checkpoint", track_restore)
+    monkeypatch.setattr(pretrain, "_publish_training_state", check_published_state)
+
+    result = pretrain.resume(
+        config.output_run, data=data, overrides=_overrides(maximum_steps=2)
+    )
+    assert result.step == 2
+
+
+def test_scalar_state_reads_verify_payloads_without_loading_tensors(
+    tmp_path, monkeypatch
+):
+    data = _prepared_bundle(tmp_path / "prepared")
+    run = tmp_path / "run"
+    result = pretrain.train(_config(data, run, maximum_steps=1))
+    resolved = resolve_latest_step(
+        run, writable=False, verification=VerificationLevel.FULL
+    )
+
+    def forbid_tensor_loading(*args, **kwargs):
+        raise AssertionError(
+            "scalar progress reads must not deserialize model or optimizer arrays"
+        )
+
+    monkeypatch.setattr(
+        checkpoint_module, "_load_checkpoint_array_stream", forbid_tensor_loading
+    )
+    scalar = pretrain.read_scalar_state(resolved)
+    assert (scalar.step, scalar.rows, scalar.cursor.epoch) == (
+        result.step,
+        result.rows,
+        result.epoch,
+    )
+
+    weights = resolved.step_directory / "model.safetensors"
+    payload = bytearray(weights.read_bytes())
+    payload[-1] ^= 1
+    weights.write_bytes(payload)
+    with pytest.raises(SMLArtifactError):
+        pretrain.read_scalar_state(resolved)

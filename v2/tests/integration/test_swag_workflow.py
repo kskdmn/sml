@@ -47,7 +47,7 @@ from sml.data.swag import (
     prepare_swag_bundle,
 )
 from sml.data.tokenizer import TokenizerTrainingConfig, train_tokenizer_bundle
-from sml.errors import SMLArtifactError, SMLConfigurationError
+from sml.errors import SMLArtifactError, SMLConfigurationError, SMLRuntimeError
 from sml.inference import InferenceSession, resolve_model_artifact
 from sml.model.config import ModelConfig
 from sml.training import swag as swag_module
@@ -938,6 +938,66 @@ def test_resume_rejects_wrong_key_before_runtime_or_retention(
             overrides=ResumeOverrides(maximum_steps=2),
         )
     assert reached == []
+
+
+@pytest.mark.parametrize("cursor", [(0, 99, 0), (0, 0, 99)])
+@pytest.mark.parametrize("maximum_steps", [1, 2])
+def test_resume_rejects_resigned_invalid_cursor_before_restore_or_retention(
+    tiny_lora_run, tiny_swag_bundle, monkeypatch, cursor, maximum_steps
+):
+    resolved = resolve_latest_step(
+        tiny_lora_run, writable=False, verification=VerificationLevel.FULL
+    )
+    state_path = resolved.step_directory / "state.json"
+    state = json.loads(state_path.read_bytes())
+    state["cursor"] = dict(
+        zip(("epoch", "bucket_order_position", "row_offset"), cursor, strict=True)
+    )
+    state_path.write_bytes(canonical_json_bytes(state))
+    checkpoint = replace(
+        resolved.checkpoint, scalar_state=_payload_ref(state_path, "state.json")
+    )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    (resolved.step_directory / "checkpoint.json").write_bytes(
+        canonical_json_bytes(checkpoint)
+    )
+    latest = read_manifest(
+        tiny_lora_run, LatestIndex, VerificationLevel.MANIFEST_TRUSTED
+    ).manifest
+    latest = replace(latest, checkpoint_identity=checkpoint.identity)
+    latest = replace(latest, identity=latest.recompute_identity())
+    (tiny_lora_run / "latest.json").write_bytes(canonical_json_bytes(latest))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("invalid cursor reached runtime or retention")
+
+    monkeypatch.setattr(swag_module, "_restore_adapter_checkpoint", forbidden)
+    monkeypatch.setattr(swag_module, "prune_to_latest", forbidden)
+    monkeypatch.setattr(swag_module, "_wrap_copied_base", forbidden)
+    with pytest.raises(SMLArtifactError, match="invalid checkpoint SWAG cursor"):
+        resume_finetune(
+            tiny_lora_run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=maximum_steps),
+        )
+
+
+def test_resume_stops_if_a_training_stream_produces_no_progress(
+    tiny_lora_run, tiny_swag_bundle, monkeypatch
+):
+    @contextmanager
+    def empty_stream(*_args, **_kwargs):
+        yield iter(())
+
+    monkeypatch.setattr(
+        swag_module.SwagBatchStream, "_borrowing_bundle", staticmethod(empty_stream)
+    )
+    with pytest.raises(SMLRuntimeError, match="training stream made no progress"):
+        resume_finetune(
+            tiny_lora_run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
 
 
 def test_lora_microbatch_progress_supports_full_checkpoint_consumers(

@@ -1170,6 +1170,26 @@ def test_pretraining_run_manifest_rejects_noncanonical_rope_factor():
         )
 
 
+@pytest.mark.parametrize("dtype", ["<i4", ">i4", "int64", "uint32"])
+def test_row_blocks_preserve_identity_across_chunking_and_strides(dtype):
+    rows = np.arange(84, dtype=dtype).reshape(7, 12)[:, ::2]
+    blocks = (rows[:2], rows[2:2], rows[2:5], rows[5:])
+    assert manifest_module._row_content_identity_blocks(blocks, 7, 6) == (
+        row_content_identity(rows, 7, 6)
+    )
+
+
+def test_row_blocks_reject_overflow_and_incorrect_count():
+    with pytest.raises(ValueError, match="fit int32"):
+        manifest_module._row_content_identity_blocks(
+            (np.array([[0, 2**31]], dtype=np.uint32),), 1, 2
+        )
+    with pytest.raises(ValueError, match="row count mismatch"):
+        manifest_module._row_content_identity_blocks(
+            (np.zeros((3, 2), dtype=np.int32),), 4, 2
+        )
+
+
 def test_row_content_identity_pins_shape_count_order_and_little_endian_int32():
     """Changing row order or metadata encoding must change the semantic data digest."""
     rows = [np.array([1, 2], dtype=np.int64), np.array([-3, 4], dtype=np.int16)]

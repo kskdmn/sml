@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.metadata
 import mmap
 import queue
@@ -28,6 +27,7 @@ from sml.artifacts.manifest import (
     SwagDataManifest,
     VerificationLevel,
     VerifiedPayload,
+    _HashingWriter,
     canonical_json_bytes,
     open_artifact,
     structured_identity,
@@ -1087,26 +1087,6 @@ def _pad_candidate(
     return input_ids, valid_token_mask, score_mask
 
 
-class _HashingWriter:
-    def __init__(self, raw) -> None:
-        self._raw = raw
-        self._digest = hashlib.sha256()
-
-    def write(self, data: bytes | bytearray | memoryview) -> int:
-        view = memoryview(data).cast("B")
-        self._digest.update(view)
-        written = self._raw.write(data)
-        return int(len(view) if written is None else written)
-
-    def flush(self) -> None:
-        flush = getattr(self._raw, "flush", None)
-        if flush is not None:
-            flush()
-
-    def identity(self) -> str:
-        return f"sha256:{self._digest.hexdigest()}"
-
-
 def _write_npy(path: Path, array: np.ndarray, logical_path: str) -> ArrayPayloadRef:
     contiguous = np.ascontiguousarray(array)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1894,6 +1874,34 @@ class SwagCursor:
         return cls(epoch=0, bucket_order_position=0, row_offset=0)
 
 
+def validate_swag_cursor(
+    cursor: SwagCursor,
+    bundle: SwagDataBundle,
+    *,
+    epoch_seed: int,
+) -> None:
+    """Require the next real example to have a canonical location in its epoch."""
+    if not isinstance(cursor, SwagCursor):
+        raise TypeError("cursor must be a SwagCursor")
+    if not isinstance(bundle, SwagDataBundle):
+        raise TypeError("bundle must be a SwagDataBundle")
+    _require_plain_int(epoch_seed, "epoch_seed")
+    buckets = bundle._owned_buckets()
+    generator = np.random.Generator(
+        np.random.PCG64(np.random.SeedSequence([epoch_seed, cursor.epoch]))
+    )
+    order = tuple(
+        int(index)
+        for index in generator.permutation(len(buckets))
+        if buckets[index].input_ids.shape[0]
+    )
+    if cursor.bucket_order_position >= len(order):
+        raise SMLDataError("SWAG cursor is beyond the epoch bucket order")
+    row_count = buckets[order[cursor.bucket_order_position]].input_ids.shape[0]
+    if cursor.row_offset >= row_count:
+        raise SMLDataError("SWAG cursor offset is beyond its bucket")
+
+
 def _epoch_bucket_plan(
     buckets: tuple[SwagBucket, ...],
     *,
@@ -2287,6 +2295,9 @@ class SwagBatchStream:
         self._consumer_lock = threading.RLock()
         self._state_lock = threading.Lock()
         self._committed_cursor = cursor
+        self._delivered: dict[SwagCursor, int] = {}
+        self._delivery_sequence = 0
+        self._committed_sequence = 0
         self._initial_epoch = cursor.epoch
         self._plan_epoch: int | None = None
         self._plan: tuple[tuple[int, tuple[int, ...]], ...] = ()
@@ -2294,6 +2305,7 @@ class SwagBatchStream:
         self._closed = False
         self._producer: threading.Thread | None = None
         try:
+            validate_swag_cursor(cursor, bundle, epoch_seed=loader.epoch_seed)
             self._producer = threading.Thread(
                 target=self._produce,
                 name="sml-swag-prefetch",
@@ -2341,17 +2353,7 @@ class SwagBatchStream:
         plan = self._plan
         if not plan:
             raise SMLDataError("SWAG bundle does not contain any examples")
-        if cursor.bucket_order_position >= len(plan):
-            return self._next_from_cursor(SwagCursor(cursor.epoch + 1, 0, 0))
         _bucket_index, row_permutation = plan[cursor.bucket_order_position]
-        if cursor.row_offset >= len(row_permutation):
-            if cursor.bucket_order_position + 1 < len(plan):
-                next_cursor = SwagCursor(
-                    cursor.epoch, cursor.bucket_order_position + 1, 0
-                )
-            else:
-                next_cursor = SwagCursor(cursor.epoch + 1, 0, 0)
-            return self._next_from_cursor(next_cursor)
         remaining = len(row_permutation) - cursor.row_offset
         take = min(self._loader.microbatch_size, remaining)
         selected = row_permutation[cursor.row_offset : cursor.row_offset + take]
@@ -2452,13 +2454,41 @@ class SwagBatchStream:
                 raise StopIteration
             if envelope.cursor_after.epoch > self._initial_epoch:
                 self._epoch_complete = True
+            with self._state_lock:
+                self._delivery_sequence += 1
+                self._delivered[envelope.cursor_after] = self._delivery_sequence
             return envelope
 
     def commit(self, cursor_after: SwagCursor) -> None:
         if not isinstance(cursor_after, SwagCursor):
             raise TypeError("cursor_after must be a SwagCursor")
         with self._state_lock:
+            if cursor_after == self._committed_cursor:
+                return
+            cursor_key = (
+                cursor_after.epoch,
+                cursor_after.bucket_order_position,
+                cursor_after.row_offset,
+            )
+            committed_key = (
+                self._committed_cursor.epoch,
+                self._committed_cursor.bucket_order_position,
+                self._committed_cursor.row_offset,
+            )
+            if cursor_key < committed_key:
+                raise SMLDataError("SWAG cursor commit would regress")
+            sequence = self._delivered.get(cursor_after)
+            if sequence is None:
+                raise SMLDataError("SWAG cursor was not delivered by this stream")
+            if sequence <= self._committed_sequence:
+                raise SMLDataError("SWAG cursor commit would regress")
             self._committed_cursor = cursor_after
+            self._committed_sequence = sequence
+            self._delivered = {
+                cursor: delivered_sequence
+                for cursor, delivered_sequence in self._delivered.items()
+                if delivered_sequence > sequence
+            }
 
     def close(self) -> None:
         if self._closed:
@@ -2514,4 +2544,5 @@ __all__ = [
     "SwagSourceConfig",
     "load_swag_bundle",
     "prepare_swag_bundle",
+    "validate_swag_cursor",
 ]

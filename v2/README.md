@@ -87,6 +87,11 @@ uv run python -m sml infer --checkpoint v2/output/base-run --max-new-tokens 128 
 Add `--include-prompt` to include the prompt in rendered text and `--full` to
 rehash every consumed payload.
 
+Inference requires a KV cache. Model configurations with `use_cache=false` are
+rejected instead of silently enabling caching. Persistent sessions retain a
+bounded set of recently used compiled functions and share prefill compilation
+across decoding settings.
+
 ### Evaluation
 
 Evaluate one or more supported lm-eval tasks and atomically write the result:

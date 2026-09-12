@@ -25,13 +25,14 @@ from sml.artifacts.manifest import (
     TokenizerManifest,
     VerificationLevel,
     VerifiedPayload,
+    _HashingWriter,
     _open_verified_payload,
     _read_manifest_from_root,
+    _row_content_identity_blocks,
     _stable_stat_fields,
     canonical_json_bytes,
     file_identity,
     open_artifact,
-    row_content_identity,
 )
 from sml.data.corpus import CorpusConfig, discover_corpus_files, iter_filtered_texts
 from sml.data.tokenizer import LoadedTokenizer, load_tokenizer_bundle
@@ -446,7 +447,7 @@ def _close_prepared_resources(
         raise errors[0]
 
 
-def _validated_prepared_rows(
+def _validated_prepared_row_blocks(
     shards: Iterable[np.ndarray],
     *,
     vocab_size: int,
@@ -465,7 +466,7 @@ def _validated_prepared_rows(
                 raise SMLArtifactError(
                     "packed pretraining rows must not contain padding token IDs"
                 )
-            yield from chunk
+            yield chunk
 
 
 class _PreparedShardStore:
@@ -537,8 +538,8 @@ class _PreparedShardStore:
                 raise error from cleanup_error
             raise
 
-    def rows(self, *, vocab_size: int, pad_token_id: int) -> Iterator[np.ndarray]:
-        return _validated_prepared_rows(
+    def row_blocks(self, *, vocab_size: int, pad_token_id: int) -> Iterator[np.ndarray]:
+        return _validated_prepared_row_blocks(
             (self.get(index) for index in range(len(self.artifact.manifest.shards))),
             vocab_size=vocab_size,
             pad_token_id=pad_token_id,
@@ -585,8 +586,8 @@ def _validate_prepared_store(
     row_count = sum(manifest.shard_row_counts)
     if row_count < batch_size:
         raise SMLDataError("prepared bundle does not contain one full runtime batch")
-    actual_identity = row_content_identity(
-        store.rows(
+    actual_identity = _row_content_identity_blocks(
+        store.row_blocks(
             vocab_size=tokenizer_manifest.vocab_size,
             pad_token_id=tokenizer_manifest.pad_token_id,
         ),
@@ -1322,10 +1323,13 @@ def _encoded_text_ranges(
             ) from error
 
 
-def _write_shard(path: Path, rows: np.ndarray) -> None:
+def _write_shard(path: Path, rows: np.ndarray) -> PayloadRef:
     array = np.ascontiguousarray(rows, dtype=_INT32)
     with path.open("xb") as destination:
-        np.save(destination, array, allow_pickle=False)
+        writer = _HashingWriter(destination)
+        np.save(writer, array, allow_pickle=False)
+        writer.flush()
+    return PayloadRef(f"shards/{path.name}", writer.identity(), writer.byte_size)
 
 
 def _write_shards(
@@ -1334,17 +1338,18 @@ def _write_shards(
     *,
     row_width: int,
     shard_rows: int,
-) -> tuple[tuple[Path, ...], tuple[int, ...]]:
+) -> tuple[tuple[Path, ...], tuple[int, ...], tuple[PayloadRef, ...]]:
     directory.mkdir()
     buffer = np.empty((shard_rows, row_width), dtype=_INT32)
     paths: list[Path] = []
     counts: list[int] = []
+    references: list[PayloadRef] = []
     cursor = 0
 
     def flush() -> None:
         nonlocal cursor
         path = directory / f"train-{len(paths):06d}.npy"
-        _write_shard(path, buffer[:cursor])
+        references.append(_write_shard(path, buffer[:cursor]))
         paths.append(path)
         counts.append(cursor)
         cursor = 0
@@ -1359,10 +1364,10 @@ def _write_shards(
             flush()
     if cursor:
         flush()
-    return tuple(paths), tuple(counts)
+    return tuple(paths), tuple(counts), tuple(references)
 
 
-def _saved_rows(paths: Iterable[Path], *, row_width: int) -> Iterator[np.ndarray]:
+def _saved_row_blocks(paths: Iterable[Path], *, row_width: int) -> Iterator[np.ndarray]:
     for path in paths:
         array = np.load(path, mmap_mode="r", allow_pickle=False)
         if array.ndim != 2 or array.shape[1] != row_width:
@@ -1371,7 +1376,8 @@ def _saved_rows(paths: Iterable[Path], *, row_width: int) -> Iterator[np.ndarray
             raise SMLArtifactError(
                 f"invalid prepared shard representation: {path.name}"
             )
-        yield from array
+        for start in range(0, array.shape[0], _PREPARED_ROW_SCAN_SIZE):
+            yield array[start : start + _PREPARED_ROW_SCAN_SIZE]
 
 
 def prepare_pretraining_bundle(
@@ -1394,7 +1400,10 @@ def prepare_pretraining_bundle(
         tokenizer_model, tokenizer_vocab = _copy_verified_tokenizer(
             tokenizer, private_path / "tokenizer"
         )
-        files = discover_corpus_files(config.corpus)
+        try:
+            files = discover_corpus_files(config.corpus)
+        except OSError as error:
+            raise SMLDataError(f"Could not read pretraining corpus: {error}") from error
         texts = iter_filtered_texts(config.corpus, files)
         packed = pack_token_ranges(
             _encoded_text_ranges(texts, tokenizer),
@@ -1407,7 +1416,7 @@ def prepare_pretraining_bundle(
             seed=config.seed,
         )
         try:
-            shard_paths, shard_counts = _write_shards(
+            shard_paths, shard_counts, shard_refs = _write_shards(
                 shuffled,
                 private_path / "shards",
                 row_width=row_width,
@@ -1419,13 +1428,10 @@ def prepare_pretraining_bundle(
         if row_count == 0:
             raise SMLDataError("no complete pretraining rows were produced")
 
-        content_identity = row_content_identity(
-            _saved_rows(shard_paths, row_width=row_width),
+        content_identity = _row_content_identity_blocks(
+            _saved_row_blocks(shard_paths, row_width=row_width),
             row_count,
             row_width,
-        )
-        shard_refs = tuple(
-            _payload_ref(path, f"shards/{path.name}") for path in shard_paths
         )
         source_summary = {
             "corpus": _corpus_projection(config.corpus),

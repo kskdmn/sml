@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import secrets
 import threading
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -60,6 +61,24 @@ from sml.training.lora import (
 _MODEL_GROUP = "model.safetensors"
 _MASTER_GROUP = "master.safetensors"
 _ADAPTER_GROUP = "adapters.safetensors"
+_COMPILATION_CACHE_LIMIT = 32
+_DECODE_VARIANT_CACHE_LIMIT = 16
+
+
+def _cached_compilation[K, V](cache: OrderedDict[K, V], key: K) -> V | None:
+    compiled = cache.get(key)
+    if compiled is not None:
+        cache.move_to_end(key)
+    return compiled
+
+
+def _retain_compilation[K, V](
+    cache: OrderedDict[K, V], key: K, compiled: V, *, limit: int
+) -> None:
+    cache[key] = compiled
+    cache.move_to_end(key)
+    if len(cache) > limit:
+        cache.popitem(last=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +445,28 @@ def _target_log_probabilities(
     )
 
 
+def _generation_forward(
+    model, parameters, input_ids, attention_mask, positions, cache_state
+):
+    logits_positions = None
+    if input_ids.shape[1] > 1:
+        token_order = mx.arange(input_ids.shape[1], dtype=mx.int32)[None, :]
+        logits_positions = mx.max(
+            mx.where(attention_mask, token_order, 0), axis=1, keepdims=True
+        )
+    logits, cache_state, _next_key = model.forward_arrays(
+        parameters,
+        input_ids,
+        attention_mask=attention_mask,
+        positions=positions,
+        cache_state=cache_state,
+        training=False,
+        key=None,
+        logits_positions=logits_positions,
+    )
+    return logits, cache_state
+
+
 def load_owned_model_arrays(
     run: Path,
     *,
@@ -689,8 +730,12 @@ class InferenceSession:
         self.buffer_pool = BufferPool()
         self._model = SMLLanguageModel(resolved.model_config, key=mx.random.key(0))
         self._parameters = tree_unflatten(sorted(resolved.model_arrays.items()))
-        self._compiled: dict[tuple[object, ...], object] = {}
-        self._scoring_compiled: dict[ScoringKernelKey, object] = {}
+        self._forward = partial(_generation_forward, self._model)
+        self._prefill_compiled: OrderedDict[tuple[int, int, int], object] = (
+            OrderedDict()
+        )
+        self._compiled: OrderedDict[tuple[object, ...], object] = OrderedDict()
+        self._scoring_compiled: OrderedDict[ScoringKernelKey, object] = OrderedDict()
 
     @classmethod
     def from_checkpoint(
@@ -1059,7 +1104,7 @@ class InferenceSession:
         key = ScoringKernelKey(
             length_bucket, batch_size_bucket, padding, continuation_length_bucket
         )
-        compiled = self._scoring_compiled.get(key)
+        compiled = _cached_compilation(self._scoring_compiled, key)
         if compiled is not None:
             return compiled
 
@@ -1097,7 +1142,9 @@ class InferenceSession:
             return log_likelihood, greedy_match
 
         compiled = mx.compile(_score)
-        self._scoring_compiled[key] = compiled
+        _retain_compilation(
+            self._scoring_compiled, key, compiled, limit=_COMPILATION_CACHE_LIMIT
+        )
         return compiled
 
     def _compiled_kernels(
@@ -1107,41 +1154,36 @@ class InferenceSession:
         batch_size_bucket: int,
         kernel_key: GenerationKernelKey,
     ):
+        shape_key = (
+            prefill_length_bucket,
+            cache_capacity_bucket,
+            batch_size_bucket,
+        )
+        prefill = _cached_compilation(self._prefill_compiled, shape_key)
+        if prefill is None:
+            prefill = mx.compile(partial(self._forward))
+            _retain_compilation(
+                self._prefill_compiled,
+                shape_key,
+                prefill,
+                limit=_COMPILATION_CACHE_LIMIT,
+            )
         key = (
             prefill_length_bucket,
             cache_capacity_bucket,
             batch_size_bucket,
             kernel_key,
         )
-        compiled = self._compiled.get(key)
-        if compiled is not None:
-            return compiled
+        decode_chunk = _cached_compilation(self._compiled, key)
+        if decode_chunk is not None:
+            return prefill, decode_chunk
 
-        model = self._model
+        forward = self._forward
         eos_id = self._resolved.model_config.eos_token_id
         temperature = kernel_key.temperature
         top_p = kernel_key.top_p
         repetition_penalty = kernel_key.repetition_penalty
         ngram_size = kernel_key.no_repeat_ngram_size
-
-        def _forward(parameters, input_ids, attention_mask, positions, cache_state):
-            logits_positions = None
-            if input_ids.shape[1] > 1:
-                token_order = mx.arange(input_ids.shape[1], dtype=mx.int32)[None, :]
-                logits_positions = mx.max(
-                    mx.where(attention_mask, token_order, 0), axis=1, keepdims=True
-                )
-            logits, cache_state, _next_key = model.forward_arrays(
-                parameters,
-                input_ids,
-                attention_mask=attention_mask,
-                positions=positions,
-                cache_state=cache_state,
-                training=False,
-                key=None,
-                logits_positions=logits_positions,
-            )
-            return logits, cache_state
 
         def select_one_token(logits_row, key):
             return select_next_token_arrays(
@@ -1181,7 +1223,7 @@ class InferenceSession:
                         if step > 0
                         else mx.take_along_axis(tokens, step_positions, axis=1)
                     )
-                    logits, cache_state = _forward(
+                    logits, cache_state = forward(
                         parameters,
                         step_ids,
                         active[:, None],
@@ -1229,11 +1271,11 @@ class InferenceSession:
                 keys,
             )
 
-        decode_variants = {}
+        decode_variants = OrderedDict()
 
         def decode_chunk(chunk_steps: int, first_chunk: bool, *state):
             variant_key = (chunk_steps, first_chunk)
-            decode = decode_variants.get(variant_key)
+            decode = _cached_compilation(decode_variants, variant_key)
             if decode is None:
                 decode = mx.compile(
                     partial(
@@ -1242,12 +1284,18 @@ class InferenceSession:
                         first_chunk=first_chunk,
                     )
                 )
-                decode_variants[variant_key] = decode
+                _retain_compilation(
+                    decode_variants,
+                    variant_key,
+                    decode,
+                    limit=_DECODE_VARIANT_CACHE_LIMIT,
+                )
             return decode(*state)
 
-        compiled = (mx.compile(_forward), decode_chunk)
-        self._compiled[key] = compiled
-        return compiled
+        _retain_compilation(
+            self._compiled, key, decode_chunk, limit=_COMPILATION_CACHE_LIMIT
+        )
+        return prefill, decode_chunk
 
     def _decode_chunk(self, bucket: GenerationBucket, lease: _Lease):
         prefill, decode_chunk = self._compiled_kernels(
