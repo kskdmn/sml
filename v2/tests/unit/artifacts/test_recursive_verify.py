@@ -1414,7 +1414,8 @@ def test_full_pretraining_run_rejects_resigned_model_config_leaf_disagreement(
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
-        ("accumulator", "trainer accumulators must be empty"),
+        ("accumulation-count", "trainer accumulation must be empty"),
+        ("unexpected-accumulator", "trainer keys"),
         ("next-key", "next RNG key"),
     ),
 )
@@ -1431,9 +1432,10 @@ def test_full_pretraining_run_rejects_resigned_invalid_current_state(
     trainer_path = step / checkpoint.trainer.payload.logical_path
     arrays = dict(mx.load(trainer_path))
     mx.eval(*arrays.values())
-    if mutation == "accumulator":
-        name = next(name for name in arrays if name.startswith("accumulators."))
-        arrays[name] = mx.ones(arrays[name].shape, dtype=mx.float32)
+    if mutation == "accumulation-count":
+        arrays["accumulation_count"] = mx.array(1, dtype=mx.int32)
+    elif mutation == "unexpected-accumulator":
+        arrays["accumulators.weight"] = mx.ones((1,), dtype=mx.float32)
     else:
         arrays["next_key"] = mx.random.key(999)
     mx.save_safetensors(trainer_path, arrays)

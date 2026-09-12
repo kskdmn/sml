@@ -556,6 +556,28 @@ def test_strict_manifest_parser_round_trips_every_schema(tmp_path):
         assert verified.verification is VerificationLevel.MANIFEST_TRUSTED
 
 
+@pytest.mark.parametrize("version", (1, 2))
+def test_checkpoint_manifest_versions_round_trip_and_bind_identity(tmp_path, version):
+    for manifest in manifest_fixtures():
+        if not isinstance(
+            manifest, (PretrainingCheckpointManifest, LoRACheckpointManifest)
+        ):
+            continue
+        root = tmp_path / manifest.kind
+        root.mkdir()
+        manifest = _materialize_payloads(root, manifest)
+        legacy_identity = manifest.recompute_identity()
+        manifest = replace(manifest, version=version)
+        expected = _write_manifest(root, manifest, "checkpoint.json")
+        verified = read_manifest(
+            root, type(manifest), VerificationLevel.MANIFEST_TRUSTED
+        )
+        assert verified.manifest == expected
+        assert (expected.identity == legacy_identity) is (version == 1)
+        with pytest.raises(ValueError, match="version"):
+            replace(manifest, version=3)
+
+
 def test_open_artifact_does_not_preopen_declared_payloads(tmp_path):
     """Proof-only eager payload opens would separate later semantic use from proof."""
     expected = _write_manifest(tmp_path, tokenizer_manifest_fixture(), "manifest.json")

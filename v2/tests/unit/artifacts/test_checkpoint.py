@@ -1061,7 +1061,7 @@ def test_publication_hashes_payloads_once_per_verification_boundary(
     valid_run: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Builder, pre-rename, and post-rename proofs each read tensor bytes once."""
+    """Pre-rename and post-rename proofs each read tensor bytes exactly once."""
     hashes: Counter[str] = Counter()
     original_identity = artifact_manifest.file_identity
 
@@ -1078,7 +1078,109 @@ def test_publication_hashes_payloads_once_per_verification_boundary(
         )
 
     for reference in checkpoint.checkpoint_array_payloads(published.checkpoint):
-        assert hashes[reference.payload.identity] == 3
+        assert hashes[reference.payload.identity] == 2
+
+
+def test_publish_and_prune_reuses_only_unchanged_checkpoint_proofs(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proofs: Counter[int] = Counter()
+    hashes: Counter[str] = Counter()
+    real_verify = checkpoint._verify_checkpoint_semantics
+    real_identity = artifact_manifest.file_identity
+
+    def record_proof(descriptor, manifest, verification, **kwargs):
+        proofs[manifest.step] += 1
+        return real_verify(descriptor, manifest, verification, **kwargs)
+
+    def record_hash(stream):
+        identity = real_identity(stream)
+        hashes[identity] += 1
+        return identity
+
+    monkeypatch.setattr(checkpoint, "_verify_checkpoint_semantics", record_proof)
+    monkeypatch.setattr(artifact_manifest, "file_identity", record_hash)
+    with checkpoint.run_writer_lock(valid_run):
+        retained = checkpoint.publish_and_prune_checkpoint(
+            valid_run, _checkpoint_builder(_run_manifest(), step=2)
+        )
+
+    assert proofs == {1: 1, 2: 2}
+    for reference in checkpoint.checkpoint_array_payloads(retained.checkpoint):
+        assert hashes[reference.payload.identity] == 2
+    assert retained.pruning_pending is False
+    assert [path.name for path in (valid_run / "checkpoints").iterdir()] == [
+        "step-000000002"
+    ]
+
+
+@pytest.mark.parametrize("changed_step", (1, 2))
+def test_publish_and_prune_rejects_changed_cached_payload_before_deletion(
+    valid_run: Path,
+    changed_step: int,
+) -> None:
+    class MutatingFilesystemOps(RecordingFilesystemOps):
+        def _complete(self, stage):
+            super()._complete(stage)
+            if stage == "latest-parent-fsynced":
+                payload = (
+                    valid_run
+                    / "checkpoints"
+                    / f"step-{changed_step:09d}"
+                    / "optimizer.safetensors"
+                )
+                original = payload.read_bytes()
+                payload.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+
+    fs = MutatingFilesystemOps(valid_run)
+    with (
+        checkpoint.run_writer_lock(valid_run),
+        pytest.raises(SMLArtifactError, match="payload identity mismatch"),
+    ):
+        checkpoint.publish_and_prune_checkpoint(
+            valid_run, _checkpoint_builder(_run_manifest(), step=2), fs=fs
+        )
+
+    assert fs.delete_count == 0
+    assert all(
+        (valid_run / "checkpoints" / f"step-{step:09d}").is_dir() for step in (1, 2)
+    )
+
+
+def test_publish_and_prune_reproves_replaced_identical_payload(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ReplacingFilesystemOps(RecordingFilesystemOps):
+        def _complete(self, stage):
+            super()._complete(stage)
+            if stage == "latest-parent-fsynced":
+                payload = (
+                    valid_run / "checkpoints" / "step-000000002" / "model.safetensors"
+                )
+                replacement = payload.with_suffix(".replacement")
+                replacement.write_bytes(payload.read_bytes())
+                replacement.replace(payload)
+
+    real_verify = checkpoint._verify_checkpoint_semantics
+    proofs: Counter[int] = Counter()
+
+    def record_proof(descriptor, manifest, verification, **kwargs):
+        proofs[manifest.step] += 1
+        return real_verify(descriptor, manifest, verification, **kwargs)
+
+    monkeypatch.setattr(checkpoint, "_verify_checkpoint_semantics", record_proof)
+    with checkpoint.run_writer_lock(valid_run):
+        retained = checkpoint.publish_and_prune_checkpoint(
+            valid_run,
+            _checkpoint_builder(_run_manifest(), step=2),
+            fs=ReplacingFilesystemOps(valid_run),
+        )
+
+    assert proofs == {1: 1, 2: 3}
+    assert retained.step == 2
+    assert retained.pruning_pending is False
 
 
 def test_post_commit_mutation_never_publishes_latest_or_returns_full(

@@ -223,6 +223,63 @@ def test_identity_mismatch_at_existing_target_is_a_collision(tmp_path):
         )
 
 
+@pytest.mark.parametrize("existing", ["matching", "different-revision", "corrupt"])
+def test_cli_reuses_only_matching_fully_verified_swag_data(
+    tmp_path, monkeypatch, capsys, existing
+):
+    from sml.cli import main
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    base = tiny_base_model()
+    output = tmp_path / "swag"
+    config = tiny_swag_config(provider, bucket_boundaries=(64, 128, 256))
+    with prepare_swag_bundle(config, base, output) as bundle:
+        payload = output / bundle.manifest.buckets[0].payload.logical_path
+    if existing == "corrupt":
+        contents = bytearray(payload.read_bytes())
+        contents[-1] ^= 1
+        payload.write_bytes(contents)
+    before = {path: path.read_bytes() for path in output.rglob("*") if path.is_file()}
+    provider.fail_resolve = True
+    provider.resolve_calls = provider.iter_calls = 0
+    monkeypatch.setattr(
+        "sml.data.swag.HuggingFaceDatasetsSwagProvider", lambda: provider
+    )
+
+    def resolve_base(path, *, full_verify):
+        assert path == Path("base")
+        assert full_verify is True
+        return base
+
+    monkeypatch.setattr("sml.inference.resolve_model_artifact", resolve_base)
+    revision = (
+        "another-revision"
+        if existing == "different-revision"
+        else config.source.revision
+    )
+    result = main(
+        [
+            "prepare",
+            "swag",
+            "--checkpoint",
+            "base",
+            "--revision",
+            revision,
+            "--maximum-length",
+            "32",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert result == (0 if existing == "matching" else 3)
+    assert provider.resolve_calls == provider.iter_calls == 0
+    assert {path: path.read_bytes() for path in before} == before
+    if existing != "matching":
+        assert "SMLArtifactError" in capsys.readouterr().err
+
+
 def test_swag_module_import_does_not_load_datasets(monkeypatch):
     monkeypatch.delitem(sys.modules, "datasets", raising=False)
     monkeypatch.delitem(sys.modules, "sml.data.swag", raising=False)

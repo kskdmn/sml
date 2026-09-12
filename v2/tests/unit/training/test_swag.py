@@ -18,7 +18,7 @@ from sml.data.swag import (
     SwagCursor,
     prepare_swag_bundle,
 )
-from sml.errors import SMLConfigurationError
+from sml.errors import SMLConfigurationError, SMLRuntimeError
 from sml.inference import ResolvedModel
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
@@ -711,7 +711,8 @@ def test_compiled_swag_optimizer_core_consumes_builtin_adapter_and_adam_trees(
     )
     mx.eval(outputs)
     assert_builtin_array_tree(outputs)
-    next_adapters, next_adam_tree, next_trainer_tree = outputs
+    next_adapters, next_adam_tree, next_trainer_tree, finite = outputs
+    assert bool(finite)
     assert_tree_dtypes(next_adapters, mx.float32)
     assert_tree_dtypes(next_adam_tree[1], mx.float32)
     assert_tree_dtypes(next_adam_tree[2], mx.float32)
@@ -724,6 +725,55 @@ def test_compiled_swag_optimizer_core_consumes_builtin_adapter_and_adam_trees(
             break
     assert changed
     assert int(next_trainer_tree[1].item()) == 0
+
+
+@pytest.mark.parametrize("compiled", (False, True))
+@pytest.mark.parametrize(
+    "failure",
+    ("nan-loss", "infinite-gradient", "parameter-overflow", "epsilon-underflow"),
+)
+def test_swag_optimizer_rejects_numerical_failure_without_changing_input_state(
+    tiny_swag_runtime, compiled, failure
+):
+    runtime = tiny_swag_runtime
+    config = replace(runtime.config, compile=compiled)
+    adapters = runtime.initial_adapters
+    optimizer = initialize_adam_state(adapters)
+    trainer = replace(
+        swag_module.initial_swag_trainer_state(adapters, key=mx.random.key(11)),
+        accumulators=tree_map(mx.ones_like, adapters),
+        valid_count=mx.array(1, dtype=mx.int32),
+        loss_numerator=mx.array(1.0, dtype=mx.float32),
+    )
+    if failure == "nan-loss":
+        trainer = replace(
+            trainer, loss_numerator=mx.array(float("nan"), dtype=mx.float32)
+        )
+    elif failure == "infinite-gradient":
+        trainer = replace(
+            trainer,
+            accumulators=tree_map(
+                lambda value: mx.full_like(value, float("inf")), adapters
+            ),
+        )
+    elif failure == "parameter-overflow":
+        config = replace(
+            config,
+            optimizer=replace(
+                config.optimizer,
+                learning_rate=3e38,
+                schedule_steps=None,
+                warmup_steps=0,
+            ),
+        )
+    else:
+        config = replace(config, optimizer=replace(config.optimizer, epsilon=1e-100))
+    kernels = build_swag_kernels(runtime.model, config, runtime.weight_decay_tree)
+    before = dict(tree_flatten(adapters))
+    with pytest.raises(SMLRuntimeError, match="nonfinite"):
+        kernels.optimizer_step(adapters, optimizer, trainer)
+    assert int(optimizer.step.item()) == 0
+    assert all(value is before[name] for name, value in tree_flatten(adapters))
 
 
 def test_direct_swag_envelope_validates_numpy_arrays_and_stores_readonly_views():

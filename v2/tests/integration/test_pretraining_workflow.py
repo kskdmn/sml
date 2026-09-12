@@ -49,7 +49,7 @@ from sml.data.pretraining import (
     prepare_pretraining_bundle,
 )
 from sml.data.tokenizer import TokenizerTrainingConfig, train_tokenizer_bundle
-from sml.errors import SMLArtifactError
+from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.inference import InferenceSession
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
@@ -425,12 +425,12 @@ def _run_with_unpruned_latest(
     run: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    real_retention = pretrain.prune_to_latest
+    real_retention = checkpoint_module._prune_to_latest
 
     def interrupt_retention(*_args, **_kwargs):
         raise InjectedFailure("before retention")
 
-    monkeypatch.setattr(pretrain, "prune_to_latest", interrupt_retention)
+    monkeypatch.setattr(checkpoint_module, "_prune_to_latest", interrupt_retention)
     with pytest.raises(InjectedFailure, match="before retention"):
         pretrain.train(
             replace(
@@ -438,7 +438,7 @@ def _run_with_unpruned_latest(
                 checkpoint=CheckpointPolicy(interval=1),
             )
         )
-    monkeypatch.setattr(pretrain, "prune_to_latest", real_retention)
+    monkeypatch.setattr(checkpoint_module, "_prune_to_latest", real_retention)
     assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
         "step-000000000",
         "step-000000001",
@@ -667,6 +667,99 @@ def test_interrupted_accumulation_replays_the_complete_window(
 
     assert resumed.step == uninterrupted.step == 2
     _assert_run_states_equal(resumed.run, uninterrupted.run)
+
+
+@pytest.mark.parametrize("hidden_dropout", (0.0, 0.2))
+def test_legacy_checkpoint_resumes_identically_and_publishes_compact_state(
+    prepared_data: Path, tmp_path: Path, hidden_dropout: float
+) -> None:
+    config = _config(prepared_data, tmp_path / "compact", maximum_steps=1)
+    config = replace(config, model=replace(config.model, hidden_dropout=hidden_dropout))
+    compact = pretrain.train(config)
+    legacy_run = tmp_path / "legacy"
+    shutil.copytree(compact.run, legacy_run)
+    resolved = resolve_latest_step(
+        legacy_run, writable=False, verification=VerificationLevel.FULL
+    )
+    assert resolved.checkpoint.version == 2
+    trainer_path = resolved.step_directory / "trainer.safetensors"
+    trainer = dict(mx.load(trainer_path))
+    assert set(trainer) == {"accumulation_count", "loss_numerator", "next_key"}
+    masters = mx.load(resolved.step_directory / "master.safetensors")
+    trainer.update(
+        (f"accumulators.{name}", mx.zeros_like(value))
+        for name, value in masters.items()
+    )
+    mx.eval(trainer)
+    mx.save_safetensors(trainer_path, trainer)
+    legacy = replace(
+        resolved.checkpoint,
+        version=1,
+        trainer=ArrayPayloadRef(
+            payload=_payload_ref(trainer_path, "trainer.safetensors"),
+            arrays=tuple(
+                ArraySpec(name, tuple(value.shape), _dtype_name(value))
+                for name, value in sorted(trainer.items())
+            ),
+        ),
+    )
+    legacy = replace(legacy, identity=legacy.recompute_identity())
+    (resolved.step_directory / "checkpoint.json").write_bytes(
+        canonical_json_bytes(legacy)
+    )
+    latest = read_manifest(
+        legacy_run, LatestIndex, VerificationLevel.MANIFEST_TRUSTED
+    ).manifest
+    latest = replace(latest, checkpoint_identity=legacy.identity)
+    latest = replace(latest, identity=latest.recompute_identity())
+    (legacy_run / "latest.json").write_bytes(canonical_json_bytes(latest))
+
+    for run in (compact.run, legacy_run):
+        assert (
+            pretrain.resume(
+                run, data=prepared_data, overrides=_overrides(maximum_steps=2)
+            ).step
+            == 2
+        )
+        final = resolve_latest_step(
+            run, writable=False, verification=VerificationLevel.FULL
+        )
+        assert final.checkpoint.version == 2
+        assert {spec.name for spec in final.checkpoint.trainer.arrays} == {
+            "accumulation_count",
+            "loss_numerator",
+            "next_key",
+        }
+    _assert_run_states_equal(compact.run, legacy_run)
+
+
+@pytest.mark.parametrize("interval", (1, 1000))
+def test_nonfinite_update_preserves_last_checkpoint_before_cursor_commit(
+    prepared_data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interval: int
+) -> None:
+    config = _config(prepared_data, tmp_path / "failed", maximum_steps=3)
+    config = replace(
+        config,
+        optimizer=replace(config.optimizer, learning_rate=3e38, beta1=0.9, beta2=0.999),
+        checkpoint=CheckpointPolicy(interval=interval),
+    )
+    committed = []
+    monkeypatch.setattr(
+        data_module.PretrainingBatchStream,
+        "commit",
+        lambda _self, cursor: committed.append(cursor),
+    )
+    with pytest.raises(SMLRuntimeError, match="nonfinite"):
+        pretrain.train(config)
+    assert committed == []
+    retained = resolve_latest_step(
+        config.output_run, writable=False, verification=VerificationLevel.FULL
+    )
+    assert retained.step == 0
+    assert pretrain.read_scalar_state(retained).rows == 0
+    assert [path.name for path in (config.output_run / "checkpoints").iterdir()] == [
+        "step-000000000"
+    ]
 
 
 @pytest.mark.parametrize("maximum_steps", (1, 2))
@@ -1136,14 +1229,14 @@ def test_checkpoint_interval_counts_updates_and_final_state_is_committed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     published: list[int] = []
-    real_publish = pretrain.publish_checkpoint
+    real_publish = checkpoint_module._publish_checkpoint
 
-    def record_publish(run, build):
-        resolved = real_publish(run, build)
+    def record_publish(run, build, **kwargs):
+        resolved = real_publish(run, build, **kwargs)
         published.append(resolved.step)
         return resolved
 
-    monkeypatch.setattr(pretrain, "publish_checkpoint", record_publish)
+    monkeypatch.setattr(checkpoint_module, "_publish_checkpoint", record_publish)
 
     result = pretrain.train(_config(prepared_data, tmp_path / "run", maximum_steps=3))
 
@@ -1173,9 +1266,9 @@ def test_checkpoint_retention_rejects_same_step_identity_substitution(
     assert substituted.step == 1
 
     monkeypatch.setattr(
-        pretrain,
-        "prune_to_latest",
-        lambda _run: substituted,
+        checkpoint_module,
+        "_prune_to_latest",
+        lambda _run, **_kwargs: substituted,
     )
     with pytest.raises(SMLArtifactError, match="identity"):
         pretrain.train(
@@ -1300,7 +1393,6 @@ def test_restored_state_corruption_fails_before_pruning_stream_or_model(
     )
     moment_name = f"first_moments.{parameter_name}"
     second_name = f"second_moments.{parameter_name}"
-    accumulator_name = f"accumulators.{parameter_name}"
 
     if mutation.startswith("optimizer-"):
         optimizer = mx.load(resolved.step_directory / "optimizer.safetensors")
@@ -1318,14 +1410,15 @@ def test_restored_state_corruption_fails_before_pruning_stream_or_model(
     elif mutation.startswith(("trainer-", "prng-")):
         trainer = mx.load(resolved.step_directory / "trainer.safetensors")
         if mutation == "trainer-missing-key":
-            trainer.pop(accumulator_name)
+            trainer.pop("accumulation_count")
         elif mutation == "trainer-additional-key":
-            trainer["accumulators.unexpected.weight"] = trainer[accumulator_name]
+            trainer["accumulators.unexpected.weight"] = mx.zeros_like(
+                masters[parameter_name]
+            )
         elif mutation == "trainer-wrong-dtype":
-            trainer[accumulator_name] = trainer[accumulator_name].astype(mx.bfloat16)
+            trainer["loss_numerator"] = trainer["loss_numerator"].astype(mx.bfloat16)
         elif mutation == "trainer-wrong-shape":
-            wrong_shape = (int(np.prod(masters[parameter_name].shape)),)
-            trainer[accumulator_name] = mx.zeros(wrong_shape, dtype=mx.float32)
+            trainer["loss_numerator"] = mx.zeros((1,), dtype=mx.float32)
         elif mutation == "prng-wrong-dtype":
             trainer["next_key"] = trainer["next_key"].astype(mx.int32)
         else:
@@ -1410,14 +1503,14 @@ def test_dropped_epoch_tail_does_not_publish_duplicate_progress_checkpoint(
         checkpoint=CheckpointPolicy(interval=1),
     )
     published: list[int] = []
-    real_publish = pretrain.publish_checkpoint
+    real_publish = checkpoint_module._publish_checkpoint
 
-    def record_publish(run, build):
-        resolved = real_publish(run, build)
+    def record_publish(run, build, **kwargs):
+        resolved = real_publish(run, build, **kwargs)
         published.append(resolved.step)
         return resolved
 
-    monkeypatch.setattr(pretrain, "publish_checkpoint", record_publish)
+    monkeypatch.setattr(checkpoint_module, "_publish_checkpoint", record_publish)
 
     result = pretrain.train(config)
 

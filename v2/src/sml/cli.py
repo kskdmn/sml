@@ -1104,7 +1104,6 @@ def _validate_command(command: str, values: dict[str, object]) -> None:
     if command in {
         "tokenize",
         "prepare.pretraining",
-        "prepare.swag",
         "train",
         "finetune",
         "export",

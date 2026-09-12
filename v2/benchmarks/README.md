@@ -157,6 +157,11 @@ the current paths below; canonical training and validation fixtures are checked
 in. Pretraining publication recovery uses
 `results/.pretraining-quality-v3.recording`.
 
+SWAG `record` reuses existing evidence only when the current harness, production
+sources, and fixtures match the recorded inputs. Changed inputs require fresh
+evidence. The `validate` command can still verify historical evidence against its
+recorded source commit.
+
 ```sh
 uv run python -m v2.benchmarks.quality record --steps 1000 \
   --manifest v2/benchmarks/manifests/pretraining-quality-v3.json \

@@ -18,6 +18,7 @@ from mlx.utils import tree_flatten
 from sml.artifacts import checkpoint as checkpoint_module
 from sml.artifacts.checkpoint import CheckpointReader, resolve_latest_step
 from sml.artifacts.manifest import (
+    ArraySpec,
     ArtifactRoot,
     BaseSnapshotManifest,
     ExportManifest,
@@ -248,7 +249,6 @@ def assert_checkpoint_array_dtypes(
     *,
     adapters: mx.Dtype,
     optimizer_moments: mx.Dtype,
-    trainer_accumulators: mx.Dtype,
 ) -> None:
     adapter_arrays = _load_group(step.step_directory, "adapters.safetensors")
     optimizer_arrays = _load_group(step.step_directory, "optimizer.safetensors")
@@ -258,13 +258,11 @@ def assert_checkpoint_array_dtypes(
     moment_arrays = [array for key, array in optimizer_arrays.items() if key != "step"]
     assert moment_arrays
     assert all(array.dtype == optimizer_moments for array in moment_arrays)
-    accumulator_arrays = [
-        array
-        for key, array in trainer_arrays.items()
-        if key not in {"accumulation_count", "next_key", "loss_numerator"}
-    ]
-    assert accumulator_arrays
-    assert all(array.dtype == trainer_accumulators for array in accumulator_arrays)
+    assert step.checkpoint.version == 2
+    assert set(trainer_arrays) == {"accumulation_count", "next_key", "loss_numerator"}
+    assert trainer_arrays["accumulation_count"].dtype == mx.int32
+    assert trainer_arrays["next_key"].dtype == mx.uint32
+    assert trainer_arrays["loss_numerator"].dtype == mx.float32
 
 
 def assert_base_snapshot_array_dtypes(base_directory: Path, *, model: mx.Dtype) -> None:
@@ -499,7 +497,6 @@ def test_lora_checkpoint_omits_frozen_base(tiny_lora_run):
         step,
         adapters=mx.float32,
         optimizer_moments=mx.float32,
-        trainer_accumulators=mx.float32,
     )
     assert_base_snapshot_array_dtypes(tiny_lora_run / "base", model=mx.bfloat16)
     verified = read_manifest(
@@ -510,6 +507,71 @@ def test_lora_checkpoint_omits_frozen_base(tiny_lora_run):
     assert verified.manifest.precision.get("working_parameter_dtype") == "bfloat16"
     assert verified.manifest.precision.get("master_weights") is True
     assert "adapter_parameter_dtype" not in verified.manifest.precision
+
+
+def test_legacy_lora_checkpoint_resumes_identically_and_saves_compact_state(
+    tiny_lora_run, tiny_swag_bundle, tmp_path
+):
+    legacy_run = tmp_path / "legacy-lora-run"
+    shutil.copytree(tiny_lora_run, legacy_run)
+    resolved = resolve_latest_step(
+        legacy_run, writable=False, verification=VerificationLevel.FULL
+    )
+    checkpoint = resolved.checkpoint
+    assert isinstance(checkpoint, LoRACheckpointManifest)
+    assert checkpoint.version == 2
+    trainer_path = resolved.step_directory / "trainer.safetensors"
+    trainer = _load_group(resolved.step_directory, "trainer.safetensors")
+    specs = {spec.name: spec for spec in checkpoint.trainer.arrays}
+    adapters = _load_group(resolved.step_directory, "adapters.safetensors")
+    mx.eval(trainer, adapters)
+    for name, array in adapters.items():
+        accumulator_name = f"accumulators.{name}"
+        trainer[accumulator_name] = mx.zeros_like(array)
+        specs[accumulator_name] = ArraySpec(accumulator_name, array.shape, "float32")
+    mx.save_safetensors(trainer_path, trainer)
+    checkpoint = replace(
+        checkpoint,
+        version=1,
+        trainer=replace(
+            checkpoint.trainer,
+            payload=_payload_ref(trainer_path, "trainer.safetensors"),
+            arrays=tuple(specs[name] for name in sorted(specs)),
+        ),
+    )
+    checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())
+    (resolved.step_directory / "checkpoint.json").write_bytes(
+        canonical_json_bytes(checkpoint)
+    )
+    latest = read_manifest(
+        legacy_run, LatestIndex, VerificationLevel.MANIFEST_TRUSTED
+    ).manifest
+    latest = replace(latest, checkpoint_identity=checkpoint.identity)
+    latest = replace(latest, identity=latest.recompute_identity())
+    (legacy_run / "latest.json").write_bytes(canonical_json_bytes(latest))
+    verify_artifact(legacy_run, full=True)
+
+    for run in (tiny_lora_run, legacy_run):
+        resumed = resume_finetune(
+            run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=resolved.step + 1),
+        )
+        assert resumed.step == resolved.step + 1
+        latest = resolve_latest_step(
+            run, writable=False, verification=VerificationLevel.FULL
+        )
+        assert latest.checkpoint.version == 2
+        assert {spec.name for spec in latest.checkpoint.trainer.arrays} == {
+            "accumulation_count",
+            "next_key",
+            "loss_numerator",
+        }
+    compact_state = _latest_checkpoint_state(tiny_lora_run)
+    legacy_state = _latest_checkpoint_state(legacy_run)
+    assert legacy_state["scalar"] == compact_state["scalar"]
+    for group in ("adapters", "optimizer", "trainer"):
+        _assert_array_maps_equal(legacy_state[group], compact_state[group])
 
 
 def test_full_lora_resolve_applies_exact_run_semantics(tiny_lora_run: Path) -> None:
@@ -1133,13 +1195,14 @@ def _run_with_unpruned_lora_history(
     run: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Path:
-    real_prune = swag_module.prune_to_latest
-
     def interrupt_retention(*_args, **_kwargs):
         raise RuntimeError("retention interrupted")
 
-    monkeypatch.setattr(swag_module, "prune_to_latest", interrupt_retention)
-    with pytest.raises(RuntimeError, match="retention interrupted"):
+    with (
+        monkeypatch.context() as interrupted,
+        pytest.raises(RuntimeError, match="retention interrupted"),
+    ):
+        interrupted.setattr(checkpoint_module, "_prune_to_latest", interrupt_retention)
         finetune(
             tiny_swag_training_config(
                 tiny_base_run,
@@ -1148,7 +1211,6 @@ def _run_with_unpruned_lora_history(
                 maximum_steps=1,
             )
         )
-    monkeypatch.setattr(swag_module, "prune_to_latest", real_prune)
     assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
         "step-000000000",
         "step-000000001",

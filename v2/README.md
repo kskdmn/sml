@@ -55,6 +55,9 @@ is still applied. Progress is printed to stderr every `log_interval` optimizer
 updates, including loss, learning rate, and processed rows or examples;
 fine-tuning also reports accuracy.
 
+Training stops on nonfinite loss, gradients, or updated parameters before committing
+the failed update. The preceding published checkpoint remains available for recovery.
+
 Resume an existing run with only the allowed operational overrides:
 
 ```sh
@@ -115,6 +118,9 @@ uv run python -m sml prepare swag --checkpoint v2/output/base-run --revision 012
 ```
 
 Preparation fully verifies the selected base run before publication.
+Repeating the command with the same configuration and output reuses a matching,
+fully verified bundle without contacting the dataset provider. Changed configuration
+or damaged cached payloads are rejected.
 
 ### LoRA fine-tuning
 
@@ -238,6 +244,11 @@ swag-run/
         ├── state.json
         └── trainer.safetensors
 ```
+
+New checkpoints use format version 2. They save trainer counters and RNG state,
+and reconstruct empty gradient accumulators on resume instead of storing a full
+tree of zeros. Version 1 checkpoints remain readable and resumable; the next saved
+checkpoint uses version 2.
 
 A merged export is independently portable and contains no optimizer, master, or
 adapter training state:

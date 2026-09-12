@@ -58,6 +58,7 @@ from sml.artifacts.manifest import (
     _open_verified_payload,
     _parse_manifest,
     _reject_json_constant,
+    _same_stable_entry,
     canonical_json_bytes,
     parse_logical_path,
     structured_identity,
@@ -1203,9 +1204,11 @@ def _validate_builder_result(
     manifest: object,
     temporary_descriptor: int,
     fs: FilesystemOps,
+    *,
+    defer_checkpoint_proof: bool = False,
 ) -> object:
     if type(manifest) not in _MANIFEST_TYPES:
-        raise SMLArtifactError("builder returned an unsupported version-1 manifest")
+        raise SMLArtifactError("builder returned an unsupported artifact manifest")
     if manifest.identity != manifest.recompute_identity():
         raise SMLArtifactError("builder returned a manifest identity mismatch")
     if (
@@ -1226,7 +1229,7 @@ def _validate_builder_result(
         # Checkpoint semantic verification owns the full payload proof below.
         verify_contents=not checkpoint_manifest,
     )
-    if checkpoint_manifest:
+    if checkpoint_manifest and not defer_checkpoint_proof:
         _verify_checkpoint_semantics(
             temporary_descriptor,
             manifest,
@@ -1879,6 +1882,67 @@ class VerifiedCheckpointContents:
         object.__setattr__(self, "payload_bytes", MappingProxyType(raw_payloads))
 
 
+@dataclass(slots=True)
+class _CheckpointProof:
+    descriptor: int
+    array_stats: dict[str, os.stat_result]
+    contents: VerifiedCheckpointContents
+
+
+class _CheckpointProofCache:
+    """Retain transaction-local proofs, reusable only for unchanged owned files."""
+
+    def __init__(self) -> None:
+        self._proofs: dict[str, _CheckpointProof] = {}
+
+    def remember(
+        self,
+        descriptor: int,
+        manifest: CheckpointManifest,
+        array_stats: dict[str, os.stat_result],
+        contents: VerifiedCheckpointContents,
+    ) -> None:
+        proof = _CheckpointProof(os.dup(descriptor), array_stats, contents)
+        previous = self._proofs.get(manifest.identity)
+        self._proofs[manifest.identity] = proof
+        if previous is not None:
+            os.close(previous.descriptor)
+
+    def reuse(
+        self,
+        descriptor: int,
+        manifest: CheckpointManifest,
+    ) -> VerifiedCheckpointContents | None:
+        proof = self._proofs.get(manifest.identity)
+        if proof is None or not _same_inode(
+            os.fstat(descriptor), os.fstat(proof.descriptor)
+        ):
+            return None
+        with (
+            ArtifactRoot(os.dup(descriptor), local_apfs=True) as root,
+            ExitStack() as payload_stack,
+        ):
+            # Scalar state is small; reprove it instead of caching another file.
+            scalar = _read_checkpoint_scalar_payload(root, manifest, full=True)
+            for path, expected in proof.array_stats.items():
+                payload = payload_stack.enter_context(_open_stable_payload(root, path))
+                if not _same_stable_entry(expected, payload.opened_stat):
+                    return None
+        return dataclasses.replace(proof.contents, scalar_state=scalar)
+
+    def close(self) -> None:
+        failure: OSError | None = None
+        for proof in self._proofs.values():
+            try:
+                os.close(proof.descriptor)
+            except OSError as error:
+                if failure is None:
+                    failure = error
+        self._proofs.clear()
+        if failure is not None:
+            raise failure
+
+
 def _mlx_core() -> ModuleType:
     return importlib.import_module("mlx.core")
 
@@ -2026,7 +2090,7 @@ def verify_checkpoint_current_state(
         raise SMLArtifactError(
             "checkpoint trainer current state is incomplete"
         ) from error
-    if not accumulators:
+    if reader.resolved.checkpoint.version == 1 and not accumulators:
         raise SMLArtifactError("checkpoint trainer has no parameter accumulators")
     mx = _mlx_core()
     mx.eval(accumulation_count, loss_numerator, next_key, *accumulators)
@@ -2333,6 +2397,7 @@ def _validate_optimizer_and_trainer_specs(
     trainer: ArrayPayloadRef,
     *,
     master_specs: Mapping[str, object],
+    checkpoint_version: int,
 ) -> None:
     expected_optimizer = {
         "step",
@@ -2343,8 +2408,9 @@ def _validate_optimizer_and_trainer_specs(
         "accumulation_count",
         "next_key",
         "loss_numerator",
-        *(f"accumulators.{name}" for name in trainable_names),
     }
+    if checkpoint_version == 1:
+        expected_trainer.update(f"accumulators.{name}" for name in trainable_names)
     optimizer_specs = _array_specs_by_name(optimizer)
     trainer_specs = _array_specs_by_name(trainer)
     if set(optimizer_specs) != expected_optimizer:
@@ -2385,6 +2451,8 @@ def _validate_optimizer_and_trainer_specs(
             ("second_moments.", optimizer_specs, "optimizer"),
             ("accumulators.", trainer_specs, "trainer"),
         ):
+            if prefix == "accumulators." and checkpoint_version == 2:
+                continue
             _require_spec_contract(
                 specs[f"{prefix}{name}"],
                 shape=shape,
@@ -2400,6 +2468,7 @@ def _verify_checkpoint_semantics(
     *,
     load_array_groups: frozenset[str] | None = None,
     materialize_byte_groups: frozenset[str] | None = None,
+    proof_cache: _CheckpointProofCache | None = None,
 ) -> VerifiedCheckpointContents:
     local_apfs = _descriptor_is_local_apfs(descriptor)
     full = verification is VerificationLevel.FULL
@@ -2450,6 +2519,7 @@ def _verify_checkpoint_semantics(
             manifest.optimizer,
             manifest.trainer,
             master_specs=trainable_specs,
+            checkpoint_version=manifest.version,
         )
         payload_bytes: dict[str, bytes] = {}
         groups = {
@@ -2471,13 +2541,17 @@ def _verify_checkpoint_semantics(
             boundary_state = _checkpoint_boundary_state(manifest, streams, layouts)
             if isinstance(manifest, PretrainingCheckpointManifest):
                 _verify_streaming_model_master_cast(streams, layouts)
+        array_stats = {path: payload.opened_stat for path, payload in payloads.items()}
 
-    return VerifiedCheckpointContents(
+    contents = VerifiedCheckpointContents(
         scalar,
         groups,
         payload_bytes,
         boundary_state,
     )
+    if proof_cache is not None and full and not selected and not byte_groups:
+        proof_cache.remember(descriptor, manifest, array_stats, contents)
+    return contents
 
 
 def _validate_checkpoint_owner(
@@ -2581,6 +2655,7 @@ def _open_verified_step_from_descriptor(
     load_array_groups: frozenset[str] | None = None,
     materialize_byte_groups: frozenset[str] | None = None,
     verify_contents: bool | None = None,
+    proof_cache: _CheckpointProofCache | None = None,
 ) -> _OwnedStep:
     name = _step_name(step)
     descriptor = -1
@@ -2620,17 +2695,23 @@ def _open_verified_step_from_descriptor(
             if verify_contents is None
             else verify_contents,
         )
-        contents = (
-            _verify_checkpoint_semantics(
+        contents = None
+        if (
+            proof_cache is not None
+            and verification is VerificationLevel.FULL
+            and effective_load_groups == frozenset()
+            and not materialize_byte_groups
+        ):
+            contents = proof_cache.reuse(descriptor, manifest)
+        if materialize and contents is None:
+            contents = _verify_checkpoint_semantics(
                 descriptor,
                 manifest,
                 verification,
                 load_array_groups=effective_load_groups,
                 materialize_byte_groups=materialize_byte_groups,
+                proof_cache=proof_cache,
             )
-            if materialize
-            else None
-        )
         _require_named_directory_inode(
             fs,
             name,
@@ -2961,6 +3042,7 @@ def _resolve_step_from_descriptor(
     verification: VerificationLevel,
     fs: FilesystemOps,
     verify_contents: bool | None = None,
+    proof_cache: _CheckpointProofCache | None = None,
 ) -> ResolvedStep:
     owned = _open_verified_step_from_descriptor(
         run,
@@ -2973,6 +3055,7 @@ def _resolve_step_from_descriptor(
             frozenset() if verification is VerificationLevel.FULL else None
         ),
         verify_contents=verify_contents,
+        proof_cache=proof_cache,
     )
     try:
         return owned.resolved
@@ -3186,6 +3269,7 @@ def _recover_latest_open(
     fs: FilesystemOps,
     allow_empty: bool,
     defer_selected_proof: bool = False,
+    proof_cache: _CheckpointProofCache | None = None,
 ) -> ResolvedStep | None:
     if writable and defer_selected_proof:
         raise SMLArtifactError("writable latest recovery cannot defer winner proof")
@@ -3232,6 +3316,7 @@ def _recover_latest_open(
             step=selected.step,
             verification=verification,
             fs=fs,
+            proof_cache=proof_cache,
         )
         if proven.checkpoint.identity != selected.checkpoint.identity:
             raise SMLArtifactError("selected latest changed before winner proof")
@@ -3443,6 +3528,16 @@ def publish_checkpoint(
     *,
     fs: FilesystemOps = OS_FILESYSTEM,
 ) -> ResolvedStep:
+    return _publish_checkpoint(run, build, fs=fs, proof_cache=None)
+
+
+def _publish_checkpoint(
+    run: Path,
+    build: Callable[[Path], CheckpointManifest],
+    *,
+    fs: FilesystemOps,
+    proof_cache: _CheckpointProofCache | None,
+) -> ResolvedStep:
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
     if not callable(build):
@@ -3494,6 +3589,7 @@ def publish_checkpoint(
             manifest,
             temporary_descriptor,
             fs,
+            defer_checkpoint_proof=True,
         )
         if validated_manifest is not manifest:
             raise SMLArtifactError(
@@ -3509,6 +3605,7 @@ def publish_checkpoint(
             verification=VerificationLevel.FULL,
             fs=fs,
             allow_empty=True,
+            proof_cache=proof_cache,
         )
         if current_latest is not None and manifest.step < current_latest.step:
             raise SMLArtifactError(
@@ -3524,6 +3621,12 @@ def publish_checkpoint(
             )
             is not None
         ):
+            _verify_checkpoint_semantics(
+                temporary_descriptor,
+                manifest,
+                VerificationLevel.FULL,
+                load_array_groups=frozenset(),
+            )
             existing = _resolve_step_from_descriptor(
                 run,
                 run_manifest,
@@ -3531,6 +3634,7 @@ def publish_checkpoint(
                 step=manifest.step,
                 verification=VerificationLevel.FULL,
                 fs=fs,
+                proof_cache=proof_cache,
             )
             if existing.checkpoint.identity != manifest.identity:
                 raise SMLArtifactError(
@@ -3571,6 +3675,13 @@ def publish_checkpoint(
             manifest,
             manifest_present=True,
             full=True,
+            verify_contents=False,
+        )
+        _verify_checkpoint_semantics(
+            temporary_descriptor,
+            manifest,
+            VerificationLevel.FULL,
+            load_array_groups=frozenset(),
         )
         _require_named_directory_inode(
             fs,
@@ -3628,6 +3739,7 @@ def publish_checkpoint(
             committed_manifest,
             VerificationLevel.FULL,
             load_array_groups=frozenset(),
+            proof_cache=proof_cache,
         )
         _require_named_directory_inode(
             fs,
@@ -3960,6 +4072,15 @@ def prune_to_latest(
     *,
     fs: FilesystemOps = OS_FILESYSTEM,
 ) -> ResolvedStep:
+    return _prune_to_latest(run, fs=fs, proof_cache=None)
+
+
+def _prune_to_latest(
+    run: Path,
+    *,
+    fs: FilesystemOps,
+    proof_cache: _CheckpointProofCache | None,
+) -> ResolvedStep:
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
     if not isinstance(fs, FilesystemOps):
@@ -3998,10 +4119,11 @@ def prune_to_latest(
                 run_manifest,
                 run_descriptor,
                 checkpoints_descriptor,
-                writable=True,
+                writable=False,
                 verification=VerificationLevel.FULL,
                 fs=fs,
                 allow_empty=False,
+                defer_selected_proof=True,
             )
             if latest is None:
                 raise SMLArtifactError("run has no published checkpoints")
@@ -4018,6 +4140,7 @@ def prune_to_latest(
                         verification=VerificationLevel.FULL,
                         fs=fs,
                         load_array_groups=frozenset(),
+                        proof_cache=proof_cache,
                     )
                 )
 
@@ -4029,6 +4152,7 @@ def prune_to_latest(
                 verification=VerificationLevel.FULL,
                 fs=fs,
                 load_array_groups=frozenset(),
+                proof_cache=proof_cache,
             )
             latest_proof = owned_latest.resolved
             if latest_proof.checkpoint.identity != latest.checkpoint.identity:
@@ -4040,6 +4164,9 @@ def prune_to_latest(
                 latest_recovered=latest.latest_recovered,
                 latest_repair_persisted=latest.latest_repair_persisted,
             )
+            if latest.latest_recovered:
+                _persist_latest_index(run_descriptor, latest, fs)
+                latest = dataclasses.replace(latest, latest_repair_persisted=True)
             _cleanup_retention_temporaries(
                 checkpoints_descriptor,
                 latest=owned_latest,
@@ -4063,6 +4190,43 @@ def prune_to_latest(
             os.close(run_descriptor)
 
 
+def publish_and_prune_checkpoint(
+    run: Path,
+    build: Callable[[Path], CheckpointManifest],
+    *,
+    fs: FilesystemOps = OS_FILESYSTEM,
+) -> ResolvedStep:
+    """Publish and retain latest while reusing unchanged inode-bound proofs.
+
+    The caller owns the run-writer lock. Every reused array must retain its
+    original device, inode, size, modification time, and change time. Changed
+    files receive a fresh FULL proof before retention can delete anything.
+    """
+    proof_cache = _CheckpointProofCache()
+    failure: BaseException | None = None
+    try:
+        published = _publish_checkpoint(run, build, fs=fs, proof_cache=proof_cache)
+        retained = _prune_to_latest(run, fs=fs, proof_cache=proof_cache)
+        if (
+            retained.run.identity != published.run.identity
+            or retained.checkpoint.identity != published.checkpoint.identity
+        ):
+            raise SMLArtifactError(
+                "retention did not preserve the published run and checkpoint identity"
+            )
+        return retained
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        try:
+            proof_cache.close()
+        except BaseException as cleanup_error:
+            if failure is not None:
+                raise failure from cleanup_error
+            raise
+
+
 __all__ = [
     "CHECKPOINT_PUBLICATION_STAGES",
     "IMMUTABLE_PUBLICATION_STAGES",
@@ -4076,6 +4240,7 @@ __all__ = [
     "open_latest_checkpoint_reader",
     "prune_to_latest",
     "publication_lock",
+    "publish_and_prune_checkpoint",
     "publish_checkpoint",
     "publish_immutable_bundle",
     "publish_run",

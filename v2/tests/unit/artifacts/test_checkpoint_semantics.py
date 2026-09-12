@@ -119,7 +119,9 @@ def _array_ref(
     )
 
 
-def _write_valid_checkpoint_run(tmp_path: Path) -> Path:
+def _write_valid_checkpoint_run(
+    tmp_path: Path, *, version: int = 1, accumulator_value: float = 0.0
+) -> Path:
     run = tmp_path / "valid-run"
     step_directory = run / "checkpoints" / "step-000000000"
     step_directory.mkdir(parents=True)
@@ -154,9 +156,11 @@ def _write_valid_checkpoint_run(tmp_path: Path) -> Path:
             "accumulation_count": mx.array(0, dtype=mx.int32),
             "next_key": mx.random.key(7),
             "loss_numerator": mx.array(0.0, dtype=mx.float32),
-            "accumulators.weight": mx.array([0.0], dtype=mx.float32),
+            "accumulators.weight": mx.array([accumulator_value], dtype=mx.float32),
         },
     }
+    if version == 2:
+        del groups["trainer.safetensors"]["accumulators.weight"]
     references = {}
     for logical_path, arrays in groups.items():
         path = step_directory / logical_path
@@ -183,7 +187,7 @@ def _write_valid_checkpoint_run(tmp_path: Path) -> Path:
     )
     manifest = PretrainingCheckpointManifest(
         kind="pretraining-checkpoint",
-        version=1,
+        version=version,
         identity=_PLACEHOLDER_IDENTITY,
         owning_run_identity=run_manifest.identity,
         step=0,
@@ -196,6 +200,61 @@ def _write_valid_checkpoint_run(tmp_path: Path) -> Path:
     manifest = replace(manifest, identity=manifest.recompute_identity())
     (step_directory / "checkpoint.json").write_bytes(canonical_json_bytes(manifest))
     return run
+
+
+@pytest.mark.parametrize("version", (1, 2))
+@pytest.mark.parametrize("materialize", (False, True))
+def test_versioned_checkpoint_preserves_empty_trainer_boundary(
+    tmp_path: Path, version: int, materialize: bool
+) -> None:
+    run = _write_valid_checkpoint_run(tmp_path, version=version)
+    with open_checkpoint_reader(
+        run,
+        step=0,
+        load_array_groups=None if materialize else frozenset(),
+    ) as reader:
+        assert reader.resolved.checkpoint.version == version
+        contents = reader.read_contents()
+        assert contents.boundary_state.accumulators_zero is True
+        checkpoint_module.verify_checkpoint_current_state(
+            reader, expected_next_key=mx.random.key(7)
+        )
+        if materialize:
+            trainer = contents.array_groups["trainer.safetensors"]
+            assert ("accumulators.weight" in trainer) is (version == 1)
+
+
+@pytest.mark.parametrize("declared_version", (1, 2))
+def test_checkpoint_rejects_trainer_arrays_from_another_format_version(
+    tmp_path: Path, declared_version: int
+) -> None:
+    run = _write_valid_checkpoint_run(tmp_path, version=3 - declared_version)
+    resolved = resolve_exact_step(run, step=0, verification=VerificationLevel.FULL)
+    manifest = replace(resolved.checkpoint, version=declared_version)
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    (resolved.step_directory / "checkpoint.json").write_bytes(
+        canonical_json_bytes(manifest)
+    )
+    with pytest.raises(SMLArtifactError, match="trainer keys"):
+        resolve_exact_step(run, step=0, verification=VerificationLevel.FULL)
+
+
+@pytest.mark.parametrize("materialize", (False, True))
+def test_legacy_checkpoint_still_rejects_nonzero_accumulators(
+    tmp_path: Path, materialize: bool
+) -> None:
+    run = _write_valid_checkpoint_run(tmp_path, accumulator_value=1.0)
+    with (
+        open_checkpoint_reader(
+            run,
+            step=0,
+            load_array_groups=None if materialize else frozenset(),
+        ) as reader,
+        pytest.raises(SMLArtifactError, match="trainer accumulators must be empty"),
+    ):
+        checkpoint_module.verify_checkpoint_current_state(
+            reader, expected_next_key=mx.random.key(7)
+        )
 
 
 @pytest.mark.parametrize("full", [False, True])

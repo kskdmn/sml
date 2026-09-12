@@ -1127,11 +1127,7 @@ def test_full_lora_run_rejects_resigned_adapter_leaf_or_dtype(
         for prefix in ("first_moments.", "second_moments."):
             optimizer[f"{prefix}{new_name}"] = optimizer.pop(f"{prefix}{old_name}")
         mx.save_safetensors(optimizer_path, optimizer)
-        trainer_path = step / checkpoint.trainer.payload.logical_path
-        trainer = dict(mx.load(trainer_path))
-        mx.eval(*trainer.values())
-        trainer[f"accumulators.{new_name}"] = trainer.pop(f"accumulators.{old_name}")
-        mx.save_safetensors(trainer_path, trainer)
+        assert checkpoint.version == 2
         checkpoint = replace(
             checkpoint,
             adapters=_array_ref(
@@ -1143,11 +1139,6 @@ def test_full_lora_run_rejects_resigned_adapter_leaf_or_dtype(
                 optimizer_path,
                 checkpoint.optimizer.payload.logical_path,
                 optimizer,
-            ),
-            trainer=_array_ref(
-                trainer_path,
-                checkpoint.trainer.payload.logical_path,
-                trainer,
             ),
         )
     checkpoint = replace(checkpoint, identity=checkpoint.recompute_identity())

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import mlx.core as mx
-from mlx.utils import tree_map, tree_map_with_path
+from mlx.utils import tree_flatten, tree_map, tree_map_with_path
 
 from sml.errors import SMLConfigurationError
 from sml.model.config import ModelConfig
@@ -760,6 +760,20 @@ def normalize_and_clip(
     *,
     gradient_clip_norm: float,
 ) -> dict:
+    gradients, _finite = _normalize_and_clip_with_health(
+        accumulated_gradients,
+        normalization_count,
+        gradient_clip_norm=gradient_clip_norm,
+    )
+    return gradients
+
+
+def _normalize_and_clip_with_health(
+    accumulated_gradients: dict,
+    normalization_count: mx.array,
+    *,
+    gradient_clip_norm: float,
+) -> tuple[dict, mx.array]:
     _require_top_level_dict(accumulated_gradients, "accumulated_gradients")
     _require_dtype(accumulated_gradients, "accumulated_gradients", mx.float32)
     if (
@@ -802,7 +816,7 @@ def normalize_and_clip(
         mx.array(gradient_clip_norm, dtype=mx.float32)
         / mx.maximum(global_norm, mx.array(1e-12, dtype=mx.float32)),
     )
-    return tree_map(
+    clipped = tree_map(
         lambda gradient: mx.where(
             valid_count,
             (gradient * scale).astype(mx.float32),
@@ -810,6 +824,59 @@ def normalize_and_clip(
         ),
         normalized,
     )
+    finite = (
+        valid_count
+        & mx.isfinite(global_norm)
+        & mx.isfinite(mx.array(gradient_clip_norm, dtype=mx.float32))
+    )
+    return clipped, finite
+
+
+def _parameters_are_finite(parameters: dict) -> mx.array:
+    """Reduce each updated parameter once, inside the compiled optimizer boundary."""
+    return mx.all(
+        mx.stack(
+            [
+                mx.all(mx.isfinite(value))
+                for value in _array_leaves(parameters, "parameters")
+            ]
+        )
+    )
+
+
+def _optimizer_scalars_are_finite(
+    step: mx.array, config: OptimizerConfig, weight_decay_tree: dict
+) -> mx.array:
+    rate = learning_rate_at(step, config)
+    epsilon = mx.array(config.epsilon, dtype=mx.float32)
+    decay = mx.array(
+        [
+            _decay_coefficient(value, config)
+            for _name, value in tree_flatten(weight_decay_tree)
+        ],
+        dtype=mx.float32,
+    )
+    finite = (
+        mx.isfinite(rate)
+        & mx.isfinite(epsilon)
+        & (epsilon > 0.0)
+        & mx.all(mx.isfinite(rate * decay))
+    )
+    if config.bias_correction:
+        completed_updates = step.astype(mx.float32) + 1.0
+        first_denominator = 1.0 - mx.power(config.beta1, completed_updates)
+        second_denominator = 1.0 - mx.power(config.beta2, completed_updates)
+        finite = finite & (first_denominator > 0.0) & (second_denominator > 0.0)
+    return finite
+
+
+def _require_finite_optimizer_state(optimizer: AdamState) -> None:
+    """Establish finite moments once when restoring an older checkpoint."""
+    if not bool(
+        _parameters_are_finite(optimizer.first_moments)
+        & _parameters_are_finite(optimizer.second_moments)
+    ):
+        raise SMLConfigurationError("optimizer moments must be finite")
 
 
 def _decay_coefficient(value: object, config: OptimizerConfig) -> float:

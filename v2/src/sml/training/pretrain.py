@@ -18,6 +18,7 @@ from sml.artifacts.checkpoint import (
     ResolvedStep,
     open_checkpoint_reader,
     prune_to_latest,
+    publish_and_prune_checkpoint,
     publish_checkpoint,
     publish_run,
     resolve_latest_step,
@@ -47,7 +48,12 @@ from sml.data.pretraining import (
     _PreparedShardStore,
     canonicalize_pretraining_cursor,
 )
-from sml.errors import SMLArtifactError, SMLConfigurationError, SMLDataError
+from sml.errors import (
+    SMLArtifactError,
+    SMLConfigurationError,
+    SMLDataError,
+    SMLRuntimeError,
+)
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel, causal_lm_loss
 from sml.training.common import (
@@ -61,6 +67,10 @@ from sml.training.common import (
     ResumeOverrides,
     TrainerState,
     WeightDecayPolicy,
+    _normalize_and_clip_with_health,
+    _optimizer_scalars_are_finite,
+    _parameters_are_finite,
+    _require_finite_optimizer_state,
     accumulate_fp32,
     adamw_mixed_precision_update_tree,
     build_weight_decay_tree,
@@ -68,7 +78,6 @@ from sml.training.common import (
     initialize_base_parameter_state,
     learning_rate_at,
     log_training_progress,
-    normalize_and_clip,
 )
 from sml.training.random import counter_random_key
 
@@ -163,6 +172,10 @@ class PretrainingKernels:
             next_trainer_tree,
             metrics,
         )
+        if not bool(metrics["finite"]):
+            raise SMLRuntimeError(
+                "pretraining update has nonfinite loss, gradients, optimizer scalars, or parameters"
+            )
         return OptimizerStepState(
             parameters=BaseParameterState.from_compiled_tree(
                 (next_masters, next_working)
@@ -243,7 +256,7 @@ def build_pretraining_kernels(
     ]:
         del working_parameters
         accumulators, accumulation_count, next_key, loss_numerator = trainer_tree
-        gradients = normalize_and_clip(
+        gradients, finite_gradients = _normalize_and_clip_with_health(
             accumulators,
             accumulation_count,
             gradient_clip_norm=config.optimizer.gradient_clip_norm,
@@ -273,6 +286,15 @@ def build_pretraining_kernels(
             "accumulation_count": accumulation_count,
             "loss_numerator": loss_numerator,
             "loss": (loss_numerator / safe_count).astype(mx.float32),
+            "finite": (
+                finite_gradients
+                & mx.isfinite(loss_numerator)
+                & _optimizer_scalars_are_finite(
+                    adam_tree[0], config.optimizer, weight_decay_tree
+                )
+                # A finite BF16 cast also proves that its FP32 master is finite.
+                & _parameters_are_finite(next_working)
+            ),
         }
         return (
             next_masters,
@@ -489,10 +511,6 @@ def _flatten_checkpoint_groups(
         "accumulation_count": trainer.accumulation_count,
         "next_key": trainer.next_key,
         "loss_numerator": trainer.loss_numerator,
-        **{
-            f"accumulators.{name}": value
-            for name, value in tree_flatten(trainer.accumulators)
-        },
     }
     return {
         "model.safetensors": dict(sorted(model.items())),
@@ -552,7 +570,6 @@ def _checkpoint_builder(
         "accumulation_count",
         "next_key",
         "loss_numerator",
-        *(f"accumulators.{name}" for name in master_names),
     }
     if set(groups["optimizer.safetensors"]) != expected_optimizer:
         raise SMLArtifactError("optimizer checkpoint keys must match master keys")
@@ -562,7 +579,6 @@ def _checkpoint_builder(
     for prefix, group_name in (
         ("first_moments.", "optimizer.safetensors"),
         ("second_moments.", "optimizer.safetensors"),
-        ("accumulators.", "trainer.safetensors"),
     ):
         group = groups[group_name]
         for name, master_array in master.items():
@@ -594,7 +610,7 @@ def _checkpoint_builder(
         }
         manifest = PretrainingCheckpointManifest(
             kind="pretraining-checkpoint",
-            version=1,
+            version=2,
             identity=_PLACEHOLDER_IDENTITY,
             owning_run_identity=run_manifest.identity,
             step=scalar.step,
@@ -665,19 +681,28 @@ def _restore_checkpoint(reader: CheckpointReader) -> _RestoredTrainingState:
             _unflatten_prefixed(optimizer_arrays, "first_moments."),
             _unflatten_prefixed(optimizer_arrays, "second_moments."),
         )
+        _require_finite_optimizer_state(optimizer)
         trainer_arrays = groups["trainer.safetensors"]
-        if set(trainer_arrays) != {
+        expected_trainer = {
             "accumulation_count",
             "next_key",
             "loss_numerator",
-            *(f"accumulators.{name}" for name in masters),
-        }:
+        }
+        if verified.checkpoint.version == 1:
+            expected_trainer.update(f"accumulators.{name}" for name in masters)
+        if set(trainer_arrays) != expected_trainer:
             raise SMLArtifactError("trainer checkpoint keys do not match masters")
-        for name, master in masters.items():
-            if trainer_arrays[f"accumulators.{name}"].shape != master.shape:
-                raise SMLArtifactError("trainer checkpoint shapes do not match masters")
+        if verified.checkpoint.version == 1:
+            for name, master in masters.items():
+                if trainer_arrays[f"accumulators.{name}"].shape != master.shape:
+                    raise SMLArtifactError(
+                        "trainer checkpoint shapes do not match masters"
+                    )
+            accumulators = _unflatten_prefixed(trainer_arrays, "accumulators.")
+        else:
+            accumulators = tree_map(mx.zeros_like, parameters.master_parameters)
         trainer = TrainerState(
-            _unflatten_prefixed(trainer_arrays, "accumulators."),
+            accumulators,
             trainer_arrays["accumulation_count"],
             trainer_arrays["next_key"],
             trainer_arrays["loss_numerator"],
@@ -908,25 +933,7 @@ def _publish_training_state(
     manifest: PretrainingRunManifest,
     state: _RestoredTrainingState,
 ) -> ResolvedStep:
-    published = publish_checkpoint(run, _checkpoint_builder(manifest, state))
-    retained = prune_to_latest(run)
-    _require_retained_publication(published, retained)
-    if retained.step != published.step:
-        raise SMLArtifactError("retention did not preserve the published latest step")
-    return retained
-
-
-def _require_retained_publication(
-    published: ResolvedStep,
-    retained: ResolvedStep,
-) -> None:
-    if (
-        retained.run.identity != published.run.identity
-        or retained.checkpoint.identity != published.checkpoint.identity
-    ):
-        raise SMLArtifactError(
-            "retention did not preserve the published run and checkpoint identity"
-        )
+    return publish_and_prune_checkpoint(run, _checkpoint_builder(manifest, state))
 
 
 def _training_result(run: Path, state: ScalarTrainingState) -> TrainingResult:

@@ -870,7 +870,7 @@ class Verified[M]:
 
 class _Manifest:
     EXPECTED_KIND: ClassVar[str]
-    EXPECTED_VERSION: ClassVar[int] = 1
+    SUPPORTED_VERSIONS: ClassVar[tuple[int, ...]] = (1,)
     IDENTITY_DOMAIN: ClassVar[str]
     MANIFEST_FILENAME: ClassVar[str] = "manifest.json"
 
@@ -883,8 +883,8 @@ class _Manifest:
         if self.kind != self.EXPECTED_KIND:
             raise ValueError(f"kind must be {self.EXPECTED_KIND!r}")
         _require_plain_int(self.version, "version", minimum=1)
-        if self.version != self.EXPECTED_VERSION:
-            raise ValueError(f"version must be {self.EXPECTED_VERSION}")
+        if self.version not in self.SUPPORTED_VERSIONS:
+            raise ValueError(f"version must be one of {self.SUPPORTED_VERSIONS}")
         _require_identity(self.identity, "manifest identity")
 
     def identity_projection(self) -> Mapping[str, object]:
@@ -1033,6 +1033,7 @@ class PretrainingCheckpointManifest(_Manifest):
     trainer: ArrayPayloadRef
 
     EXPECTED_KIND: ClassVar[str] = "pretraining-checkpoint"
+    SUPPORTED_VERSIONS: ClassVar[tuple[int, ...]] = (1, 2)
     IDENTITY_DOMAIN: ClassVar[str] = "sml-pretraining-checkpoint-manifest-v1"
     MANIFEST_FILENAME: ClassVar[str] = "checkpoint.json"
 
@@ -1070,6 +1071,7 @@ class LoRACheckpointManifest(_Manifest):
     trainer: ArrayPayloadRef
 
     EXPECTED_KIND: ClassVar[str] = "lora-checkpoint"
+    SUPPORTED_VERSIONS: ClassVar[tuple[int, ...]] = (1, 2)
     IDENTITY_DOMAIN: ClassVar[str] = "sml-lora-checkpoint-manifest-v1"
     MANIFEST_FILENAME: ClassVar[str] = "checkpoint.json"
 
@@ -1490,10 +1492,10 @@ def _parse_manifest[M: _Manifest](raw: object, manifest_type: type[M]) -> M:
     if (
         isinstance(raw["version"], bool)
         or not isinstance(raw["version"], int)
-        or raw["version"] != manifest_type.EXPECTED_VERSION
+        or raw["version"] not in manifest_type.SUPPORTED_VERSIONS
     ):
         raise SMLArtifactError(
-            f"manifest version must be {manifest_type.EXPECTED_VERSION}"
+            f"manifest version must be one of {manifest_type.SUPPORTED_VERSIONS}"
         )
     _require_identity(raw["identity"], "manifest identity")
 
@@ -1814,7 +1816,7 @@ def _read_manifest_types[M: _Manifest](
 def read_manifest[M: _Manifest](
     root: Path, manifest_type: type[M], verification: VerificationLevel
 ) -> Verified[M]:
-    """Read one exact version-1 schema and verify its structured identity."""
+    """Read one supported exact schema and verify its structured identity."""
     return _read_manifest_types(root, (manifest_type,), verification)
 
 

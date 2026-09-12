@@ -18,6 +18,7 @@ from sml.artifacts.checkpoint import (
     ResolvedStep,
     open_latest_checkpoint_reader,
     prune_to_latest,
+    publish_and_prune_checkpoint,
     publish_checkpoint,
     publish_immutable_bundle,
     publish_run,
@@ -51,7 +52,7 @@ from sml.data.swag import (
     SwagDataBundle,
     load_swag_bundle,
 )
-from sml.errors import SMLArtifactError, SMLConfigurationError
+from sml.errors import SMLArtifactError, SMLConfigurationError, SMLRuntimeError
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel
 from sml.model.layers import LoRAForwardPolicy
@@ -63,14 +64,17 @@ from sml.training.common import (
     ResumeOverrides,
     WeightDecayPolicy,
     _adamw_fp32_update_tree,
+    _normalize_and_clip_with_health,
+    _optimizer_scalars_are_finite,
+    _parameters_are_finite,
     _require_dtype,
+    _require_finite_optimizer_state,
     _require_int32_counter,
     accumulate_fp32,
     build_weight_decay_tree,
     initialize_adam_state,
     learning_rate_at,
     log_training_progress,
-    normalize_and_clip,
 )
 from sml.training.lora import (
     LoRAConfig,
@@ -357,11 +361,18 @@ class SwagKernels:
         optimizer: AdamState,
         trainer: SwagTrainerState,
     ) -> tuple[dict, AdamState, SwagTrainerState]:
-        next_adapters, next_adam_tree, next_trainer = self.compiled_optimizer_step_core(
-            adapters,
-            optimizer.to_tree(),
-            trainer.to_tree(),
+        next_adapters, next_adam_tree, next_trainer, finite = (
+            self.compiled_optimizer_step_core(
+                adapters,
+                optimizer.to_tree(),
+                trainer.to_tree(),
+            )
         )
+        mx.eval(next_adapters, next_adam_tree, next_trainer, finite)
+        if not bool(finite):
+            raise SMLRuntimeError(
+                "SWAG update has nonfinite loss, gradients, optimizer scalars, or parameters"
+            )
         _require_dtype(next_adapters, "parameters", mx.float32)
         _require_dtype(next_adam_tree[1], "first_moments", mx.float32)
         _require_dtype(next_adam_tree[2], "second_moments", mx.float32)
@@ -466,7 +477,7 @@ def build_swag_kernels(
         accumulators, valid_count, next_key, loss_numerator, correct_count = (
             trainer_tree
         )
-        gradients = normalize_and_clip(
+        gradients, finite_gradients = _normalize_and_clip_with_health(
             accumulators,
             valid_count,
             gradient_clip_norm=kernel_config.gradient_clip_norm,
@@ -488,7 +499,15 @@ def build_swag_kernels(
             (loss_numerator - loss_numerator).astype(mx.float32),
             (correct_count - correct_count).astype(mx.int32),
         )
-        return next_adapters, next_adam_tree, next_trainer
+        finite = (
+            finite_gradients
+            & mx.isfinite(loss_numerator)
+            & _optimizer_scalars_are_finite(
+                adam_tree[0], config.optimizer, weight_decay_tree
+            )
+            & _parameters_are_finite(next_adapters)
+        )
+        return next_adapters, next_adam_tree, next_trainer, finite
 
     ranking_microstep_core_impl = (
         mx.compile(ranking_microstep_core) if config.compile else ranking_microstep_core
@@ -894,10 +913,6 @@ def _flatten_checkpoint_groups(
         "accumulation_count": trainer.valid_count,
         "next_key": trainer.next_key,
         "loss_numerator": trainer.loss_numerator,
-        **{
-            f"accumulators.{name}": value
-            for name, value in tree_flatten(trainer.accumulators)
-        },
     }
     return {
         "adapters.safetensors": dict(sorted(adapter_arrays.items())),
@@ -956,7 +971,6 @@ def _checkpoint_builder(
         "accumulation_count",
         "next_key",
         "loss_numerator",
-        *(f"accumulators.{name}" for name in adapter_names),
     }
     if set(groups["optimizer.safetensors"]) != expected_optimizer:
         raise SMLArtifactError("optimizer checkpoint keys must match adapter keys")
@@ -984,7 +998,7 @@ def _checkpoint_builder(
         }
         manifest = LoRACheckpointManifest(
             kind="lora-checkpoint",
-            version=1,
+            version=2,
             identity=_PLACEHOLDER_IDENTITY,
             owning_run_identity=run_manifest.identity,
             step=state.scalar.step,
@@ -1031,16 +1045,22 @@ def _restore_adapter_checkpoint(
             _unflatten_prefixed(optimizer_arrays, "first_moments."),
             _unflatten_prefixed(optimizer_arrays, "second_moments."),
         )
+        _require_finite_optimizer_state(optimizer)
         expected_trainer = {
             "accumulation_count",
             "next_key",
             "loss_numerator",
-            *(f"accumulators.{name}" for name in adapters),
         }
+        if verified.checkpoint.version == 1:
+            expected_trainer.update(f"accumulators.{name}" for name in adapters)
         if set(trainer_arrays) != expected_trainer:
             raise SMLArtifactError("trainer checkpoint keys do not match adapters")
         trainer = SwagTrainerState(
-            accumulators=_unflatten_prefixed(trainer_arrays, "accumulators."),
+            accumulators=(
+                _unflatten_prefixed(trainer_arrays, "accumulators.")
+                if verified.checkpoint.version == 1
+                else tree_map(mx.zeros_like, adapter_tree)
+            ),
             valid_count=trainer_arrays["accumulation_count"],
             next_key=trainer_arrays["next_key"],
             loss_numerator=trainer_arrays["loss_numerator"],
@@ -1064,30 +1084,12 @@ def _restore_adapter_tree(adapters: Mapping[str, mx.array]) -> dict:
     return adapter_tree
 
 
-def _require_retained_publication(
-    published: ResolvedStep,
-    retained: ResolvedStep,
-) -> None:
-    if (
-        retained.run.identity != published.run.identity
-        or retained.checkpoint.identity != published.checkpoint.identity
-    ):
-        raise SMLArtifactError(
-            "retention did not preserve the published run and checkpoint identity"
-        )
-
-
 def _publish_training_state(
     run: Path,
     manifest: LoRARunManifest,
     state: _RestoredSwagState,
 ) -> ResolvedStep:
-    published = publish_checkpoint(run, _checkpoint_builder(manifest, state))
-    retained = prune_to_latest(run)
-    _require_retained_publication(published, retained)
-    if retained.step != published.step:
-        raise SMLArtifactError("retention did not preserve the published latest step")
-    return retained
+    return publish_and_prune_checkpoint(run, _checkpoint_builder(manifest, state))
 
 
 def _limit_reached(config: SwagTrainingConfig, state: ScalarSwagState) -> bool:
@@ -1181,7 +1183,6 @@ def _run_training(
             optimizer,
             trainer,
         )
-        mx.eval(adapters, optimizer.to_tree(), trainer.to_tree())
         model.update(adapters)
         stream.commit(pending_cursor)
         scalar = ScalarSwagState(

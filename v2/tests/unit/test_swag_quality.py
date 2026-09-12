@@ -780,6 +780,79 @@ def test_current_standalone_evidence_validation(current_recorded_evidence, monke
     )
 
 
+@pytest.mark.parametrize("changed_input", [None, "production", "harness", "fixture"])
+def test_record_reuses_only_current_workload_evidence(
+    current_recorded_evidence, tmp_path, monkeypatch, changed_input
+):
+    recorded_root, _destinations, _manifest, _workload = current_recorded_evidence
+    root = tmp_path / "recording"
+    shutil.copytree(recorded_root, root)
+    destinations = swag_quality._canonical_evidence_destinations(
+        root,
+        root / swag_quality.RECORD_MANIFEST_PATH,
+        root / swag_quality.RECORD_RAW_PATH,
+        root / swag_quality.RECORD_REPORT_PATH,
+    )
+    original_payloads = {
+        path: path.read_bytes() for _name, path in destinations.ordered()
+    }
+    if changed_input is not None:
+        relative = {
+            "production": Path("v2/src/sml/training/swag.py"),
+            "harness": Path("v2/benchmarks/swag_quality.py"),
+            "fixture": swag_quality.TRAINING_FIXTURE,
+        }[changed_input]
+        source = root / relative
+        if changed_input == "fixture":
+            arrays = swag_quality._load_encoded_arrays(source)
+            arrays["labels"][0] = (arrays["labels"][0] + 1) % 4
+            swag_quality._write_npz(source, arrays)
+        else:
+            source.write_bytes(source.read_bytes() + b"\n# changed recording input\n")
+        for arguments in (
+            ("add", str(source)),
+            ("commit", "--quiet", "-m", "change recording input"),
+        ):
+            subprocess.run(
+                ["git", *arguments], cwd=root, check=True, capture_output=True
+            )
+
+    def forbid_quality_execution(*_args, **_kwargs):
+        raise AssertionError(
+            "existing evidence must be checked before quality execution"
+        )
+
+    monkeypatch.setattr(swag_quality, "_root", lambda: root)
+    monkeypatch.setattr(swag_quality, "_run_runtime", forbid_quality_execution)
+    monkeypatch.setattr(
+        swag_quality, "_verified_source_snapshot", forbid_quality_execution
+    )
+    args = SimpleNamespace(
+        manifest=destinations.manifest,
+        raw_output=destinations.raw_output,
+        output=destinations.report,
+    )
+    if changed_input is not None:
+        with pytest.raises(ValueError, match="recording .* changed"):
+            swag_quality._record(args)
+    else:
+        assert swag_quality._record(args) == 0
+
+    assert all(
+        path.read_bytes() == payload for path, payload in original_payloads.items()
+    )
+    assert (
+        swag_quality._validate(
+            SimpleNamespace(
+                manifest=destinations.manifest,
+                raw_input=destinations.raw_output,
+                report=destinations.report,
+            )
+        )
+        == 0
+    )
+
+
 def test_recorded_validator_rejects_required_component_omission(
     current_recorded_evidence,
 ):

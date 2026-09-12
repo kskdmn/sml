@@ -8775,6 +8775,58 @@ def test_post_exit_recovery_records_the_deadline_sample_without_extending_deadli
     assert persisted[-1]["elapsed_seconds"] == 300.0
 
 
+def test_post_exit_recovery_shifted_cadence_times_out_without_an_early_final_sample():
+    clock = _RecoveryClock()
+    clock.now = 6.0
+    workload = build_canonical_workload()
+    measurement = _valid_child_measurement(workload)
+    immediate = _valid_observation("2026-08-09T00:00:00+00:00")
+    immediate["environment_status"]["memory_pressure"] = "warning"
+    post_exit = build_post_exit_observation(measurement=measurement, **immediate)
+    collection_starts = []
+
+    def collect(_deadline):
+        collection_starts.append(clock())
+        return clock(), immediate
+
+    def record_sample(index, elapsed, observation, previous_identity):
+        return build_post_exit_recovery_sample(
+            measurement=measurement,
+            post_exit=post_exit,
+            sample_index=index,
+            previous_sample_identity=previous_identity,
+            elapsed_seconds=elapsed,
+            **observation,
+        )
+
+    result = wait_for_post_exit_memory_recovery(
+        immediate_observation=immediate,
+        immediate_started_at=0.0,
+        recovery_policy=_valid_recovery_policy(workload),
+        collect=collect,
+        classify_nonmemory=lambda observation: (),
+        record_sample=record_sample,
+        clock=clock,
+        sleep=clock.sleep,
+    )
+
+    assert result.outcome == "timeout"
+    assert result.duration_seconds == clock() == 300.0
+    assert collection_starts == list(range(6, 300, 5))
+    assert [sample["elapsed_seconds"] for sample in result.samples] == collection_starts
+    recovery = build_post_exit_recovery(
+        measurement=measurement,
+        post_exit=post_exit,
+        samples=result.samples,
+        policy=post_exit_recovery_policy(workload),
+        outcome=result.outcome,
+        duration_seconds=result.duration_seconds,
+        completion_source="live",
+    )
+    trial = finalize_raw_trial(measurement, post_exit, result.samples, recovery)
+    validate_raw_trial_evidence(trial)
+
+
 def test_post_exit_recovery_first_wake_overshoot_finalizes_zero_sample_timeout():
     clock = _RecoveryClock()
     immediate = _valid_observation("2026-08-09T00:00:00+00:00")

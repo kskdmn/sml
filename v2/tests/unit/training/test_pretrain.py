@@ -10,7 +10,7 @@ import pytest
 import sml.training.pretrain as pretrain_module
 from mlx.utils import tree_flatten, tree_map
 from sml.data.pretraining import PretrainingCursor
-from sml.errors import SMLArtifactError
+from sml.errors import SMLRuntimeError
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel, causal_lm_loss
 from sml.training.common import (
@@ -118,22 +118,6 @@ def build_tiny_runtime(tmp_path: Path, *, dropout: float = 0.0) -> TinyRuntime:
     )
 
 
-def test_retention_handoff_requires_run_and_checkpoint_identity():
-    published = SimpleNamespace(
-        step=7,
-        run=SimpleNamespace(identity="run-a"),
-        checkpoint=SimpleNamespace(identity="checkpoint-a"),
-    )
-    substituted = SimpleNamespace(
-        step=7,
-        run=SimpleNamespace(identity="run-b"),
-        checkpoint=SimpleNamespace(identity="checkpoint-b"),
-    )
-
-    with pytest.raises(SMLArtifactError, match="identity"):
-        pretrain_module._require_retained_publication(published, substituted)
-
-
 @pytest.fixture
 def tiny_runtime(tmp_path: Path) -> TinyRuntime:
     return build_tiny_runtime(tmp_path)
@@ -149,6 +133,56 @@ def test_microstep_preserves_parameters_and_accumulates_fp32_state(tiny_runtime)
     assert state.trainer.accumulation_count.dtype == mx.int32
     assert state.trainer.loss_numerator.dtype == mx.float32
     assert state.trainer.accumulators["embed_tokens"]["weight"].dtype == mx.float32
+
+
+@pytest.mark.parametrize("compiled", (False, True))
+@pytest.mark.parametrize(
+    "failure",
+    ("nan-loss", "infinite-gradient", "parameter-overflow", "epsilon-underflow"),
+)
+def test_optimizer_rejects_numerical_failure_without_changing_input_state(
+    tiny_runtime, compiled, failure
+):
+    runtime = tiny_runtime
+    config = replace(runtime.config, compile=compiled)
+    trainer = runtime.microstep(
+        runtime.parameters, runtime.trainer, runtime.rows
+    ).trainer
+    if failure == "nan-loss":
+        trainer = TrainerState.from_compiled_tree(
+            (
+                trainer.accumulators,
+                trainer.accumulation_count,
+                trainer.next_key,
+                mx.array(float("nan"), dtype=mx.float32),
+            )
+        )
+    elif failure == "infinite-gradient":
+        accumulators = tree_map(mx.array, trainer.accumulators)
+        accumulators["norm"]["weight"] = mx.full_like(
+            accumulators["norm"]["weight"], float("inf")
+        )
+        trainer = replace(trainer, accumulators=accumulators)
+    elif failure == "parameter-overflow":
+        config = replace(
+            config,
+            optimizer=replace(
+                config.optimizer, learning_rate=3e38, beta1=0.9, beta2=0.999
+            ),
+        )
+    else:
+        config = replace(config, optimizer=replace(config.optimizer, epsilon=1e-100))
+    kernels = build_pretraining_kernels(
+        runtime.model, config, runtime.weight_decay_tree
+    )
+    before = dict(tree_flatten(runtime.parameters.working_parameters))
+    with pytest.raises(SMLRuntimeError, match="nonfinite"):
+        kernels.optimizer_step(runtime.parameters, runtime.optimizer, trainer)
+    assert int(runtime.optimizer.step.item()) == 0
+    assert all(
+        value is before[name]
+        for name, value in tree_flatten(runtime.parameters.working_parameters)
+    )
 
 
 @pytest.mark.parametrize("accumulation_steps", (1, 4))
@@ -278,6 +312,7 @@ def _reference_partial_window_update(runtime: TinyRuntime, trainer_tree: tuple):
             "loss_numerator": loss_numerator,
             "loss": loss_numerator / count,
             "accumulation_count": accumulation_count,
+            "finite": mx.array(True),
         },
     )
 

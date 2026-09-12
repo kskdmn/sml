@@ -201,9 +201,10 @@ def wait_for_post_exit_memory_recovery(
         )
 
     while True:
-        scheduled = min(last_sample_started_at + interval, deadline)
+        next_sample_at = last_sample_started_at + interval
+        scheduled = min(next_sample_at, deadline)
         sleep(max(0.0, scheduled - clock()))
-        if clock() > deadline:
+        if next_sample_at > deadline or clock() > deadline:
             return timeout_result()
         collected = collect(deadline)
         if collected is None:

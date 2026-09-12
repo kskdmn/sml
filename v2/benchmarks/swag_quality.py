@@ -2049,11 +2049,47 @@ def _read_raw(path: Path) -> tuple[SwagQualityRecord, ...]:
     return tuple(records)
 
 
+def _validate_current_workload_inputs(
+    root: Path, workload: SwagQualityWorkload
+) -> None:
+    """Check provenance without regenerating the recorded trained snapshot."""
+    if harness_content_identity(root) != workload.harness_identity:
+        raise ValueError("swag quality recording harness changed")
+    components = production_dependency_components(root)
+    if (
+        tuple(path.as_posix() for path in components)
+        != workload.production_dependency_components
+        or _current_production_dependency_identity(root, components)
+        != workload.production_dependency_identity
+    ):
+        raise ValueError("swag quality recording production dependencies changed")
+    for fixture, relative_path, split, count in (
+        (
+            workload.training_fixture,
+            TRAINING_FIXTURE,
+            "training",
+            TRAINING_EXAMPLE_COUNT,
+        ),
+        (
+            workload.validation_fixture,
+            VALIDATION_FIXTURE,
+            "validation",
+            VALIDATION_EXAMPLE_COUNT,
+        ),
+    ):
+        _arrays, current_fixture = _load_fixture(
+            root, relative_path, split=split, example_count=count
+        )
+        if current_fixture != fixture:
+            raise ValueError(f"swag quality recording {split} fixture changed")
+
+
 def _validate_evidence_files(
     root: Path,
     destinations: _EvidenceDestinations,
     *,
     recorded_workload: SwagQualityWorkload | None = None,
+    require_current_inputs: bool = False,
 ) -> Literal["pass", "fail"]:
     for _name, path in destinations.ordered():
         if path.is_symlink() or not path.is_file():
@@ -2071,6 +2107,8 @@ def _validate_evidence_files(
         raise ValueError("swag quality manifest workload changed")
     manifest = _validate_manifest_fields(raw_manifest, workload, expected_command)
     _validate_harness_commit(root, str(manifest["harness_commit"]), workload)
+    if require_current_inputs:
+        _validate_current_workload_inputs(root, workload)
     artifact_sizes = manifest["artifact_byte_sizes"]
     if len(manifest_payload) != artifact_sizes["manifest"]:
         raise ValueError("quality manifest byte size changed")
@@ -2200,7 +2238,9 @@ def _record_locked(
         raise RuntimeError("quality recording requires a full Git source commit")
     all_destinations, any_destination = _all_or_no_destinations(destinations)
     if all_destinations:
-        decision = _validate_evidence_files(root, destinations)
+        decision = _validate_evidence_files(
+            root, destinations, require_current_inputs=True
+        )
         print(decision)
         return 0 if decision == "pass" else 1
     if any_destination:
