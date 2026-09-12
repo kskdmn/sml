@@ -178,7 +178,11 @@ def build_pretraining_kernels(
     config: PretrainingConfig,
     weight_decay_tree: dict,
 ) -> PretrainingKernels:
-    """Build eager and compiled kernels over explicit, built-in state trees."""
+    """Build kernels for fully validated, unpadded, fixed-size microbatches.
+
+    The prepared-data preflight guarantees equal target counts per microbatch,
+    so averaging their gradients preserves the effective batch's token weighting.
+    """
 
     def loss_with_key(
         working_parameters: dict,

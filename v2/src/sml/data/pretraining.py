@@ -450,6 +450,7 @@ def _validated_prepared_rows(
     shards: Iterable[np.ndarray],
     *,
     vocab_size: int,
+    pad_token_id: int,
 ) -> Iterator[np.ndarray]:
     for shard in shards:
         for start in range(0, shard.shape[0], _PREPARED_ROW_SCAN_SIZE):
@@ -459,6 +460,10 @@ def _validated_prepared_rows(
             ):
                 raise SMLArtifactError(
                     f"prepared bundle token IDs must be in [0, {vocab_size})"
+                )
+            if np.any(chunk == pad_token_id):
+                raise SMLArtifactError(
+                    "packed pretraining rows must not contain padding token IDs"
                 )
             yield from chunk
 
@@ -532,10 +537,11 @@ class _PreparedShardStore:
                 raise error from cleanup_error
             raise
 
-    def rows(self, *, vocab_size: int) -> Iterator[np.ndarray]:
+    def rows(self, *, vocab_size: int, pad_token_id: int) -> Iterator[np.ndarray]:
         return _validated_prepared_rows(
             (self.get(index) for index in range(len(self.artifact.manifest.shards))),
             vocab_size=vocab_size,
+            pad_token_id=pad_token_id,
         )
 
     def close(self, *, close_root: bool = True, check_evicted: bool = True) -> None:
@@ -580,7 +586,10 @@ def _validate_prepared_store(
     if row_count < batch_size:
         raise SMLDataError("prepared bundle does not contain one full runtime batch")
     actual_identity = row_content_identity(
-        store.rows(vocab_size=tokenizer_manifest.vocab_size),
+        store.rows(
+            vocab_size=tokenizer_manifest.vocab_size,
+            pad_token_id=tokenizer_manifest.pad_token_id,
+        ),
         row_count,
         manifest.row_width,
     )

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import io
 import itertools
+import json
 import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+import zstandard as zstd
 
 from sml.artifacts.checkpoint import publish_immutable_bundle
 from sml.artifacts.manifest import (
@@ -214,6 +217,34 @@ def _require_nonempty(texts: Iterator[str]) -> Iterator[str]:
     return itertools.chain((first,), texts)
 
 
+class _TokenizerCorpusTexts:
+    """Retain input errors across SentencePiece's native exception boundary."""
+
+    def __init__(self, config: CorpusConfig) -> None:
+        self.error: SMLDataError | None = None
+        self._texts = self._read(config)
+
+    def __iter__(self) -> Iterator[str]:
+        return self._texts
+
+    def close(self) -> None:
+        self._texts.close()
+
+    def _read(self, config: CorpusConfig) -> Iterator[str]:
+        try:
+            files = discover_corpus_files(config)
+            yield from iter_filtered_texts(config, files)
+        except (OSError, ValueError, RuntimeError) as error:
+            # The corpus reader preserves JSON/zstd format errors as their
+            # causes. Keep unrelated programming errors visible.
+            if not isinstance(error, OSError) and not isinstance(
+                error.__cause__, (json.JSONDecodeError, zstd.ZstdError)
+            ):
+                raise
+            self.error = SMLDataError(f"Could not read tokenizer corpus: {error}")
+            raise self.error from error
+
+
 def train_tokenizer_bundle(
     config: TokenizerTrainingConfig,
     output: Path,
@@ -223,15 +254,13 @@ def train_tokenizer_bundle(
         raise TypeError("config must be a TokenizerTrainingConfig")
     if not isinstance(output, Path):
         raise TypeError("output must be a Path")
-    files = discover_corpus_files(config.corpus)
-    texts = iter_filtered_texts(config.corpus, files)
+    texts = _TokenizerCorpusTexts(config.corpus)
     sentence_iterator = _require_nonempty(iter(texts))
 
-    # The dependency is intentionally absent from package import state until valid,
-    # nonempty training input has been established.
-    import sentencepiece
-
     def build(private_path: Path) -> TokenizerManifest:
+        # Import only after valid, nonempty training input has been established.
+        import sentencepiece
+
         model_writer = io.BytesIO()
         trainer_arguments: dict[str, object] = {
             "sentence_iterator": sentence_iterator,
@@ -255,7 +284,12 @@ def train_tokenizer_bundle(
         }
         if config.maximum_sentence_length is not None:
             trainer_arguments["max_sentence_length"] = config.maximum_sentence_length
-        sentencepiece.SentencePieceTrainer.train(**trainer_arguments)
+        try:
+            sentencepiece.SentencePieceTrainer.train(**trainer_arguments)
+        except Exception:
+            if texts.error is not None:
+                raise texts.error
+            raise
 
         model_path = private_path / _MODEL_FILENAME
         vocab_path = private_path / _VOCAB_FILENAME
@@ -333,7 +367,10 @@ def train_tokenizer_bundle(
         )
         return replace(manifest, identity=manifest.recompute_identity())
 
-    published = publish_immutable_bundle(output, build)
+    try:
+        published = publish_immutable_bundle(output, build)
+    finally:
+        texts.close()
     return TokenizerBundle(
         path=published.path,
         manifest=published.manifest,

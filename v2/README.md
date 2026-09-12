@@ -36,6 +36,11 @@ immutable, memory-mapped directory bundle:
 uv run python -m sml prepare pretraining --input data/corpus --tokenizer v2/output/tokenizer --output v2/output/pretraining-data
 ```
 
+Pretraining rows are packed without padding. Full verification and training
+preflight reject rows containing the tokenizer's padding token, including custom
+prepared bundles. This keeps every microbatch's target count equal during gradient
+accumulation.
+
 ### Base training
 
 Start a new pretraining run from a prepared-data bundle:

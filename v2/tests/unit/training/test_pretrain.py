@@ -114,7 +114,7 @@ def build_tiny_runtime(tmp_path: Path, *, dropout: float = 0.0) -> TinyRuntime:
         optimizer=initialize_adam_state(parameters.master_parameters),
         kernels=build_pretraining_kernels(model, config, weight_decay_tree),
         weight_decay_tree=weight_decay_tree,
-        rows=np.arange(10, dtype=np.int32).reshape(2, 5) % model_config.vocab_size,
+        rows=np.arange(4, 14, dtype=np.int32).reshape(2, 5),
     )
 
 

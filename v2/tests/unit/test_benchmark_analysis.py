@@ -2728,6 +2728,130 @@ def test_compare_requires_the_executing_parent_harness_identity(
     assert verified_roots == [Path(benchmark_runner.__file__).resolve().parents[2]]
 
 
+@pytest.mark.parametrize(
+    ("protected", "output_field", "alias"),
+    (
+        ("outputs", "raw_output", "same"),
+        ("outputs", "raw_output", "normalized"),
+        ("outputs", "raw_output", "casefold"),
+        ("outputs", "raw_output", "unicode"),
+        ("outputs", "raw_output", "descendant"),
+        ("outputs", "output", "descendant"),
+        ("outputs", "raw_output", "symlink-parent"),
+        ("outputs", "raw_output", "hardlink"),
+        ("baseline", "output", "same"),
+        ("baseline", "raw_output", "symlink"),
+        ("baseline", "output", "hardlink"),
+        ("predecessor", "output", "same"),
+        ("predecessor", "raw_output", "normalized"),
+        ("predecessor-identity", "output", "same"),
+        ("mapping", "output", "same"),
+        ("mapping", "raw_output", "same"),
+    ),
+)
+def test_compare_rejects_output_aliases_before_measurement(
+    tmp_path, monkeypatch, protected, output_field, alias
+):
+    _workload, baseline, predecessor = _valid_prepared_comparison()
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(baseline))
+    predecessor_path = tmp_path / "v2" / "benchmarks" / "results" / "predecessor.json"
+    predecessor_path.parent.mkdir(parents=True)
+    predecessor_path.write_text(json.dumps(predecessor))
+    requested_predecessor = (
+        predecessor["identity"]
+        if protected == "predecessor-identity"
+        else str(predecessor_path)
+    )
+    mapping = json.dumps({"prepared-data": requested_predecessor})
+    mapping_path = tmp_path / "predecessors.json"
+    mapping_path.write_text(mapping)
+    output_path = tmp_path / ("café.json" if alias == "unicode" else "report.json")
+    args = build_parser().parse_args(
+        [
+            "compare",
+            "--baseline",
+            str(baseline_path),
+            "--candidate",
+            "HEAD",
+            "--metrics",
+            "prepared-data",
+            "--mode",
+            "screen",
+            "--lower-bound-report-only",
+            "--predecessors",
+            str(mapping_path) if protected == "mapping" else mapping,
+            "--output",
+            str(output_path),
+            "--raw-output",
+            str(tmp_path / "raw.jsonl"),
+        ]
+    )
+    protected_path = {
+        "outputs": output_path,
+        "baseline": baseline_path,
+        "predecessor": predecessor_path,
+        "predecessor-identity": predecessor_path,
+        "mapping": mapping_path,
+    }[protected]
+    if alias == "same":
+        aliased_path = protected_path
+    elif alias == "normalized":
+        intermediate = protected_path.parent / "intermediate"
+        intermediate.mkdir()
+        aliased_path = intermediate / ".." / protected_path.name
+    elif alias == "casefold":
+        aliased_path = protected_path.with_name(protected_path.name.upper())
+    elif alias == "unicode":
+        aliased_path = protected_path.with_name("cafe\u0301.json")
+    elif alias == "descendant":
+        if output_field == "output":
+            args.raw_output = protected_path
+        aliased_path = protected_path / "nested.json"
+    elif alias == "symlink-parent":
+        linked_parent = tmp_path / "linked-parent"
+        linked_parent.symlink_to(protected_path.parent, target_is_directory=True)
+        aliased_path = linked_parent / protected_path.name
+    else:
+        aliased_path = tmp_path / "aliased-output.json"
+        if alias == "symlink":
+            aliased_path.symlink_to(protected_path)
+        else:
+            if not protected_path.exists():
+                protected_path.write_text("previous output\n")
+            os.link(protected_path, aliased_path)
+    setattr(args, output_field, aliased_path)
+    saved_files = {
+        path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()
+    }
+
+    def reject_measurement(**_kwargs):
+        pytest.fail("measurement started before validating output paths")
+
+    monkeypatch.setattr(benchmark_runner, "_git_root", lambda _path: tmp_path)
+    monkeypatch.setattr(
+        benchmark_runner, "_require_clean_checkout", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "_git_commit", lambda *_a: predecessor["candidate_commit"]
+    )
+    monkeypatch.setattr(
+        benchmark_runner,
+        "harness_content_identity",
+        lambda _root: baseline["harness"]["content_identity"],
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "_collect_comparison_attempt", reject_measurement
+    )
+
+    with pytest.raises(ValueError, match="comparison output paths must be distinct"):
+        benchmark_runner._compare(args)
+
+    assert {
+        path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()
+    } == saved_files
+
+
 @pytest.mark.parametrize("version", (True, 1.0))
 def test_comparison_validator_rejects_boolean_and_float_version_aliases(version):
     _workload, baseline, report = _valid_prepared_comparison()

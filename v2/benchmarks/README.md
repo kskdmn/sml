@@ -120,6 +120,10 @@ predecessors. Groups are: 1, compute plus both inference metrics; 2, prepared da
 group 4 requires both inference predecessors. The other groups require null
 predecessors.
 
+Comparison report and raw-output paths must be distinct from each other and
+from the baseline, predecessor reports, and any predecessor mapping file.
+Conflicting paths are rejected before measurements begin.
+
 Final comparisons require all metrics except `pretraining-compute`, in canonical
 order, with `--mode final --pairs 10 --maximum-dispersion 0.015
 --pretraining-minimum-ratio 1.03` and required confidence lower bounds (omit

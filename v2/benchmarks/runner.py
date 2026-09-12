@@ -38,6 +38,7 @@ from v2.benchmarks.journal import (
     BaselineJournal,
     BaselineSlot,
     JournalAttempt,
+    _canonical_output_lock_key,
     atomic_write_json,
     atomic_write_text,
     baseline_output_lock,
@@ -3116,13 +3117,15 @@ def _resolve_predecessor_mapping(
     metrics: Sequence[MetricName],
     *,
     additional_search_directories: Sequence[Path] = (),
+    source_paths: list[Path] | None = None,
 ) -> tuple[dict[str, dict | None], dict[str, dict], dict[str, dict | None]]:
     mapping_path = Path(value)
-    raw_mapping = (
-        json.loads(mapping_path.read_text(encoding="utf-8"))
-        if mapping_path.is_file()
-        else json.loads(value)
-    )
+    if mapping_path.is_file():
+        raw_mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
+        if source_paths is not None:
+            source_paths.append(mapping_path)
+    else:
+        raw_mapping = json.loads(value)
     if not isinstance(raw_mapping, dict) or set(raw_mapping) != set(metrics):
         raise ValueError("predecessors must map every measured metric exactly once")
     reports: dict[str, dict | None] = {}
@@ -3164,6 +3167,8 @@ def _resolve_predecessor_mapping(
             ):
                 continue
             report = candidate_report
+            if source_paths is not None:
+                source_paths.append(candidate)
             break
         if report is None:
             raise FileNotFoundError(f"predecessor report does not exist: {requested}")
@@ -3512,18 +3517,49 @@ def _combine_previous_attempts(
     return combined
 
 
+def _validate_comparison_output_paths(
+    outputs: Sequence[Path], inputs: Sequence[Path]
+) -> None:
+    resolved_outputs = tuple(path.resolve() for path in outputs)
+    resolved_inputs = tuple(path.resolve() for path in inputs)
+    for index, output in enumerate(resolved_outputs):
+        output_key = Path(_canonical_output_lock_key(output))
+        for other in (*resolved_outputs[index + 1 :], *resolved_inputs):
+            other_key = Path(_canonical_output_lock_key(other))
+            if (
+                output_key == other_key
+                or output_key in other_key.parents
+                or other_key in output_key.parents
+                or (output.exists() and other.exists() and output.samefile(other))
+            ):
+                raise ValueError(
+                    "comparison output paths must be distinct and must not overlap "
+                    f"each other or input files: {output} and {other}"
+                )
+
+
 def _compare(args: argparse.Namespace) -> int:
     repository = _git_root(Path.cwd())
     _require_clean_checkout(repository, label="candidate")
+    output_paths = [args.output]
+    if args.raw_output is not None:
+        output_paths.append(args.raw_output)
+    source_paths = [args.baseline]
+    _validate_comparison_output_paths(output_paths, source_paths)
     baseline = _read_json_object(args.baseline, label="baseline manifest")
     _validate_baseline_document(baseline)
     args.prepared_data_measure = _resolve_prepared_data_measure(args, baseline)
     comparison_mode = _resolve_comparison_mode(args, baseline)
     predecessor_reports, predecessor_metrics, predecessor_proof = (
         _resolve_predecessor_mapping(
-            args.predecessors, repository, baseline, args.metrics
+            args.predecessors,
+            repository,
+            baseline,
+            args.metrics,
+            source_paths=source_paths,
         )
     )
+    _validate_comparison_output_paths(output_paths, source_paths)
     if comparison_mode == COMPARISON_FINAL:
         supplied = {
             metric

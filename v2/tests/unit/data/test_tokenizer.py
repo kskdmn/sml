@@ -237,6 +237,56 @@ def test_empty_filtered_corpus_fails_before_trainer_invocation(tmp_path, monkeyp
     assert calls == []
 
 
+@pytest.mark.parametrize("error_type", [TypeError, ValueError, RuntimeError])
+def test_training_preserves_unexpected_corpus_errors(tmp_path, monkeypatch, error_type):
+    error = error_type("unexpected corpus failure")
+
+    def texts(*_args):
+        yield "usable text"
+        raise error
+
+    _install_fake_sentencepiece(monkeypatch)
+    monkeypatch.setattr(tokenizer_module, "iter_filtered_texts", texts)
+    output = tmp_path / "bundle"
+
+    with pytest.raises(error_type) as caught:
+        train_tokenizer_bundle(_config(tmp_path), output)
+
+    assert caught.value is error
+    assert not output.exists()
+    assert not list(tmp_path.glob(".sml-tmp-*"))
+
+
+def test_training_preserves_unexpected_trainer_errors(tmp_path, monkeypatch):
+    _install_fake_sentencepiece(monkeypatch)
+    closed = []
+
+    def texts(*_args):
+        try:
+            yield "usable text"
+        finally:
+            closed.append(True)
+
+    monkeypatch.setattr(tokenizer_module, "iter_filtered_texts", texts)
+    error = RuntimeError("unexpected trainer failure")
+
+    def train(**_kwargs):
+        raise error
+
+    monkeypatch.setattr(
+        sys.modules["sentencepiece"].SentencePieceTrainer, "train", train
+    )
+    output = tmp_path / "bundle"
+
+    with pytest.raises(RuntimeError) as caught:
+        train_tokenizer_bundle(_config(tmp_path), output)
+
+    assert caught.value is error
+    assert closed == [True]
+    assert not output.exists()
+    assert not list(tmp_path.glob(".sml-tmp-*"))
+
+
 def test_changed_config_collides_and_identical_target_is_fully_verified(
     tmp_path, monkeypatch
 ):

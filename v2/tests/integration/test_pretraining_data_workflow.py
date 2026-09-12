@@ -1517,12 +1517,72 @@ def test_all_full_prepared_consumers_reject_inconsistent_row_identity(
             )
 
 
+@pytest.mark.parametrize("entry_point", ("preflight", "stream", "verify", "train"))
+@pytest.mark.parametrize("padding", ("input", "target", "whole-row"))
+def test_pretraining_rejects_padding_before_consuming_batches(
+    prepared_bundle, tmp_path, monkeypatch, entry_point, padding
+):
+    from sml.model.config import ModelConfig
+    from sml.training import pretrain
+    from sml.training.common import LoaderConfig, PretrainingConfig
+
+    tokenizer = read_manifest(
+        prepared_bundle.path / "tokenizer", TokenizerManifest, VerificationLevel.FULL
+    ).manifest
+    rows = _rows(prepared_bundle.manifest.row_width, 4, 5)
+    if padding == "whole-row":
+        rows[-1, :] = tokenizer.pad_token_id
+    else:
+        rows[-1, 0 if padding == "input" else -1] = tokenizer.pad_token_id
+    prepared_bundle = _replace_shards(prepared_bundle, (rows,))
+
+    def forbidden_initialization(*_args, **_kwargs):
+        raise AssertionError("model initialized before validating packed rows")
+
+    monkeypatch.setattr(pretrain, "_initial_state", forbidden_initialization)
+    run = tmp_path / "run"
+    with pytest.raises(SMLArtifactError, match="padding token IDs"):
+        if entry_point == "preflight":
+            preflight_pretraining_bundle(prepared_bundle, batch_size=1)
+        elif entry_point == "verify":
+            verify_artifact(prepared_bundle.path, full=True)
+        elif entry_point == "train":
+            pretrain.train(
+                PretrainingConfig(
+                    data=prepared_bundle.path,
+                    output_run=run,
+                    model=ModelConfig(
+                        vocab_size=tokenizer.vocab_size,
+                        hidden_size=8,
+                        num_layers=1,
+                        num_q_heads=2,
+                        num_kv_heads=1,
+                        intermediate_size=16,
+                        original_context_length=prepared_bundle.manifest.sequence_length,
+                    ),
+                    loader=LoaderConfig(microbatch_size=1),
+                    maximum_steps=1,
+                )
+            )
+        else:
+            with PretrainingBatchStream(
+                prepared_bundle,
+                batch_size=1,
+                seed=5,
+                prefetch_depth=1,
+                cursor=PretrainingCursor.initial(),
+            ):
+                pass
+    assert not run.exists()
+
+
 def test_many_shards_fit_small_descriptor_limit_without_rehashing_epochs(
     prepared_bundle,
 ):
     width = prepared_bundle.manifest.row_width
     prepared_bundle = _replace_shards(
-        prepared_bundle, tuple(_rows(width, index, index) for index in range(64))
+        prepared_bundle,
+        tuple(_rows(width, index + 4, index + 4) for index in range(64)),
     )
     program = r"""
 import resource
@@ -1580,7 +1640,7 @@ def test_reopening_evicted_shard_rejects_changes_to_fully_verified_bytes(
 ):
     width = prepared_bundle.manifest.row_width
     prepared_bundle = _replace_shards(
-        prepared_bundle, tuple(_rows(width, index) for index in range(8))
+        prepared_bundle, tuple(_rows(width, index + 4) for index in range(8))
     )
     store = pretraining_module._open_validated_prepared_resources(prepared_bundle)
     assert 0 not in store._cache

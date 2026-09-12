@@ -454,6 +454,8 @@ def _bind_run_to_token_invalid_data(
     run: Path,
     source_data: Path,
     invalid_data: Path,
+    *,
+    token_id: int = 32,
 ) -> None:
     shutil.copytree(source_data, invalid_data)
     data_manifest = read_manifest(
@@ -463,7 +465,7 @@ def _bind_run_to_token_invalid_data(
     ).manifest
     shard_path = invalid_data / data_manifest.shards[0].logical_path
     rows = np.load(shard_path, allow_pickle=False)
-    rows[0, 0] = 32
+    rows[0, 0] = token_id
     with shard_path.open("wb") as payload:
         np.save(payload, rows, allow_pickle=False)
     shards = (
@@ -936,17 +938,21 @@ def test_completed_limit_returns_before_stream_model_or_kernel_construction(
     assert result == completed
 
 
+@pytest.mark.parametrize("token_id", (32, 3), ids=("out-of-range", "padding"))
 def test_resume_semantic_data_preflight_precedes_restore_prune_and_early_return(
     prepared_data: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    token_id: int,
 ) -> None:
     """A hash-consistent invalid NPY bundle must fail before checkpoint consumption."""
     completed = pretrain.train(
         _config(prepared_data, tmp_path / "run", maximum_steps=1)
     )
     invalid_data = tmp_path / "token-invalid-data"
-    _bind_run_to_token_invalid_data(completed.run, prepared_data, invalid_data)
+    _bind_run_to_token_invalid_data(
+        completed.run, prepared_data, invalid_data, token_id=token_id
+    )
     reached: list[str] = []
 
     def forbidden(name):
