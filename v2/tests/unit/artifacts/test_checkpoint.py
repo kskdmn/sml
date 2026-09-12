@@ -16,6 +16,7 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 from sml.artifacts import checkpoint
+from sml.artifacts import manifest as artifact_manifest
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
@@ -1067,6 +1068,30 @@ def test_checkpoint_scalar_state_must_be_named_state_json(valid_run: Path) -> No
                 scalar_logical_path="scalar.json",
             ),
         )
+
+
+def test_publication_hashes_payloads_once_per_verification_boundary(
+    valid_run: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Builder, pre-rename, and post-rename proofs each read tensor bytes once."""
+    hashes: Counter[str] = Counter()
+    original_identity = artifact_manifest.file_identity
+
+    def counted_identity(stream):
+        identity = original_identity(stream)
+        hashes[identity] += 1
+        return identity
+
+    monkeypatch.setattr(artifact_manifest, "file_identity", counted_identity)
+    with checkpoint.run_writer_lock(valid_run):
+        published = checkpoint.publish_checkpoint(
+            valid_run,
+            _checkpoint_builder(_run_manifest(), step=2),
+        )
+
+    for reference in checkpoint.checkpoint_array_payloads(published.checkpoint):
+        assert hashes[reference.payload.identity] == 3
 
 
 def test_post_commit_mutation_never_publishes_latest_or_returns_full(

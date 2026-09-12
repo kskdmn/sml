@@ -1926,8 +1926,15 @@ def test_compiled_scoring_kernel_receives_request_mask(
     captured: list[tuple[tuple[object, ...], dict[str, object]]] = []
     original = tiny_session._compiled_scoring_kernel
 
-    def wrapping(length_bucket: int, batch_size_bucket: int, padding: str):
-        compiled = original(length_bucket, batch_size_bucket, padding)
+    def wrapping(
+        length_bucket: int,
+        batch_size_bucket: int,
+        padding: str,
+        continuation_length_bucket: int,
+    ):
+        compiled = original(
+            length_bucket, batch_size_bucket, padding, continuation_length_bucket
+        )
 
         def spy(*args, **kwargs):
             captured.append((args, kwargs))

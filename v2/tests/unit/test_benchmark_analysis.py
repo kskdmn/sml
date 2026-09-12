@@ -1150,6 +1150,66 @@ def _with_trial_payload(trial, **changes):
     return finalize_raw_trial(measurement, post_exit, samples, recovery)
 
 
+def _validate_trial_metadata(protocol, workload, reference):
+    if protocol == "baseline":
+        validate_baseline_trial(
+            reference,
+            workload=workload,
+            source_commit=reference.source_commit,
+            harness_commit=reference.harness_commit,
+            harness_identity=reference.harness_identity,
+            expected_hardware=reference.hardware,
+            expected_software_versions=reference.software_versions,
+        )
+        return
+    candidate = _with_trial_payload(
+        reference, side="candidate", process_order=1, source_commit="e" * 40
+    )
+    validator = {
+        "comparison": benchmark_runner._validate_comparison_trial_pair,
+        "predecessor": benchmark_runner._validate_predecessor_trial_pair,
+    }[protocol]
+    validator(
+        reference_trial=reference,
+        candidate_trial=candidate,
+        pair_index=0,
+        attempt_index=0,
+        baseline={
+            "harness": {
+                "commit": reference.harness_commit,
+                "content_identity": reference.harness_identity,
+            },
+            "canonical_workload_identity": canonical_workload_identity(workload),
+        },
+        workload=workload,
+        expected_projection=canonical_metric_projection(reference.metric, workload),
+        expected_input_identity=canonical_input_identity(reference.metric, workload),
+        expected_warmup=reference.warmup_units,
+        expected_units=reference.measured_units,
+    )
+
+
+@pytest.mark.parametrize("protocol", ("baseline", "comparison", "predecessor"))
+@pytest.mark.parametrize(
+    "field,value,message",
+    (
+        ("canonical_projection_identity", None, "projection identity"),
+        ("rope_scaling_factor", 1, "rope_scaling_factor"),
+        ("parameter_precision_policy", None, "precision policy"),
+    ),
+)
+def test_all_trial_validators_enforce_native_metadata(protocol, field, value, message):
+    workload = build_canonical_workload()
+    reference = _valid_raw_trial(workload, metric="inference-decode")
+    changed = _with_trial_payload(
+        reference,
+        native_configuration={**reference.native_configuration, field: value},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _validate_trial_metadata(protocol, workload, changed)
+
+
 def test_child_and_post_exit_documents_are_exactly_identity_bound():
     measurement = _valid_child_measurement(build_canonical_workload())
     post_exit = _valid_post_exit_observation(measurement)
@@ -2447,7 +2507,7 @@ def test_comparison_report_pins_pairs_decisions_and_metric_lineage():
                     process_order=order.index("candidate"),
                     source_commit=candidate_commit,
                     native_configuration={
-                        **baseline_trial.native_configuration,
+                        **reference_template.native_configuration,
                         "parameter_precision_policy": PRECISION_POLICY,
                     },
                     value=103.0,

@@ -319,6 +319,21 @@ def _validate_baseline_header(manifest: dict) -> CanonicalWorkload:
     return workload
 
 
+def _validate_native_configuration(
+    trial: RawTrial, expected_projection: dict, *, label: str
+) -> None:
+    configuration = trial.native_configuration
+    if configuration.get("canonical_projection_identity") != structured_identity(
+        "sml-benchmark-metric-projection-v1", expected_projection
+    ):
+        raise ValueError(f"{label} native projection identity is invalid")
+    rope_scaling_factor = configuration.get("rope_scaling_factor")
+    if type(rope_scaling_factor) is not float or rope_scaling_factor != 1.0:
+        raise ValueError(f"{label} rope_scaling_factor must be exact float 1.0")
+    if configuration.get("parameter_precision_policy") != PRECISION_POLICY:
+        raise ValueError(f"{label} precision policy is invalid")
+
+
 def validate_baseline_trial(
     trial: RawTrial,
     *,
@@ -362,10 +377,7 @@ def validate_baseline_trial(
         trial.metric, workload
     ):
         raise ValueError("raw adapter used the wrong logical work order")
-    if trial.native_configuration.get(
-        "canonical_projection_identity"
-    ) != structured_identity("sml-benchmark-metric-projection-v1", expected_projection):
-        raise ValueError("raw native projection identity is invalid")
+    _validate_native_configuration(trial, expected_projection, label="raw")
     expected_units = next(
         unit.measured_units
         for unit in workload.work_units
@@ -382,9 +394,6 @@ def validate_baseline_trial(
         raise ValueError("raw trial omitted mandatory startup verification")
     if trial.synchronization_boundaries != workload.synchronization_boundaries:
         raise ValueError("raw synchronization boundaries do not match workload")
-    rope_scaling_factor = trial.native_configuration.get("rope_scaling_factor")
-    if type(rope_scaling_factor) is not float or rope_scaling_factor != 1.0:
-        raise ValueError("raw rope_scaling_factor must be exact float 1.0")
     if (
         isinstance(trial.value, bool)
         or not isinstance(trial.value, Real)
@@ -1020,6 +1029,7 @@ def _validate_comparison_trial_pair(
             raise ValueError("comparison raw trial uses invalid work-unit counts")
         if trial.startup_verification_seconds is None:
             raise ValueError("comparison raw trial omitted input verification")
+        _validate_native_configuration(trial, expected_projection, label="comparison")
         _validate_acceptance_environment(workload, trial)
         _validate_software_versions(workload, trial.software_versions)
     if (
@@ -1027,13 +1037,6 @@ def _validate_comparison_trial_pair(
         != candidate_trial.initial_parameter_identity
     ):
         raise ValueError("comparison sides use different initial parameters")
-    if (
-        reference_trial.native_configuration.get("parameter_precision_policy")
-        != PRECISION_POLICY
-        or candidate_trial.native_configuration.get("parameter_precision_policy")
-        != PRECISION_POLICY
-    ):
-        raise ValueError("comparison precision-policy proof is invalid")
 
 
 def _validate_predecessor_trial_pair(
@@ -1079,11 +1082,9 @@ def _validate_predecessor_trial_pair(
             or trial.startup_verification_seconds is None
         ):
             raise ValueError("direct predecessor canonical proof is invalid")
-        if (
-            trial.native_configuration.get("parameter_precision_policy")
-            != PRECISION_POLICY
-        ):
-            raise ValueError("direct predecessor precision policy is invalid")
+        _validate_native_configuration(
+            trial, expected_projection, label="direct predecessor"
+        )
         _validate_acceptance_environment(workload, trial)
         _validate_software_versions(workload, trial.software_versions)
     if (

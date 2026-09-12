@@ -345,6 +345,10 @@ class SwagKernels:
             batch.example_mask,
             batch.valid_token_mask,
         )
+        # Keep accumulation graphs bounded and overlap device work with the
+        # next batch without synchronizing before the optimizer boundary.
+        if self.kernel_config.accumulation_steps > 1:
+            mx.async_eval(next_tree)
         return SwagTrainerState.from_compiled_tree(next_tree)
 
     def optimizer_step(

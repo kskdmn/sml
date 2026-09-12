@@ -682,6 +682,56 @@ def test_swag_kernel_wrappers_do_not_eval_before_rebuilding_host_state():
     assert "mx.eval(" not in inspect.getsource(swag_module.SwagKernels.optimizer_step)
 
 
+@pytest.mark.parametrize("accumulation_steps", (1, 4))
+def test_swag_accumulation_submits_masked_microsteps_without_host_waits(
+    tiny_swag_runtime, monkeypatch, accumulation_steps
+):
+    """Padded batches must submit gradients and counts before the window ends."""
+    runtime = tiny_swag_runtime
+    batch = _first_padded_batch(runtime)
+    real_examples = int(batch.example_mask.sum().item())
+    config = replace(
+        runtime.config,
+        loader=replace(
+            runtime.config.loader,
+            gradient_accumulation_steps=accumulation_steps,
+        ),
+    )
+    kernels = build_swag_kernels(runtime.model, config, runtime.weight_decay_tree)
+    trainer = swag_module.initial_swag_trainer_state(
+        runtime.initial_adapters, key=mx.random.key(11)
+    )
+    submitted = []
+    submit = mx.async_eval
+
+    def record_submission(tree):
+        submitted.append(dict(tree_flatten(tree)))
+        submit(tree)
+
+    def reject_host_wait(*_args):
+        raise AssertionError("microstep blocked the host before the optimizer update")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "async_eval", record_submission)
+        patch.setattr(mx, "eval", reject_host_wait)
+        for index in range(accumulation_steps):
+            trainer = kernels.ranking_microstep(
+                runtime.initial_adapters, runtime.frozen_base, trainer, batch
+            )
+            if accumulation_steps > 1:
+                assert len(submitted) == index + 1
+                returned = dict(tree_flatten(trainer.to_tree()))
+                assert submitted[-1].keys() == returned.keys()
+                assert all(
+                    submitted[-1][name] is value for name, value in returned.items()
+                )
+            else:
+                assert not submitted
+
+    assert int(trainer.valid_count.item()) == accumulation_steps * real_examples
+    assert float(trainer.loss_numerator.item()) > 0.0
+
+
 def test_swag_optimizer_splits_compiled_fp32_tree_from_host_reconstruction():
     host_source = inspect.getsource(swag_module.SwagKernels.optimizer_step)
     assert "adamw_fp32_update(" not in host_source

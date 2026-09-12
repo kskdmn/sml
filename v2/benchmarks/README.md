@@ -30,7 +30,10 @@ All nine metrics execute real production operations:
 
 Each process synchronizes MLX at timing boundaries. Except for cold compilation,
 it performs one untimed compilation pass and five warmup units. Cold compilation
-uses zero warmups. Inference measures encoded model primitives; tokenization and
+uses zero warmups. Accumulated training submits each microstep asynchronously,
+matching the production kernels and quality runs. Changes to this harness require
+fresh baseline and quality evidence under their updated content identities.
+Inference measures encoded model primitives; tokenization and
 public-session scheduling are outside its timing boundaries. Decode uses a fixed
 transition count without early EOS termination. Each checkpoint publication
 follows a real optimizer update, which is outside the timed pause. Checkpoints

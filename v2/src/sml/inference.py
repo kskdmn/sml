@@ -7,6 +7,7 @@ import threading
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 
@@ -179,6 +180,7 @@ class ScoringKernelKey:
     length_bucket: int
     batch_size_bucket: int
     padding: str
+    continuation_length_bucket: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,20 +393,22 @@ def _pad_scoring_row(
     capacity: int,
     padding: str,
     pad_id: int,
-) -> tuple[list[int], list[bool], list[bool]]:
+    continuation_capacity: int,
+) -> tuple[list[int], list[bool], list[int], list[bool]]:
     length = len(token_ids)
     pad_count = capacity - length
     offset = 0 if padding == "right" else pad_count
     padded_ids = [pad_id] * capacity
     attention = [False] * capacity
-    target_mask = [False] * capacity
-    for index, token_id in enumerate(token_ids):
-        position = offset + index
-        padded_ids[position] = token_id
-        attention[position] = True
-        if index >= continuation_start:
-            target_mask[position] = True
-    return padded_ids, attention, target_mask
+    padded_ids[offset : offset + length] = token_ids
+    attention[offset : offset + length] = [True] * length
+    continuation_length = length - continuation_start
+    predictors = list(range(offset + continuation_start - 1, offset + length - 1))
+    predictors.extend([0] * (continuation_capacity - continuation_length))
+    target_mask = [True] * continuation_length + [False] * (
+        continuation_capacity - continuation_length
+    )
+    return padded_ids, attention, predictors, target_mask
 
 
 def _target_log_probabilities(
@@ -761,12 +765,19 @@ class InferenceSession:
         for bucket in self._bucketize(items):
             lease = None
             try:
-                lease = self.buffer_pool.lease(
-                    batch_size=bucket.batch_size_bucket,
-                    capacity=bucket.cache_capacity_bucket,
-                    config=self._resolved.model_config,
-                )
-                bucket_results = self._decode_chunk(bucket, lease)
+                if bucket.host_max_new:
+                    lease = self.buffer_pool.lease(
+                        batch_size=bucket.batch_size_bucket,
+                        capacity=bucket.cache_capacity_bucket,
+                        config=self._resolved.model_config,
+                    )
+                    bucket_results = self._decode_chunk(bucket, lease)
+                else:
+                    bucket_results = self._host_results(
+                        bucket,
+                        ((),) * bucket.batch_size_bucket,
+                        (0,) * bucket.batch_size_bucket,
+                    )
                 for caller_index, result in bucket_results:
                     results[caller_index] = result
             finally:
@@ -973,24 +984,30 @@ class InferenceSession:
         batch_size_bucket: int,
         padding: str,
     ) -> tuple[tuple[float, bool], ...]:
+        continuation_length_bucket = self._select_length_bucket(
+            max(len(token_ids) - start for _index, token_ids, start, _bucket in members)
+        )
         compiled = self._compiled_scoring_kernel(
-            length_bucket, batch_size_bucket, padding
+            length_bucket, batch_size_bucket, padding, continuation_length_bucket
         )
         pad_id = self._resolved.model_config.pad_token_id
         rows: list[list[int]] = []
         attention_rows: list[list[bool]] = []
+        predictor_rows: list[list[int]] = []
         target_rows: list[list[bool]] = []
         request_rows: list[bool] = []
         for _caller_index, token_ids, continuation_start, _length_bucket in members:
-            padded_ids, attention, target_mask = _pad_scoring_row(
+            padded_ids, attention, predictors, target_mask = _pad_scoring_row(
                 token_ids,
                 continuation_start,
                 length_bucket,
                 padding,
                 pad_id,
+                continuation_length_bucket,
             )
             rows.append(padded_ids)
             attention_rows.append(attention)
+            predictor_rows.append(predictors)
             target_rows.append(target_mask)
             request_rows.append(True)
         while len(rows) < batch_size_bucket:
@@ -999,11 +1016,13 @@ class InferenceSession:
             synthetic_attention[0] = True
             rows.append(synthetic_ids)
             attention_rows.append(synthetic_attention)
-            target_rows.append([False] * length_bucket)
+            predictor_rows.append([0] * continuation_length_bucket)
+            target_rows.append([False] * continuation_length_bucket)
             request_rows.append(False)
 
         input_ids = mx.array(rows, dtype=mx.int32)
         attention_mask = mx.array(attention_rows, dtype=mx.bool_)
+        logits_positions = mx.array(predictor_rows, dtype=mx.int32)
         target_mask = mx.array(target_rows, dtype=mx.bool_)
         request_mask = mx.array(request_rows, dtype=mx.bool_)
         positions = mx.cumsum(attention_mask.astype(mx.int32), axis=1) - 1
@@ -1017,6 +1036,7 @@ class InferenceSession:
             input_ids,
             attention_mask,
             positions,
+            logits_positions,
             target_mask,
             request_mask,
         )
@@ -1034,8 +1054,11 @@ class InferenceSession:
         length_bucket: int,
         batch_size_bucket: int,
         padding: str,
+        continuation_length_bucket: int,
     ):
-        key = ScoringKernelKey(length_bucket, batch_size_bucket, padding)
+        key = ScoringKernelKey(
+            length_bucket, batch_size_bucket, padding, continuation_length_bucket
+        )
         compiled = self._scoring_compiled.get(key)
         if compiled is not None:
             return compiled
@@ -1047,6 +1070,7 @@ class InferenceSession:
             input_ids,
             attention_mask,
             positions,
+            logits_positions,
             target_mask,
             request_mask,
         ):
@@ -1058,17 +1082,17 @@ class InferenceSession:
                 cache_state=None,
                 training=False,
                 key=None,
+                logits_positions=logits_positions,
             )
-            predictor = logits[:, :-1, :].astype(mx.float32)
-            targets = input_ids[:, 1:]
+            predictor = logits.astype(mx.float32)
+            targets = mx.take_along_axis(input_ids, logits_positions + 1, axis=1)
             gathered = _target_log_probabilities(predictor, targets)
-            continuation_mask = target_mask[:, 1:]
             log_likelihood = mx.sum(
-                gathered * continuation_mask.astype(mx.float32),
+                mx.where(target_mask, gathered, 0.0),
                 axis=-1,
             ) * request_mask.astype(mx.float32)
             greedy = mx.argmax(predictor, axis=-1)
-            matches = (greedy == targets) | (~continuation_mask)
+            matches = (greedy == targets) | (~target_mask)
             greedy_match = mx.all(matches, axis=-1) | (~request_mask)
             return log_likelihood, greedy_match
 
@@ -1094,7 +1118,6 @@ class InferenceSession:
             return compiled
 
         model = self._model
-        chunk_size = self._runtime.decode_chunk_size
         eos_id = self._resolved.model_config.eos_token_id
         temperature = kernel_key.temperature
         top_p = kernel_key.top_p
@@ -1141,9 +1164,31 @@ class InferenceSession:
             max_new,
             keys,
             request_mask,
+            *,
+            chunk_steps: int,
+            first_chunk: bool,
         ):
-            for _ in range(chunk_size):
+            selected_i32 = None
+            for step in range(chunk_steps):
                 active = request_mask & (~finished) & (generated < max_new)
+                if step > 0 or not first_chunk:
+                    # The previous sample enters the cache only when another
+                    # prediction is needed. Chunk boundaries can therefore stop
+                    # without evaluating an unused final model forward.
+                    step_positions = mx.maximum(lengths - 1, 0)[:, None]
+                    step_ids = (
+                        selected_i32[:, None]
+                        if step > 0
+                        else mx.take_along_axis(tokens, step_positions, axis=1)
+                    )
+                    logits, cache_state = _forward(
+                        parameters,
+                        step_ids,
+                        active[:, None],
+                        step_positions,
+                        cache_state,
+                    )
+                    logits = logits[:, 0]
                 scored = logits.astype(mx.float32)
                 scored = apply_repetition_penalty(
                     scored, tokens, lengths, repetition_penalty
@@ -1171,17 +1216,6 @@ class InferenceSession:
                 finished = (
                     finished | ~request_mask | hit_eos | (new_generated >= max_new)
                 )
-                step_ids = selected_i32[:, None]
-                step_mask = wrote[:, None]
-                step_positions = lengths[:, None]
-                logits, cache_state = _forward(
-                    parameters,
-                    step_ids,
-                    step_mask,
-                    step_positions,
-                    cache_state,
-                )
-                logits = logits[:, 0]
                 lengths = new_lengths
                 generated = new_generated
                 keys = next_keys
@@ -1195,7 +1229,23 @@ class InferenceSession:
                 keys,
             )
 
-        compiled = (mx.compile(_forward), mx.compile(_decode_chunk_core))
+        decode_variants = {}
+
+        def decode_chunk(chunk_steps: int, first_chunk: bool, *state):
+            variant_key = (chunk_steps, first_chunk)
+            decode = decode_variants.get(variant_key)
+            if decode is None:
+                decode = mx.compile(
+                    partial(
+                        _decode_chunk_core,
+                        chunk_steps=chunk_steps,
+                        first_chunk=first_chunk,
+                    )
+                )
+                decode_variants[variant_key] = decode
+            return decode(*state)
+
+        compiled = (mx.compile(_forward), decode_chunk)
         self._compiled[key] = compiled
         return compiled
 
@@ -1252,9 +1302,9 @@ class InferenceSession:
 
         max_steps = bucket.host_max_new
         chunk_size = self._runtime.decode_chunk_size
-        n_chunks = (max_steps + chunk_size - 1) // chunk_size if max_steps else 0
         tokens = lease.token_storage
-        for _chunk in range(n_chunks):
+        for chunk_start in range(0, max_steps, chunk_size):
+            chunk_steps = min(chunk_size, max_steps - chunk_start)
             (
                 tokens,
                 cache_state,
@@ -1264,6 +1314,8 @@ class InferenceSession:
                 finished,
                 keys,
             ) = decode_chunk(
+                chunk_steps,
+                chunk_start == 0,
                 self._parameters,
                 tokens,
                 cache_state,
@@ -1290,16 +1342,14 @@ class InferenceSession:
                 break
         lease.token_storage = tokens
         lease.cache_state = cache_state
-        return self._host_results(bucket, tokens, generated)
+        return self._host_results(bucket, tokens.tolist(), generated.tolist())
 
     def _host_results(
         self,
         bucket: GenerationBucket,
-        tokens: mx.array,
-        generated: mx.array,
+        token_rows: Sequence[Sequence[int]],
+        generated_counts: Sequence[int],
     ) -> tuple[tuple[int, GenerationResult], ...]:
-        token_rows = tokens.tolist()
-        generated_counts = generated.tolist()
         results: list[tuple[int, GenerationResult]] = []
         identity = self.model_identity
         processor = self._resolved.tokenizer.processor

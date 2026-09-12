@@ -1217,13 +1217,16 @@ def _validate_builder_result(
         is not None
     ):
         raise SMLArtifactError("builder must not write the manifest")
+    checkpoint_manifest = isinstance(manifest, CHECKPOINT_MANIFEST_TYPES)
     _verify_closed_world(
         fs,
         temporary_descriptor,
         manifest,
         manifest_present=False,
+        # Checkpoint semantic verification owns the full payload proof below.
+        verify_contents=not checkpoint_manifest,
     )
-    if isinstance(manifest, CHECKPOINT_MANIFEST_TYPES):
+    if checkpoint_manifest:
         _verify_checkpoint_semantics(
             temporary_descriptor,
             manifest,
@@ -3617,6 +3620,8 @@ def publish_checkpoint(
             committed_manifest,
             manifest_present=True,
             full=True,
+            # Keep the fresh post-publication proof in the semantic read below.
+            verify_contents=False,
         )
         _verify_checkpoint_semantics(
             temporary_descriptor,

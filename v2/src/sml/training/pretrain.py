@@ -112,6 +112,7 @@ class PretrainingKernels:
     compiled_optimizer_step_core: object
     eager_microstep_core: object
     eager_optimizer_step_core: object
+    accumulation_steps: int
 
     def microstep(
         self,
@@ -126,6 +127,10 @@ class PretrainingKernels:
             rows_array[:, :-1],
             rows_array[:, 1:],
         )
+        # Submit each microbatch while the host prepares the next one, instead
+        # of retaining the whole accumulation window as an unevaluated graph.
+        if self.accumulation_steps > 1:
+            mx.async_eval(next_trainer_tree)
         return MicrostepState(
             # Microsteps only accumulate gradients; parameters change at the
             # optimizer boundary, so their validated state can be reused.
@@ -282,6 +287,7 @@ def build_pretraining_kernels(
         ),
         eager_microstep_core=microstep_core,
         eager_optimizer_step_core=optimizer_step_core,
+        accumulation_steps=config.loader.gradient_accumulation_steps,
     )
 
 

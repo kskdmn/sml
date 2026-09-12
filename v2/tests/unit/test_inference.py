@@ -332,6 +332,155 @@ def test_session_generate_returns_tokens_and_releases_lease(
     assert tiny_session.buffer_pool.active_leases == 0
 
 
+@pytest.mark.parametrize("max_new_tokens", [1, 2, 7, 8, 9, 15, 16, 17])
+def test_decode_bounds_forward_work_and_omits_terminal_prediction(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+    max_new_tokens: int,
+) -> None:
+    forward_lengths: list[int] = []
+    forward = tiny_session._model.forward_arrays
+
+    def controlled_forward(parameters, input_ids, **kwargs):
+        forward_lengths.append(input_ids.shape[1])
+        logits, cache_state, key = forward(parameters, input_ids, **kwargs)
+        forced_logits = mx.where(
+            mx.arange(logits.shape[-1])[None, None, :] == 4,
+            0.0,
+            -100.0,
+        )
+        return mx.broadcast_to(forced_logits, logits.shape), cache_state, key
+
+    monkeypatch.setattr(tiny_session._model, "forward_arrays", controlled_forward)
+    result = tiny_session.generate("alpha", GenerationRequest(max_new_tokens))
+
+    assert result.token_ids == (4,) * max_new_tokens
+    assert forward_lengths == [
+        tiny_session._select_length_bucket(len(tiny_session._encode_prompt("alpha"))),
+        *([1] * (max_new_tokens - 1)),
+    ]
+    assert tiny_session.buffer_pool.active_leases == 0
+
+
+@pytest.mark.parametrize("include_prompt", [False, True])
+def test_zero_token_generation_skips_model_and_buffers(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+    include_prompt: bool,
+) -> None:
+    def forbidden(*args, **kwargs):
+        pytest.fail("a zero-token request does not need model computation or buffers")
+
+    monkeypatch.setattr(tiny_session.buffer_pool, "lease", forbidden)
+    monkeypatch.setattr(tiny_session._model, "forward_arrays", forbidden)
+    result = tiny_session.generate(
+        "alpha",
+        GenerationRequest(
+            0, config=GenerationConfig(seed=19), include_prompt=include_prompt
+        ),
+    )
+    expected_ids = tiny_session._encode_prompt("alpha") if include_prompt else ()
+    assert result.token_ids == expected_ids
+    assert result.text == tiny_session.resolved_model.tokenizer.processor.decode(
+        list(expected_ids)
+    )
+    assert result.seed == 19
+    assert result.model == tiny_session.model_identity
+
+
+@pytest.mark.parametrize("sampled", [False, True])
+def test_tail_chunks_preserve_tokens_across_chunk_sizes(
+    tiny_session: InferenceSession,
+    sampled: bool,
+) -> None:
+    single_step = InferenceSession(
+        tiny_session.resolved_model,
+        InferenceRuntimeConfig(decode_chunk_size=1),
+    )
+    config = GenerationConfig(
+        temperature=0.8 if sampled else 0.0,
+        top_p=0.9,
+        repetition_penalty=1.2,
+        no_repeat_ngram_size=2,
+        seed=43,
+    )
+    items = [
+        ("alpha", GenerationRequest(max_new_tokens=count, config=config))
+        for count in (1, 9, 10, 12, 17)
+    ]
+
+    expected = single_step.generate_batch(items)
+    actual = tiny_session.generate_batch(items)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("padding", ["left", "right"])
+def test_scoring_projects_only_bucketed_continuation_predictors(
+    tiny_session: InferenceSession,
+    monkeypatch: pytest.MonkeyPatch,
+    padding: str,
+) -> None:
+    items = (
+        ((1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), 12),
+        ((1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14), 9),
+        ((1, 6, 7, 8, 9, 10, 11, 12, 13, 14), 7),
+    )
+    expected = []
+    forward = tiny_session._model.forward_arrays
+    for token_ids, start in items:
+        input_ids = mx.array([token_ids], dtype=mx.int32)
+        logits, _, _ = forward(
+            tiny_session._parameters,
+            input_ids,
+            attention_mask=None,
+            positions=None,
+            cache_state=None,
+            training=False,
+            key=None,
+        )
+        predictor = logits[:, start - 1 : -1, :].astype(mx.float32)
+        targets = input_ids[:, start:]
+        likelihood = mx.sum(inference._target_log_probabilities(predictor, targets))
+        greedy_match = mx.all(mx.argmax(predictor, axis=-1) == targets)
+        mx.eval(likelihood, greedy_match)
+        expected.append((float(likelihood.item()), bool(greedy_match.item())))
+
+    projected_shapes: list[tuple[int, ...]] = []
+
+    def selected_forward(parameters, input_ids, **kwargs):
+        projected_shapes.append(tuple(kwargs["logits_positions"].shape))
+        return forward(parameters, input_ids, **kwargs)
+
+    monkeypatch.setattr(tiny_session._model, "forward_arrays", selected_forward)
+    actual = tiny_session.score_encoded_loglikelihoods(items, padding=padding)
+
+    assert projected_shapes == [(4, 4)]
+    for result, reference in zip(actual, expected, strict=True):
+        assert result[0] == pytest.approx(reference[0], abs=1e-5, rel=1e-5)
+        assert result[1] == reference[1]
+    assert {
+        key.continuation_length_bucket for key in tiny_session._scoring_compiled
+    } == {4}
+
+
+def test_scoring_reuses_continuation_shape_buckets(tiny_session: InferenceSession):
+    token_ids = tuple(range(4, 17))
+    tiny_session.score_encoded_loglikelihoods(((token_ids, 10),), padding="right")
+    initial = dict(tiny_session._scoring_compiled)
+    tiny_session.score_encoded_loglikelihoods(((token_ids, 9),), padding="right")
+    assert tiny_session._scoring_compiled == initial
+
+    tiny_session.score_encoded_loglikelihoods(((token_ids, 8),), padding="right")
+    assert len(tiny_session._scoring_compiled) == 2
+    assert {
+        key.continuation_length_bucket for key in tiny_session._scoring_compiled
+    } == {
+        4,
+        8,
+    }
+
+
 def test_short_prompt_and_long_generation_select_independent_buckets(
     tiny_session: InferenceSession,
 ) -> None:

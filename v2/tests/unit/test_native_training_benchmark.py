@@ -13,6 +13,11 @@ from sml.data import pretraining as prepared_data
 from sml.data.pretraining import PretrainingCursor
 from sml.errors import SMLConfigurationError
 from sml.training.pretrain import _restore_checkpoint
+from test_benchmark_analysis import (
+    _valid_raw_trial,
+    _validate_trial_metadata,
+    _with_trial_payload,
+)
 
 from v2.benchmarks.adapters import native_training
 from v2.benchmarks.adapters import runtime as replacement
@@ -210,8 +215,15 @@ def test_native_checkpoint_publication_restores_prepared_update_and_prunes_previ
 
 
 @pytest.mark.parametrize("metric", METRIC_NAMES)
-def test_every_replacement_metric_executes_real_tiny_workload(metric):
-    native = replacement.resolve_native_workload(metric, _workload(), Path.cwd())
+def test_every_native_metric_measurement_satisfies_trial_validators(metric):
+    workload = _workload()
+    workload = replace(
+        workload,
+        work_units=tuple(
+            replace(unit, measured_units=2) for unit in workload.work_units
+        ),
+    )
+    native = replacement.resolve_native_workload(metric, workload, Path.cwd())
     assert isinstance(native, replacement.NativeWorkload)
     expected_work = {
         "prepared-data": 2.0,
@@ -229,7 +241,7 @@ def test_every_replacement_metric_executes_real_tiny_workload(metric):
             metric=metric,
             adapter=replacement,
             native_workload=native,
-            warmup_units=0,
+            warmup_units=0 if metric == "compile-cold-start" else 5,
             measured_units=2,
             synchronize=mx.synchronize,
             peak_memory=mx.get_peak_memory,
@@ -238,6 +250,23 @@ def test_every_replacement_metric_executes_real_tiny_workload(metric):
         assert result.work_count == expected_work[metric]
         assert result.value > 0.0
         assert result.elapsed_seconds > 0.0
+        reference = _with_trial_payload(
+            _valid_raw_trial(workload, metric=metric),
+            native_configuration=native.native_configuration,
+            native_representation_identity=native.native_representation_identity,
+            canonical_row_identity=native.canonical_row_identity,
+            canonical_input_identity=native.canonical_input_identity,
+            canonical_projection=native.canonical_projection,
+            execution_order_identity=native.execution_order_identity,
+            initial_parameter_identity=native.initial_parameter_identity,
+            startup_verification_seconds=native.startup_verification_seconds,
+            elapsed_seconds=result.elapsed_seconds,
+            value=result.value,
+            compilation_seconds=result.compilation_seconds,
+            peak_memory_bytes=result.peak_memory_bytes,
+        )
+        for protocol in ("baseline", "comparison", "predecessor"):
+            _validate_trial_metadata(protocol, workload, reference)
     finally:
         native.runtime.close()
 

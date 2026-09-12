@@ -950,7 +950,10 @@ def test_raw_validation_reconstructs_every_accepting_telemetry_summary(
         )
 
 
-def test_multi_step_runtime_submits_each_optimizer_boundary(monkeypatch, tmp_path):
+@pytest.mark.parametrize("accumulation_steps", (1, 2))
+def test_multi_step_runtime_submits_accumulation_and_optimizer_boundaries(
+    monkeypatch, tmp_path, accumulation_steps
+):
     config, model, parameters, optimizer, trainer, decay = _tiny_runtime(tmp_path)
     kernels = quality_module._build_candidate_kernels(model, config, decay)
     rows = np.asarray([[1, 4, 5, 2, 6]], dtype=np.int32)
@@ -989,8 +992,8 @@ def test_multi_step_runtime_submits_each_optimizer_boundary(monkeypatch, tmp_pat
     result = quality_module._execute_training_steps(
         kernels=kernels,
         runtime="candidate",
-        gradient_accumulation_steps=1,
-        ordered_batches=((0,), (0,), (0,)),
+        gradient_accumulation_steps=accumulation_steps,
+        ordered_batches=((0,),) * (3 * accumulation_steps),
         training_rows=rows,
         start_step=0,
         stop_step=3,
@@ -1000,9 +1003,17 @@ def test_multi_step_runtime_submits_each_optimizer_boundary(monkeypatch, tmp_pat
     )
     mx.eval(result.masters, result.adam_tree, result.trainer_tree)
 
-    assert len(submissions) == 3
+    expected_submissions = 3 * (accumulation_steps + 1 if accumulation_steps > 1 else 1)
+    assert len(submissions) == expected_submissions
+    if accumulation_steps > 1:
+        for step in range(3):
+            for microstep in range(accumulation_steps):
+                (submitted_trainer,) = submissions[
+                    step * (accumulation_steps + 1) + microstep
+                ]
+                assert int(submitted_trainer[1].item()) == microstep + 1
     assert int(result.adam_tree[0].item()) == 3
-    assert result.microstep_index == 3
+    assert result.microstep_index == 3 * accumulation_steps
     for index, key in enumerate(received_keys):
         assert bool(
             mx.array_equal(key, quality_module.counter_random_key(config.seed, index))

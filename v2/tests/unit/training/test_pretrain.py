@@ -165,6 +165,56 @@ def test_microstep_transfers_rows_once_and_keeps_state_on_device(tiny_runtime):
     assert "mx.eval(" not in inspect.getsource(tiny_runtime.kernels.microstep)
 
 
+@pytest.mark.parametrize("accumulation_steps", (1, 4))
+def test_accumulation_submits_complete_microsteps_without_host_waits(
+    tiny_runtime, monkeypatch, accumulation_steps
+):
+    """Multi-batch windows must run before the eventual optimizer boundary."""
+    config = replace(
+        tiny_runtime.config,
+        loader=replace(
+            tiny_runtime.config.loader,
+            gradient_accumulation_steps=accumulation_steps,
+        ),
+    )
+    kernels = build_pretraining_kernels(
+        tiny_runtime.model, config, tiny_runtime.weight_decay_tree
+    )
+    submitted = []
+    submit = mx.async_eval
+
+    def record_submission(tree):
+        submitted.append(dict(tree_flatten(tree)))
+        submit(tree)
+
+    def reject_host_wait(*_args):
+        raise AssertionError("microstep blocked the host before the optimizer update")
+
+    trainer = tiny_runtime.trainer
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "async_eval", record_submission)
+        patch.setattr(mx, "eval", reject_host_wait)
+        for index in range(accumulation_steps):
+            result = kernels.microstep(
+                tiny_runtime.parameters, trainer, tiny_runtime.rows
+            )
+            trainer = result.trainer
+            assert result.parameters is tiny_runtime.parameters
+            if accumulation_steps > 1:
+                assert len(submitted) == index + 1
+                returned = dict(tree_flatten(trainer.to_tree()))
+                assert submitted[-1].keys() == returned.keys()
+                assert all(
+                    submitted[-1][name] is value for name, value in returned.items()
+                )
+            else:
+                assert not submitted
+
+    assert int(trainer.accumulation_count.item()) == accumulation_steps
+    assert int(tiny_runtime.optimizer.step.item()) == 0
+    assert float(trainer.loss_numerator.item()) > 0.0
+
+
 def test_compiled_cores_use_only_builtin_array_trees(tiny_runtime):
     """A wrapper object at a compile boundary would capture mutable host state."""
     rows = mx.array(tiny_runtime.rows)

@@ -2206,6 +2206,8 @@ def _execute_training_steps(
                 batch[:, :-1],
                 batch[:, 1:],
             )
+            if gradient_accumulation_steps > 1:
+                mx.async_eval(trainer_tree)
             microstep_index += 1
         previous_masters = masters
         previous_working = working

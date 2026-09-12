@@ -11,6 +11,7 @@ from v2.benchmarks.workload import (
     canonical_execution_order_identity,
     canonical_input_identity,
     canonical_metric_projection,
+    structured_identity,
 )
 
 
@@ -39,10 +40,15 @@ class NativeRuntime:
             else:
                 from v2.benchmarks.adapters.native_training import make_runtime
             self._runtime = make_runtime(metric, workload, Path(self._directory.name))
+            self.canonical_projection = canonical_metric_projection(metric, workload)
             self.native_configuration = {
                 "metric": metric,
                 "parameter_precision_policy": PRECISION_POLICY,
-                "canonical_projection": canonical_metric_projection(metric, workload),
+                "canonical_projection": self.canonical_projection,
+                "canonical_projection_identity": structured_identity(
+                    "sml-benchmark-metric-projection-v1", self.canonical_projection
+                ),
+                "rope_scaling_factor": float(workload.model["rope_scaling_factor"]),
                 "implementation": "production-explicit-state-kernels-v1",
             }
             self.native_representation_identity = (
@@ -55,7 +61,6 @@ class NativeRuntime:
             self.canonical_input_identity = canonical_input_identity(metric, workload)
             if self._runtime.canonical_input_identity != self.canonical_input_identity:
                 raise ValueError("native benchmark input verification failed")
-            self.canonical_projection = canonical_metric_projection(metric, workload)
             self.execution_order_identity = canonical_execution_order_identity(
                 metric, workload
             )
