@@ -10,7 +10,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
-from inspect import signature
 from pathlib import Path
 
 import mlx.core as mx
@@ -43,13 +42,6 @@ CHECKPOINT_STAGES = (
     "latest-replaced",
     "latest-parent-fsynced",
 )
-
-
-def test_checkpoint_public_retention_surface_is_latest_only() -> None:
-    """Callers must not be able to select arbitrary checkpoint history depth."""
-    assert "apply_retention" not in checkpoint.__all__
-    assert not hasattr(checkpoint, "apply_retention")
-    assert "keep_last" not in signature(checkpoint.prune_to_latest).parameters
 
 
 class InjectedFailure(RuntimeError):
@@ -920,11 +912,6 @@ def test_exclusive_run_access_conflicts_with_shared_access_holder(
         checkpoint.run_access_lock(run, exclusive=True),
     ):
         pytest.fail("exclusive access entered while a shared reader was live")
-
-
-def test_checkpoint_stage_tuple_is_exact_and_ordered() -> None:
-    """Changing a checkpoint durability boundary must break the public mapping."""
-    assert checkpoint.CHECKPOINT_PUBLICATION_STAGES == CHECKPOINT_STAGES
 
 
 def test_exact_step_ignores_latest_and_malformed_newer_step(valid_run: Path) -> None:

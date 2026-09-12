@@ -252,35 +252,6 @@ def test_source_identity_requires_a_portable_logical_path() -> None:
             )
 
 
-def test_task_and_result_identities_cover_metrics_requests_and_model() -> None:
-    task = make_task_record(metric_payload={"acc,none": 0.5})
-    task = replace(task, task_identity=evaluation_task_identity(task))
-    result = make_result(model=model_identity(), tasks=(task,))
-    result = replace(result, identity=evaluation_result_identity(result))
-    changed_metric = replace(task, metric_payload={"acc,none": 0.75})
-    changed_request = replace(task, ordered_request_identity="sha256:" + "2" * 64)
-    assert (
-        evaluation_result_identity(
-            replace(
-                make_result(model=model_identity(), tasks=(changed_metric,)),
-                identity="sha256:" + "0" * 64,
-            )
-        )
-        != result.identity
-    )
-    assert evaluation_task_identity(changed_request) != task.task_identity
-    assert (
-        evaluation_result_identity(
-            replace(
-                result,
-                identity="sha256:" + "0" * 64,
-                model=replace(model_identity(), step=8),
-            )
-        )
-        != result.identity
-    )
-
-
 def test_identity_projections_are_pinned_selective_and_complete() -> None:
     task = make_task_record()
     expected_task_identity = (

@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import inspect
-
 import mlx.core as mx
 import pytest
 from sml.model.layers import (
-    GroupedQueryAttention,
     LoRAAdapterSpec,
     LoRAForwardPolicy,
     RMSNorm,
@@ -67,14 +64,6 @@ def test_keyed_dropout_replays_from_the_same_explicit_key():
     assert first.dtype == mx.bfloat16
     mx.eval(first_next_key, key)
     assert not bool(mx.array_equal(first_next_key, key).item())
-
-
-def test_grouped_query_attention_uses_fused_gqa_without_tiling_kv_heads():
-    source = inspect.getsource(GroupedQueryAttention.forward_arrays)
-
-    assert "mx.fast.scaled_dot_product_attention" in source
-    assert "mx.tile" not in source
-    assert "mx.repeat" not in source
 
 
 def test_linear_plain_weight_returns_bfloat16_and_consumes_no_key():

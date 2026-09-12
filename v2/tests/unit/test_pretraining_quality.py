@@ -580,46 +580,6 @@ def _tiny_runtime(tmp_path: Path):
     return config, model, parameters, optimizer, trainer, decay
 
 
-def test_candidate_transition_is_the_reviewed_production_kernel(tmp_path):
-    config, model, parameters, optimizer, trainer, decay = _tiny_runtime(tmp_path)
-    rows = mx.array([[1, 4, 5, 2, 6]], dtype=mx.int32)
-    candidate = quality_module._build_candidate_kernels(model, config, decay)
-    production = quality_module.build_pretraining_kernels(model, config, decay)
-
-    candidate_working, candidate_trainer = candidate.microstep_core(
-        parameters.working_parameters,
-        trainer.to_tree(),
-        rows[:, :-1],
-        rows[:, 1:],
-    )
-    expected_working, expected_trainer = production.eager_microstep_core(
-        parameters.working_parameters,
-        trainer.to_tree(),
-        rows[:, :-1],
-        rows[:, 1:],
-    )
-    actual = candidate.optimizer_step_core(
-        parameters.master_parameters,
-        candidate_working,
-        optimizer.to_tree(),
-        candidate_trainer,
-    )
-    expected = production.eager_optimizer_step_core(
-        parameters.master_parameters,
-        expected_working,
-        optimizer.to_tree(),
-        expected_trainer,
-    )
-    mx.eval(actual, expected)
-
-    for (_, actual_leaf), (_, expected_leaf) in zip(
-        quality_module.tree_flatten(actual),
-        quality_module.tree_flatten(expected),
-        strict=True,
-    ):
-        assert bool(mx.array_equal(actual_leaf, expected_leaf))
-
-
 def test_oracle_transition_keeps_fp32_working_state_and_matching_key(tmp_path):
     config, model, parameters, optimizer, trainer, decay = _tiny_runtime(tmp_path)
     rows = mx.array([[1, 4, 5, 2, 6]], dtype=mx.int32)

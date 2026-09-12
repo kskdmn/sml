@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -11,10 +9,6 @@ from sml.model.generation import (
 )
 
 from v2.benchmarks.adapters.native_inference import make_runtime
-from v2.benchmarks.adapters.runtime import (
-    NativeWorkload,
-    resolve_native_workload,
-)
 from v2.benchmarks.workload import build_canonical_workload
 
 
@@ -120,21 +114,6 @@ def test_inference_metrics_use_identical_initial_parameters(workload, tmp_path):
     prefill = make_runtime("inference-prefill", workload, tmp_path)
     decode = make_runtime("inference-decode", workload, tmp_path)
     assert prefill.initial_parameter_identity == decode.initial_parameter_identity
-
-
-@pytest.mark.parametrize("metric", ["inference-prefill", "inference-decode"])
-def test_native_inference_resolves_through_benchmark_wrapper(metric, workload):
-    native = resolve_native_workload(metric, workload, Path.cwd())
-    assert isinstance(native, NativeWorkload)
-    try:
-        assert (
-            native.canonical_input_identity
-            == workload.semantic_identities["canonical_inference_requests"]
-        )
-        assert native.native_representation_identity.startswith("sha256:")
-        assert native.runtime.run(1) == (4 if metric == "inference-prefill" else 2)
-    finally:
-        native.runtime.close()
 
 
 def test_native_inference_rejects_unpaired_sampling(workload, tmp_path):

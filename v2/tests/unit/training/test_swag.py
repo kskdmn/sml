@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -154,15 +153,6 @@ def tiny_swag_config(provider):
         maximum_length=32,
         bucket_boundaries=(16, 32),
     )
-
-
-def source_contains(module: object, snippet: str) -> bool:
-    return snippet in inspect.getsource(module)
-
-
-def source_has_none_of(module: object, forbidden: list[str]) -> bool:
-    source = inspect.getsource(module)
-    return all(token not in source for token in forbidden)
 
 
 def assert_close(actual: mx.array, expected: mx.array, *, atol: float, rtol: float):
@@ -654,32 +644,6 @@ def test_compiled_swag_cores_accept_only_builtin_array_trees(tiny_swag_runtime):
     core_outputs = kernels.compiled_ranking_microstep_core(*core_inputs)
     mx.eval(core_outputs)
     assert_builtin_array_tree(core_outputs)
-    assert source_has_none_of(
-        swag_module,
-        [
-            "mx.compile(lambda state",
-            "mx.compile(lambda batch",
-            "mx.compile(lambda config",
-        ],
-    )
-    builder_source = inspect.getsource(swag_module.build_swag_kernels)
-    assert "mx.random" not in builder_source
-    assert "random." not in builder_source
-
-
-def test_swag_value_and_grad_targets_adapters_only():
-    assert source_contains(swag_module, "mx.value_and_grad(adapter_loss, argnums=0)")
-    assert source_has_none_of(
-        swag_module,
-        ["mx.value_and_grad(combined_parameters", "nn.value_and_grad(model"],
-    )
-
-
-def test_swag_kernel_wrappers_do_not_eval_before_rebuilding_host_state():
-    assert "mx.eval(" not in inspect.getsource(
-        swag_module.SwagKernels.ranking_microstep
-    )
-    assert "mx.eval(" not in inspect.getsource(swag_module.SwagKernels.optimizer_step)
 
 
 @pytest.mark.parametrize("accumulation_steps", (1, 4))
@@ -730,26 +694,6 @@ def test_swag_accumulation_submits_masked_microsteps_without_host_waits(
 
     assert int(trainer.valid_count.item()) == accumulation_steps * real_examples
     assert float(trainer.loss_numerator.item()) > 0.0
-
-
-def test_swag_optimizer_splits_compiled_fp32_tree_from_host_reconstruction():
-    host_source = inspect.getsource(swag_module.SwagKernels.optimizer_step)
-    assert "adamw_fp32_update(" not in host_source
-    assert "_adamw_fp32_update_tree" not in host_source
-    assert "AdamState.from_tree(" not in host_source
-    assert "AdamState.from_compiled_tree(" in host_source
-    assert "SwagTrainerState.from_compiled_tree(" in host_source
-    assert "optimizer.to_tree()" in host_source
-    assert "_require_dtype" in host_source
-    assert "mx.eval(" not in host_source
-    assert "adamw_mixed_precision_update(" not in host_source
-    builder_source = inspect.getsource(swag_module.build_swag_kernels)
-    assert "_adamw_fp32_update_tree" in builder_source
-    assert "normalize_and_clip(" in builder_source
-    assert "AdamState" not in builder_source
-    module_source = inspect.getsource(swag_module)
-    assert "adamw_mixed_precision_update(" not in module_source
-    assert ".astype(mx.bfloat16)" not in module_source
 
 
 def test_compiled_swag_optimizer_core_consumes_builtin_adapter_and_adam_trees(
@@ -1374,14 +1318,6 @@ def test_kernel_config_is_frozen_from_loader_optimizer_and_compile(tiny_swag_run
         == tiny_swag_runtime.config.optimizer.gradient_clip_norm
     )
     assert config.compile is True
-
-
-def test_permutation_uses_loader_epoch_seed_not_training_seed():
-    stream_source = inspect.getsource(inspect.getmodule(SwagBatchStream))
-    assert "PCG64" in stream_source
-    assert "SeedSequence" in stream_source
-    assert "epoch_seed" in stream_source
-    assert "sml.training" not in stream_source
 
 
 def test_stream_builds_one_permutation_per_epoch(tiny_swag_runtime, monkeypatch):

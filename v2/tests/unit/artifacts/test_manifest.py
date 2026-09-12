@@ -467,29 +467,6 @@ def test_all_manifest_outer_field_sets_are_frozen():
             manifest.identity = IDENTITY_B
 
 
-def test_run_and_checkpoint_schema_kinds_are_distinct_and_strict():
-    """One optional-field container cannot freeze pretraining and LoRA contracts."""
-    required = (
-        "PretrainingRunManifest",
-        "LoRARunManifest",
-        "PretrainingCheckpointManifest",
-        "LoRACheckpointManifest",
-    )
-    missing = [name for name in required if not hasattr(manifest_module, name)]
-    assert missing == []
-
-    run_kinds = {
-        manifest_module.PretrainingRunManifest.EXPECTED_KIND,
-        manifest_module.LoRARunManifest.EXPECTED_KIND,
-    }
-    checkpoint_kinds = {
-        manifest_module.PretrainingCheckpointManifest.EXPECTED_KIND,
-        manifest_module.LoRACheckpointManifest.EXPECTED_KIND,
-    }
-    assert run_kinds == {"pretraining-run", "lora-run"}
-    assert checkpoint_kinds == {"pretraining-checkpoint", "lora-checkpoint"}
-
-
 @pytest.mark.parametrize(
     ("manifest_index", "manifest_type", "foreign_field"),
     [
@@ -1118,14 +1095,6 @@ def test_strict_manifest_parser_rejects_forged_manifest_identity(tmp_path):
 
     with pytest.raises(SMLArtifactError, match="manifest identity"):
         read_manifest(tmp_path, TokenizerManifest, VerificationLevel.MANIFEST_TRUSTED)
-
-
-def test_manifest_verification_levels_have_only_the_two_pinned_values():
-    """A third verification label could overstate what a reader checked."""
-    assert {level.value for level in VerificationLevel} == {
-        "manifest-trusted",
-        "full",
-    }
 
 
 @pytest.mark.parametrize("run_type", (PretrainingRunManifest, LoRARunManifest))

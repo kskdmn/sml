@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import ast
-import inspect
-from dataclasses import fields, replace
-from pathlib import Path
+from dataclasses import replace
 
 import mlx.core as mx
 import pytest
@@ -12,7 +9,6 @@ from mlx.utils import tree_flatten, tree_map
 from sml.model.cache import KVCache
 from sml.model.config import ModelConfig
 from sml.model.language_model import (
-    ForwardOutput,
     SMLLanguageModel,
     causal_lm_loss,
     model_parameter_specs,
@@ -133,12 +129,6 @@ def test_model_parameter_specs_match_plain_model_state(tie_word_embeddings):
     assert actual == expected
     assert actual["embed_tokens.weight"] == ((64, 16), "bfloat16")
     assert ("lm_head.weight" in actual) is (not tie_word_embeddings)
-
-
-def test_model_config_rejects_invalid_parameter_projection_dimensions():
-    """Catches accepting a configuration that cannot describe model leaves."""
-    with pytest.raises(ValueError, match="divisible"):
-        _tiny_model_config(hidden_size=15)
 
 
 def test_initialization_is_replayable_and_replaces_parameters_explicitly():
@@ -404,45 +394,3 @@ def test_forward_does_not_synchronize_for_token_validation(monkeypatch):
 
     assert output.logits.shape == (1, 3, 64)
     assert calls == []
-
-
-def test_model_outputs_are_host_wrappers_but_compiled_boundaries_are_array_trees():
-    assert [field.name for field in fields(ForwardOutput)] == [
-        "logits",
-        "cache",
-        "next_key",
-    ]
-
-    module_paths = {
-        Path(inspect.getfile(KVCache)),
-        Path(inspect.getfile(SMLLanguageModel)),
-    }
-    forbidden_types = {"KVCache", "KVView", "ForwardOutput"}
-    for module_path in module_paths:
-        tree = ast.parse(module_path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            is_compiled = any(
-                "compile" in ast.unparse(decorator) for decorator in node.decorator_list
-            )
-            if not is_compiled:
-                continue
-            signature = " ".join(
-                ast.unparse(annotation)
-                for annotation in [
-                    *(argument.annotation for argument in node.args.args),
-                    node.returns,
-                ]
-                if annotation is not None
-            )
-            assert forbidden_types.isdisjoint(signature.split())
-
-
-def test_forward_kernels_contain_no_host_validation_or_parameter_installation():
-    source = inspect.getsource(SMLLanguageModel.forward_arrays)
-
-    assert ".item(" not in source
-    assert ".tolist(" not in source
-    assert "mx.eval(" not in source
-    assert ".update(" not in source

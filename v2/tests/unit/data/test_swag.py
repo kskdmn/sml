@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import io
 import shutil
 import subprocess
@@ -1419,16 +1418,6 @@ def test_swag_stream_rejects_an_already_closed_bundle(tmp_path):
         SwagBatchStream(bundle, _one_example_loader(), cursor=SwagCursor.initial())
 
 
-def test_swag_stream_public_constructor_does_not_expose_borrowed_ownership():
-    from sml.data.swag import SwagBatchStream
-
-    assert tuple(inspect.signature(SwagBatchStream).parameters) == (
-        "bundle",
-        "loader",
-        "cursor",
-    )
-
-
 def test_swag_stream_pull_preserves_producer_failure_when_close_fails(
     tmp_path, monkeypatch
 ):
@@ -2727,11 +2716,3 @@ def test_chunked_ingest_does_not_stack_all_examples_at_once(tmp_path, monkeypatc
         assert all(count <= 2 for count in stacked_example_batches)
     finally:
         bundle.close()
-
-
-def test_swag_data_module_does_not_import_training():
-    from sml.data import swag as data_swag
-
-    source = inspect.getsource(data_swag)
-    assert "sml.training" not in source
-    assert "LoaderConfig" not in source

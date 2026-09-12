@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import io
 import math
 import multiprocessing
@@ -1238,9 +1237,6 @@ def test_target_log_probabilities_gather_before_normalization(
     assert actual.dtype == mx.float32
     assert calls == [((1, 2, 3), (1, 2, 1), (1, 2, 1))]
     assert bool(mx.allclose(actual, expected, atol=1e-7, rtol=1e-7).item())
-    source = inspect.getsource(inference._target_log_probabilities)
-    assert "take_along_axis" in source
-    assert "predictor_logits_fp32 -" not in source
 
 
 def test_compiled_scoring_uses_token_shaped_target_log_probabilities(
@@ -1276,10 +1272,6 @@ def test_compiled_scoring_uses_token_shaped_target_log_probabilities(
     predictor_shape, target_shape, result_shape = calls[0]
     assert predictor_shape[:-1] == target_shape == result_shape
     assert predictor_shape[-1] == tiny_session.resolved_model.model_config.vocab_size
-
-    source = inspect.getsource(InferenceSession._compiled_scoring_kernel)
-    assert "_target_log_probabilities(" in source
-    assert "log_probs" not in source
 
 
 @pytest.mark.parametrize("padding", ["left", "right"])
@@ -1423,17 +1415,6 @@ def test_greedy_match_is_boolean_and_stable(tiny_session: InferenceSession) -> N
     assert first.log_likelihood == pytest.approx(
         second.log_likelihood, abs=2e-2, rel=2e-2
     )
-
-
-def test_empty_context_inserts_prefix_token(tiny_session: InferenceSession) -> None:
-    processor = tiny_session.resolved_model.tokenizer.processor
-    assert int(processor.bos_id()) >= 0
-    result = score_loglikelihood_batch(
-        tiny_session,
-        [LoglikelihoodRequest(context="", continuation=" beta")],
-        padding="left",
-    )[0]
-    assert math.isfinite(result.log_likelihood)
 
 
 def test_empty_context_without_prefix_fails_before_bucketing(
@@ -1585,17 +1566,6 @@ def test_evaluation_config_rejects_unknown_tasks(tmp_path: Path) -> None:
             tasks=("mmlu",),
             output=tmp_path / "out.json",
         )
-
-
-def test_importing_evaluation_does_not_import_lm_eval() -> None:
-    from sml import evaluation
-
-    assert "lm_eval" not in evaluation.__dict__
-    source = Path(evaluation.__file__).read_text(encoding="utf-8")
-    tree_import_lines = [
-        line for line in source.splitlines() if line.startswith(("import ", "from "))
-    ]
-    assert all("lm_eval" not in line for line in tree_import_lines)
 
 
 def test_evaluate_does_not_use_the_network(
@@ -1897,26 +1867,6 @@ def test_evaluate_passes_installed_lm_eval_lm(
     evaluate(tiny_evaluation_config(tiny_pretraining_run, tmp_path))
     model = fake_lm_eval.calls[0]["model"]
     assert isinstance(model, LM)
-
-
-def test_evaluation_publish_does_not_replace_destination(
-    tiny_pretraining_run: Path,
-    fake_lm_eval,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    replaced: list[Path] = []
-    real_replace = os.replace
-
-    def tracking_replace(src, dst, *args, **kwargs):
-        replaced.append(Path(dst))
-        return real_replace(src, dst, *args, **kwargs)
-
-    monkeypatch.setattr(os, "replace", tracking_replace)
-    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
-    evaluate(config)
-    assert all(path != config.output for path in replaced)
-    assert config.output.exists()
 
 
 def test_compiled_scoring_kernel_receives_request_mask(

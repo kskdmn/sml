@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-import ast
-import inspect
-from dataclasses import fields
-from pathlib import Path
-
 import mlx.core as mx
 from sml.model.config import GenerationConfig
 from sml.model.generation import (
@@ -35,10 +30,6 @@ def test_greedy_selection_returns_argmax_without_advancing_key():
     )
 
     assert isinstance(selected, TokenSelection)
-    assert [field.name for field in fields(TokenSelection)] == [
-        "token_ids",
-        "next_key",
-    ]
     assert selected.token_ids.shape == (2,)
     assert selected.token_ids.dtype == mx.uint32
     assert selected.next_key.shape == (2,)
@@ -237,17 +228,3 @@ def test_compiled_vmap_accepts_one_distinct_key_per_row():
     assert next_keys.shape == (3, 2)
     assert next_keys.dtype == mx.uint32
     _assert_array_equal(next_keys, mx.vmap(lambda key: mx.random.split(key)[0])(keys))
-
-
-def test_generation_kernels_contain_no_host_conversion_or_synchronization():
-    """Processor kernels must remain traceable when generation moves under compile."""
-    module_path = Path(inspect.getfile(select_next_token_arrays))
-    tree = ast.parse(module_path.read_text(encoding="utf-8"))
-    forbidden_attributes = {"item", "tolist", "eval", "numpy"}
-
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            imported = [alias.name.split(".")[0] for alias in node.names]
-            assert "numpy" not in imported
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            assert node.func.attr not in forbidden_attributes

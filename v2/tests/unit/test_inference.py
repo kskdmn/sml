@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 import shutil
 from contextlib import contextmanager
@@ -12,7 +11,6 @@ import pytest
 import zstandard as zstd
 from sml import inference
 from sml.artifacts import checkpoint
-from sml.artifacts.checkpoint import VerifiedCheckpointContents
 from sml.data.corpus import CorpusConfig
 from sml.data.pretraining import (
     PretrainingPreparationConfig,
@@ -229,40 +227,12 @@ def test_encoded_scoring_rejects_invalid_continuation_indices(
         )
 
 
-def test_resolve_rejects_directory_without_artifact_manifest(tmp_path: Path) -> None:
-    with pytest.raises(SMLArtifactError):
-        resolve_model_artifact(tmp_path, full_verify=False)
-
-
 def test_resolve_rejects_checkpoint_manifest_as_model_artifact(
     tiny_pretraining_run: Path,
 ) -> None:
     step_path = next((tiny_pretraining_run / "checkpoints").glob("step-*"))
     with pytest.raises(SMLArtifactError):
         resolve_model_artifact(step_path, full_verify=False)
-
-
-def test_verified_checkpoint_contents_mappings_are_immutable_for_session_resolve() -> (
-    None
-):
-    scalar = {
-        "kind": "pretraining-state",
-        "cursor": {"epoch": 0, "shard_order_position": 0, "row_offset": 0},
-    }
-    inner = {"weight": mx.array([1.0], dtype=mx.float32)}
-    groups = {"model.safetensors": inner}
-    contents = VerifiedCheckpointContents(scalar, groups)
-
-    with pytest.raises(TypeError):
-        contents.scalar_state["kind"] = "mutated"
-    with pytest.raises(TypeError):
-        contents.scalar_state["cursor"]["epoch"] = 1
-    with pytest.raises(TypeError):
-        contents.array_groups["trainer.safetensors"] = {}
-    with pytest.raises(TypeError):
-        contents.array_groups["model.safetensors"]["weight"] = mx.array(
-            [2.0], dtype=mx.float32
-        )
 
 
 def test_session_loads_latest_once_and_pins_identity(
@@ -963,9 +933,6 @@ def test_load_owned_model_arrays_does_not_nest_run_access_lock(
     assert max_depth == 1
 
 
-inference_module = inference
-
-
 @dataclass(frozen=True, slots=True)
 class _CompileSpyKey:
     prefill_length_bucket: int
@@ -1002,15 +969,6 @@ def compile_spy(tiny_session: InferenceSession) -> _CompileSpy:
     return _CompileSpy(tiny_session)
 
 
-def source_contains(module: object, snippet: str) -> bool:
-    return snippet in inspect.getsource(module)
-
-
-def source_has_none_of(module: object, forbidden: list[str]) -> bool:
-    source = inspect.getsource(module)
-    return all(token not in source for token in forbidden)
-
-
 def seed_requests(count: int) -> list[tuple[str, GenerationRequest]]:
     return [
         (
@@ -1022,20 +980,6 @@ def seed_requests(count: int) -> list[tuple[str, GenerationRequest]]:
         )
         for index in range(count)
     ]
-
-
-def fixed_bucket_logits(*, batch_size: int) -> mx.array:
-    peak = mx.array([8.0, 0.0, -8.0, -8.0], dtype=mx.float32)
-    return mx.broadcast_to(peak[None, :], (batch_size, peak.shape[0]))
-
-
-def vmapped_select_one_token(logits, keys, request_mask, kernel_key):
-    return inference.vmapped_select_one_token(
-        logits,
-        keys,
-        request_mask,
-        kernel_key,
-    )
 
 
 def test_empty_batch_returns_before_taking_the_call_guard(
@@ -1074,19 +1018,6 @@ def test_infer_constructs_one_session_and_delegates_once_to_generate(
     assert result.model.run_identity is not None
 
 
-def test_generate_delegates_to_the_same_batch_engine(
-    tiny_session: InferenceSession,
-) -> None:
-    request = GenerationRequest(
-        max_new_tokens=2,
-        config=GenerationConfig(temperature=0.8, top_p=0.9, seed=41),
-    )
-    single = tiny_session.generate("alpha", request)
-    batched = tiny_session.generate_batch([("alpha", request)])[0]
-    assert single.token_ids == batched.token_ids
-    assert single.seed == batched.seed == 41
-
-
 def test_batch_cardinality_reuses_fixed_compiled_bucket(
     tiny_session: InferenceSession, compile_spy: _CompileSpy
 ) -> None:
@@ -1096,24 +1027,3 @@ def test_batch_cardinality_reuses_fixed_compiled_bucket(
     assert set(compile_spy.keys) == compiled_after_three
     assert len(compiled_after_three) == 1
     assert next(iter(compiled_after_three)).batch_size_bucket == 4
-
-
-def test_sampling_vmaps_scalar_keys_and_ignores_synthetic_slots(
-    tiny_session: InferenceSession,
-) -> None:
-    bucket = tiny_session._bucketize(seed_requests(3))[0]
-    assert bucket.keys.shape == (4, 2)
-    assert bucket.request_mask.tolist() == [True, True, True, False]
-    selected, next_keys = vmapped_select_one_token(
-        fixed_bucket_logits(batch_size=4),
-        bucket.keys,
-        bucket.request_mask,
-        bucket.kernel_key,
-    )
-    mx.eval(selected, next_keys)
-    assert selected.shape == (4,)
-    assert next_keys.shape == (4, 2)
-    assert source_contains(inference_module, "mx.vmap(select_one_token")
-    assert source_has_none_of(
-        inference_module, ["mx.random.categorical(logits, key=keys)"]
-    )

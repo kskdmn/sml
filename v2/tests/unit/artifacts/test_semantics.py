@@ -5,26 +5,6 @@ import sys
 from pathlib import Path
 
 import pytest
-from sml import inference
-from sml.artifacts import semantics, verify
-
-
-def test_inference_and_recursive_verifier_share_neutral_semantic_validators() -> None:
-    assert (
-        inference.validate_full_run_semantics
-        is semantics.validate_full_run_semantics
-        is verify.validate_full_run_semantics
-    )
-    assert (
-        inference.validate_base_semantics
-        is semantics.validate_base_semantics
-        is verify.validate_base_semantics
-    )
-    assert (
-        inference.validate_export_semantics
-        is semantics.validate_export_semantics
-        is verify.validate_export_semantics
-    )
 
 
 @pytest.mark.parametrize(

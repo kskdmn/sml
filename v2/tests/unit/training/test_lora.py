@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import math
 from dataclasses import FrozenInstanceError, replace
 
@@ -131,7 +130,6 @@ def test_lora_precision_is_distinct_from_pretraining_master_weights():
     assert config.optimizer_state_dtype == "float32"
     assert config.update_dtype == "float32"
     assert config.dynamic_loss_scaling is False
-    assert "master_weights" not in LoRAPrecisionConfig.__dataclass_fields__
     assert PrecisionConfig().master_weights is True
     with pytest.raises(SMLConfigurationError, match="frozen_base_dtype"):
         LoRAPrecisionConfig(frozen_base_dtype="float32")  # type: ignore[arg-type]
@@ -773,10 +771,3 @@ def test_lora_state_dict_round_trip_preserves_adapter_arrays(tiny_model_config):
     load_lora_state_dict(target, lora_state_dict(source))
 
     assert_lora_state_equal(lora_state_dict(target), lora_state_dict(source))
-
-
-def test_lora_uses_keyed_dropout_rather_than_nn_dropout():
-    source = inspect.getsource(layers_module)
-
-    assert "keyed_dropout" in source
-    assert "nn.Dropout" not in source

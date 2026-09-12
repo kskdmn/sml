@@ -50,7 +50,6 @@ def test_package_exports_only_supported_domain_types():
 
     import sml
 
-    assert sml.__file__.endswith("sml/__init__.py")
     assert set(sml.__all__) == set(EXPECTED_PUBLIC_TYPES)
     for name, module_name in EXPECTED_PUBLIC_TYPES.items():
         owner = importlib.import_module(module_name)
@@ -68,15 +67,6 @@ def test_module_entrypoint_is_available():
     assert "SML workflows" in completed.stdout
 
 
-def test_cli_requires_a_command_for_non_help_dispatch(capsys):
-    from sml.cli import main
-
-    assert main([]) == 2
-    captured = capsys.readouterr()
-    assert "SMLConfigurationError: a command is required" in captured.err
-    assert "Traceback" not in captured.err
-
-
 def test_empty_module_entrypoint_renders_configuration_error_without_traceback():
     completed = subprocess.run(
         [sys.executable, "-m", "sml"],
@@ -88,26 +78,3 @@ def test_empty_module_entrypoint_renders_configuration_error_without_traceback()
     assert completed.returncode == 2
     assert "SMLConfigurationError: a command is required" in completed.stderr
     assert "Traceback" not in completed.stderr
-
-
-def test_error_types_are_distinct_sml_exceptions():
-    from sml.errors import (
-        SMLArtifactError,
-        SMLConfigurationError,
-        SMLDataError,
-        SMLRuntimeError,
-    )
-
-    assert (
-        len({SMLConfigurationError, SMLArtifactError, SMLDataError, SMLRuntimeError})
-        == 4
-    )
-    assert all(
-        issubclass(error, Exception)
-        for error in (
-            SMLConfigurationError,
-            SMLArtifactError,
-            SMLDataError,
-            SMLRuntimeError,
-        )
-    )

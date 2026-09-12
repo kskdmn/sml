@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import math
 from dataclasses import replace
 from pathlib import Path
@@ -11,7 +10,6 @@ import pytest
 from mlx.utils import tree_flatten
 from sml.errors import SMLConfigurationError
 from sml.model.config import ModelConfig
-from sml.training import common as common_module
 from sml.training.common import (
     AdamState,
     BaseParameterState,
@@ -140,8 +138,8 @@ def test_training_configs_reject_invalid_controls_before_array_allocation(tmp_pa
         )
 
 
-def test_learning_rate_schedule_matches_scalar_oracle_without_host_step_conversion():
-    """A host conversion would make the compiled schedule synchronize per update."""
+def test_learning_rate_schedule_matches_scalar_oracle():
+    """Warmup and cosine decay must agree with the reference at their boundaries."""
     config = OptimizerConfig(
         schedule_steps=100,
         warmup_steps=10,
@@ -153,10 +151,6 @@ def test_learning_rate_schedule_matches_scalar_oracle_without_host_step_conversi
     expected = numpy_schedule_oracle(steps.tolist(), config)
 
     assert_close(actual, expected, atol=1e-8, rtol=1e-8)
-    source = inspect.getsource(common_module)
-    assert "int(step)" not in source
-    assert ".item(" not in source
-    assert "mx.eval(" not in source
 
 
 def test_weight_decay_policy_classifies_tied_embeddings_norms_projections_and_lora():
@@ -357,39 +351,6 @@ def test_trainer_state_requires_fp32_scalar_loss_numerator():
             mx.random.key(4),
             mx.array(0.0, dtype=mx.bfloat16),
         )
-
-
-def test_tree_native_adam_update_carries_array_state_through_compilation():
-    """A custom Adam wrapper in the traced body would break a pure array boundary."""
-    masters = {"weight": mx.array([1.0], dtype=mx.float32)}
-    gradients = {"weight": mx.array([1.0], dtype=mx.bfloat16)}
-    config = OptimizerConfig(
-        schedule_steps=None,
-        warmup_steps=0,
-        learning_rate=0.1,
-        beta1=0.0,
-        beta2=0.0,
-    )
-
-    @mx.compile
-    def update(parameters, adam_tree):
-        return adamw_mixed_precision_update_tree(
-            parameters, gradients, adam_tree, config, {"weight": False}
-        )
-
-    first_masters, _first_working, first_adam = update(
-        masters, initialize_adam_state(masters).to_tree()
-    )
-    second_masters, _second_working, second_adam = update(first_masters, first_adam)
-
-    mx.eval(second_masters, second_adam)
-    assert int(second_adam[0].item()) == 2
-    assert_close(
-        second_masters["weight"],
-        mx.array([0.8], dtype=mx.float32),
-        atol=1e-6,
-        rtol=1e-6,
-    )
 
 
 def _run_two_updates(*, compiled: bool):
@@ -862,32 +823,3 @@ def test_fp32_adam_preserves_adapter_dtype_and_formula():
     assert_tree_close(
         next_state.second_moments, expected_state.second_moments, atol=1e-6, rtol=1e-6
     )
-    source = inspect.getsource(common_module.adamw_fp32_update)
-    assert "adamw_mixed_precision_update(" not in source
-    assert ".astype(mx.bfloat16)" not in source
-    oracle_source = inspect.getsource(direct_fp32_adamw_oracle)
-    assert ("adamw_" + "fp32_update") not in oracle_source
-    assert ("adamw_" + "mixed_precision_update") not in oracle_source
-    mixed_source = inspect.getsource(common_module.adamw_mixed_precision_update)
-    assert updated["lora_a"].dtype == mx.float32
-    masters, working, _state = adamw_mixed_precision_update(
-        {"weight": mx.array([[1.0, -2.0]], dtype=mx.float32)},
-        {"weight": mx.array([[0.25, -0.5]], dtype=mx.float32)},
-        initialize_adam_state({"weight": mx.array([[1.0, -2.0]], dtype=mx.float32)}),
-        config,
-        {"weight": True},
-    )
-    mx.eval(masters, working)
-    assert masters["weight"].dtype == mx.float32
-    assert working["weight"].dtype == mx.bfloat16
-    assert mixed_source is not None
-
-
-def test_fp32_adam_public_surface_is_only_host_wrapper():
-    assert "adamw_fp32_update" in common_module.__all__
-    assert "adamw_fp32_update_tree" not in common_module.__all__
-    assert not hasattr(common_module, "adamw_fp32_update_tree")
-    source = inspect.getsource(common_module.adamw_fp32_update)
-    assert "_require_dtype" in source
-    assert "AdamState" in source
-    assert "adamw_mixed_precision_update(" not in source

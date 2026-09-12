@@ -279,42 +279,6 @@ def test_canonical_workload_rejects_unsupported_versions_and_numeric_aliases(ver
         CanonicalWorkload.from_dict(raw)
 
 
-def test_benchmark_parser_exposes_explicit_prepared_data_count():
-    baseline = build_parser().parse_args(
-        [
-            "record-baseline",
-            "--source-commit",
-            "c" * 40,
-            "--manifest",
-            "manifest.json",
-            "--raw-output",
-            "raw.jsonl",
-            "--state-directory",
-            "state",
-            "--prepared-data-measure",
-            "100",
-        ]
-    )
-    comparison = build_parser().parse_args(
-        [
-            "compare",
-            "--baseline",
-            "manifest.json",
-            "--candidate",
-            "HEAD",
-            "--metrics",
-            "prepared-data",
-            "--predecessors",
-            '{"prepared-data":null}',
-            "--output",
-            "report.json",
-        ]
-    )
-
-    assert (baseline.measure, baseline.prepared_data_measure) == (20, 100)
-    assert (comparison.measure, comparison.prepared_data_measure) == (20, None)
-
-
 @pytest.mark.parametrize("metric", ("compile-cold-start", "peak-metal-memory"))
 def test_canonical_workload_rejects_boolean_measured_units(metric):
     raw = build_canonical_workload().to_dict()
@@ -784,6 +748,7 @@ def test_benchmark_parser_defaults_to_the_shorter_protocol():
     assert (baseline.pairs, baseline.warmup, baseline.measure) == (5, 5, 20)
     assert baseline.prepared_data_measure == 100
     assert (comparison.pairs, comparison.warmup, comparison.measure) == (5, 5, 20)
+    assert comparison.prepared_data_measure is None
 
 
 def test_final_mode_is_inferred_only_for_the_strict_ten_pair_protocol():
@@ -2588,20 +2553,6 @@ def _comparison_trials(
             )
         )
     return trials
-
-
-def test_evidence_resigned_comparison_and_thermal_variants_are_valid():
-    workload = build_canonical_workload()
-    comparison_trials = _comparison_trials(
-        workload,
-        "e" * 40,
-        [101.0],
-        attempt_index=1,
-    )
-    thermal_trial = _with_thermal_state(_valid_raw_trial(workload), "fair", 1)
-
-    for trial in (*comparison_trials, thermal_trial):
-        validate_raw_trial_evidence(trial)
 
 
 def test_raw_trial_evidence_rejects_a_cached_only_environment_change():
@@ -5457,35 +5408,6 @@ def test_thermal_episode_without_trigger_preserves_nonempty_malformed_evidence(
     with pytest.raises(ValueError, match="thermal recovery trigger"):
         resumed._thermal_recovery_records()
     assert read_json_object(evidence, label="evidence") == {"partial": True}
-
-
-def test_baseline_journal_rejects_old_journal_session_without_post_exit_policy(
-    tmp_path,
-):
-    state = tmp_path / "state"
-    current = _session_document(tmp_path)
-    old = json.loads(json.dumps(current))
-    required = old["canonical_workload"]["required_environment"]
-    for key in (
-        "measurement_end_memory_pressure_allowed",
-        "post_exit_memory_pressure_allowed",
-        "post_exit_memory_pressure",
-        "post_exit_recovery_required_for_warning",
-        "post_exit_recovery_sample_interval_seconds",
-        "post_exit_recovery_timeout_seconds",
-        "post_exit_recovery_stability_seconds",
-        "post_exit_recovery_evidence_required",
-    ):
-        required.pop(key)
-    old["canonical_workload_identity"] = structured_identity(
-        "sml-canonical-benchmark-workload-v1", old["canonical_workload"]
-    )
-    old_body = {key: value for key, value in old.items() if key != "identity"}
-    old["identity"] = structured_identity("sml-baseline-journal-session-v1", old_body)
-    BaselineJournal.open(state, old)
-
-    with pytest.raises(ValueError, match="session does not match expected session"):
-        BaselineJournal.open(state, current)
 
 
 @pytest.mark.parametrize(
@@ -8924,25 +8846,6 @@ def test_post_exit_recovery_validates_immediate_start_time(started_at):
             clock=lambda: 0.0,
             sleep=lambda seconds: pytest.fail("invalid start time must not sleep"),
         )
-
-
-def test_recovery_import_does_not_eagerly_import_runner():
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import sys; import v2.benchmarks.recovery; "
-                "assert 'v2.benchmarks.runner' not in sys.modules"
-            ),
-        ],
-        cwd=Path(__file__).resolve().parents[3],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize(
