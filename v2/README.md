@@ -27,6 +27,47 @@ mkdir -p v2/output
 uv run python -m sml tokenize --input data/corpus --output v2/output/tokenizer
 ```
 
+Tokenizer input defaults to a reproducible sample of at most **100,000 unique
+normalized documents** and **128 MiB of UTF-8 text**. Exact duplicates are removed
+after whitespace normalization. Selection uses seeded document priorities across
+all scanned files, so filling the sample does not exclude later scanned rows or
+files. Whole documents are retained; the byte limit can leave some unused space.
+
+Control the tokenizer input and the work spent reading candidate documents:
+
+```sh
+uv run python -m sml tokenize --input data/corpus --output v2/output/tokenizer --max-documents 50000 --max-corpus-bytes 67108864 --max-files 40 --max-rows-per-file 8192 --sampling-seed 42
+```
+
+The equivalent TOML configuration is:
+
+```toml
+[tokenize]
+input = "data/corpus"
+output = "v2/output/tokenizer"
+
+[tokenize.corpus]
+max_files = 40
+max_rows_per_file = 8192
+
+[tokenize.sampling]
+max_documents = 50000
+max_bytes = 67108864
+seed = 42
+```
+
+Discovery includes all nonhidden `*.jsonl.zst` direct children and selects up to
+100 files by default, using `corpus.file_order_seed`. Each selected file contributes
+at most its first 8,192 physical lines to the candidate scan. Compressed files
+must be read from the beginning: this is sampling across bounded scanned prefixes,
+not uniform sampling across entire files. Increase the scan limits to consider
+more source text. The default scan is at most 819,200 lines; document and byte
+caps bound the text passed to SentencePiece, not total process memory or elapsed
+time. SentencePiece's optional `input_sentence_size` can further reduce its input.
+Normalized documents outside the existing 100–16,384-byte range are still filtered.
+Sampling settings are recorded in the tokenizer manifest; older bundles remain
+readable without rewriting their metadata.
+
 ### Pretraining data
 
 Encode and deterministically shuffle fixed-width pretraining rows into an
@@ -41,6 +82,11 @@ preflight reject rows containing the tokenizer's padding token, including custom
 prepared bundles. This keeps every microbatch's target count equal during gradient
 accumulation.
 
+Pretraining uses all eligible text within its own corpus scan limits. It does not
+inherit the tokenizer's document/byte sample caps or deduplication. Configure a
+larger scan independently through `[prepare.pretraining.corpus]`, for example
+`max_files = 300` and `max_rows_per_file = 32768`.
+
 ### Base training
 
 Start a new pretraining run from a prepared-data bundle:
@@ -54,6 +100,20 @@ per optimizer update. An incomplete accumulation window at the end of an epoch
 is still applied. Progress is printed to stderr every `log_interval` optimizer
 updates, including loss, learning rate, and processed rows or examples;
 fine-tuning also reports accuracy.
+
+For a fresh base run, an omitted `optimizer.schedule_steps` resolves to the planned
+number of optimizer updates, using the prepared row count, microbatch size,
+accumulation, and whichever step or epoch limit is reached first. An incomplete
+microbatch is dropped at the end of an epoch; an incomplete accumulation window
+is applied. Warmup defaults to 1% of the resolved schedule, followed by cosine
+decay. An explicit `[train.optimizer] schedule_steps` overrides this automatic
+choice. The resolved schedule is saved with the run and remains unchanged on
+resume, including when extending the stopping limits. SWAG keeps its existing
+fine-tuning schedule.
+
+The final checkpoint is the selected model after the requested budget completes.
+Intermediate checkpoints support recovery; training does not select an earlier
+model through evaluation or stop based on validation scores.
 
 Training stops on nonfinite loss, gradients, or updated parameters before committing
 the failed update. The preceding published checkpoint remains available for recovery.
@@ -75,6 +135,10 @@ is reached. The default base run has a one-epoch limit and no step limit, so the
 example adds a second epoch. Set any active limits beyond the saved progress when
 continuing a completed run; increasing only the step limit leaves a reached epoch
 limit in effect.
+
+For a 100,000-update run, set `maximum_steps = 100000` and an epoch limit large
+enough to supply those updates. Setting the step limit alone still leaves the
+default one-epoch limit active.
 
 ### Inference
 

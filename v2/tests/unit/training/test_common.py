@@ -101,8 +101,8 @@ def test_pretraining_config_pins_standard_rope_and_composed_defaults(tmp_path):
     assert config.loader.microbatch_size == 1
     assert config.loader.gradient_accumulation_steps == 8
     assert config.optimizer.bias_correction is False
+    assert config.optimizer.schedule_steps is None
     assert config.optimizer.warmup_steps is None
-    assert resolved_warmup_steps(config.optimizer) == 2_680
     with pytest.raises(
         SMLConfigurationError, match="pretraining.*rope_scaling_factor.*1.0"
     ):

@@ -212,6 +212,65 @@ def _config(data: Path, run: Path, *, maximum_steps: int = 2) -> PretrainingConf
 
 
 @pytest.mark.parametrize(
+    ("maximum_steps", "maximum_epochs", "expected_steps"),
+    ((None, 2, 4), (3, 2, 3), (8, 1, 2), (3, None, 3)),
+)
+def test_auto_schedule_persists_actual_training_budget(
+    tmp_path: Path,
+    maximum_steps: int | None,
+    maximum_epochs: int | None,
+    expected_steps: int,
+) -> None:
+    # Seven rows yield three full microbatches, with one partial accumulation
+    # window per epoch. The remaining row is dropped by the runtime loader.
+    data = _prepared_bundle(tmp_path / "prepared", partitions=((0, 1, 2), (3, 4, 5, 6)))
+    config = replace(
+        _config(data, tmp_path / "run"),
+        optimizer=OptimizerConfig(learning_rate=0.01),
+        loader=LoaderConfig(microbatch_size=2, gradient_accumulation_steps=2),
+        maximum_steps=maximum_steps,
+        maximum_epochs=maximum_epochs,
+    )
+
+    result = pretrain.train(config)
+
+    assert result.step == expected_steps
+    manifest = read_manifest(
+        result.run, PretrainingRunManifest, VerificationLevel.MANIFEST_TRUSTED
+    ).manifest
+    assert manifest.optimizer["schedule_steps"] == result.step
+    restored = pretrain._config_from_run(result.run, data, manifest, _overrides())
+    assert training_common.resolved_warmup_steps(restored.optimizer) == 0
+
+
+def test_resuming_with_extended_limits_preserves_resolved_schedule(
+    prepared_data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    progress: list[tuple[int, float]] = []
+
+    def record_progress(_phase, *, step, learning_rate, **_metrics):
+        progress.append((step, learning_rate))
+
+    monkeypatch.setattr(pretrain, "log_training_progress", record_progress)
+    config = _config(prepared_data, tmp_path / "resumed", maximum_steps=2)
+    config = replace(config, optimizer=replace(config.optimizer, schedule_steps=None))
+    first = pretrain.train(config)
+    original_manifest = (first.run / "run.json").read_bytes()
+
+    resumed = pretrain.resume(
+        first.run, data=prepared_data, overrides=_overrides(maximum_steps=4)
+    )
+    assert first.step == 2
+    assert resumed.step == 4
+    assert (first.run / "run.json").read_bytes() == original_manifest
+    assert json.loads(original_manifest)["optimizer"]["schedule_steps"] == 2
+    assert [step for step, _rate in progress] == [1, 2, 3, 4]
+    assert [rate for _step, rate in progress] == pytest.approx(
+        [0.01, 0.0055, 0.001, 0.001]
+    )
+
+
+@pytest.mark.parametrize(
     "mode", ("fresh", "resume", "complete", "restore-failure", "initial-state-failure")
 )
 def test_training_retains_one_full_data_proof_and_closes_it(

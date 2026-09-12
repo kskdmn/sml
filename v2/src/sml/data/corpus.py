@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import heapq
 import io
 import itertools
 import json
 import random
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -16,8 +18,9 @@ import zstandard as zstd
 
 from sml.errors import SMLDataError
 
-DEFAULT_FILENAME_PATTERN = r".*-00[0-9][0-9]\.jsonl\.zst\Z"
+DEFAULT_FILENAME_PATTERN = r".*\.jsonl\.zst\Z"
 DEFAULT_FILE_ORDER_SEED = 42
+DEFAULT_MAX_FILES = 100
 DEFAULT_TEXT_FIELD = "text"
 DEFAULT_MIN_TEXT_BYTES = 100
 DEFAULT_MAX_TEXT_BYTES = 16_384
@@ -46,6 +49,7 @@ class CorpusConfig:
     min_text_bytes: int = DEFAULT_MIN_TEXT_BYTES
     max_text_bytes: int | None = DEFAULT_MAX_TEXT_BYTES
     max_rows_per_file: int | None = DEFAULT_MAX_ROWS_PER_FILE
+    max_files: int | None = DEFAULT_MAX_FILES
 
     def __post_init__(self) -> None:
         if not isinstance(self.input_root, Path):
@@ -75,6 +79,26 @@ class CorpusConfig:
                 "max_rows_per_file",
                 minimum=1,
             )
+        if self.max_files is not None:
+            _require_plain_int(self.max_files, "max_files", minimum=1)
+
+
+@dataclass(frozen=True, slots=True)
+class CorpusSamplingConfig:
+    """Bound a deterministic sample of the normalized, scanned source texts."""
+
+    max_documents: int | None = 100_000
+    max_bytes: int | None = 128 * 1024 * 1024
+    seed: int = 42
+
+    def __post_init__(self) -> None:
+        for name in ("max_documents", "max_bytes"):
+            value = getattr(self, name)
+            if value is not None:
+                _require_plain_int(value, name, minimum=1)
+        if self.max_documents is None and self.max_bytes is None:
+            raise ValueError("at least one sampling limit must be set")
+        _require_plain_int(self.seed, "seed")
 
 
 def discover_corpus_files(config: CorpusConfig) -> tuple[Path, ...]:
@@ -98,6 +122,11 @@ def discover_corpus_files(config: CorpusConfig) -> tuple[Path, ...]:
         ),
         key=lambda path: path.name,
     )
+    if config.max_files is not None and len(files) > config.max_files:
+        files = sorted(
+            random.Random(config.file_order_seed).sample(files, config.max_files),
+            key=lambda path: path.name,
+        )
     if config.shuffle_files:
         random.Random(config.file_order_seed).shuffle(files)
     return tuple(files)
@@ -217,9 +246,74 @@ def iter_filtered_texts(
     return FilteredTexts(config, selected_files)
 
 
+def sample_texts(
+    texts: Iterable[str],
+    sampling: CorpusSamplingConfig,
+) -> Iterator[str]:
+    """Yield a bounded, unique sample in the selected texts' first-seen order."""
+    if not isinstance(sampling, CorpusSamplingConfig):
+        raise TypeError("sampling must be a CorpusSamplingConfig")
+    # Retain UTF-8 bytes instead of Unicode strings so the byte budget also
+    # bounds the sample's text payload in memory. The set shares those bytes
+    # with the heap and checks actual equality, not only hash equality.
+    heap: list[tuple[int, int, bytes]] = []
+    retained: set[bytes] = set()
+    retained_bytes = 0
+    rejected_priority: int | None = None
+    seed_prefix = str(sampling.seed).encode("ascii") + b"\x00"
+    for sequence, text in enumerate(texts):
+        encoded = text.encode("utf-8")
+        if sampling.max_bytes is not None and len(encoded) > sampling.max_bytes:
+            continue
+        if encoded in retained:
+            continue
+        priority = int.from_bytes(hashlib.sha256(seed_prefix + encoded).digest())
+        if rejected_priority is not None and priority >= rejected_priority:
+            continue
+        heapq.heappush(heap, (-priority, sequence, encoded))
+        retained.add(encoded)
+        retained_bytes += len(encoded)
+        while (
+            sampling.max_documents is not None and len(heap) > sampling.max_documents
+        ) or (sampling.max_bytes is not None and retained_bytes > sampling.max_bytes):
+            negative_priority, _sequence, evicted = heapq.heappop(heap)
+            retained.remove(evicted)
+            retained_bytes -= len(evicted)
+            # Keep the random-priority prefix even when byte eviction leaves
+            # spare capacity. A rejected document, including its duplicates,
+            # must never reenter merely because a later copy fits that gap.
+            rejected_priority = -negative_priority
+
+    # Selection is independent of source traversal; preserve first-seen order
+    # for the retained texts, including the order of small unsampled corpora.
+    retained.clear()
+    heap.sort(key=lambda entry: entry[1])
+    for _priority, _sequence, encoded in heap:
+        yield encoded.decode("utf-8")
+
+
+def iter_sampled_texts(
+    config: CorpusConfig,
+    sampling: CorpusSamplingConfig,
+    files: Sequence[Path] | None = None,
+) -> Iterator[str]:
+    """Sample unique normalized texts within document and UTF-8 byte limits.
+
+    Every selected file is scanned up to its physical row limit before yielding
+    the sample. File and row caps control decompression work independently of
+    the sample size; the sample represents those scanned prefixes only.
+    """
+    if not isinstance(sampling, CorpusSamplingConfig):
+        raise TypeError("sampling must be a CorpusSamplingConfig")
+    return sample_texts(iter_filtered_texts(config, files), sampling)
+
+
 __all__ = [
     "CorpusConfig",
+    "CorpusSamplingConfig",
     "FilteredTexts",
     "discover_corpus_files",
     "iter_filtered_texts",
+    "iter_sampled_texts",
+    "sample_texts",
 ]

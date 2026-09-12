@@ -6,7 +6,7 @@ import io
 import itertools
 import math
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -19,7 +19,13 @@ from sml.artifacts.manifest import (
     file_identity,
     open_artifact,
 )
-from sml.data.corpus import CorpusConfig, discover_corpus_files, iter_filtered_texts
+from sml.data.corpus import (
+    CorpusConfig,
+    CorpusSamplingConfig,
+    discover_corpus_files,
+    iter_filtered_texts,
+    sample_texts,
+)
 from sml.errors import SMLArtifactError, SMLDataError
 
 CONVERSATION_USER_SYMBOLS = ("<|system|>", "<|user|>", "<|assistant|>")
@@ -46,6 +52,7 @@ _TRAINING_KEYS = frozenset(
         "eos_id",
         "pad_id",
         "corpus",
+        "sampling",
     }
 )
 _CORPUS_KEYS = frozenset(
@@ -57,6 +64,7 @@ _CORPUS_KEYS = frozenset(
         "min_text_bytes",
         "max_text_bytes",
         "max_rows_per_file",
+        "max_files",
     }
 )
 
@@ -91,10 +99,15 @@ class TokenizerTrainingConfig:
     bos_id: int = 1
     eos_id: int = 2
     pad_id: int = 3
+    sampling: CorpusSamplingConfig | None = field(default_factory=CorpusSamplingConfig)
 
     def __post_init__(self) -> None:
         if not isinstance(self.corpus, CorpusConfig):
             raise TypeError("corpus must be a CorpusConfig")
+        if self.sampling is not None and not isinstance(
+            self.sampling, CorpusSamplingConfig
+        ):
+            raise TypeError("sampling must be a CorpusSamplingConfig or None")
         if self.algorithm != "bpe":
             raise ValueError("algorithm must be 'bpe'")
         _require_plain_int(self.vocab_size, "vocab_size", minimum=5)
@@ -178,6 +191,7 @@ def _corpus_training_projection(config: CorpusConfig) -> Mapping[str, object]:
         "min_text_bytes": config.min_text_bytes,
         "max_text_bytes": config.max_text_bytes,
         "max_rows_per_file": config.max_rows_per_file,
+        "max_files": config.max_files,
     }
 
 
@@ -201,6 +215,7 @@ def _training_projection(config: TokenizerTrainingConfig) -> Mapping[str, object
         "eos_id": config.eos_id,
         "pad_id": config.pad_id,
         "corpus": _corpus_training_projection(config.corpus),
+        "sampling": None if config.sampling is None else asdict(config.sampling),
     }
 
 
@@ -217,7 +232,7 @@ def _require_nonempty(texts: Iterator[str]) -> Iterator[str]:
 class _TokenizerCorpusTexts:
     """Retain input errors across SentencePiece's native exception boundary."""
 
-    def __init__(self, config: CorpusConfig) -> None:
+    def __init__(self, config: TokenizerTrainingConfig) -> None:
         self.error: SMLDataError | None = None
         self._texts = self._read(config)
 
@@ -227,10 +242,14 @@ class _TokenizerCorpusTexts:
     def close(self) -> None:
         self._texts.close()
 
-    def _read(self, config: CorpusConfig) -> Iterator[str]:
+    def _read(self, config: TokenizerTrainingConfig) -> Iterator[str]:
         try:
-            files = discover_corpus_files(config)
-            yield from iter_filtered_texts(config, files)
+            files = discover_corpus_files(config.corpus)
+            texts = iter_filtered_texts(config.corpus, files)
+            if config.sampling is None:
+                yield from texts
+            else:
+                yield from sample_texts(texts, config.sampling)
         except SMLDataError as error:
             self.error = error
             raise
@@ -248,7 +267,7 @@ def train_tokenizer_bundle(
         raise TypeError("config must be a TokenizerTrainingConfig")
     if not isinstance(output, Path):
         raise TypeError("output must be a Path")
-    texts = _TokenizerCorpusTexts(config.corpus)
+    texts = _TokenizerCorpusTexts(config)
     sentence_iterator = _require_nonempty(iter(texts))
 
     def build(private_path: Path) -> TokenizerManifest:
@@ -401,7 +420,8 @@ def _read_vocab(vocab_bytes: bytes) -> tuple[tuple[str, float], ...]:
 def _validate_training_metadata(manifest: TokenizerManifest) -> None:
     try:
         training = manifest.training
-        if set(training) != _TRAINING_KEYS:
+        legacy_training = _TRAINING_KEYS - {"sampling"}
+        if set(training) not in (_TRAINING_KEYS, legacy_training):
             missing = sorted(_TRAINING_KEYS - set(training))
             unknown = sorted(set(training) - _TRAINING_KEYS)
             raise ValueError(
@@ -410,17 +430,43 @@ def _validate_training_metadata(manifest: TokenizerManifest) -> None:
         corpus_raw = training["corpus"]
         if not isinstance(corpus_raw, Mapping):
             raise TypeError("corpus training metadata must be a mapping")
-        if set(corpus_raw) != _CORPUS_KEYS:
+        legacy_corpus = _CORPUS_KEYS - {"max_files"}
+        if set(corpus_raw) not in (_CORPUS_KEYS, legacy_corpus):
             missing = sorted(_CORPUS_KEYS - set(corpus_raw))
             unknown = sorted(set(corpus_raw) - _CORPUS_KEYS)
             raise ValueError(
                 f"corpus keys mismatch: missing={missing}, unknown={unknown}"
             )
 
-        corpus = CorpusConfig(input_root=Path("."), **dict(corpus_raw))
-        config_values = {key: training[key] for key in _TRAINING_KEYS - {"corpus"}}
-        config = TokenizerTrainingConfig(corpus=corpus, **config_values)
-        if _training_projection(config) != training:
+        corpus_values = dict(corpus_raw)
+        corpus_values.setdefault("max_files", None)
+        corpus = CorpusConfig(input_root=Path("."), **corpus_values)
+        sampling_raw = training.get("sampling")
+        sampling = None
+        if sampling_raw is not None:
+            if not isinstance(sampling_raw, Mapping) or set(sampling_raw) != {
+                "max_documents",
+                "max_bytes",
+                "seed",
+            }:
+                raise ValueError("sampling keys mismatch")
+            sampling = CorpusSamplingConfig(**dict(sampling_raw))
+        config_values = {key: training[key] for key in legacy_training - {"corpus"}}
+        config = TokenizerTrainingConfig(
+            corpus=corpus, sampling=sampling, **config_values
+        )
+        projection = dict(_training_projection(config))
+        # Older bundles record the original streaming corpus configuration.
+        # Validate it without rewriting their metadata or artifact identities.
+        if "sampling" not in training:
+            projection.pop("sampling")
+        if "max_files" not in corpus_raw:
+            projection["corpus"] = {
+                key: value
+                for key, value in projection["corpus"].items()
+                if key != "max_files"
+            }
+        if projection != training:
             raise ValueError("training values are not in canonical configuration form")
         outer_ids = {
             "bos": manifest.bos_token_id,

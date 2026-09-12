@@ -1216,7 +1216,8 @@ def build_pretraining_quality_workload(root: Path) -> PretrainingQualityWorkload
     )
     _require_source_disjoint(training, validation)
     model_config = ModelConfig()
-    optimizer_config = OptimizerConfig()
+    # Keep the canonical comparison workload fixed as runtime defaults evolve.
+    optimizer_config = OptimizerConfig(schedule_steps=268_000)
     loader_config = LoaderConfig()
     model_key, _trainer_key = mx.random.split(mx.random.key(42))
     model = SMLLanguageModel(model_config, key=model_key)

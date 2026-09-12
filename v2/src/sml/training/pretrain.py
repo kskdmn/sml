@@ -795,17 +795,29 @@ def _verified_data(
         shards.close()
 
 
-def _resolved_fresh_config(config: PretrainingConfig) -> PretrainingConfig:
+def _resolved_fresh_config(
+    config: PretrainingConfig, *, row_count: int
+) -> PretrainingConfig:
     if config.model.rope_scaling_factor != 1.0:
         raise SMLConfigurationError(
             "pretraining model rope_scaling_factor must be exactly 1.0"
         )
-    if config.optimizer.schedule_steps is None and config.maximum_steps is not None:
+    if config.optimizer.schedule_steps is None:
+        # Runtime batches span shards, drop the final incomplete batch, and
+        # flush a partial accumulation window at each epoch boundary.
+        microsteps_per_epoch = row_count // config.loader.microbatch_size
+        accumulation = config.loader.gradient_accumulation_steps
+        updates_per_epoch = (microsteps_per_epoch + accumulation - 1) // accumulation
+        limits = []
+        if config.maximum_steps is not None:
+            limits.append(config.maximum_steps)
+        if config.maximum_epochs is not None:
+            limits.append(config.maximum_epochs * updates_per_epoch)
         return replace(
             config,
             optimizer=replace(
                 config.optimizer,
-                schedule_steps=config.maximum_steps,
+                schedule_steps=min(limits),
             ),
         )
     return config
@@ -1055,7 +1067,6 @@ def _run_training(
 def train(config: PretrainingConfig) -> TrainingResult:
     if not isinstance(config, PretrainingConfig):
         raise TypeError("config must be a PretrainingConfig")
-    config = _resolved_fresh_config(config)
     stream: PretrainingBatchStream | None = None
     runtime: tuple[SMLLanguageModel, _RestoredTrainingState] | None = None
     with run_writer_lock(config.output_run), ExitStack() as resources:
@@ -1071,6 +1082,9 @@ def train(config: PretrainingConfig) -> TrainingResult:
                     model=config.model,
                     loader=config.loader,
                 )
+            )
+            config = _resolved_fresh_config(
+                config, row_count=sum(data.manifest.shard_row_counts)
             )
             stream = PretrainingBatchStream._from_validated_shards(
                 data,

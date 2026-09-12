@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import itertools
+import json
 import random
 from pathlib import Path
 
 import pytest
 import zstandard as zstd
-from sml.data.corpus import CorpusConfig, discover_corpus_files, iter_filtered_texts
+from sml.data.corpus import (
+    CorpusConfig,
+    CorpusSamplingConfig,
+    discover_corpus_files,
+    iter_filtered_texts,
+    iter_sampled_texts,
+    sample_texts,
+)
 from sml.errors import SMLDataError
 
 
@@ -44,6 +53,8 @@ def test_discovery_is_seeded_without_mutating_global_random_state(tmp_path):
         ({"min_text_bytes": -1}, "min_text_bytes"),
         ({"min_text_bytes": 5, "max_text_bytes": 4}, "max_text_bytes"),
         ({"max_rows_per_file": 0}, "max_rows_per_file"),
+        ({"max_files": 0}, "max_files"),
+        ({"max_files": True}, "max_files"),
         ({"text_field": ""}, "text_field"),
     ],
 )
@@ -169,3 +180,137 @@ def test_corpus_row_limit_does_not_require_consuming_later_frames(tmp_path):
     config = CorpusConfig(input_root=tmp_path, min_text_bytes=1, max_rows_per_file=1)
 
     assert list(iter_filtered_texts(config, (shard,))) == ["first"]
+
+
+def test_default_discovery_samples_all_shard_names_with_a_file_budget(tmp_path):
+    for index in range(120):
+        (tmp_path / f"data-{index:04d}.jsonl.zst").write_bytes(b"")
+    config = CorpusConfig(input_root=tmp_path, shuffle_files=False)
+
+    selected = discover_corpus_files(config)
+    shuffled = discover_corpus_files(CorpusConfig(input_root=tmp_path))
+
+    assert len(selected) == 100
+    assert list(selected) == sorted(selected)
+    assert set(selected) == set(shuffled)
+    assert any(path.name.startswith("data-01") for path in selected)
+    assert selected == discover_corpus_files(config)
+    assert set(selected) != set(
+        discover_corpus_files(CorpusConfig(input_root=tmp_path, file_order_seed=43))
+    )
+    assert (
+        len(discover_corpus_files(CorpusConfig(input_root=tmp_path, max_files=None)))
+        == 120
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"max_documents": 0}, "max_documents"),
+        ({"max_documents": True}, "max_documents"),
+        ({"max_bytes": -1}, "max_bytes"),
+        ({"max_bytes": 1.5}, "max_bytes"),
+        ({"seed": False}, "seed"),
+        ({"max_documents": None, "max_bytes": None}, "at least one"),
+    ],
+)
+def test_sampling_config_rejects_invalid_values(overrides, message):
+    with pytest.raises((TypeError, ValueError), match=message):
+        CorpusSamplingConfig(**overrides)
+
+
+def test_sampling_is_seeded_and_does_not_change_global_random_state():
+    texts = [f"document {index}" for index in range(200)]
+    sampling = CorpusSamplingConfig(max_documents=20, max_bytes=None, seed=17)
+    random_state = random.getstate()
+
+    selected = list(sample_texts(texts, sampling))
+
+    assert random.getstate() == random_state
+    assert len(selected) == 20
+    assert selected == list(sample_texts(texts, sampling))
+    assert selected != list(
+        sample_texts(
+            texts,
+            CorpusSamplingConfig(max_documents=20, max_bytes=None, seed=18),
+        )
+    )
+    assert any(text in texts[100:] for text in selected)
+    assert selected == [text for text in texts if text in selected]
+
+
+def test_sampling_obeys_utf8_bytes_and_normalizes_before_deduplication(tmp_path):
+    shard = tmp_path / "any-shard.jsonl.zst"
+    _write_zstd_jsonl(
+        shard,
+        [
+            json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
+            for text in ("  é\n é  ", "é é", "é\t\x00é", "ab", "é" * 10)
+        ],
+    )
+    config = CorpusConfig(input_root=tmp_path, min_text_bytes=1)
+
+    selected = list(
+        iter_sampled_texts(
+            config,
+            CorpusSamplingConfig(max_documents=None, max_bytes=7),
+        )
+    )
+
+    assert selected == ["é é", "ab"]
+    assert sum(len(text.encode("utf-8")) for text in selected) == 7
+    assert list(sample_texts(["é"], CorpusSamplingConfig(max_bytes=1))) == []
+
+
+def test_sampling_set_is_independent_of_traversal_and_duplicate_placement():
+    texts = ("a" * 5, "b" * 7, "c" * 11, "d" * 13, "e" * 17)
+    sampling = CorpusSamplingConfig(max_documents=3, max_bytes=21)
+    expected = set(sample_texts(texts, sampling))
+    assert expected
+
+    for ordering in itertools.permutations(texts):
+        selected = list(sample_texts((*ordering, *texts, *reversed(texts)), sampling))
+        assert set(selected) == expected
+        assert len(selected) == len(set(selected)) <= 3
+        assert sum(len(text.encode("utf-8")) for text in selected) <= 21
+        assert selected == [text for text in ordering if text in expected]
+
+
+def test_sampling_represents_multiple_shards_and_later_scanned_rows(tmp_path):
+    for name in ("first", "second"):
+        _write_zstd_jsonl(
+            tmp_path / f"{name}.jsonl.zst",
+            [
+                json.dumps({"text": f"{name} document {index}"}).encode()
+                for index in range(100)
+            ],
+        )
+    selected = list(
+        iter_sampled_texts(
+            CorpusConfig(input_root=tmp_path, min_text_bytes=1),
+            CorpusSamplingConfig(max_documents=20, max_bytes=None),
+        )
+    )
+
+    assert len(selected) == 20
+    assert {text.split()[0] for text in selected} == {"first", "second"}
+    assert any(int(text.split()[-1]) >= 50 for text in selected)
+
+
+def test_sampling_keeps_physical_scan_budget_and_lazy_input_errors(tmp_path):
+    shard = tmp_path / "limited.jsonl.zst"
+    _write_zstd_jsonl(
+        shard,
+        [b'{"text":"first"}', b'{"text":"second"}', b"invalid-json"],
+    )
+    sampling = CorpusSamplingConfig(max_documents=1)
+    bounded = CorpusConfig(input_root=tmp_path, min_text_bytes=1, max_rows_per_file=2)
+    assert len(list(iter_sampled_texts(bounded, sampling))) == 1
+
+    unbounded = iter_sampled_texts(
+        CorpusConfig(input_root=tmp_path, min_text_bytes=1, max_rows_per_file=None),
+        sampling,
+    )
+    with pytest.raises(SMLDataError, match=r"limited\.jsonl\.zst at line 3"):
+        next(unbounded)

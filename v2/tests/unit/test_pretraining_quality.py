@@ -110,7 +110,9 @@ def test_workload_binds_checked_in_source_disjoint_rows_and_exact_work(
 
     assert workload.checkpoint_steps == CHECKPOINT_STEPS == (0, 10, 100, 1_000)
     assert workload.model == dataclasses.asdict(ModelConfig())
-    assert workload.optimizer == dataclasses.asdict(OptimizerConfig())
+    assert workload.optimizer == dataclasses.asdict(
+        OptimizerConfig(schedule_steps=268_000)
+    )
     assert workload.optimizer["schedule_steps"] == 268_000
     assert workload.loader == dataclasses.asdict(LoaderConfig())
     assert len(workload.ordered_batches) == (

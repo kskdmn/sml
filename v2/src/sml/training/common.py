@@ -265,7 +265,7 @@ class OptimizerConfig:
     beta2: float = 0.999
     epsilon: float = 1e-8
     bias_correction: bool = False
-    schedule_steps: int | None = 268_000
+    schedule_steps: int | None = None
     warmup_steps: int | None = None
     minimum_learning_rate_ratio: float = 0.1
     gradient_clip_norm: float = 1.0

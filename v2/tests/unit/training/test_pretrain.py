@@ -10,7 +10,7 @@ import pytest
 import sml.training.pretrain as pretrain_module
 from mlx.utils import tree_flatten, tree_map
 from sml.data.pretraining import PretrainingCursor
-from sml.errors import SMLRuntimeError
+from sml.errors import SMLConfigurationError, SMLRuntimeError
 from sml.model.config import ModelConfig
 from sml.model.language_model import SMLLanguageModel, causal_lm_loss
 from sml.training.common import (
@@ -22,9 +22,92 @@ from sml.training.common import (
     build_weight_decay_tree,
     initialize_adam_state,
     initialize_base_parameter_state,
+    resolved_warmup_steps,
 )
 from sml.training.pretrain import build_pretraining_kernels
 from sml.training.random import counter_random_key
+
+
+@pytest.mark.parametrize(
+    (
+        "row_count",
+        "microbatch_size",
+        "accumulation_steps",
+        "maximum_steps",
+        "maximum_epochs",
+        "expected_steps",
+    ),
+    (
+        (17, 3, 2, None, 3, 9),
+        (17, 3, 2, 5, 3, 5),
+        (17, 3, 2, 20, 3, 9),
+        (17, 3, 2, 20, None, 20),
+        (17, 3, 8, None, 1, 1),
+        (40_000, 2, 4, None, 2, 10_000),
+        (2**40, 1, 8, 100_000, 2**31 - 1, 100_000),
+    ),
+)
+def test_automatic_schedule_matches_planned_optimizer_updates(
+    tmp_path,
+    row_count,
+    microbatch_size,
+    accumulation_steps,
+    maximum_steps,
+    maximum_epochs,
+    expected_steps,
+):
+    config = PretrainingConfig(
+        data=tmp_path / "data",
+        output_run=tmp_path / "run",
+        model=ModelConfig(),
+        loader=LoaderConfig(
+            microbatch_size=microbatch_size,
+            gradient_accumulation_steps=accumulation_steps,
+        ),
+        maximum_steps=maximum_steps,
+        maximum_epochs=maximum_epochs,
+    )
+
+    resolved = pretrain_module._resolved_fresh_config(config, row_count=row_count)
+
+    assert config.optimizer.schedule_steps is None
+    assert resolved.optimizer.schedule_steps == expected_steps
+    assert resolved_warmup_steps(resolved.optimizer) == int(0.01 * expected_steps)
+
+
+def test_explicit_schedule_and_warmup_remain_authoritative(tmp_path):
+    config = PretrainingConfig(
+        data=tmp_path / "data",
+        output_run=tmp_path / "run",
+        model=ModelConfig(),
+        optimizer=OptimizerConfig(schedule_steps=1_000, warmup_steps=200),
+        maximum_steps=2,
+    )
+
+    assert pretrain_module._resolved_fresh_config(config, row_count=8) is config
+
+
+def test_automatic_schedule_rejects_explicit_warmup_longer_than_run(tmp_path):
+    config = PretrainingConfig(
+        data=tmp_path / "data",
+        output_run=tmp_path / "run",
+        model=ModelConfig(),
+        optimizer=OptimizerConfig(warmup_steps=2),
+    )
+
+    with pytest.raises(SMLConfigurationError, match="warmup_steps.*schedule_steps"):
+        pretrain_module._resolved_fresh_config(config, row_count=8)
+
+
+def test_automatic_schedule_rejects_update_counter_overflow(tmp_path):
+    config = PretrainingConfig(
+        data=tmp_path / "data",
+        output_run=tmp_path / "run",
+        model=ModelConfig(),
+    )
+
+    with pytest.raises(SMLConfigurationError, match="schedule_steps.*int32"):
+        pretrain_module._resolved_fresh_config(config, row_count=8 * 2**31)
 
 
 def assert_tree_close(

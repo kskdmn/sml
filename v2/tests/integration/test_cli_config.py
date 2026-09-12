@@ -38,6 +38,47 @@ def test_inference_accepts_step_named_ancestors_and_literal_prompt():
     assert command.to_domain().checkpoint == Path("step-experiments/run")
 
 
+def test_tokenizer_sampling_cli_overrides_only_selected_nested_fields(tmp_path):
+    config = tmp_path / "tokenize.toml"
+    config.write_text(
+        '[tokenize]\ninput="corpus"\noutput="tokenizer"\n'
+        "[tokenize.corpus]\nmax_files=20\nmax_rows_per_file=1000\n"
+        "[tokenize.sampling]\nmax_documents=100\nmax_bytes=10000\nseed=17\n"
+    )
+    command = parse_command(
+        [
+            "tokenize",
+            "--config",
+            str(config),
+            "--max-documents",
+            "50",
+            "--max-corpus-bytes",
+            "5000",
+            "--max-files",
+            "10",
+        ]
+    )
+    domain = command.to_domain()
+    assert domain.sampling.max_documents == 50
+    assert domain.sampling.max_bytes == 5000
+    assert domain.sampling.seed == 17
+    assert domain.corpus.max_files == 10
+    assert domain.corpus.max_rows_per_file == 1000
+
+
+def test_pretraining_corpus_budget_is_independent_of_tokenizer_sample(tmp_path):
+    config = tmp_path / "prepare.toml"
+    config.write_text(
+        '[prepare.pretraining]\ninput="corpus"\noutput="prepared"\ntokenizer="tok"\n'
+        "[prepare.pretraining.corpus]\nmax_files=300\nmax_rows_per_file=32768\n"
+    )
+    domain = parse_command(
+        ["prepare", "pretraining", "--config", str(config)]
+    ).to_domain()
+    assert domain.corpus.max_files == 300
+    assert domain.corpus.max_rows_per_file == 32768
+
+
 @pytest.mark.parametrize(
     ("argv", "contents"),
     [

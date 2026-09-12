@@ -19,7 +19,7 @@ from sml.artifacts.manifest import (
     read_manifest,
 )
 from sml.data import tokenizer as tokenizer_module
-from sml.data.corpus import CorpusConfig
+from sml.data.corpus import CorpusConfig, CorpusSamplingConfig
 from sml.data.tokenizer import (
     CONVERSATION_USER_SYMBOLS,
     TokenizerTrainingConfig,
@@ -421,13 +421,19 @@ def test_manifest_training_is_recursive_and_source_locator_is_diagnostic(
 
     assert manifest_json["algorithm"] == "bpe"
     assert manifest_json["training"]["corpus"] == {
-        "filename_pattern": r".*-00[0-9][0-9]\.jsonl\.zst\Z",
+        "filename_pattern": r".*\.jsonl\.zst\Z",
         "file_order_seed": 42,
+        "max_files": 100,
         "max_rows_per_file": 8192,
         "max_text_bytes": 16384,
         "min_text_bytes": 1,
         "shuffle_files": True,
         "text_field": "text",
+    }
+    assert manifest_json["training"]["sampling"] == {
+        "max_documents": 100_000,
+        "max_bytes": 128 * 1024 * 1024,
+        "seed": 42,
     }
     assert manifest_json["diagnostic_source_locator"] == str(tmp_path)
 
@@ -699,6 +705,8 @@ def test_loader_requires_canonical_tokenizer_manifest_contract(
         "training_outer_id_mismatch",
         "actual_vocab_exceeds_requested",
         "hard_limit_vocab_mismatch",
+        "missing_sampling_key",
+        "invalid_sampling_limit",
     ],
 )
 def test_loader_rejects_noncanonical_training_schema_before_processor_import(
@@ -735,6 +743,10 @@ def test_loader_rejects_noncanonical_training_schema_before_processor_import(
     elif mutation == "hard_limit_vocab_mismatch":
         training["vocab_size"] = 6
         training["hard_vocab_limit"] = True
+    elif mutation == "missing_sampling_key":
+        del training["sampling"]["seed"]
+    elif mutation == "invalid_sampling_limit":
+        training["sampling"]["max_bytes"] = 0
     manifest = replace(manifest, training=training)
     manifest = replace(manifest, identity=manifest.recompute_identity())
     (output / "manifest.json").write_bytes(canonical_json_bytes(manifest))
@@ -744,3 +756,51 @@ def test_loader_rejects_noncanonical_training_schema_before_processor_import(
         load_tokenizer_bundle(output, VerificationLevel.MANIFEST_TRUSTED)
 
     assert "sentencepiece" not in sys.modules
+
+
+def test_tokenizer_sampling_caps_actual_sentencepiece_input(tmp_path, monkeypatch):
+    _install_fake_sentencepiece(monkeypatch)
+    received = []
+
+    def train(**kwargs):
+        received.extend(kwargs["sentence_iterator"])
+        kwargs["model_writer"].write(b"model")
+
+    monkeypatch.setattr(
+        sys.modules["sentencepiece"].SentencePieceTrainer, "train", train
+    )
+    texts = [f"document {i} é" for i in range(50)]
+    monkeypatch.setattr(
+        tokenizer_module, "iter_filtered_texts", lambda *_args: iter(texts * 3)
+    )
+    config = _config(
+        tmp_path, sampling=CorpusSamplingConfig(max_documents=7, max_bytes=80, seed=13)
+    )
+    bundle = train_tokenizer_bundle(config, tmp_path / "sampled")
+
+    assert 0 < len(received) <= 7
+    assert len(received) == len(set(received))
+    assert sum(len(text.encode("utf-8")) for text in received) <= 80
+    assert set(received) <= set(texts)
+    assert bundle.manifest.training["sampling"]["seed"] == 13
+
+
+def test_loader_accepts_legacy_unsampled_tokenizer_metadata(tmp_path, monkeypatch):
+    _install_fake_sentencepiece(monkeypatch)
+    monkeypatch.setattr(
+        tokenizer_module, "iter_filtered_texts", lambda *_args: iter(("text",))
+    )
+    output = tmp_path / "legacy"
+    bundle = train_tokenizer_bundle(_config(tmp_path), output)
+    training = json.loads(canonical_json_bytes(bundle.manifest.training))
+    training.pop("sampling")
+    training["corpus"].pop("max_files")
+    manifest = replace(bundle.manifest, training=training)
+    manifest = replace(manifest, identity=manifest.recompute_identity())
+    original = canonical_json_bytes(manifest)
+    (output / "manifest.json").write_bytes(original)
+
+    loaded = load_tokenizer_bundle(output, VerificationLevel.FULL)
+
+    assert loaded.manifest.identity == manifest.identity
+    assert (output / "manifest.json").read_bytes() == original

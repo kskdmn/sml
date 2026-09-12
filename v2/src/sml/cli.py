@@ -77,6 +77,11 @@ _SCHEMAS: dict[str, dict[str, object]] = {
         "bos_id": None,
         "eos_id": None,
         "pad_id": None,
+        "sampling": {
+            "max_documents": None,
+            "max_bytes": None,
+            "seed": None,
+        },
         "corpus": {
             "filename_pattern": None,
             "shuffle_files": None,
@@ -85,6 +90,7 @@ _SCHEMAS: dict[str, dict[str, object]] = {
             "min_text_bytes": None,
             "max_text_bytes": None,
             "max_rows_per_file": None,
+            "max_files": None,
         },
     },
     "prepare.pretraining": {
@@ -104,6 +110,7 @@ _SCHEMAS: dict[str, dict[str, object]] = {
             "min_text_bytes": None,
             "max_text_bytes": None,
             "max_rows_per_file": None,
+            "max_files": None,
         },
     },
     "prepare.swag": {
@@ -354,6 +361,31 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=argparse.SUPPRESS,
     )
+    for flag, help_text in (
+        (
+            "max_documents",
+            "Maximum unique normalized documents in the tokenizer sample (default: 100000).",
+        ),
+        (
+            "max_corpus_bytes",
+            "Maximum UTF-8 text bytes in the tokenizer sample (default: 134217728).",
+        ),
+        (
+            "sampling_seed",
+            "Seed for reproducible tokenizer document sampling (default: 42).",
+        ),
+        ("max_files", "Maximum corpus files to sample (default: 100)."),
+        (
+            "max_rows_per_file",
+            "Maximum physical lines scanned per selected file (default: 8192).",
+        ),
+    ):
+        tokenize.add_argument(
+            f"--{flag.replace('_', '-')}",
+            type=int,
+            default=argparse.SUPPRESS,
+            help=help_text,
+        )
     _add_config(tokenize)
 
     prepare = subparsers.add_parser("prepare")
@@ -539,6 +571,27 @@ def _normalize_cli_values(
     configured = (
         _load_command_table(config, command) if isinstance(config, Path) else {}
     )
+    if command == "tokenize":
+        for table, names in (
+            (
+                "sampling",
+                {
+                    "max_documents": "max_documents",
+                    "max_corpus_bytes": "max_bytes",
+                    "sampling_seed": "seed",
+                },
+            ),
+            (
+                "corpus",
+                {"max_files": "max_files", "max_rows_per_file": "max_rows_per_file"},
+            ),
+        ):
+            nested = dict(configured.get(table, {}))
+            for flag, field_name in names.items():
+                if flag in values:
+                    nested[field_name] = values.pop(flag)
+            if nested:
+                configured[table] = nested
     configured.update(values)
     path_fields = {
         "tokenize": ("input", "output"),
@@ -698,14 +751,16 @@ class TokenizeCommand(_Command):
     command: ClassVar[str] = "tokenize"
 
     def to_domain(self) -> Any:
+        from sml.data.corpus import CorpusSamplingConfig
         from sml.data.tokenizer import TokenizerTrainingConfig
 
         values = dict(self.values)
         input_root = values.pop("input")
         values.pop("output")
         corpus = _build_corpus(input_root, values.pop("corpus", {}))
+        sampling = CorpusSamplingConfig(**dict(values.pop("sampling", {})))
         values = _tuple_values(values, "conversation_user_symbols")
-        return TokenizerTrainingConfig(corpus=corpus, **values)
+        return TokenizerTrainingConfig(corpus=corpus, sampling=sampling, **values)
 
     def dispatch(self) -> object:
         from sml.data.tokenizer import train_tokenizer_bundle

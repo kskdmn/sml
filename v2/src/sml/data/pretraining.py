@@ -1302,6 +1302,7 @@ def _corpus_projection(config: CorpusConfig) -> Mapping[str, object]:
         "min_text_bytes": config.min_text_bytes,
         "max_text_bytes": config.max_text_bytes,
         "max_rows_per_file": config.max_rows_per_file,
+        "max_files": config.max_files,
     }
 
 
