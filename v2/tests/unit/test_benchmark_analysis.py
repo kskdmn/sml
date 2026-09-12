@@ -2980,7 +2980,8 @@ def test_noisy_comparison_retains_exactly_one_cooled_retry():
     )
 
 
-def test_persistent_noise_blocks_acceptance_after_the_single_retry():
+@pytest.mark.parametrize("metric", METRIC_NAMES)
+def test_persistent_noise_blocks_acceptance_after_the_single_retry(metric):
     workload = build_canonical_workload()
     baseline_trials = _valid_baseline_trials(workload)
     baseline = build_baseline_manifest(
@@ -2997,8 +2998,10 @@ def test_persistent_noise_blocks_acceptance_after_the_single_retry():
     )
     candidate_commit = "e" * 40
     noisy = [95.0, 100.0, 103.0, 106.0, 110.0]
-    trials = _comparison_trials(workload, candidate_commit, noisy, 0)
-    trials.extend(_comparison_trials(workload, candidate_commit, noisy, 1))
+    trials = _comparison_trials(workload, candidate_commit, noisy, 0, metric=metric)
+    trials.extend(
+        _comparison_trials(workload, candidate_commit, noisy, 1, metric=metric)
+    )
     report = build_comparison_report(
         baseline=baseline,
         trials=trials,
@@ -3015,6 +3018,23 @@ def test_persistent_noise_blocks_acceptance_after_the_single_retry():
     validate_comparison_report(report, baseline, predecessor_reports=None)
     with pytest.raises(ValueError, match="baseline gate failed"):
         validate_throughput_gates(report, label="phase")
+
+
+@pytest.mark.parametrize(
+    "metric", ("checkpoint-pause", "compile-cold-start", "peak-metal-memory")
+)
+@pytest.mark.parametrize("decision", ("fail", "inconclusive"))
+def test_secondary_metric_ratios_remain_report_only(metric, decision):
+    report = {
+        "metrics": {
+            metric: {
+                "baseline_comparison": {"decision": decision},
+                "previous_comparison": {"analysis": {"decision": decision}},
+            }
+        }
+    }
+
+    validate_throughput_gates(report, label="final acceptance")
 
 
 def test_cooldown_uses_fake_clock_and_proves_final_nominal_window():
@@ -3308,6 +3328,134 @@ def test_final_validation_requires_complete_raw_input_and_passing_gates(monkeypa
             {metric: None for metric in benchmark_runner.FINAL_METRICS},
             (),
         )
+
+
+@pytest.mark.parametrize(
+    ("rejected_metric", "candidate_values", "decision"),
+    (
+        ("pretraining-end-to-end", [102.0] * 10, "fail"),
+        (
+            "pretraining-end-to-end",
+            [102.0, 102.5, 102.8, 102.9, 103.0, 103.0, 103.2, 103.5, 104.0, 104.5],
+            "inconclusive",
+        ),
+        ("peak-metal-memory", [95.0, 100.0, 103.0, 106.0, 110.0] * 2, "too-noisy"),
+    ),
+)
+def test_rejected_final_comparison_publishes_complete_valid_evidence(
+    tmp_path, monkeypatch, rejected_metric, candidate_values, decision
+):
+    workload = build_canonical_workload()
+    baseline, _baseline_trials = _baseline_fixture()
+    baseline_commit = baseline["source"]["commit"]
+    candidate_commit = "e" * 40
+    metrics = benchmark_runner.FINAL_METRICS
+    predecessor_metrics = benchmark_runner.FINAL_PREDECESSOR_METRICS
+    predecessor = build_comparison_report(
+        baseline=baseline,
+        trials=[
+            trial
+            for metric in metrics
+            if metric in predecessor_metrics
+            for trial in _comparison_trials(
+                workload, baseline_commit, [100.0] * 5, 0, metric=metric
+            )
+        ],
+        candidate_commit=baseline_commit,
+        minimum_ratio=0.97,
+        pretraining_minimum_ratio=None,
+        maximum_dispersion=0.02,
+        require_lower_bound=False,
+        bootstrap_resamples=10_000,
+        predecessor_metrics={},
+    )
+    baseline_path = tmp_path / "baseline.json"
+    predecessor_path = tmp_path / "predecessor.json"
+    benchmark_runner._write_json(baseline_path, baseline)
+    benchmark_runner._write_json(predecessor_path, predecessor)
+    args = SimpleNamespace(
+        baseline=baseline_path,
+        candidate=candidate_commit,
+        metrics=metrics,
+        mode="final",
+        pairs=10,
+        warmup=5,
+        measure=20,
+        prepared_data_measure=100,
+        bootstrap_resamples=10_000,
+        minimum_ratio=0.97,
+        pretraining_minimum_ratio=1.03,
+        maximum_dispersion=0.015,
+        lower_bound_report_only=False,
+        predecessors=json.dumps(
+            {
+                metric: str(predecessor_path) if metric in predecessor_metrics else None
+                for metric in metrics
+            }
+        ),
+        raw_output=tmp_path / "final.jsonl",
+        output=tmp_path / "final.json",
+    )
+    collected_trials = []
+
+    def collect_attempt(*, attempt_index, **_kwargs):
+        trials = []
+        for metric in metrics:
+            values = (
+                candidate_values
+                if metric == rejected_metric
+                else [104.0 if metric == "pretraining-end-to-end" else 100.0] * 10
+            )
+            trials.extend(
+                _comparison_trials(
+                    workload, candidate_commit, values, attempt_index, metric=metric
+                )
+            )
+        collected_trials.extend(trials)
+        return trials, {}
+
+    monkeypatch.setattr(benchmark_runner, "_git_root", lambda _path: tmp_path)
+    monkeypatch.setattr(
+        benchmark_runner, "_require_clean_checkout", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(benchmark_runner, "_git_commit", lambda *_a: candidate_commit)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "harness_content_identity",
+        lambda _root: baseline["harness"]["content_identity"],
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "_collect_comparison_attempt", collect_attempt
+    )
+    monkeypatch.setattr(
+        benchmark_runner, "perform_cooldown", _nominal_cooldown_evidence
+    )
+
+    with pytest.raises(ValueError, match=f"baseline gate failed for {rejected_metric}"):
+        benchmark_runner._compare(args)
+
+    report = benchmark_runner._read_json_object(args.output, label="final report")
+    raw_trials = benchmark_runner._read_trials(args.raw_output)
+    predecessors = {
+        metric: predecessor if metric in predecessor_metrics else None
+        for metric in metrics
+    }
+    validate_comparison_report(report, baseline, predecessors)
+    assert raw_trials == tuple(collected_trials)
+    assert report["raw_trials"] == [trial.to_dict() for trial in collected_trials]
+    assert (
+        report["metrics"][rejected_metric]["baseline_comparison"]["decision"]
+        == decision
+    )
+    attempts = 2 if decision == "too-noisy" else 1
+    assert all(
+        len(record["attempts"]) == attempts for record in report["metrics"].values()
+    )
+    assert report["cooldown_evidence"] == (
+        _nominal_cooldown_evidence() if attempts == 2 else None
+    )
+    with pytest.raises(ValueError, match=f"baseline gate failed for {rejected_metric}"):
+        validate_final_report(report, baseline, predecessors, raw_trials)
 
 
 @pytest.mark.parametrize("phase", (1, 3, 4, "final"))

@@ -1169,8 +1169,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
     )
     result = replace(result, identity=evaluation_result_identity(result))
     manager.verify_sources_unchanged()
-    publish_evaluation_result(config.output, result)
-    return result
+    return publish_evaluation_result(config.output, result)
 
 
 __all__ = (

@@ -240,8 +240,10 @@ class ScalarSwagState:
             raise SMLArtifactError("checkpoint cursor must be a SwagCursor")
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _RestoredSwagState:
+    """The current runtime state, shared with its orchestration owner."""
+
     adapters: dict
     frozen_base: dict
     optimizer: AdamState
@@ -1146,6 +1148,7 @@ def _run_training(
     optimizer = restored.optimizer
     trainer = restored.trainer
     scalar = restored.scalar
+    model.update(adapters)
     weight_decay_tree = build_weight_decay_tree(
         adapters,
         config.optimizer.weight_decay,
@@ -1175,6 +1178,7 @@ def _run_training(
             trainer,
         )
         mx.eval(adapters, optimizer.to_tree(), trainer.to_tree())
+        model.update(adapters)
         stream.commit(pending_cursor)
         scalar = ScalarSwagState(
             step=scalar.step + 1,
@@ -1182,6 +1186,10 @@ def _run_training(
             microsteps=scalar.microsteps + window_microsteps,
             cursor=pending_cursor,
         )
+        restored.adapters = adapters
+        restored.optimizer = optimizer
+        restored.trainer = trainer
+        restored.scalar = scalar
         if metrics is not None:
             mx.eval(metrics)
             loss, learning_rate, accuracy = (float(metric.item()) for metric in metrics)
@@ -1229,12 +1237,14 @@ def _run_training(
                             trainer_tree[4],
                         )
                     )
+                    del trainer_tree
                 trainer = kernels.ranking_microstep(
                     adapters,
                     frozen_base,
                     trainer,
                     batch,
                 )
+                restored.trainer = trainer
                 pending_cursor = batch.cursor_after
                 window_microsteps += 1
                 window_full = window_microsteps >= accumulation_steps
@@ -1312,7 +1322,7 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
             runtime: tuple[SMLLanguageModel, _RestoredSwagState] | None = None
 
             def build(private_run: Path) -> LoRARunManifest:
-                nonlocal runtime
+                nonlocal runtime, selected
                 _write_tokenizer_directory(
                     private_run / "tokenizer", selected.tokenizer_files
                 )
@@ -1381,6 +1391,7 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
                 raise SMLArtifactError("fresh run builder did not return runtime state")
             if published.manifest.identity != published.manifest.recompute_identity():
                 raise SMLArtifactError("published run identity changed during creation")
+            del build, selected
             return _run_training(
                 config.output_run,
                 published.manifest,
@@ -1474,6 +1485,7 @@ def resume_finetune(
                 limit_reached = _limit_reached(config, scalar)
                 run_manifest = resolved.run
                 checkpoint_identity = resolved.checkpoint.identity
+            del reader
             retained = prune_to_latest(run)
             if retained.checkpoint.identity != checkpoint_identity:
                 raise SMLArtifactError(
@@ -1496,6 +1508,7 @@ def resume_finetune(
                 trainer,
                 scalar,
             )
+            del adapters, optimizer, trainer, _initialized
             return _run_training(
                 run,
                 run_manifest,

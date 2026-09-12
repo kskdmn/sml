@@ -727,6 +727,97 @@ def test_identical_concurrent_publication_is_idempotent_for_every_writer(
     assert read_evaluation_result(path) == result
 
 
+def with_provider_metadata(result: EvaluationResult, **metadata) -> EvaluationResult:
+    changed = replace(result, provider_result={**result.provider_result, **metadata})
+    return replace(changed, identity=evaluation_result_identity(changed))
+
+
+@pytest.mark.parametrize("metadata", ({"date": 200.0}, {"date": None}, {}))
+def test_date_only_retry_returns_original_artifact(
+    tmp_path: Path, metadata: dict[str, object]
+) -> None:
+    path = tmp_path / "evaluation.json"
+    original = identified_result()
+    first = with_provider_metadata(original, date=100.0)
+    retry = with_provider_metadata(original, **metadata)
+    assert first.identity != retry.identity
+    assert publish_evaluation_result(path, first) == first
+    saved_bytes = path.read_bytes()
+
+    reused = publish_evaluation_result(path, retry)
+
+    assert reused == first == read_evaluation_result(path)
+    assert path.read_bytes() == saved_bytes == evaluation_result_bytes(first)
+    assert retry.provider_result.get("date") == metadata.get("date")
+    assert retry.identity == evaluation_result_identity(retry)
+    assert tuple(tmp_path.iterdir()) == (path,)
+
+
+def test_concurrent_execution_dates_return_the_same_saved_result(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "evaluation.json"
+    results = tuple(
+        with_provider_metadata(identified_result(), date=date)
+        for date in (100.0, 200.0)
+    )
+    start = threading.Barrier(len(results))
+
+    def publish_simultaneously(result: EvaluationResult) -> EvaluationResult:
+        start.wait()
+        return publish_evaluation_result(path, result)
+
+    with ThreadPoolExecutor(max_workers=len(results)) as executor:
+        saved = tuple(executor.map(publish_simultaneously, results))
+
+    winner = read_evaluation_result(path)
+    assert winner in results
+    assert all(result == winner for result in saved)
+    assert path.read_bytes() == evaluation_result_bytes(winner)
+    assert tuple(tmp_path.iterdir()) == (path,)
+
+
+@pytest.mark.parametrize(
+    "change", ("metrics", "model", "task", "metadata", "nested_date", "scalar_type")
+)
+def test_date_retry_still_rejects_other_content_changes(tmp_path: Path, change: str):
+    path = tmp_path / "evaluation.json"
+    first = with_provider_metadata(
+        identified_result(), date=100.0, metadata=True, samples=({"date": 1},)
+    )
+    publish_evaluation_result(path, first)
+    retry = with_provider_metadata(first, date=200.0)
+    if change == "metrics":
+        retry = with_provider_metadata(
+            identified_result(metric_payload={"acc,none": 0.75}),
+            date=200.0,
+            metadata=True,
+            samples=({"date": 1},),
+        )
+    elif change == "model":
+        retry = replace(
+            retry,
+            model=replace(retry.model, artifact_identity="sha256:" + "b" * 64),
+        )
+    elif change == "task":
+        task = replace(retry.tasks[0], dataset_revision="revision-2")
+        task = replace(task, task_identity=evaluation_task_identity(task))
+        retry = replace(retry, tasks=(task,))
+    elif change == "metadata":
+        retry = with_provider_metadata(retry, metadata=False)
+    elif change == "nested_date":
+        retry = with_provider_metadata(retry, samples=({"date": 2},))
+    else:
+        retry = with_provider_metadata(retry, metadata=1)
+    retry = replace(retry, identity=evaluation_result_identity(retry))
+
+    with pytest.raises(SMLRuntimeError, match="collision"):
+        publish_evaluation_result(path, retry)
+
+    assert path.read_bytes() == evaluation_result_bytes(first)
+    assert tuple(tmp_path.iterdir()) == (path,)
+
+
 @pytest.mark.parametrize("operation", ("stat", "fstat", "read"))
 def test_collision_validation_normalizes_destination_os_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str

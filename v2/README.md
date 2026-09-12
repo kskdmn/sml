@@ -23,6 +23,7 @@ Train a self-describing SentencePiece bundle from compressed JSONL rows whose
 selected text field contains the corpus text:
 
 ```sh
+mkdir -p v2/output
 uv run python -m sml tokenize --input data/corpus --output v2/output/tokenizer
 ```
 
@@ -94,6 +95,10 @@ intentionally excluded from the artifact and its identity.
 Results use schema version 3 and bind each model to its complete artifact
 identity, so different exported weights remain distinguishable even when the
 tokenizer and source step match.
+
+Repeating an evaluation at the same output path reuses the saved result when
+only the provider's execution date changes. The original timestamp, artifact
+identity, and file contents are preserved; other result differences are rejected.
 
 ### SWAG data
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import json
 import os
 import shutil
+import weakref
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import replace
@@ -12,6 +14,7 @@ import mlx.core as mx
 import pytest
 import sml.inference as inference_module
 import zstandard as zstd
+from mlx.utils import tree_flatten
 from sml.artifacts import checkpoint as checkpoint_module
 from sml.artifacts.checkpoint import CheckpointReader, resolve_latest_step
 from sml.artifacts.manifest import (
@@ -1275,6 +1278,104 @@ def test_resume_prunes_stale_history_before_continuing_model_failure(
     assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
         "step-000000001"
     ]
+
+
+def test_finetune_releases_selected_base_before_training(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    real_select = swag_module._select_pretraining_base
+    real_run = swag_module._run_training
+    selections = []
+
+    class TrackedSelection:
+        def __init__(self, selected):
+            self.selected = selected
+
+        def __getattr__(self, name):
+            return getattr(self.selected, name)
+
+    def track_selection(*args, **kwargs):
+        selected = TrackedSelection(real_select(*args, **kwargs))
+        selections.append(weakref.ref(selected))
+        return selected
+
+    def check_training(*args, **kwargs):
+        gc.collect()
+        assert len(selections) == 1
+        assert selections[0]() is None
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(swag_module, "_select_pretraining_base", track_selection)
+    monkeypatch.setattr(swag_module, "_run_training", check_training)
+
+    result = finetune(
+        tiny_swag_training_config(
+            tiny_base_run, tiny_swag_bundle, tmp_path / "released-base-run"
+        )
+    )
+
+    assert result.step == 1
+
+
+@pytest.mark.parametrize("compile", (False, True))
+@pytest.mark.parametrize("resume", (False, True), ids=("fresh", "resume"))
+def test_swag_releases_superseded_device_arrays_after_update(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch, compile, resume
+):
+    config = tiny_swag_training_config(
+        tiny_base_run,
+        tiny_swag_bundle,
+        tmp_path / "released-state-run",
+        maximum_steps=2,
+        compile=compile,
+    )
+    config = replace(config, lora=replace(config.lora, dropout=0.2))
+    if resume:
+        finetune(replace(config, maximum_steps=1))
+
+    real_wrap = swag_module._wrap_copied_base
+    real_run = swag_module._run_training
+    real_publish = swag_module._publish_training_state
+    original_arrays = []
+    published_steps = []
+
+    def track_arrays(tree):
+        original_arrays.extend(weakref.ref(array) for _, array in tree_flatten(tree))
+
+    def track_wrapped_base(*args, **kwargs):
+        model, adapters, frozen = real_wrap(*args, **kwargs)
+        track_arrays(adapters)
+        return model, adapters, frozen
+
+    def track_training(run, manifest, config, model, restored, bundle):
+        track_arrays(restored.adapters)
+        track_arrays(restored.optimizer.first_moments)
+        track_arrays(restored.optimizer.second_moments)
+        track_arrays(restored.trainer.accumulators)
+        return real_run(run, manifest, config, model, restored, bundle)
+
+    def check_publication(run, manifest, state):
+        gc.collect()
+        assert original_arrays
+        assert all(reference() is None for reference in original_arrays)
+        published_steps.append(state.scalar.step)
+        return real_publish(run, manifest, state)
+
+    monkeypatch.setattr(swag_module, "_wrap_copied_base", track_wrapped_base)
+    monkeypatch.setattr(swag_module, "_run_training", track_training)
+    monkeypatch.setattr(swag_module, "_publish_training_state", check_publication)
+
+    if resume:
+        result = resume_finetune(
+            config.output_run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(maximum_steps=2),
+        )
+    else:
+        result = finetune(config)
+
+    assert result.step == 2
+    assert published_steps == ([2] if resume else [1, 2])
 
 
 def test_finetune_closes_swag_bundle_exactly_once_on_success(

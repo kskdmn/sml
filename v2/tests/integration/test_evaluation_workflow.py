@@ -88,6 +88,61 @@ def test_evaluate_is_idempotent_for_identical_output(
     assert read_evaluation_result(config.output) == first
 
 
+def test_real_provider_execution_dates_reuse_the_saved_result(
+    tiny_pretraining_run: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datasets import Dataset, DatasetDict, DatasetInfo, Version
+    from sml import evaluation
+
+    rows = [
+        {
+            "ctx_a": "alpha",
+            "ctx_b": "beta",
+            "activity_label": "gamma",
+            "endings": ["beta", "gamma", "delta", "alpha"],
+            "label": str(index),
+        }
+        for index in range(4)
+    ]
+    dataset = DatasetDict(
+        {
+            split: Dataset.from_list(rows, info=DatasetInfo(version=Version("1.0.0")))
+            for split in ("train", "validation")
+        }
+    )
+
+    def load_local_dataset(path, *args, **kwargs):
+        assert path == "Rowan/hellaswag"
+        return dataset
+
+    monkeypatch.setattr("datasets.load_dataset", load_local_dataset)
+    provider = evaluation._import_lm_eval()
+    provider_dates = []
+
+    def record_provider_date(**kwargs):
+        result = provider.simple_evaluate(**kwargs)
+        provider_dates.append(result["date"])
+        return result
+
+    monkeypatch.setattr(
+        evaluation,
+        "_import_lm_eval",
+        lambda: replace(provider, simple_evaluate=record_provider_date),
+    )
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+    first = evaluate(config)
+    saved_bytes = config.output.read_bytes()
+    second = evaluate(config)
+
+    assert len(provider_dates) == 2
+    assert provider_dates[0] != provider_dates[1]
+    assert second == first == read_evaluation_result(config.output)
+    assert second.provider_result["date"] == provider_dates[0]
+    assert config.output.read_bytes() == saved_bytes
+
+
 def test_evaluate_rejects_conflicting_existing_output(
     tiny_pretraining_run: Path,
     fake_lm_eval,

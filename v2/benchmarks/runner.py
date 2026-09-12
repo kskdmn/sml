@@ -3602,11 +3602,11 @@ def _compare(args: argparse.Namespace) -> int:
         **report_arguments,
     )
     validate_comparison_report(report, baseline, predecessor_reports)
-    if comparison_mode == COMPARISON_FINAL:
-        validate_throughput_gates(report, label="final acceptance")
     if args.raw_output is not None:
         _write_jsonl(args.raw_output, trials)
     _write_json(args.output, report)
+    if comparison_mode == COMPARISON_FINAL:
+        validate_throughput_gates(report, label="final acceptance")
     return 0
 
 
@@ -3711,16 +3711,18 @@ def validate_throughput_gates(report: dict, *, label: str) -> None:
         "inference-decode",
     }
     for metric, record in report["metrics"].items():
-        if metric not in throughput_metrics:
-            continue
-        if record["baseline_comparison"]["decision"] != "pass":
+        baseline_decision = record["baseline_comparison"]["decision"]
+        if baseline_decision == "too-noisy" or (
+            metric in throughput_metrics and baseline_decision != "pass"
+        ):
             raise ValueError(f"{label} baseline gate failed for {metric}")
         previous_comparison = record["previous_comparison"]
-        if (
-            previous_comparison is not None
-            and previous_comparison["analysis"]["decision"] != "pass"
-        ):
-            raise ValueError(f"{label} predecessor gate failed for {metric}")
+        if previous_comparison is not None:
+            previous_decision = previous_comparison["analysis"]["decision"]
+            if previous_decision == "too-noisy" or (
+                metric in throughput_metrics and previous_decision != "pass"
+            ):
+                raise ValueError(f"{label} predecessor gate failed for {metric}")
 
 
 def process_order(pair_index: int) -> tuple[Side, Side]:

@@ -737,8 +737,22 @@ def _cleanup_temporary_output(parent: int, temporary: str) -> None:
     os.fsync(parent)
 
 
-def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
-    """Durably publish *result* once, accepting only exact idempotent reuse."""
+def _publication_comparison_bytes(result: EvaluationResult) -> bytes:
+    """Compare evaluation content while retaining the first execution date."""
+    payload = _result_payload(result)
+    del payload["identity"]
+    payload["provider_result"] = {
+        name: value for name, value in result.provider_result.items() if name != "date"
+    }
+    return canonical_json_bytes(payload)
+
+
+def publish_evaluation_result(path: Path, result: EvaluationResult) -> EvaluationResult:
+    """Publish once and return the saved result, tolerating a changed provider date.
+
+    Reuse preserves the original bytes and identity. All other evaluation content
+    must match, including model and task provenance and complete provider metrics.
+    """
     if not isinstance(path, Path):
         raise TypeError("path must be a Path")
     payload = evaluation_result_bytes(result)
@@ -769,8 +783,12 @@ def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
                 raise SMLRuntimeError(
                     "evaluation output collision: " + str(path)
                 ) from None
-            if existing != result:
+            if existing.identity != result.identity and (
+                _publication_comparison_bytes(existing)
+                != _publication_comparison_bytes(result)
+            ):
                 raise SMLRuntimeError("evaluation output collision: " + str(path))
+            result = existing
         _cleanup_temporary_output(parent, temporary)
         temporary = None
     except BaseException as error:
@@ -790,6 +808,7 @@ def publish_evaluation_result(path: Path, result: EvaluationResult) -> None:
             primary_error.add_note(
                 f"evaluation output parent close failed: {close_error!r}"
             )
+    return result
 
 
 __all__ = (

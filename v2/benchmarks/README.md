@@ -136,7 +136,10 @@ A noisy comparison removes temporary checkouts, cools down for 15 minutes, and
 repeats the complete alternating experiment once. Its last five cooldown minutes
 must satisfy the recorded power mode, nominal thermals, normal memory, and no
 competing GPU work. Reports retain both attempts and cooldown evidence; persistent
-noise blocks acceptance. Baseline, comparison, phase, final, and predecessor
+noise in any selected metric blocks acceptance. Checkpoint pause, cold compilation,
+and peak-memory ratio gates are report-only. Final comparisons publish their valid
+report and requested raw output before enforcing acceptance, so rejected results
+remain available for inspection. Baseline, comparison, phase, final, and predecessor
 validation all verify raw-trial version 3 identities and their complete embedded
 post-exit recovery evidence before using measurements.
 
