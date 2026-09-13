@@ -20,8 +20,10 @@ from sml.artifacts.manifest import (
     open_artifact,
 )
 from sml.data.corpus import (
+    CORPUS_METADATA_FIELDS,
     CorpusConfig,
     CorpusSamplingConfig,
+    corpus_metadata,
     discover_corpus_files,
     iter_filtered_texts,
     sample_texts,
@@ -55,18 +57,7 @@ _TRAINING_KEYS = frozenset(
         "sampling",
     }
 )
-_CORPUS_KEYS = frozenset(
-    {
-        "filename_pattern",
-        "shuffle_files",
-        "file_order_seed",
-        "text_field",
-        "min_text_bytes",
-        "max_text_bytes",
-        "max_rows_per_file",
-        "max_files",
-    }
-)
+_CORPUS_KEYS = frozenset(CORPUS_METADATA_FIELDS)
 
 
 def _require_plain_int(value: object, name: str, *, minimum: int = 0) -> int:
@@ -182,19 +173,6 @@ def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
     )
 
 
-def _corpus_training_projection(config: CorpusConfig) -> Mapping[str, object]:
-    return {
-        "filename_pattern": config.filename_pattern,
-        "shuffle_files": config.shuffle_files,
-        "file_order_seed": config.file_order_seed,
-        "text_field": config.text_field,
-        "min_text_bytes": config.min_text_bytes,
-        "max_text_bytes": config.max_text_bytes,
-        "max_rows_per_file": config.max_rows_per_file,
-        "max_files": config.max_files,
-    }
-
-
 def _training_projection(config: TokenizerTrainingConfig) -> Mapping[str, object]:
     return {
         "algorithm": config.algorithm,
@@ -214,7 +192,7 @@ def _training_projection(config: TokenizerTrainingConfig) -> Mapping[str, object
         "bos_id": config.bos_id,
         "eos_id": config.eos_id,
         "pad_id": config.pad_id,
-        "corpus": _corpus_training_projection(config.corpus),
+        "corpus": corpus_metadata(config.corpus),
         "sampling": None if config.sampling is None else asdict(config.sampling),
     }
 

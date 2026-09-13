@@ -18,6 +18,7 @@ import pytest
 import sml.data.pretraining as pretraining_module
 import zstandard as zstd
 from sml.artifacts import manifest as manifest_module
+from sml.artifacts import npy as npy_module
 from sml.artifacts.manifest import (
     ArtifactRoot,
     OpenedArtifact,
@@ -1387,8 +1388,8 @@ def _instrument_real_prepared_cleanup(
     payloads: list[VerifiedPayload] = []
     roots: list[ArtifactRoot] = []
     array_refs: dict[int, weakref.ReferenceType[np.ndarray]] = {}
-    original_mmap = pretraining_module.mmap.mmap
-    original_ndarray = pretraining_module.np.ndarray
+    original_mmap = npy_module.mmap.mmap
+    original_ndarray = npy_module.np.ndarray
     original_open_payload = OpenedArtifact.open_payload
     original_payload_close = VerifiedPayload.close
     original_root_close = ArtifactRoot.close
@@ -1443,8 +1444,8 @@ def _instrument_real_prepared_cleanup(
                 raise RuntimeError("injected ndarray construction failure")
         return array
 
-    monkeypatch.setattr(pretraining_module.mmap, "mmap", ObservedMmap)
-    monkeypatch.setattr(pretraining_module.np, "ndarray", construct_array)
+    monkeypatch.setattr(npy_module.mmap, "mmap", ObservedMmap)
+    monkeypatch.setattr(npy_module.np, "ndarray", construct_array)
     monkeypatch.setattr(OpenedArtifact, "open_payload", open_payload)
     monkeypatch.setattr(VerifiedPayload, "close", close_payload)
     monkeypatch.setattr(ArtifactRoot, "close", close_root)
@@ -1722,59 +1723,6 @@ def test_reopening_evicted_shard_rejects_changes_to_fully_verified_bytes(
     with pytest.raises(SMLArtifactError, match="changed during use"):
         store.close()
     store.close()
-
-
-def test_prepared_resource_cleanup_releases_views_mappings_payloads_then_root():
-    events: list[str] = []
-    arrays = [np.zeros((1, 1), dtype="<i4")]
-
-    class Mapping:
-        def close(self):
-            assert arrays == []
-            events.append("mmap")
-
-    class Payload:
-        def close(self):
-            assert events == ["mmap"]
-            events.append("payload")
-
-    class Root:
-        def close(self):
-            assert events == ["mmap", "payload"]
-            events.append("root")
-
-    mappings = [Mapping()]
-    payloads = [Payload()]
-    pretraining_module._close_prepared_resources(Root(), payloads, mappings, arrays)
-
-    assert events == ["mmap", "payload", "root"]
-    assert arrays == mappings == payloads == []
-
-
-def test_prepared_resource_cleanup_continues_after_mapping_failure():
-    events: list[str] = []
-    arrays = [np.zeros((1, 1), dtype="<i4")]
-
-    class Mapping:
-        def close(self):
-            events.append("mmap")
-            raise RuntimeError("mmap close failed")
-
-    class Payload:
-        def close(self):
-            events.append("payload")
-
-    class Root:
-        def close(self):
-            events.append("root")
-
-    with pytest.raises(RuntimeError, match="mmap close failed"):
-        pretraining_module._close_prepared_resources(
-            Root(), [Payload()], [Mapping()], arrays
-        )
-
-    assert events == ["mmap", "payload", "root"]
-    assert arrays == []
 
 
 def test_prepared_open_failure_preserves_semantic_error_when_cleanup_fails(
@@ -2083,7 +2031,7 @@ def test_stream_retains_nonwriteable_descriptor_mapped_shards(prepared_bundle):
     )
     try:
         assert stream._shards is not None
-        arrays = [resource[2] for resource in stream._shards._cache.values()]
+        arrays = [resource.array for resource in stream._shards._cache.values()]
         assert arrays
         assert all(not array.flags.writeable for array in arrays)
         with pytest.raises(ValueError, match="read-only"):

@@ -1050,9 +1050,11 @@ def test_failed_lease_does_not_increment_active_leases(
     assert pool.active_leases == 0
 
 
-def test_load_owned_model_arrays_does_not_nest_run_access_lock(
+@pytest.mark.parametrize("full_verify", (False, True))
+def test_resolve_model_artifact_does_not_nest_run_access_lock(
     tiny_pretraining_run: Path,
     monkeypatch: pytest.MonkeyPatch,
+    full_verify: bool,
 ) -> None:
     depth = 0
     max_depth = 0
@@ -1077,8 +1079,9 @@ def test_load_owned_model_arrays_does_not_nest_run_access_lock(
                 depth -= 1
 
     monkeypatch.setattr(checkpoint, "_protected_lock", tracking)
-    inference.load_owned_model_arrays(tiny_pretraining_run, full_verify=False)
+    resolve_model_artifact(tiny_pretraining_run, full_verify=full_verify)
     assert max_depth == 1
+    assert depth == 0
 
 
 @dataclass(frozen=True, slots=True)

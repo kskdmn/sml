@@ -205,11 +205,6 @@ class SMLLanguageModel(nn.Module):
             )
             self.lm_head.weight = head_weight
 
-    def project_vocabulary(self, hidden: mx.array) -> mx.array:
-        if self.config.tie_word_embeddings:
-            return hidden @ self.embed_tokens.weight.T
-        return self.lm_head(hidden)
-
     def forward_arrays(
         self,
         parameters: dict[str, object],

@@ -1,4 +1,4 @@
-"""Lazy discovery and filtering for compressed tokenizer-training corpora."""
+"""Lazy discovery, normalization, and sampling for compressed text corpora."""
 
 from __future__ import annotations
 
@@ -25,6 +25,18 @@ DEFAULT_TEXT_FIELD = "text"
 DEFAULT_MIN_TEXT_BYTES = 100
 DEFAULT_MAX_TEXT_BYTES = 16_384
 DEFAULT_MAX_ROWS_PER_FILE = 8_192
+
+# Persist only corpus semantics, excluding the relocatable source directory.
+CORPUS_METADATA_FIELDS = (
+    "filename_pattern",
+    "shuffle_files",
+    "file_order_seed",
+    "text_field",
+    "min_text_bytes",
+    "max_text_bytes",
+    "max_rows_per_file",
+    "max_files",
+)
 
 _WHITESPACE = re.compile(r"\s+")
 
@@ -81,6 +93,11 @@ class CorpusConfig:
             )
         if self.max_files is not None:
             _require_plain_int(self.max_files, "max_files", minimum=1)
+
+
+def corpus_metadata(config: CorpusConfig) -> dict[str, object]:
+    """Return the explicit corpus fields used in tokenizer and data identities."""
+    return {name: getattr(config, name) for name in CORPUS_METADATA_FIELDS}
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,9 +326,11 @@ def iter_sampled_texts(
 
 
 __all__ = [
+    "CORPUS_METADATA_FIELDS",
     "CorpusConfig",
     "CorpusSamplingConfig",
     "FilteredTexts",
+    "corpus_metadata",
     "discover_corpus_files",
     "iter_filtered_texts",
     "iter_sampled_texts",

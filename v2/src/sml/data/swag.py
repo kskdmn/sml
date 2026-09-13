@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import importlib.metadata
-import mmap
 import queue
 import tempfile
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from math import prod
 from pathlib import Path
 from traceback import clear_frames
 from typing import Literal, Protocol, Self
@@ -26,12 +24,12 @@ from sml.artifacts.manifest import (
     PayloadRef,
     SwagDataManifest,
     VerificationLevel,
-    VerifiedPayload,
     _HashingWriter,
     canonical_json_bytes,
     open_artifact,
     structured_identity,
 )
+from sml.artifacts.npy import VerifiedNpyMapping
 from sml.errors import SMLArtifactError, SMLDataError
 from sml.inference import ResolvedModel
 
@@ -384,30 +382,17 @@ class SwagBucketLease:
         self.close()
 
 
-class _OwnedNpyMapping:
-    """One read-only NPY view backed by its proven payload descriptor."""
+class _OwnedNpyMapping(VerifiedNpyMapping):
+    """Resolve a SWAG array declaration before acquiring its shared NPY owner."""
 
-    __slots__ = ("_closed", "array", "logical_path", "mapping", "payload")
-
-    def __init__(
-        self,
-        logical_path: str,
-        payload: VerifiedPayload,
-        mapping: mmap.mmap,
-        array: np.ndarray,
-    ) -> None:
-        self.logical_path = logical_path
-        self.payload = payload
-        self.mapping = mapping
-        self.array = array
-        self._closed = False
+    __slots__ = ()
 
     @classmethod
     def open(
         cls,
         artifact: OpenedArtifact[SwagDataManifest],
         reference: ArrayPayloadRef,
-    ) -> _OwnedNpyMapping:
+    ) -> Self:
         if len(reference.arrays) != 1:
             raise SMLArtifactError(
                 f"SWAG NPY payload must declare one array: {reference.payload.logical_path}"
@@ -420,130 +405,13 @@ class _OwnedNpyMapping:
             raise SMLArtifactError(
                 f"unsupported SWAG array dtype: {reference.payload.logical_path}"
             ) from error
-        expected_shape = tuple(spec.shape)
-
-        payload = artifact.open_payload(reference.payload)
-        mapping: mmap.mmap | None = None
-        array: np.ndarray | None = None
-        try:
-            stream = payload.stream
-            try:
-                version = np.lib.format.read_magic(stream)
-                if version == (1, 0):
-                    shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(
-                        stream
-                    )
-                elif version == (2, 0):
-                    shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(
-                        stream
-                    )
-                else:
-                    raise SMLArtifactError(f"unsupported SWAG NPY version: {version}")
-                data_offset = stream.tell()
-            except SMLArtifactError:
-                raise
-            except (EOFError, OSError, TypeError, ValueError) as error:
-                raise SMLArtifactError(
-                    f"invalid SWAG array NPY header: {reference.payload.logical_path}"
-                ) from error
-
-            parsed_dtype = np.dtype(dtype)
-            if fortran_order:
-                raise SMLArtifactError(
-                    f"SWAG array must use C order: {reference.payload.logical_path}"
-                )
-            if parsed_dtype.hasobject or parsed_dtype != expected_dtype:
-                raise SMLArtifactError(
-                    f"SWAG array dtype mismatch: {reference.payload.logical_path}"
-                )
-            if tuple(shape) != expected_shape:
-                raise SMLArtifactError(
-                    f"SWAG array shape mismatch: {reference.payload.logical_path}"
-                )
-            element_count = prod(expected_shape)
-            expected_size = data_offset + element_count * parsed_dtype.itemsize
-            if expected_size != payload.opened_stat.st_size:
-                raise SMLArtifactError(
-                    f"SWAG array payload size mismatch: {reference.payload.logical_path}"
-                )
-
-            mapping = mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ)
-            array = np.ndarray(
-                expected_shape,
-                dtype=parsed_dtype,
-                buffer=mapping,
-                offset=data_offset,
-                order="C",
-            )
-            array.setflags(write=False)
-            return cls(reference.payload.logical_path, payload, mapping, array)
-        except BaseException as error:
-            if error.__traceback__ is not None:
-                clear_frames(error.__traceback__)
-            array = None
-            cleanup_errors: list[BaseException] = []
-            try:
-                if mapping is not None:
-                    mapping.close()
-            except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
-                cleanup_errors.append(cleanup_error)
-            try:
-                payload.close()
-            except BaseException as cleanup_error:  # noqa: BLE001 - cleanup continues
-                cleanup_errors.append(cleanup_error)
-            if cleanup_errors:
-                raise error from cleanup_errors[0]
-            raise
-
-    def _release_view(self) -> None:
-        self.array = np.empty((0,), dtype=self.array.dtype)
-        self.array.setflags(write=False)
-
-    def _close_mapping(self) -> None:
-        self.mapping.close()
-
-    def _close_payload(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self.payload.close()
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        errors: list[BaseException] = []
-        try:
-            self._release_view()
-        except BaseException as error:  # noqa: BLE001 - cleanup must continue
-            errors.append(error)
-        try:
-            self._close_mapping()
-        except BaseException as error:  # noqa: BLE001 - cleanup must continue
-            errors.append(error)
-        try:
-            self._close_payload()
-        except BaseException as error:  # noqa: BLE001 - cleanup must continue
-            errors.append(error)
-        if errors:
-            raise errors[0]
-
-    def __enter__(self) -> Self:
-        if self._closed:
-            raise SMLArtifactError("SWAG NPY mapping is closed")
-        return self
-
-    def __exit__(
-        self,
-        exception_type: object,
-        exception: object,
-        traceback: object,
-    ) -> None:
-        try:
-            self.close()
-        except BaseException as close_error:
-            if isinstance(exception, BaseException):
-                raise exception from close_error
-            raise
+        return cls.from_payload(
+            artifact.open_payload(reference.payload),
+            logical_path=reference.payload.logical_path,
+            expected_shape=tuple(spec.shape),
+            expected_dtype=expected_dtype,
+            description="SWAG array",
+        )
 
 
 def _close_swag_resources(
@@ -558,32 +426,32 @@ def _close_swag_resources(
         unregistered_pending = None
     if unregistered_pending is not None:
         try:
-            unregistered_pending._release_view()
+            unregistered_pending.release_view()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     for owner in reversed(mappings):
         try:
-            owner._release_view()
+            owner.release_view()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     if unregistered_pending is not None:
         try:
-            unregistered_pending._close_mapping()
+            unregistered_pending.close_mapping()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     for owner in reversed(mappings):
         try:
-            owner._close_mapping()
+            owner.close_mapping()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     if unregistered_pending is not None:
         try:
-            unregistered_pending._close_payload()
+            unregistered_pending.close_payload()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     for owner in reversed(mappings):
         try:
-            owner._close_payload()
+            owner.close_payload()
         except BaseException as error:  # noqa: BLE001 - cleanup continues
             errors.append(error)
     if root is not None:

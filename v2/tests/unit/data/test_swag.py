@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from sml.artifacts import npy as npy_module
 from sml.artifacts.manifest import (
     ArrayPayloadRef,
     ArraySpec,
@@ -1146,9 +1147,9 @@ def test_swag_bundle_close_releases_views_mappings_payloads_then_root_once(
     from sml.data.swag import prepare_swag_bundle
 
     events: list[str] = []
-    original_release = swag._OwnedNpyMapping._release_view
-    original_mapping_close = swag._OwnedNpyMapping._close_mapping
-    original_payload_close = swag._OwnedNpyMapping._close_payload
+    original_release = swag._OwnedNpyMapping.release_view
+    original_mapping_close = swag._OwnedNpyMapping.close_mapping
+    original_payload_close = swag._OwnedNpyMapping.close_payload
     original_root_close = ArtifactRoot.close
 
     def release(owner):
@@ -1167,9 +1168,9 @@ def test_swag_bundle_close_releases_views_mappings_payloads_then_root_once(
         events.append("root")
         original_root_close(root)
 
-    monkeypatch.setattr(swag._OwnedNpyMapping, "_release_view", release)
-    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_mapping", close_mapping)
-    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_payload", close_payload)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "release_view", release)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "close_mapping", close_mapping)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "close_payload", close_payload)
     monkeypatch.setattr(ArtifactRoot, "close", close_root)
     bundle = prepare_swag_bundle(
         tiny_swag_config(FakeSwagProvider((VALID_ROW,))),
@@ -1527,9 +1528,9 @@ def _instrument_real_swag_cleanup(monkeypatch, *, fail_open_index: int | None = 
     roots: list[ArtifactRoot] = []
     array_refs: dict[int, weakref.ReferenceType[np.ndarray]] = {}
     original_open = swag._OwnedNpyMapping.open.__func__
-    original_release = swag._OwnedNpyMapping._release_view
-    original_mapping_close = swag._OwnedNpyMapping._close_mapping
-    original_payload_close = swag._OwnedNpyMapping._close_payload
+    original_release = swag._OwnedNpyMapping.release_view
+    original_mapping_close = swag._OwnedNpyMapping.close_mapping
+    original_payload_close = swag._OwnedNpyMapping.close_payload
     original_root_close = ArtifactRoot.close
 
     def open_mapping(cls, artifact, reference):
@@ -1561,9 +1562,9 @@ def _instrument_real_swag_cleanup(monkeypatch, *, fail_open_index: int | None = 
         original_root_close(root)
 
     monkeypatch.setattr(swag._OwnedNpyMapping, "open", classmethod(open_mapping))
-    monkeypatch.setattr(swag._OwnedNpyMapping, "_release_view", release)
-    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_mapping", close_mapping)
-    monkeypatch.setattr(swag._OwnedNpyMapping, "_close_payload", close_payload)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "release_view", release)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "close_mapping", close_mapping)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "close_payload", close_payload)
     monkeypatch.setattr(ArtifactRoot, "close", close_root)
     return events, owners, roots
 
@@ -1619,7 +1620,7 @@ def test_swag_registration_failure_closes_pending_real_mapping_phase_wide(
     events, owners, roots = _instrument_real_swag_cleanup(monkeypatch)
     semantic_error = RuntimeError("injected owner registration failure")
     cleanup_error = RuntimeError("injected payload postcheck failure")
-    instrumented_payload_close = swag._OwnedNpyMapping._close_payload
+    instrumented_payload_close = swag._OwnedNpyMapping.close_payload
 
     class FailingRegistrationKey(str):
         def __hash__(self):
@@ -1645,7 +1646,7 @@ def test_swag_registration_failure_closes_pending_real_mapping_phase_wide(
     )
     monkeypatch.setattr(
         swag._OwnedNpyMapping,
-        "_close_payload",
+        "close_payload",
         fail_after_payload_close,
     )
 
@@ -1718,7 +1719,7 @@ def test_swag_post_append_failure_closes_real_mapping_exactly_once(
     semantic_error = RuntimeError("injected post-append failure")
     cleanup_error = RuntimeError("injected payload postcheck failure")
     instrumented_open = swag._OwnedNpyMapping.open.__func__
-    instrumented_payload_close = swag._OwnedNpyMapping._close_payload
+    instrumented_payload_close = swag._OwnedNpyMapping.close_payload
     registration_pending = False
     registration_line_count = 0
     observed_pending_list_overlap = False
@@ -1757,7 +1758,7 @@ def test_swag_post_append_failure_closes_real_mapping_exactly_once(
     )
     monkeypatch.setattr(
         swag._OwnedNpyMapping,
-        "_close_payload",
+        "close_payload",
         fail_after_payload_close,
     )
     sys.settrace(fail_after_list_registration)
@@ -1869,7 +1870,7 @@ def test_owned_npy_mapping_close_attempts_every_phase_and_preserves_primary(
         events.append("view")
         raise RuntimeError("view release failed")
 
-    monkeypatch.setattr(swag._OwnedNpyMapping, "_release_view", fail_release)
+    monkeypatch.setattr(swag._OwnedNpyMapping, "release_view", fail_release)
     with pytest.raises(RuntimeError, match="view release failed"):
         owner.close()
 
@@ -1920,8 +1921,10 @@ def test_owned_npy_mapping_open_failure_clears_view_mapping_and_payload(
     def fail_construction(*_args, **_kwargs):
         raise RuntimeError("owner construction failed")
 
-    monkeypatch.setattr(swag.mmap, "mmap", lambda *_args, **_kwargs: FakeMapping())
-    monkeypatch.setattr(swag.np, "ndarray", lambda *_args, **_kwargs: FakeArray())
+    monkeypatch.setattr(
+        npy_module.mmap, "mmap", lambda *_args, **_kwargs: FakeMapping()
+    )
+    monkeypatch.setattr(npy_module.np, "ndarray", lambda *_args, **_kwargs: FakeArray())
     monkeypatch.setattr(swag._OwnedNpyMapping, "__init__", fail_construction)
 
     with pytest.raises(RuntimeError, match="owner construction failed") as caught:
@@ -1948,8 +1951,8 @@ def test_owned_npy_mapping_real_acquisition_failure_closes_every_resource(
     payloads: list[VerifiedPayload] = []
     roots: list[ArtifactRoot] = []
     array_refs: dict[int, weakref.ReferenceType[np.ndarray]] = {}
-    original_mmap = swag.mmap.mmap
-    original_ndarray = swag.np.ndarray
+    original_mmap = npy_module.mmap.mmap
+    original_ndarray = npy_module.np.ndarray
     original_init = swag._OwnedNpyMapping.__init__
     original_open_payload = OpenedArtifact.open_payload
     original_payload_close = VerifiedPayload.close
@@ -1998,8 +2001,8 @@ def test_owned_npy_mapping_real_acquisition_failure_closes_every_resource(
         events.append("root")
         return original_root_close(root)
 
-    monkeypatch.setattr(swag.mmap, "mmap", ObservedMmap)
-    monkeypatch.setattr(swag.np, "ndarray", construct_array)
+    monkeypatch.setattr(npy_module.mmap, "mmap", ObservedMmap)
+    monkeypatch.setattr(npy_module.np, "ndarray", construct_array)
     monkeypatch.setattr(swag._OwnedNpyMapping, "__init__", construct_owner)
     monkeypatch.setattr(OpenedArtifact, "open_payload", open_payload)
     monkeypatch.setattr(VerifiedPayload, "close", close_payload)

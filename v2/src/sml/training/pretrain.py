@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import json
 from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
@@ -351,21 +350,6 @@ class _RestoredTrainingState:
     scalar: ScalarTrainingState
 
 
-def _plain_nonnegative_int(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise SMLArtifactError(f"{name} must be a nonnegative integer")
-    return value
-
-
-def _json_object_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise SMLArtifactError(f"duplicate checkpoint scalar key: {key}")
-        result[key] = value
-    return result
-
-
 def _scalar_document(
     state: ScalarTrainingState,
     *,
@@ -386,65 +370,19 @@ def _scalar_document(
     }
 
 
-def _parse_scalar_document(
-    payload: bytes,
-    resolved: ResolvedStep,
-) -> ScalarTrainingState:
-    try:
-        raw = json.loads(
-            payload.decode("utf-8"),
-            object_pairs_hook=_json_object_no_duplicates,
-            parse_constant=lambda value: (_ for _ in ()).throw(
-                ValueError(f"invalid JSON constant: {value}")
-            ),
-        )
-        if not isinstance(raw, dict) or set(raw) != {
-            "kind",
-            "version",
-            "owning_run_identity",
-            "step",
-            "rows",
-            "microsteps",
-            "cursor",
-        }:
-            raise SMLArtifactError("checkpoint scalar state has invalid fields")
-        if raw["kind"] != "pretraining-state" or raw["version"] != 1:
-            raise SMLArtifactError("checkpoint scalar state has invalid schema")
-        if raw["owning_run_identity"] != resolved.run.identity:
-            raise SMLArtifactError("checkpoint scalar state belongs to another run")
-        step = _plain_nonnegative_int(raw["step"], "checkpoint scalar step")
-        if step != resolved.step:
-            raise SMLArtifactError("checkpoint scalar step does not match checkpoint")
-        cursor = raw["cursor"]
-        if not isinstance(cursor, dict) or set(cursor) != {
-            "epoch",
-            "shard_order_position",
-            "row_offset",
-        }:
-            raise SMLArtifactError("checkpoint scalar cursor has invalid fields")
-        state = ScalarTrainingState(
-            step=step,
-            rows=_plain_nonnegative_int(raw["rows"], "checkpoint scalar rows"),
-            microsteps=_plain_nonnegative_int(
-                raw["microsteps"], "checkpoint scalar microsteps"
-            ),
-            cursor=PretrainingCursor(
-                epoch=_plain_nonnegative_int(cursor["epoch"], "cursor epoch"),
-                shard_order_position=_plain_nonnegative_int(
-                    cursor["shard_order_position"], "cursor shard position"
-                ),
-                row_offset=_plain_nonnegative_int(
-                    cursor["row_offset"], "cursor row offset"
-                ),
-            ),
-        )
-        if canonical_json_bytes(raw) != payload:
-            raise SMLArtifactError("checkpoint scalar state is not canonical JSON")
-        return state
-    except SMLArtifactError:
-        raise
-    except (json.JSONDecodeError, UnicodeError, TypeError, ValueError) as error:
-        raise SMLArtifactError("invalid checkpoint scalar state") from error
+def _read_scalar_state(reader: CheckpointReader) -> ScalarTrainingState:
+    """Construct domain state from the reader's validated checkpoint contents."""
+    if not isinstance(reader, CheckpointReader):
+        raise TypeError("reader must be a CheckpointReader")
+    if not isinstance(reader.resolved.checkpoint, PretrainingCheckpointManifest):
+        raise SMLArtifactError("pretraining requires a pretraining checkpoint")
+    raw = reader.read_contents().scalar_state
+    return ScalarTrainingState(
+        step=raw["step"],
+        rows=raw["rows"],
+        microsteps=raw["microsteps"],
+        cursor=PretrainingCursor(**raw["cursor"]),
+    )
 
 
 def read_scalar_state(resolved: ResolvedStep) -> ScalarTrainingState:
@@ -456,11 +394,7 @@ def read_scalar_state(resolved: ResolvedStep) -> ScalarTrainingState:
         expected_checkpoint_identity=resolved.checkpoint.identity,
         load_array_groups=frozenset(),
     ) as reader:
-        contents = reader.read_contents()
-        return _parse_scalar_document(
-            canonical_json_bytes(dict(contents.scalar_state)),
-            reader.resolved,
-        )
+        return _read_scalar_state(reader)
 
 
 def _dtype_name(array: mx.array) -> str:
@@ -657,10 +591,7 @@ def _restore_checkpoint(reader: CheckpointReader) -> _RestoredTrainingState:
     if not isinstance(verified.checkpoint, PretrainingCheckpointManifest):
         raise SMLArtifactError("pretraining requires a pretraining checkpoint")
     contents = reader.read_contents()
-    scalar = _parse_scalar_document(
-        canonical_json_bytes(dict(contents.scalar_state)),
-        verified,
-    )
+    scalar = _read_scalar_state(reader)
     groups = {
         logical_path: dict(contents.array_groups[logical_path])
         for logical_path in _CHECKPOINT_ARRAY_PATHS
@@ -1067,26 +998,25 @@ def _run_training(
 def train(config: PretrainingConfig) -> TrainingResult:
     if not isinstance(config, PretrainingConfig):
         raise TypeError("config must be a PretrainingConfig")
-    stream: PretrainingBatchStream | None = None
     runtime: tuple[SMLLanguageModel, _RestoredTrainingState] | None = None
     with run_writer_lock(config.output_run), ExitStack() as resources:
-        try:
-            if config.output_run.exists() or config.output_run.is_symlink():
-                raise SMLArtifactError(
-                    f"fresh run target already exists: {config.output_run}"
-                )
-            data, shards = resources.enter_context(
-                _verified_data(
-                    config.data,
-                    expected_identity=None,
-                    model=config.model,
-                    loader=config.loader,
-                )
+        if config.output_run.exists() or config.output_run.is_symlink():
+            raise SMLArtifactError(
+                f"fresh run target already exists: {config.output_run}"
             )
-            config = _resolved_fresh_config(
-                config, row_count=sum(data.manifest.shard_row_counts)
+        data, shards = resources.enter_context(
+            _verified_data(
+                config.data,
+                expected_identity=None,
+                model=config.model,
+                loader=config.loader,
             )
-            stream = PretrainingBatchStream._from_validated_shards(
+        )
+        config = _resolved_fresh_config(
+            config, row_count=sum(data.manifest.shard_row_counts)
+        )
+        stream = resources.enter_context(
+            PretrainingBatchStream._from_validated_shards(
                 data,
                 shards,
                 batch_size=config.loader.microbatch_size,
@@ -1094,38 +1024,36 @@ def train(config: PretrainingConfig) -> TrainingResult:
                 prefetch_depth=config.loader.prefetch_depth,
                 cursor=PretrainingCursor.initial(),
             )
-            manifest = _run_manifest(config, data)
+        )
+        manifest = _run_manifest(config, data)
 
-            def build(private_run: Path) -> PretrainingRunManifest:
-                nonlocal runtime
-                _copy_run_tokenizer(config.data, private_run)
-                (private_run / "checkpoints").mkdir()
-                (private_run / "run.json").write_bytes(canonical_json_bytes(manifest))
-                runtime = _initial_state(config)
-                publish_checkpoint(
-                    private_run,
-                    _checkpoint_builder(manifest, runtime[1]),
-                )
-                return manifest
+        def build(private_run: Path) -> PretrainingRunManifest:
+            nonlocal runtime
+            _copy_run_tokenizer(config.data, private_run)
+            (private_run / "checkpoints").mkdir()
+            (private_run / "run.json").write_bytes(canonical_json_bytes(manifest))
+            runtime = _initial_state(config)
+            publish_checkpoint(
+                private_run,
+                _checkpoint_builder(manifest, runtime[1]),
+            )
+            return manifest
 
-            published: Published[PretrainingRunManifest] = publish_run(
-                config.output_run, build
-            )
-            if runtime is None:
-                raise SMLArtifactError("fresh run builder did not return runtime state")
-            if published.manifest.identity != manifest.identity:
-                raise SMLArtifactError("published run identity changed during creation")
-            return _run_training(
-                config.output_run,
-                manifest,
-                config,
-                runtime[0],
-                runtime[1],
-                stream,
-            )
-        finally:
-            if stream is not None:
-                stream.close()
+        published: Published[PretrainingRunManifest] = publish_run(
+            config.output_run, build
+        )
+        if runtime is None:
+            raise SMLArtifactError("fresh run builder did not return runtime state")
+        if published.manifest.identity != manifest.identity:
+            raise SMLArtifactError("published run identity changed during creation")
+        return _run_training(
+            config.output_run,
+            manifest,
+            config,
+            runtime[0],
+            runtime[1],
+            stream,
+        )
 
 
 def resume(
@@ -1140,82 +1068,77 @@ def resume(
         raise TypeError("data must be a Path or None")
     if not isinstance(overrides, ResumeOverrides):
         raise TypeError("overrides must be ResumeOverrides")
-    stream: PretrainingBatchStream | None = None
     with run_writer_lock(run), ExitStack() as resources:
-        try:
-            resolved = resolve_latest_step(
-                run,
-                writable=False,
-                verification=VerificationLevel.MANIFEST_TRUSTED,
+        resolved = resolve_latest_step(
+            run,
+            writable=False,
+            verification=VerificationLevel.MANIFEST_TRUSTED,
+        )
+        if not isinstance(resolved.run, PretrainingRunManifest):
+            raise SMLArtifactError("pretraining resume requires a pretraining run")
+        diagnostic = resolved.run.diagnostic_data_locator
+        data_path = (
+            data if data is not None else (Path(diagnostic) if diagnostic else None)
+        )
+        if data_path is None:
+            raise SMLArtifactError("resume requires a prepared-data bundle location")
+        config = _config_from_run(run, data_path, resolved.run, overrides)
+        prepared, shards = resources.enter_context(
+            _verified_data(
+                data_path,
+                expected_identity=resolved.run.data_identity,
+                model=config.model,
+                loader=config.loader,
             )
-            if not isinstance(resolved.run, PretrainingRunManifest):
-                raise SMLArtifactError("pretraining resume requires a pretraining run")
-            diagnostic = resolved.run.diagnostic_data_locator
-            data_path = (
-                data if data is not None else (Path(diagnostic) if diagnostic else None)
-            )
-            if data_path is None:
-                raise SMLArtifactError(
-                    "resume requires a prepared-data bundle location"
-                )
-            config = _config_from_run(run, data_path, resolved.run, overrides)
-            prepared, shards = resources.enter_context(
-                _verified_data(
-                    data_path,
-                    expected_identity=resolved.run.data_identity,
-                    model=config.model,
-                    loader=config.loader,
-                )
-            )
-            with open_checkpoint_reader(
-                run,
-                step=resolved.step,
-                expected_checkpoint_identity=resolved.checkpoint.identity,
-                verification=VerificationLevel.FULL,
-            ) as reader:
-                with reader.open_run_child(
-                    "tokenizer",
-                    (TokenizerManifest,),
-                ) as tokenizer:
-                    if tokenizer.manifest.identity != resolved.run.tokenizer_identity:
-                        raise SMLArtifactError(
-                            "run tokenizer identity does not match run.json"
-                        )
-                    tokenizer.root.verify_payloads(
-                        (tokenizer.manifest.model, tokenizer.manifest.vocab),
-                        full=True,
+        )
+        with open_checkpoint_reader(
+            run,
+            step=resolved.step,
+            expected_checkpoint_identity=resolved.checkpoint.identity,
+            verification=VerificationLevel.FULL,
+        ) as reader:
+            with reader.open_run_child(
+                "tokenizer",
+                (TokenizerManifest,),
+            ) as tokenizer:
+                if tokenizer.manifest.identity != resolved.run.tokenizer_identity:
+                    raise SMLArtifactError(
+                        "run tokenizer identity does not match run.json"
                     )
-                    validate_full_run_semantics(reader, tokenizer.manifest)
-                restored = _restore_checkpoint(reader)
-                resolved = reader.resolved
-            # The closed reader still owns its loaded arrays. Release it before
-            # updates replace the restored weights and optimizer moments.
-            del reader
-            scalar = restored.scalar
-            try:
-                canonical_cursor = canonicalize_pretraining_cursor(
-                    scalar.cursor,
-                    shard_row_counts=prepared.manifest.shard_row_counts,
-                    seed=config.loader.epoch_seed,
+                tokenizer.root.verify_payloads(
+                    (tokenizer.manifest.model, tokenizer.manifest.vocab),
+                    full=True,
                 )
-            except SMLDataError as error:
-                raise SMLArtifactError(
-                    "checkpoint cursor is invalid for the prepared data"
-                ) from error
-            if canonical_cursor != scalar.cursor:
-                raise SMLArtifactError(
-                    "checkpoint cursor is not in canonical prepared-data form"
-                )
-            retained = prune_to_latest(run)
-            if retained.checkpoint.identity != resolved.checkpoint.identity:
-                raise SMLArtifactError(
-                    "latest checkpoint changed during writable recovery"
-                )
-            resolved = retained
-            if _limit_reached(config, scalar):
-                return _training_result(run, scalar)
+                validate_full_run_semantics(reader, tokenizer.manifest)
+            restored = _restore_checkpoint(reader)
+            resolved = reader.resolved
+        # The closed reader still owns its loaded arrays. Release it before
+        # updates replace the restored weights and optimizer moments.
+        del reader
+        scalar = restored.scalar
+        try:
+            canonical_cursor = canonicalize_pretraining_cursor(
+                scalar.cursor,
+                shard_row_counts=prepared.manifest.shard_row_counts,
+                seed=config.loader.epoch_seed,
+            )
+        except SMLDataError as error:
+            raise SMLArtifactError(
+                "checkpoint cursor is invalid for the prepared data"
+            ) from error
+        if canonical_cursor != scalar.cursor:
+            raise SMLArtifactError(
+                "checkpoint cursor is not in canonical prepared-data form"
+            )
+        retained = prune_to_latest(run)
+        if retained.checkpoint.identity != resolved.checkpoint.identity:
+            raise SMLArtifactError("latest checkpoint changed during writable recovery")
+        resolved = retained
+        if _limit_reached(config, scalar):
+            return _training_result(run, scalar)
 
-            stream = PretrainingBatchStream._from_validated_shards(
+        stream = resources.enter_context(
+            PretrainingBatchStream._from_validated_shards(
                 prepared,
                 shards,
                 batch_size=config.loader.microbatch_size,
@@ -1223,18 +1146,16 @@ def resume(
                 prefetch_depth=config.loader.prefetch_depth,
                 cursor=scalar.cursor,
             )
-            model = SMLLanguageModel(config.model, key=mx.random.key(config.seed))
-            return _run_training(
-                run,
-                resolved.run,
-                config,
-                model,
-                restored,
-                stream,
-            )
-        finally:
-            if stream is not None:
-                stream.close()
+        )
+        model = SMLLanguageModel(config.model, key=mx.random.key(config.seed))
+        return _run_training(
+            run,
+            resolved.run,
+            config,
+            model,
+            restored,
+            stream,
+        )
 
 
 __all__ = (

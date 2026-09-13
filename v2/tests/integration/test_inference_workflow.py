@@ -290,30 +290,13 @@ def test_read_only_stale_latest_recovery_reports_operational_state(
     )
     step_dirs = list((tiny_pretraining_run / "checkpoints").glob("step-*"))
     assert len(step_dirs) == 1
+    assert resolved.model_arrays
     assert resolved.step == int(step_dirs[0].name.split("-")[1])
     assert resolved.latest_recovered is True
     assert resolved.pruning_pending is False
     assert resolved.identity().latest_recovered is True
     assert resolved.identity().pruning_pending is False
     assert latest.read_bytes() == b"not-json"
-
-
-@pytest.mark.parametrize("full_verify", (False, True))
-def test_owned_model_array_loader_preserves_recovery_state(
-    tiny_pretraining_run: Path,
-    full_verify: bool,
-) -> None:
-    """Exact-step reopening preserves the preceding latest-resolution status."""
-    (tiny_pretraining_run / "latest.json").write_bytes(b"not-json")
-
-    resolved, arrays = inference.load_owned_model_arrays(
-        tiny_pretraining_run,
-        full_verify=full_verify,
-    )
-
-    assert arrays
-    assert resolved.latest_recovered is True
-    assert resolved.pruning_pending is False
 
 
 def test_resolve_holds_shared_access_lock_through_owned_array_evaluation(

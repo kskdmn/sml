@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -826,76 +825,19 @@ def _scalar_document(
     }
 
 
-def _plain_nonnegative_int(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise SMLArtifactError(f"{name} must be a nonnegative integer")
-    return value
-
-
-def _parse_scalar_document(
-    payload: bytes,
-    resolved: ResolvedStep,
-) -> ScalarSwagState:
-    try:
-        raw = json.loads(
-            payload.decode("utf-8"),
-            object_pairs_hook=lambda pairs: _json_object_no_duplicates(pairs),
-        )
-        if not isinstance(raw, dict):
-            raise SMLArtifactError("checkpoint scalar state has invalid fields")
-        state = ScalarSwagState(
-            step=_plain_nonnegative_int(raw["step"], "checkpoint scalar step"),
-            examples=_plain_nonnegative_int(
-                raw["examples"], "checkpoint scalar examples"
-            ),
-            microsteps=_plain_nonnegative_int(
-                raw["microsteps"], "checkpoint scalar microsteps"
-            ),
-            cursor=SwagCursor(
-                epoch=_plain_nonnegative_int(raw["cursor"]["epoch"], "cursor epoch"),
-                bucket_order_position=_plain_nonnegative_int(
-                    raw["cursor"]["bucket_order_position"],
-                    "cursor bucket position",
-                ),
-                row_offset=_plain_nonnegative_int(
-                    raw["cursor"]["row_offset"], "cursor row offset"
-                ),
-            ),
-        )
-        if state.step != resolved.step:
-            raise SMLArtifactError("checkpoint scalar step does not match checkpoint")
-        if canonical_json_bytes(raw) != payload:
-            raise SMLArtifactError("checkpoint scalar state is not canonical JSON")
-        return state
-    except SMLArtifactError:
-        raise
-    except (
-        json.JSONDecodeError,
-        UnicodeError,
-        TypeError,
-        ValueError,
-        KeyError,
-    ) as error:
-        raise SMLArtifactError("invalid checkpoint scalar state") from error
-
-
 def _read_scalar_state(reader: CheckpointReader) -> ScalarSwagState:
-    """Parse the scalar state already materialized by the owned reader."""
+    """Construct domain state from the reader's validated checkpoint contents."""
     if not isinstance(reader, CheckpointReader):
         raise TypeError("reader must be a CheckpointReader")
-    contents = reader.read_contents()
-    return _parse_scalar_document(
-        canonical_json_bytes(dict(contents.scalar_state)), reader.resolved
+    if not isinstance(reader.resolved.checkpoint, LoRACheckpointManifest):
+        raise SMLArtifactError("LoRA resume requires a LoRA checkpoint")
+    raw = reader.read_contents().scalar_state
+    return ScalarSwagState(
+        step=raw["step"],
+        examples=raw["examples"],
+        microsteps=raw["microsteps"],
+        cursor=SwagCursor(**raw["cursor"]),
     )
-
-
-def _json_object_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise SMLArtifactError(f"duplicate checkpoint scalar key: {key}")
-        result[key] = value
-    return result
 
 
 def _flatten_checkpoint_groups(

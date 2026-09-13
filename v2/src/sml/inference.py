@@ -7,7 +7,7 @@ import threading
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
@@ -17,12 +17,8 @@ from mlx.utils import tree_unflatten
 
 from sml.artifacts import load_safetensors_payload
 from sml.artifacts.checkpoint import (
-    ResolvedStep,
-    open_checkpoint_reader,
     open_latest_checkpoint_reader,
-    recover_latest_index,
     require_lora_base_snapshot,
-    run_access_lock,
 )
 from sml.artifacts.dispatch import open_dispatched_artifact
 from sml.artifacts.manifest import (
@@ -59,7 +55,6 @@ from sml.training.lora import (
 )
 
 _MODEL_GROUP = "model.safetensors"
-_MASTER_GROUP = "master.safetensors"
 _ADAPTER_GROUP = "adapters.safetensors"
 _COMPILATION_CACHE_LIMIT = 32
 _DECODE_VARIANT_CACHE_LIMIT = 16
@@ -234,26 +229,6 @@ class GenerationBucket:
 
 def allocate_generation_seed() -> int:
     return secrets.randbits(32)
-
-
-def vmapped_select_one_token(
-    logits: mx.array,
-    keys: mx.array,
-    request_mask: mx.array,
-    kernel_key: GenerationKernelKey,
-) -> tuple[mx.array, mx.array]:
-    def select_one_token(logits_row, key):
-        return select_next_token_arrays(
-            logits_row,
-            key,
-            temperature=kernel_key.temperature,
-            top_p=kernel_key.top_p,
-        )
-
-    selected, next_keys = mx.vmap(select_one_token, in_axes=(0, 0))(logits, keys)
-    selected = mx.where(request_mask, selected, mx.zeros_like(selected))
-    next_keys = mx.where(request_mask[:, None], next_keys, keys)
-    return selected, next_keys
 
 
 def infer(config: InferenceConfig) -> GenerationResult:
@@ -465,48 +440,6 @@ def _generation_forward(
         logits_positions=logits_positions,
     )
     return logits, cache_state
-
-
-def load_owned_model_arrays(
-    run: Path,
-    *,
-    full_verify: bool,
-) -> tuple[ResolvedStep, Mapping[str, mx.array]]:
-    if not isinstance(full_verify, bool):
-        raise TypeError("full_verify must be a bool")
-    verification = (
-        VerificationLevel.FULL if full_verify else VerificationLevel.MANIFEST_TRUSTED
-    )
-    load_groups = frozenset(
-        {_MODEL_GROUP, _MASTER_GROUP} if full_verify else {_MODEL_GROUP}
-    )
-    with run_access_lock(run, exclusive=False):
-        recovered = recover_latest_index(
-            run,
-            writable=False,
-            verification=VerificationLevel.MANIFEST_TRUSTED,
-        )
-        with open_checkpoint_reader(
-            run,
-            step=recovered.step,
-            expected_checkpoint_identity=recovered.checkpoint.identity,
-            verification=verification,
-            load_array_groups=load_groups,
-            hold_lock=False,
-        ) as reader:
-            contents = reader.read_contents()
-            model_group = contents.array_groups[_MODEL_GROUP]
-            owned = {name: model_group[name] for name in model_group}
-            mx.eval(*owned.values())
-            return (
-                replace(
-                    reader.resolved,
-                    latest_recovered=recovered.latest_recovered,
-                    latest_repair_persisted=recovered.latest_repair_persisted,
-                    pruning_pending=recovered.pruning_pending,
-                ),
-                MappingProxyType(owned),
-            )
 
 
 def _require_unit_rope(model: Mapping[str, object], *, context: str) -> ModelConfig:
@@ -1441,7 +1374,5 @@ __all__ = (
     "ScoringKernelKey",
     "allocate_generation_seed",
     "infer",
-    "load_owned_model_arrays",
     "resolve_model_artifact",
-    "vmapped_select_one_token",
 )

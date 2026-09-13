@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-import mmap
 import os
 import queue
 import threading
 from collections import OrderedDict, deque
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from traceback import clear_frames
@@ -34,7 +33,13 @@ from sml.artifacts.manifest import (
     file_identity,
     open_artifact,
 )
-from sml.data.corpus import CorpusConfig, discover_corpus_files, iter_filtered_texts
+from sml.artifacts.npy import VerifiedNpyMapping
+from sml.data.corpus import (
+    CorpusConfig,
+    corpus_metadata,
+    discover_corpus_files,
+    iter_filtered_texts,
+)
 from sml.data.tokenizer import LoadedTokenizer, load_tokenizer_bundle
 from sml.errors import SMLArtifactError, SMLDataError
 
@@ -310,85 +315,6 @@ class _ProducerFailure:
 _QUEUE_STOP = object()
 
 
-def _map_npy_payload(
-    payload: VerifiedPayload,
-    reference: PayloadRef,
-    *,
-    declared_rows: int,
-    row_width: int,
-) -> tuple[mmap.mmap, np.ndarray]:
-    stream = payload.stream
-    try:
-        version = np.lib.format.read_magic(stream)
-        if version == (1, 0):
-            shape, fortran_order, dtype = np.lib.format.read_array_header_1_0(stream)
-        elif version == (2, 0):
-            shape, fortran_order, dtype = np.lib.format.read_array_header_2_0(stream)
-        else:
-            raise ValueError(f"unsupported NPY version: {version}")
-        data_offset = stream.tell()
-    except (EOFError, OSError, TypeError, ValueError) as error:
-        raise SMLArtifactError(
-            f"invalid prepared shard NPY header: {reference.logical_path}"
-        ) from error
-
-    expected_shape = (declared_rows, row_width)
-    if shape != expected_shape:
-        raise SMLArtifactError(
-            "prepared shard shape mismatch: "
-            f"{reference.logical_path}; expected {expected_shape}, got {shape}"
-        )
-    if fortran_order:
-        raise SMLArtifactError(
-            f"prepared shard must use C order: {reference.logical_path}"
-        )
-    if np.dtype(dtype).str != _INT32.str or np.dtype(dtype).hasobject:
-        raise SMLArtifactError(
-            f"prepared shard dtype must be <i4: {reference.logical_path}"
-        )
-    expected_size = data_offset + declared_rows * row_width * _INT32.itemsize
-    actual_size = payload.opened_stat.st_size
-    if actual_size != expected_size:
-        raise SMLArtifactError(
-            f"prepared shard payload size mismatch: {reference.logical_path}"
-        )
-
-    mapping: mmap.mmap | None = None
-    array: np.ndarray | None = None
-    try:
-        mapping = mmap.mmap(stream.fileno(), length=0, access=mmap.ACCESS_READ)
-        array = np.ndarray(
-            expected_shape,
-            dtype=_INT32,
-            buffer=mapping,
-            offset=data_offset,
-            order="C",
-        )
-        array.setflags(write=False)
-        return mapping, array
-    except BaseException as error:
-        if error.__traceback__ is not None:
-            clear_frames(error.__traceback__)
-        array = None
-        cleanup_error: BaseException | None = None
-        if mapping is not None:
-            try:
-                mapping.close()
-            except BaseException as caught:  # noqa: BLE001 - cleanup must complete
-                cleanup_error = caught
-        if isinstance(error, (BufferError, OSError, TypeError, ValueError)):
-            primary: BaseException = SMLArtifactError(
-                f"could not memory-map prepared shard: {reference.logical_path}"
-            )
-        else:
-            primary = error
-        if cleanup_error is not None:
-            raise primary from cleanup_error
-        if primary is not error:
-            raise primary from error
-        raise
-
-
 def _validate_prepared_tokenizer_binding(
     manifest: PretrainingDataManifest,
     tokenizer: TokenizerManifest,
@@ -420,33 +346,6 @@ def _validate_prepared_tokenizer_binding(
             )
 
 
-def _close_prepared_resources(
-    root: ArtifactRoot | None,
-    shard_files: list[VerifiedPayload],
-    mappings: list[mmap.mmap],
-    shard_arrays: list[np.ndarray],
-) -> None:
-    shard_arrays.clear()
-    errors: list[BaseException] = []
-    while mappings:
-        try:
-            mappings.pop().close()
-        except BaseException as error:  # noqa: BLE001 - cleanup must continue
-            errors.append(error)
-    while shard_files:
-        try:
-            shard_files.pop().close()
-        except BaseException as error:  # noqa: BLE001 - cleanup must continue
-            errors.append(error)
-    if root is not None:
-        try:
-            root.close()
-        except BaseException as error:  # noqa: BLE001 - cleanup must complete
-            errors.append(error)
-    if errors:
-        raise errors[0]
-
-
 def _validated_prepared_row_blocks(
     shards: Iterable[np.ndarray],
     *,
@@ -475,9 +374,7 @@ class _PreparedShardStore:
     def __init__(self, artifact: OpenedArtifact[PretrainingDataManifest]) -> None:
         self.artifact = artifact
         self._proofs: dict[int, os.stat_result] = {}
-        self._cache: OrderedDict[int, tuple[VerifiedPayload, mmap.mmap, np.ndarray]] = (
-            OrderedDict()
-        )
+        self._cache: OrderedDict[int, VerifiedNpyMapping] = OrderedDict()
         self._closed = False
 
     def _open_payload(self, index: int) -> VerifiedPayload:
@@ -500,40 +397,34 @@ class _PreparedShardStore:
         return payload
 
     def _evict(self) -> None:
-        _index, (payload, mapping, array) = self._cache.popitem(last=False)
-        del array
-        _close_prepared_resources(None, [payload], [mapping], [])
+        _index, owner = self._cache.popitem(last=False)
+        owner.close()
 
     def get(self, index: int) -> np.ndarray:
         if self._closed:
             raise SMLDataError("prepared shard store is closed")
         if index in self._cache:
             self._cache.move_to_end(index)
-            return self._cache[index][2]
+            return self._cache[index].array
         if len(self._cache) >= _PREPARED_OPEN_SHARDS:
             self._evict()
         manifest = self.artifact.manifest
-        payload = self._open_payload(index)
-        mapping = None
-        array = None
+        owner = VerifiedNpyMapping.from_payload(
+            self._open_payload(index),
+            logical_path=manifest.shards[index].logical_path,
+            expected_shape=(manifest.shard_row_counts[index], manifest.row_width),
+            expected_dtype=_INT32,
+            description="prepared shard",
+        )
         try:
-            mapping, array = _map_npy_payload(
-                payload,
-                manifest.shards[index],
-                declared_rows=manifest.shard_row_counts[index],
-                row_width=manifest.row_width,
-            )
-            self._proofs[index] = payload.opened_stat
-            self._cache[index] = (payload, mapping, array)
-            return array
+            self._proofs[index] = owner.payload.opened_stat
+            self._cache[index] = owner
+            return owner.array
         except BaseException as error:
             if error.__traceback__ is not None:
                 clear_frames(error.__traceback__)
-            array = None
             try:
-                _close_prepared_resources(
-                    None, [payload], [] if mapping is None else [mapping], []
-                )
+                owner.close()
             except BaseException as cleanup_error:
                 raise error from cleanup_error
             raise
@@ -1293,19 +1184,6 @@ def _copy_verified_tokenizer(
     )
 
 
-def _corpus_projection(config: CorpusConfig) -> Mapping[str, object]:
-    return {
-        "filename_pattern": config.filename_pattern,
-        "shuffle_files": config.shuffle_files,
-        "file_order_seed": config.file_order_seed,
-        "text_field": config.text_field,
-        "min_text_bytes": config.min_text_bytes,
-        "max_text_bytes": config.max_text_bytes,
-        "max_rows_per_file": config.max_rows_per_file,
-        "max_files": config.max_files,
-    }
-
-
 def _encoded_text_ranges(
     texts: Iterable[str], tokenizer: LoadedTokenizer
 ) -> Iterator[Iterable[int]]:
@@ -1435,7 +1313,7 @@ def prepare_pretraining_bundle(
             row_width,
         )
         source_summary = {
-            "corpus": _corpus_projection(config.corpus),
+            "corpus": corpus_metadata(config.corpus),
             "ordered_files": tuple(path.name for path in files),
             "physical_lines_read": texts.physical_lines_read,
             "object_rows_read": texts.object_rows_read,

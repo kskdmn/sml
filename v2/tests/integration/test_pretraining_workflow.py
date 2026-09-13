@@ -694,6 +694,56 @@ def test_failure_after_atomic_creation_leaves_complete_step_zero(
     assert trainer["loss_numerator"].dtype == mx.float32
 
 
+@pytest.mark.parametrize("resume", (False, True), ids=("fresh", "resume"))
+def test_training_failure_remains_primary_when_stream_cleanup_fails(
+    prepared_data: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resume: bool,
+) -> None:
+    config = _config(prepared_data, tmp_path / "run", maximum_steps=1)
+    if resume:
+        pretrain.train(config)
+
+    training_error = InjectedFailure("training failed")
+    cleanup_error = OSError("stream cleanup failed")
+    real_close = data_module.PretrainingBatchStream.close
+    closed_streams = []
+
+    def fail_build(*_args, **_kwargs):
+        raise training_error
+
+    def fail_close(stream):
+        closed_streams.append(stream)
+        real_close(stream)
+        raise cleanup_error
+
+    monkeypatch.setattr(pretrain, "build_pretraining_kernels", fail_build)
+    monkeypatch.setattr(data_module.PretrainingBatchStream, "close", fail_close)
+
+    with pytest.raises(InjectedFailure, match="training failed") as caught:
+        if resume:
+            pretrain.resume(
+                config.output_run,
+                data=prepared_data,
+                overrides=_overrides(maximum_steps=2),
+            )
+        else:
+            pretrain.train(config)
+
+    assert caught.value is training_error
+    assert caught.value.__cause__ is cleanup_error
+    assert len(closed_streams) == 1
+    stream = closed_streams[0]
+    assert stream._closed
+    assert stream._shards is None
+    assert not stream._producer.is_alive()
+    retained = resolve_latest_step(
+        config.output_run, writable=False, verification=VerificationLevel.FULL
+    )
+    assert retained.step == (1 if resume else 0)
+
+
 @pytest.mark.parametrize("hidden_dropout", (0.2, 0.0), ids=("model-only", "disabled"))
 def test_interrupted_accumulation_replays_the_complete_window(
     prepared_data: Path,
