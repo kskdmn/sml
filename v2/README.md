@@ -3,6 +3,103 @@
 SML v2 is an MLX-only language-model workflow for Apple Silicon. Run every
 command from the repository root with Python 3.12 through `uv run`.
 
+Create bundles and train or resume runs on a local APFS filesystem. Reading a
+run's latest checkpoint also requires a local filesystem.
+
+## Differences from v1
+
+Compared with [v1](../v1/README.md), v2 moves model execution from PyTorch to MLX,
+increases the default model width and vocabulary, prepares reusable datasets
+before training, and packages models with their tokenizer and verified training
+state. SWAG fine-tuning also changes its objective: v2 learns to rank all four
+endings, while v1 learns to generate only the correct ending.
+
+### Model and tokenizer defaults
+
+Both versions use a decoder-only Transformer with RMSNorm, grouped-query
+attention, a SwiGLU feed-forward network, rotary position embeddings, and tied
+input/output embeddings. Both train a SentencePiece BPE tokenizer with byte
+fallback and the same unknown/BOS/EOS/padding IDs (`0/1/2/3`). The default
+dimensions differ:
+
+| Setting | v1 | v2 |
+| --- | --- | --- |
+| Model parameters (default tied embeddings) | About 48.8 million | About 99.9 million |
+| Vocabulary size | 24,576 | 28,672 |
+| Hidden width | 512 | 768 |
+| Transformer layers | 12 | 12 |
+| Query / key-value heads | 8 / 2 | 12 / 3 |
+| Head dimension | 64 | 64 |
+| Feed-forward width | 1,536 | 2,176 |
+| Query / key / value projection biases | Enabled | Disabled |
+| Attention dropout | 0.005 | None |
+| Attention-output / feed-forward-output initialization std. dev. | 0.02 | `0.02 / sqrt(2 * num_layers)` |
+| Pretraining sequence length | 1,024 tokens | 1,024 tokens |
+| Default inference context | 2,048 tokens with 2× YaRN scaling | 1,024 tokens with unscaled RoPE |
+| Reserved conversation symbols | None | `<\|system\|>`, `<\|user\|>`, `<\|assistant\|>` |
+
+V2's model code includes YaRN, but its training and artifact-loading workflows
+require a RoPE scaling factor of `1.0`; v1's automatic 2× inference extension does
+not carry over. The conversation symbols are tokenizer vocabulary entries; the
+fine-tuning workflow remains SWAG.
+
+Defaults are defined in [v1's configuration](../v1/src/sml_config.py),
+[v1's tokenizer script](../v1/src/train_tokenizer.py),
+[v2's model configuration](src/sml/model/config.py), and
+[v2's tokenizer configuration](src/sml/data/tokenizer.py).
+
+### Data and training workflow
+
+| Area | v1 | v2 |
+| --- | --- | --- |
+| Runtime | PyTorch; automatic device selection prefers MPS, then CUDA, then CPU | MLX on Apple Silicon, with compiled training kernels enabled by default |
+| Configuration | Separate scripts; training settings live in Python dataclasses | One `python -m sml` CLI with command-specific TOML and explicit flag overrides |
+| Pretraining input | Decompresses, tokenizes, and packs corpus text during training | `prepare pretraining` writes shuffled, fixed-width NPY shards; training reads memory-mapped token rows |
+| Tokenizer sampling | Uses all eligible rows within a fixed shard-name pattern and 10,000-line limit per file | Seeded sampling of unique normalized documents, capped at 100,000 documents / 128 MiB by default, with separate scan limits |
+| Base learning-rate schedule | Defaults to a 100,000-update horizon and 100 warmup updates | Resolves the horizon from the planned update budget; warmup defaults to 1% and the resolved schedule is preserved on resume |
+| Base training precision | FP32 parameters with configurable autocast, BF16 by default on accelerators | BF16 working parameters with FP32 master weights, gradient accumulators, and optimizer state |
+| Base optimizer defaults | AdamW with bias correction and weight decay of 0.1 on all parameters | AdamW without bias correction; weight decay of 0.1 on projections and zero on embeddings, output head, and RMSNorm |
+| SWAG input | Loads and encodes the dataset as part of fine-tuning | `prepare swag` pins a dataset revision and writes reusable, length-bucketed candidate arrays |
+| SWAG objective | Token prediction on the correct ending, with context masked from the loss | Cross-entropy over all four candidate scores, using mean continuation-token log-likelihood including EOS |
+| Checkpoints | `.pt` files; the tokenizer is a separate file | Run directories with manifests, safetensors, a copied tokenizer, data identities, and recoverable latest-checkpoint publication |
+| LoRA output | Saves merged weights and adapter state together in `sml-swag.pt` | Keeps a frozen base snapshot and adapter checkpoints; `export` creates a separate merged inference bundle |
+
+V2 also widens the default corpus text filter: v1 requires at least 100 characters
+and at most 2,000 UTF-8 bytes, while v2 uses **100–16,384 UTF-8 bytes** after the
+same null-character replacement and whitespace normalization. V2 discovers all
+nonhidden `*.jsonl.zst` direct children and defaults to scanning up to 100 files
+and 8,192 lines per file. Tokenizer sampling limits apply only to tokenizer
+training; pretraining has independent corpus scan settings.
+
+Both versions keep a default microbatch size of **1** and **8** gradient
+accumulation steps. V2 applies a partial accumulation window at an epoch boundary
+and selects the final checkpoint after the requested budget. Its resume checks
+bind the run to its saved data and training configuration; see
+[Base training](#base-training) for the allowed overrides.
+
+SWAG keeps LoRA rank `16`, alpha `32`, dropout `0.05`, and the attention Q/K/V/O
+targets. V2 defaults to rank-stabilized LoRA (`alpha / sqrt(rank)`, a scale of `8`)
+instead of v1's `alpha / rank` (a scale of `2`), and initializes adapter A from a
+normal distribution with standard deviation `0.01` instead of Kaiming uniform;
+both initialize adapter B to zero. The default SWAG stopping limits change from
+8,192 updates / 1 epoch to 8,192 updates / 5 epochs, stopping at whichever comes
+first. With the default 8,192-update schedule, v2's 1% warmup is 81 updates versus
+v1's 100. See [v2's LoRA configuration](src/sml/training/lora.py) and
+[SWAG training](src/sml/training/swag.py) for these defaults and the ranking loss.
+
+### Compatibility and available commands
+
+V2 commands consume v2 artifact directories. They do not load v1's `sml.pt`,
+`sml-swag.pt`, or standalone `bpe_tokenizer.model`, and there is no v1 checkpoint
+conversion command. To start a v2 run, follow `tokenize` → `prepare pretraining`
+→ `train` below, then optionally `prepare swag` → `finetune` → `export`.
+
+Both versions provide text generation and HellaSwag/Winogrande evaluation. V2
+combines those evaluation tasks under `evaluate` and records model, tokenizer,
+dataset, and request provenance in the result. V1 additionally has an
+OpenAI-compatible HTTP server (`infer_sml.py --serve`) and a HumanEval script;
+those features are not exposed by v2's CLI.
+
 ## Unified command line
 
 The package exposes one entrypoint:
@@ -183,13 +280,17 @@ Resolve an immutable Hugging Face revision, encode SWAG candidates with the
 selected model's copied tokenizer, and publish an offline-reusable bundle:
 
 ```sh
-uv run python -m sml prepare swag --checkpoint v2/output/base-run --revision 0123456789abcdef --output v2/output/swag-data
+uv run python -m sml prepare swag --checkpoint v2/output/base-run --revision main --output v2/output/swag-data
 ```
 
+The `main` revision is resolved to a commit SHA and recorded in the bundle. Pass
+an explicit commit SHA to reproduce that revision in a new output directory.
+
 Preparation fully verifies the selected base run before publication.
-Repeating the command with the same configuration and output reuses a matching,
-fully verified bundle without contacting the dataset provider. Changed configuration
-or damaged cached payloads are rejected.
+Repeating the command with the same configuration, selected model checkpoint,
+and output reuses a matching, fully verified bundle without contacting the dataset
+provider. Advancing the base run changes the selected checkpoint and requires a new
+output directory. Changed configuration or damaged cached payloads are rejected.
 
 ### LoRA fine-tuning
 
@@ -227,14 +328,15 @@ uv run python -m sml verify --full v2/output/swag-export
 The default `manifest-trusted` level validates canonical manifests, identities,
 paths, structure, and the payloads a read-only workflow consumes. `--full`
 rehashes every declared payload. Training, resume, SWAG preparation, merged
-export, recovery, and retention always use full correctness-sensitive checks;
-inference and evaluation default to `manifest-trusted` and opt into full checks
-with `--full`.
+export, and writable recovery and retention always use full correctness-sensitive
+checks. Inference and evaluation default to `manifest-trusted` and opt into full
+checks with `--full`; read-only recovery uses the workflow's verification level.
 
 ## Artifact layouts
 
-All supported artifacts are directories. Manifests use canonical JSON and bind
-the identities, sizes, dtypes, shapes, and relative paths of their payloads.
+Tokenizer, prepared-data, run, and export artifacts are directories; evaluation
+results are standalone JSON files. Manifests use canonical JSON and bind the
+identities, sizes, dtypes, shapes, and relative paths of their payloads.
 
 Tokenizer bundle:
 
@@ -334,10 +436,11 @@ swag-export/
 
 ## Latest-only model selection
 
-Model-consuming commands accept a complete pretraining run, LoRA run, or merged
-export directory. A run always resolves through its recovered `latest.json`.
-Artifact manifests determine the accepted directory kind. Writable resume and
-export operations recover and prune crash leftovers only after full verification,
-while read-only
-inference and evaluation can recover a stale latest index in memory without
-mutating the artifact.
+Inference, evaluation, and SWAG preparation accept a complete pretraining run,
+LoRA run, or merged export directory. New fine-tuning requires a pretraining run;
+merged export requires a LoRA run. Artifact manifests determine the accepted
+directory kind, and runs resolve through their recovered `latest.json`.
+
+Writable resume operations recover and prune crash leftovers only after full
+verification. Inference, evaluation, verification, and export can recover a stale
+latest index in memory without modifying the source run.
