@@ -1775,19 +1775,18 @@ def _epoch_bucket_plan(
     *,
     epoch_seed: int,
     epoch: int,
-) -> tuple[tuple[int, tuple[int, ...]], ...]:
+) -> tuple[tuple[int, np.ndarray], ...]:
     generator = np.random.Generator(
         np.random.PCG64(np.random.SeedSequence([epoch_seed, epoch]))
     )
     bucket_order = tuple(int(index) for index in generator.permutation(len(buckets)))
-    plan: list[tuple[int, tuple[int, ...]]] = []
+    plan: list[tuple[int, np.ndarray]] = []
     for bucket_index in bucket_order:
         row_count = int(buckets[bucket_index].input_ids.shape[0])
         if row_count == 0:
             continue
-        row_permutation = tuple(
-            int(index) for index in generator.permutation(row_count)
-        )
+        row_permutation = generator.permutation(row_count)
+        row_permutation.setflags(write=False)
         plan.append((bucket_index, row_permutation))
     return tuple(plan)
 
@@ -1807,7 +1806,7 @@ def _synthetic_candidates(
 
 def _assemble_batch_arrays(
     bucket: SwagBucket,
-    row_indices: tuple[int, ...],
+    row_indices: tuple[int, ...] | np.ndarray,
     *,
     batch_size: int,
     manifest: SwagDataManifest,
@@ -2168,7 +2167,7 @@ class SwagBatchStream:
         self._committed_sequence = 0
         self._initial_epoch = cursor.epoch
         self._plan_epoch: int | None = None
-        self._plan: tuple[tuple[int, tuple[int, ...]], ...] = ()
+        self._plan: tuple[tuple[int, np.ndarray], ...] = ()
         self._epoch_complete = False
         self._closed = False
         self._producer: threading.Thread | None = None

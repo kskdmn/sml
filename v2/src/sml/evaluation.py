@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
-from sml.artifacts.manifest import structured_identity
+from sml.artifacts.manifest import canonical_json_bytes, structured_identity
 from sml.errors import SMLRuntimeError
 from sml.evaluation_result import (
     EvaluationProviderVersion,
@@ -253,10 +253,10 @@ def _capture_effective_eval_docs(task: object) -> None:
 
 
 class _EvaluationRequestRecorder:
-    """Capture normalized lm-eval requests in actual dispatch order."""
+    """Hash normalized requests in dispatch order without retaining their text."""
 
     def __init__(self) -> None:
-        self._requests: dict[str, list[dict[str, object]]] = {}
+        self._request_hashes = {}
 
     def record(self, request_type: str, requests: Sequence[object]) -> None:
         if request_type not in {"loglikelihood", "generate_until"}:
@@ -283,7 +283,7 @@ class _EvaluationRequestRecorder:
             normalized_args = normalize_json_value(
                 args, context="evaluation request args"
             )
-            self._requests.setdefault(task_name, []).append(
+            encoded = canonical_json_bytes(
                 {
                     "request_type": request_type,
                     "task_name": task_name,
@@ -292,18 +292,28 @@ class _EvaluationRequestRecorder:
                     "args": normalized_args,
                 }
             )
+            digest = self._request_hashes.get(task_name)
+            if digest is None:
+                # Stream the canonical JSON array used by structured_identity.
+                digest = hashlib.sha256(b"sml-evaluation-requests-v1\0[")
+                self._request_hashes[task_name] = digest
+            else:
+                digest.update(b",")
+            digest.update(encoded)
 
     def identity_for(self, task_name: str) -> str:
         if not isinstance(task_name, str) or not task_name:
             raise SMLRuntimeError("evaluation task name is invalid")
-        requests = self._requests.get(task_name)
-        if not requests:
+        digest = self._request_hashes.get(task_name)
+        if digest is None:
             raise SMLRuntimeError(f"no recorded evaluation requests for {task_name}")
-        return structured_identity("sml-evaluation-requests-v1", tuple(requests))
+        completed = digest.copy()
+        completed.update(b"]")
+        return f"sha256:{completed.hexdigest()}"
 
     @property
     def task_names(self) -> frozenset[str]:
-        return frozenset(self._requests)
+        return frozenset(self._request_hashes)
 
 
 def _evaluation_seeds() -> dict[str, int]:

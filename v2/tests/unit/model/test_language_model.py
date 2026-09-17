@@ -86,6 +86,18 @@ def test_base_precision_boundaries():
     assert model.layers[0].self_attn.rope.cos_cached.dtype == mx.float32
 
 
+def test_rotary_tables_are_shared_within_each_model():
+    config = _tiny_model_config(num_layers=3)
+    model = SMLLanguageModel(config, key=mx.random.key(9))
+    other = SMLLanguageModel(config, key=mx.random.key(9))
+    rope = model.layers[0].self_attn.rope
+
+    assert all(layer.self_attn.rope is rope for layer in model.layers)
+    assert other.layers[0].self_attn.rope is not rope
+    assert rope.cos_cached.shape == (config.effective_context_length, config.head_dim)
+    assert rope.sin_cached.shape == rope.cos_cached.shape
+
+
 @pytest.mark.parametrize("positions", [[[0, 0, 0]], [[2, 1, 0]]])
 def test_uncached_causality_follows_token_order_with_custom_rotary_positions(positions):
     model = SMLLanguageModel(_tiny_model_config(), key=mx.random.key(9))

@@ -1238,9 +1238,37 @@ def test_swag_prefetch_finishes_after_the_requested_epoch(tmp_path):
         envelopes[0].release()
 
 
+def test_swag_epoch_plan_preserves_seeded_order_in_compact_readonly_arrays():
+    from sml.data.swag import SwagBucket, _epoch_bucket_plan
+
+    buckets = tuple(
+        SwagBucket(
+            length=8,
+            input_ids=np.zeros((count, 4, 8), dtype=np.int32),
+            valid_token_mask=np.zeros((count, 4, 8), dtype=bool),
+            score_mask=np.zeros((count, 4, 8), dtype=bool),
+            labels=np.zeros(count, dtype=np.int32),
+        )
+        for count in (4, 0, 3)
+    )
+
+    plan = _epoch_bucket_plan(buckets, epoch_seed=11, epoch=2)
+
+    assert [(index, rows.tolist()) for index, rows in plan] == [
+        (0, [3, 0, 1, 2]),
+        (2, [1, 0, 2]),
+    ]
+    for _index, rows in plan:
+        assert rows.dtype == np.dtype(np.intp)
+        assert rows.flags.c_contiguous
+        assert not rows.flags.writeable
+
+
+@pytest.mark.parametrize("array_indices", [False, True])
 @pytest.mark.parametrize("row_indices", [(3,), (3, 0, 2, 1), (3, 0, 2), (3, 1)])
 def test_swag_batch_gather_preserves_order_owned_storage_and_synthetic_tails(
     row_indices,
+    array_indices,
 ):
     from sml.data.swag import SwagBucket, _assemble_batch_arrays
 
@@ -1255,6 +1283,8 @@ def test_swag_batch_gather_preserves_order_owned_storage_and_synthetic_tails(
         labels=np.array([1, 3, 0, 2], dtype=np.int32),
     )
     manifest = SimpleNamespace(pad_token_id=3, bos_token_id=1, eos_token_id=2)
+    if array_indices:
+        row_indices = np.asarray(row_indices, dtype=np.intp)
     arrays = _assemble_batch_arrays(
         bucket, row_indices, batch_size=batch_size, manifest=manifest
     )

@@ -253,6 +253,10 @@ rejected instead of silently enabling caching. Persistent sessions retain a
 bounded set of recently used compiled functions and share prefill compilation
 across decoding settings.
 
+Each model shares its RoPE tables across transformer layers. Generation prefill
+applies the final RMSNorm and vocabulary projection only to the last prompt token
+needed to start decoding, reducing work for long prompts.
+
 ### Evaluation
 
 Evaluate one or more supported lm-eval tasks and atomically write the result:
@@ -269,6 +273,10 @@ intentionally excluded from the artifact and its identity.
 Results use schema version 3 and bind each model to its complete artifact
 identity, so different exported weights remain distinguishable even when the
 tokenizer and source step match.
+
+The request recorder hashes each request as it arrives, avoiding retention of the
+full request text corpus while preserving the existing ordered-request identity
+format.
 
 Repeating an evaluation at the same output path reuses the saved result when
 only the provider's execution date changes. The original timestamp, artifact
@@ -444,3 +452,13 @@ directory kind, and runs resolve through their recovered `latest.json`.
 Writable resume operations recover and prune crash leftovers only after full
 verification. Inference, evaluation, verification, and export can recover a stale
 latest index in memory without modifying the source run.
+
+## Performance benchmarks
+
+See the [benchmark guide](benchmarks/README.md) for reproducible measurements of
+data loading, training, SWAG fine-tuning, inference, checkpoint publication, and
+Metal memory use.
+
+Benchmark baselines and quality evidence are bound to the harness source identity.
+After changing the harness or its adapters, capture fresh evidence before comparing
+results; measurements from an older harness identity cannot be reused.

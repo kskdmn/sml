@@ -103,7 +103,7 @@ def _require_same_structure(
     *,
     left_name: str,
     right_name: str,
-) -> tuple[dict[str, mx.array], dict[str, mx.array]]:
+) -> None:
     _array_leaves(left, left_name)
     _array_leaves(right, right_name)
 
@@ -143,7 +143,6 @@ def _require_same_structure(
         )
 
     compare(left, right)
-    return {}, {}
 
 
 def _require_matching_tree_keys(
@@ -184,11 +183,10 @@ def _require_matching_tree_keys(
     compare(left, right)
 
 
-def _require_dtype(tree: object, name: str, dtype: mx.Dtype) -> dict[str, mx.array]:
+def _require_dtype(tree: object, name: str, dtype: mx.Dtype) -> None:
     leaves = _array_leaves(tree, name)
     if any(leaf.dtype != dtype for leaf in leaves):
         raise SMLConfigurationError(f"{name} leaves must have dtype {dtype}")
-    return {}
 
 
 def _path_category(path: str) -> str:
@@ -902,58 +900,16 @@ def adamw_mixed_precision_update_tree(
     weight_decay_tree: dict,
 ) -> tuple[dict, dict, tuple[mx.array, dict, dict]]:
     """Update explicit Adam array trees without constructing host state wrappers."""
-    if not isinstance(config, OptimizerConfig):
-        raise SMLConfigurationError("config must be an OptimizerConfig")
-    if not isinstance(adam_tree, tuple) or len(adam_tree) != 3:
-        raise SMLConfigurationError("Adam state tree must be a three-item tuple")
-    step, first_state, second_state = adam_tree
-    if not isinstance(first_state, dict) or not isinstance(second_state, dict):
-        raise SMLConfigurationError("Adam state tree must contain moment dicts")
-    if not isinstance(step, mx.array) or step.dtype != mx.int32 or step.shape != ():
-        raise SMLConfigurationError("Adam step must be an int32 scalar")
-    if _materialized_truth((step >= 0) & (step <= _INT32_MAX)) is False:
-        raise SMLConfigurationError("Adam step must be an int32 counter")
-    _require_top_level_dict(master_parameters, "master_parameters")
-    _require_top_level_dict(gradients, "gradients")
-    _require_top_level_dict(weight_decay_tree, "weight_decay_tree")
-    _require_same_structure(
+    step, first_state, second_state, can_increment = _validate_adamw_trees(
         master_parameters,
         gradients,
-        left_name="master_parameters",
-        right_name="gradients",
-    )
-    _require_dtype(master_parameters, "master_parameters", mx.float32)
-    gradient_leaves = _array_leaves(gradients, "gradients")
-    if any(leaf.dtype not in (mx.bfloat16, mx.float32) for leaf in gradient_leaves):
-        raise SMLConfigurationError(
-            "gradients leaves must have dtype bfloat16 or float32"
-        )
-    _require_same_structure(
-        master_parameters,
-        first_state,
-        left_name="master_parameters",
-        right_name="first_moments",
-    )
-    _require_same_structure(
-        master_parameters,
-        second_state,
-        left_name="master_parameters",
-        right_name="second_moments",
-    )
-    _require_dtype(first_state, "first_moments", mx.float32)
-    _require_dtype(second_state, "second_moments", mx.float32)
-    _require_matching_tree_keys(
-        master_parameters,
+        adam_tree,
+        config,
         weight_decay_tree,
-        left_name="master_parameters",
-        right_name="weight_decay_tree",
+        parameter_name="master_parameters",
+        allow_bf16_gradients=True,
     )
     fp32_gradients = tree_map(lambda gradient: gradient.astype(mx.float32), gradients)
-    can_increment = step < _INT32_MAX
-    if _materialized_truth(can_increment) is False:
-        raise SMLConfigurationError(
-            "Adam step cannot be incremented past int32 maximum"
-        )
     updated_masters, next_tree = _adamw_fp32_formula(
         master_parameters,
         fp32_gradients,

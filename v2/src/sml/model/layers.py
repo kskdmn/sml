@@ -160,7 +160,13 @@ def _apply_rotary_batched(
 
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, config: ModelConfig, layer_index: int) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_index: int,
+        *,
+        rope: RotaryEmbedding | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.layer_index = layer_index
@@ -174,7 +180,7 @@ class GroupedQueryAttention(nn.Module):
             config.num_kv_heads * config.head_dim,
         )
         self.o_proj = _Linear(config.hidden_size, config.hidden_size)
-        self.rope = RotaryEmbedding(config)
+        self.rope = RotaryEmbedding(config) if rope is None else rope
 
     def forward_arrays(
         self,
@@ -368,10 +374,16 @@ class SwiGLUFeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config: ModelConfig, layer_index: int) -> None:
+    def __init__(
+        self,
+        config: ModelConfig,
+        layer_index: int,
+        *,
+        rope: RotaryEmbedding | None = None,
+    ) -> None:
         super().__init__()
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_epsilon)
-        self.self_attn = GroupedQueryAttention(config, layer_index)
+        self.self_attn = GroupedQueryAttention(config, layer_index, rope=rope)
         self.post_attn_norm = RMSNorm(config.hidden_size, config.rms_norm_epsilon)
         self.mlp = SwiGLUFeedForward(config)
 

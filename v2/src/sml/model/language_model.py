@@ -10,6 +10,7 @@ from sml.artifacts.manifest import ArraySpec
 from sml.model.cache import KVArrayState, KVCache
 from sml.model.config import InitializerConfig, ModelConfig
 from sml.model.layers import LoRAForwardPolicy, RMSNorm, TransformerBlock
+from sml.model.rope import RotaryEmbedding
 
 
 class _Embedding(nn.Module):
@@ -117,8 +118,9 @@ class SMLLanguageModel(nn.Module):
         self.config = config
         self.lora_forward_policy: LoRAForwardPolicy | None = None
         self.embed_tokens = _Embedding(config.vocab_size, config.hidden_size)
+        rope = RotaryEmbedding(config)
         self.layers = [
-            TransformerBlock(config, layer_index)
+            TransformerBlock(config, layer_index, rope=rope)
             for layer_index in range(config.num_layers)
         ]
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_epsilon)
@@ -259,13 +261,13 @@ class SMLLanguageModel(nn.Module):
                 training=training,
                 key=key,
             )
+        if logits_positions is not None:
+            hidden = mx.take_along_axis(hidden, logits_positions[:, :, None], axis=1)
         hidden = RMSNorm.forward_arrays(
             parameters["norm"]["weight"],
             hidden,
             self.norm.epsilon,
         )
-        if logits_positions is not None:
-            hidden = mx.take_along_axis(hidden, logits_positions[:, :, None], axis=1)
         if self.config.tie_word_embeddings:
             logits = hidden @ parameters["embed_tokens"]["weight"].T
         else:

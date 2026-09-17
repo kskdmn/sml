@@ -10,6 +10,7 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 import zstandard as zstd
+from mlx.utils import tree_flatten
 from sml import inference
 from sml.artifacts import checkpoint
 from sml.data.corpus import CorpusConfig
@@ -175,6 +176,14 @@ def test_session_runtime_config_rejects_non_increasing_batch_buckets() -> None:
 def test_session_runtime_config_rejects_non_positive_batch_buckets() -> None:
     with pytest.raises(ValueError, match="positive"):
         InferenceRuntimeConfig(batch_size_buckets=(1, 0, 4))
+
+
+def test_session_model_reuses_resolved_weights(tiny_session: InferenceSession) -> None:
+    parameters = dict(tree_flatten(tiny_session._model.parameters()))
+    resolved = tiny_session.resolved_model.model_arrays
+
+    assert parameters.keys() == resolved.keys()
+    assert all(parameters[name] is weight for name, weight in resolved.items())
 
 
 @pytest.mark.parametrize("token_ids", [(), (4,), (4, 5), (4, 5, 6)])

@@ -31,7 +31,6 @@ from sml.training.random import counter_random_key
 from sml.training.swag import (
     SwagTrainerState,
     SwagTrainingConfig,
-    _merge_adapter_parameters,
     build_swag_kernels,
     initial_swag_trainer_state,
 )
@@ -288,11 +287,8 @@ class SwagRuntime:
             self.adapters, self.optimizer, self.trainer = self.kernels.optimizer_step(
                 self.adapters, self.optimizer, self.trainer
             )
-            mx.eval(self.adapters, self.optimizer.to_tree(), self.trainer.to_tree())
             self._completed_steps.append(self.optimizer.step)
-            self.model.update(
-                _merge_adapter_parameters(self.adapters, self.frozen_base)
-            )
+            self.model.update(self.adapters)
         return float(units * self.accumulation_steps * self.batch_size)
 
     def reset_measured_order(self) -> None:

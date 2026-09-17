@@ -663,6 +663,7 @@ class InferenceSession:
         self.buffer_pool = BufferPool()
         self._model = SMLLanguageModel(resolved.model_config, key=mx.random.key(0))
         self._parameters = tree_unflatten(sorted(resolved.model_arrays.items()))
+        self._model.update(self._parameters)
         self._forward = partial(_generation_forward, self._model)
         self._prefill_compiled: OrderedDict[tuple[int, int, int], object] = (
             OrderedDict()
