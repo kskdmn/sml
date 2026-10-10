@@ -458,6 +458,7 @@ def test_full_base_verification_is_metadata_only(tmp_path, monkeypatch):
         ("wrong-dtype", "model parameter specs"),
         ("wrong-shape", "model parameter specs"),
         ("invalid-config", "invalid base snapshot model configuration"),
+        ("scaled-rope", "base snapshot rope_scaling_factor must be exactly 1.0"),
     ),
 )
 def test_full_base_rejects_resigned_semantic_corruption(
@@ -468,9 +469,12 @@ def test_full_base_rejects_resigned_semantic_corruption(
     """Base FULL requires the exact BF16 plain-model tree and canonical config."""
     root = tmp_path / f"base-{mutation}"
     manifest, arrays = _write_base_bundle(root)
-    if mutation == "invalid-config":
+    if mutation in ("invalid-config", "scaled-rope"):
         model = dict(manifest.model)
-        model["hidden_size"] = 0
+        if mutation == "scaled-rope":
+            model["rope_scaling_factor"] = 8.0
+        else:
+            model["hidden_size"] = 0
         manifest = replace(manifest, model=model)
     else:
         name = next(iter(arrays))
@@ -625,7 +629,9 @@ def test_full_tokenizer_rejects_resigned_semantic_corruption(
         verify_artifact(root, full=True)
 
 
-def _write_export_bundle(root: Path, tokenizer_root: Path) -> ExportManifest:
+def _write_export_bundle(
+    root: Path, tokenizer_root: Path, *, rope_scaling_factor: float = 1.0
+) -> ExportManifest:
     root.mkdir()
     shutil.copytree(tokenizer_root, root / "tokenizer")
     tokenizer = read_manifest(
@@ -641,6 +647,7 @@ def _write_export_bundle(root: Path, tokenizer_root: Path) -> ExportManifest:
         num_kv_heads=1,
         intermediate_size=8,
         original_context_length=8,
+        rope_scaling_factor=rope_scaling_factor,
         hidden_dropout=0.0,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -677,12 +684,17 @@ def _write_export_bundle(root: Path, tokenizer_root: Path) -> ExportManifest:
     return manifest
 
 
+@pytest.mark.parametrize("rope_scaling_factor", (1.0, 2.0, 8.0))
 def test_full_export_verification_is_metadata_only(
-    tmp_path, prepared_template, monkeypatch
+    tmp_path, prepared_template, monkeypatch, rope_scaling_factor
 ):
     """Export FULL verification must validate leaves without loading their values."""
     root = tmp_path / "export"
-    _write_export_bundle(root, prepared_template / "tokenizer")
+    _write_export_bundle(
+        root,
+        prepared_template / "tokenizer",
+        rope_scaling_factor=rope_scaling_factor,
+    )
 
     def reject_materialization(*_args, **_kwargs):
         raise AssertionError("model materialization is forbidden in verification")
@@ -692,6 +704,7 @@ def test_full_export_verification_is_metadata_only(
     result = verify_artifact(root, full=True)
 
     assert result.verification is VerificationLevel.FULL
+    assert result.manifest.model["rope_scaling_factor"] == rope_scaling_factor
 
 
 @pytest.mark.parametrize(

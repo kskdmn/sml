@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -58,7 +59,7 @@ from sml.errors import (
     SMLDataError,
     SMLRuntimeError,
 )
-from sml.model.config import ModelConfig
+from sml.model.config import DEFAULT_EXTENDED_ROPE_SCALING_FACTOR, ModelConfig
 from sml.model.language_model import SMLLanguageModel
 from sml.model.layers import LoRAForwardPolicy
 from sml.training.common import (
@@ -185,11 +186,22 @@ class SwagTrainingConfig:
     log_interval: int = 10
     seed: int = 42
     compile: bool = True
+    rope_scaling_factor: float = DEFAULT_EXTENDED_ROPE_SCALING_FACTOR
 
     def __post_init__(self) -> None:
         for field_name in ("base_checkpoint", "data", "output_run"):
             if not isinstance(getattr(self, field_name), Path):
                 raise SMLConfigurationError(f"{field_name} must be a Path")
+        if (
+            isinstance(self.rope_scaling_factor, bool)
+            or not isinstance(self.rope_scaling_factor, (int, float))
+            or not math.isfinite(self.rope_scaling_factor)
+            or self.rope_scaling_factor < 1.0
+        ):
+            raise SMLConfigurationError(
+                "rope_scaling_factor must be finite and at least 1.0"
+            )
+        object.__setattr__(self, "rope_scaling_factor", float(self.rope_scaling_factor))
         for field_name, expected_type in (
             ("lora", LoRAConfig),
             ("optimizer", OptimizerConfig),
@@ -673,6 +685,7 @@ def _verified_swag(
     expected_identity: str | None,
     tokenizer_identity: str,
     base_identity: str | None,
+    context_length: int,
 ) -> SwagDataBundle:
     bundle = load_swag_bundle(path, VerificationLevel.FULL)
     try:
@@ -685,6 +698,15 @@ def _verified_swag(
             raise SMLArtifactError("prepared SWAG tokenizer identity does not match")
         if base_identity is not None and bundle.manifest.base_identity != base_identity:
             raise SMLArtifactError("prepared SWAG base identity does not match")
+        if bundle.manifest.preprocessing["maximum_length"] > context_length:
+            raise SMLArtifactError(
+                "prepared SWAG maximum_length exceeds the fine-tuning context length"
+            )
+        with bundle.borrow_buckets() as buckets:
+            if any(bucket.length > context_length for bucket in buckets):
+                raise SMLArtifactError(
+                    "prepared SWAG bucket length exceeds the fine-tuning context length"
+                )
         return bundle
     except BaseException as error:
         try:
@@ -749,8 +771,6 @@ def _config_from_run(
 ) -> SwagTrainingConfig:
     try:
         model = ModelConfig(**_mapping_dict(manifest.model, "model"))
-        if model.rope_scaling_factor != 1.0:
-            raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
         lora = lora_config_from_mapping(_mapping_dict(manifest.lora, "lora"))
         precision = LoRAPrecisionConfig(
             **_mapping_dict(manifest.precision, "precision")
@@ -788,6 +808,7 @@ def _config_from_run(
             base_checkpoint=run,
             data=data,
             output_run=run,
+            rope_scaling_factor=model.rope_scaling_factor,
             lora=lora,
             optimizer=optimizer,
             loader=loader,
@@ -1275,11 +1296,15 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
                 f"fresh run target already exists: {config.output_run}"
             )
         selected = _select_pretraining_base(config.base_checkpoint)
+        model_config = replace(
+            selected.model_config, rope_scaling_factor=config.rope_scaling_factor
+        )
         bundle = _verified_swag(
             config.data,
             expected_identity=None,
             tokenizer_identity=selected.tokenizer_identity,
             base_identity=selected.identity,
+            context_length=model_config.effective_context_length,
         )
         with bundle:
             runtime: tuple[SMLLanguageModel, _RestoredSwagState] | None = None
@@ -1312,7 +1337,7 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
                 (private_run / "checkpoints").mkdir()
                 manifest = _run_manifest(
                     config,
-                    model=selected.model,
+                    model=dataclasses.asdict(model_config),
                     tokenizer_identity=selected.tokenizer_identity,
                     base_identity=snapshot.identity,
                     data_identity=bundle.manifest.identity,
@@ -1325,7 +1350,7 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
                     VerificationLevel.FULL,
                 ) as copied_base:
                     model, adapters, frozen_base = _wrap_copied_base(
-                        selected.model_config,
+                        model_config,
                         _load_base_snapshot_arrays(copied_base),
                         config.lora,
                         model_key,
@@ -1384,10 +1409,6 @@ def resume_finetune(
             resolved = preliminary.resolved
             if not isinstance(resolved.run, LoRARunManifest):
                 raise SMLArtifactError("LoRA resume requires a LoRA run")
-            if resolved.run.model.get("rope_scaling_factor") != 1.0:
-                raise SMLArtifactError(
-                    "LoRA run rope_scaling_factor must be exactly 1.0"
-                )
             diagnostic = resolved.run.diagnostic_data_locator
             data_path = (
                 data if data is not None else (Path(diagnostic) if diagnostic else None)
@@ -1397,12 +1418,14 @@ def resume_finetune(
                     "resume requires a prepared-data bundle location"
                 )
             config = _config_from_run(run, data_path, resolved.run, overrides)
+            model_config = ModelConfig(**_mapping_dict(resolved.run.model, "model"))
             preliminary_checkpoint_identity = resolved.checkpoint.identity
         bundle = _verified_swag(
             data_path,
             expected_identity=resolved.run.data_identity,
             tokenizer_identity=resolved.run.tokenizer_identity,
             base_identity=None,
+            context_length=model_config.effective_context_length,
         )
         with bundle:
             with open_latest_checkpoint_reader(
@@ -1504,8 +1527,6 @@ def export_merged(checkpoint: Path, output: Path) -> ExportResult:
         recovered = reader.resolved
         if not isinstance(recovered.run, LoRARunManifest):
             raise SMLArtifactError("merged export requires a LoRA run")
-        if recovered.run.model.get("rope_scaling_factor") != 1.0:
-            raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
         with reader.open_run_child("tokenizer", (TokenizerManifest,)) as tokenizer:
             if tokenizer.manifest.identity != recovered.run.tokenizer_identity:
                 raise SMLArtifactError(

@@ -105,6 +105,7 @@ class SwagRuntime:
             base_checkpoint=directory / "base",
             data=directory / "encoded",
             output_run=directory / "run",
+            rope_scaling_factor=model_config.rope_scaling_factor,
             lora=lora,
             optimizer=OptimizerConfig(
                 learning_rate=optimizer["learning_rate"],

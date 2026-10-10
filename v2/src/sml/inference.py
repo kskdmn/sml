@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import secrets
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
@@ -40,7 +41,11 @@ from sml.artifacts.semantics import (
 from sml.data.tokenizer import LoadedTokenizer, _load_opened_tokenizer_bundle
 from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.model.cache import allocate_kv_state, reset_kv_state
-from sml.model.config import GenerationConfig, ModelConfig
+from sml.model.config import (
+    DEFAULT_EXTENDED_ROPE_SCALING_FACTOR,
+    GenerationConfig,
+    ModelConfig,
+)
 from sml.model.generation import (
     apply_no_repeat_ngram,
     apply_repetition_penalty,
@@ -128,6 +133,7 @@ class GenerationRequest:
 class InferenceRuntimeConfig:
     batch_size_buckets: tuple[int, ...] = (1, 2, 4, 8, 16)
     decode_chunk_size: int = 8
+    rope_scaling_factor: float | None = None
 
     def __post_init__(self) -> None:
         buckets = self.batch_size_buckets
@@ -146,6 +152,13 @@ class InferenceRuntimeConfig:
             or self.decode_chunk_size <= 0
         ):
             raise ValueError("decode_chunk_size must be positive")
+        factor = self.rope_scaling_factor
+        if factor is not None:
+            if isinstance(factor, bool) or not isinstance(factor, (int, float)):
+                raise TypeError("rope_scaling_factor must be a finite number")
+            if not math.isfinite(factor) or factor < 1.0:
+                raise ValueError("rope_scaling_factor must be finite and at least 1.0")
+            object.__setattr__(self, "rope_scaling_factor", float(factor))
 
 
 _DEFAULT_RUNTIME = InferenceRuntimeConfig()
@@ -442,14 +455,18 @@ def _generation_forward(
     return logits, cache_state
 
 
+def _artifact_model_config(model: Mapping[str, object], *, context: str) -> ModelConfig:
+    try:
+        return ModelConfig(**dict(model))
+    except (TypeError, ValueError) as error:
+        raise SMLArtifactError(f"invalid {context} model configuration") from error
+
+
 def _require_unit_rope(model: Mapping[str, object], *, context: str) -> ModelConfig:
     rope_factor = model.get("rope_scaling_factor")
     if rope_factor != 1.0:
         raise SMLArtifactError(f"{context} rope_scaling_factor must be exactly 1.0")
-    model_config = ModelConfig(**dict(model))
-    if model_config.rope_scaling_factor != 1.0:
-        raise SMLArtifactError("resolution never substitutes rope_scaling_factor")
-    return model_config
+    return _artifact_model_config(model, context=context)
 
 
 def _resolve_pretraining_run(
@@ -546,7 +563,9 @@ def _resolve_lora_run(
         if full_verify:
             model_config = validate_full_run_semantics(reader, tokenizer.manifest)
         else:
-            model_config = _require_unit_rope(recovered.run.model, context="LoRA run")
+            model_config = _artifact_model_config(
+                recovered.run.model, context="LoRA run"
+            )
         model = SMLLanguageModel(model_config, key=mx.random.key(0))
         model.update(tree_unflatten(sorted(base_arrays.items())))
         apply_lora(
@@ -605,7 +624,7 @@ def _resolve_opened_export(artifact, *, full_verify: bool) -> ResolvedModel:
             tokenizer.manifest,
         )
     else:
-        model_config = _require_unit_rope(artifact.manifest.model, context="export")
+        model_config = _artifact_model_config(artifact.manifest.model, context="export")
     arrays = load_safetensors_payload(artifact, artifact.manifest.model_weights)
     manifest = artifact.manifest
     return ResolvedModel(
@@ -657,6 +676,20 @@ class InferenceSession:
         resolved: ResolvedModel,
         runtime: InferenceRuntimeConfig,
     ) -> None:
+        if not isinstance(runtime, InferenceRuntimeConfig):
+            raise TypeError("runtime must be an InferenceRuntimeConfig")
+        factor = runtime.rope_scaling_factor
+        if factor is None:
+            factor = (
+                DEFAULT_EXTENDED_ROPE_SCALING_FACTOR
+                if resolved.artifact_kind == "pretraining-run"
+                else resolved.model_config.rope_scaling_factor
+            )
+        if factor != resolved.model_config.rope_scaling_factor:
+            resolved = replace(
+                resolved,
+                model_config=replace(resolved.model_config, rope_scaling_factor=factor),
+            )
         self._resolved = resolved
         self._runtime = runtime
         self._call_guard = _CallGuard()

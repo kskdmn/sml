@@ -16,7 +16,7 @@ from sml.data.pretraining import (
     prepare_pretraining_bundle,
 )
 from sml.data.tokenizer import TokenizerTrainingConfig, train_tokenizer_bundle
-from sml.inference import GenerationRequest, InferenceSession
+from sml.inference import GenerationRequest, InferenceRuntimeConfig, InferenceSession
 from sml.model.config import GenerationConfig, ModelConfig
 from sml.model.layers import RMSNorm
 from sml.training.common import (
@@ -150,7 +150,10 @@ EOS_PROMPTS = ("zeta", "eta theta")
 
 @pytest.fixture
 def tiny_session(tiny_pretraining_run: Path) -> InferenceSession:
-    session = InferenceSession.from_checkpoint(tiny_pretraining_run)
+    session = InferenceSession.from_checkpoint(
+        tiny_pretraining_run,
+        runtime=InferenceRuntimeConfig(rope_scaling_factor=1.0),
+    )
     _install_distinct_policy_logits(session, POLICY_PROMPT)
     _install_early_eos_logits(session, POLICY_PROMPT)
     return session

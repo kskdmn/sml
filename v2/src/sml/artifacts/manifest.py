@@ -1213,8 +1213,14 @@ class LoRARunManifest(_Manifest):
             )
         _require_training_rng_schedule(self.checkpoint)
         rope_factor = self.model.get("rope_scaling_factor")
-        if not isinstance(rope_factor, float) or rope_factor != 1.0:
-            raise ValueError("LoRA model rope_scaling_factor must be exactly 1.0")
+        if (
+            not isinstance(rope_factor, float)
+            or not math.isfinite(rope_factor)
+            or rope_factor < 1.0
+        ):
+            raise ValueError(
+                "LoRA model rope_scaling_factor must be a finite float at least 1.0"
+            )
         _require_identity(self.tokenizer_identity, "tokenizer_identity")
         _require_identity(self.base_identity, "base_identity")
         _require_identity(self.data_identity, "data_identity")

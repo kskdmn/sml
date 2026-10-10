@@ -1396,11 +1396,12 @@ def _assemble_batch(
     )
 
 
-def _training_config(*, compile: bool) -> SwagTrainingConfig:
+def _training_config(*, compile: bool, model_config: ModelConfig) -> SwagTrainingConfig:
     return SwagTrainingConfig(
         base_checkpoint=Path("/unused-swag-quality-base"),
         data=Path("/unused-swag-quality-data"),
         output_run=Path("/unused-swag-quality-run"),
+        rope_scaling_factor=model_config.rope_scaling_factor,
         lora=LoRAConfig(),
         optimizer=default_swag_optimizer_config(),
         loader=_loader_config(),
@@ -1501,7 +1502,7 @@ def _run_runtime(
         raise ValueError(
             "quality recording requires the inference-validation workload version 2"
         )
-    config = _training_config(compile=compile)
+    config = _training_config(compile=compile, model_config=model_config)
     weight_decay_tree = build_weight_decay_tree(adapters, config.optimizer.weight_decay)
     kernels = build_swag_kernels(model, config, weight_decay_tree)
     optimizer = initialize_adam_state(adapters)

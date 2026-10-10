@@ -48,7 +48,12 @@ def _exact_configuration(
         raise SMLArtifactError(f"{context} is not an exact canonical configuration")
 
 
-def _model_configuration(projection: object, *, context: str) -> ModelConfig:
+def _model_configuration(
+    projection: object,
+    *,
+    context: str,
+    allow_scaled_rope: bool = False,
+) -> ModelConfig:
     if not isinstance(projection, dict) and not hasattr(projection, "items"):
         raise SMLArtifactError(f"{context} model configuration must be a mapping")
     try:
@@ -62,7 +67,7 @@ def _model_configuration(projection: object, *, context: str) -> ModelConfig:
         raise
     except (TypeError, ValueError) as error:
         raise SMLArtifactError(f"invalid {context} model configuration") from error
-    if configuration.rope_scaling_factor != 1.0:
+    if not allow_scaled_rope and configuration.rope_scaling_factor != 1.0:
         raise SMLArtifactError(f"{context} rope_scaling_factor must be exactly 1.0")
     return configuration
 
@@ -295,7 +300,9 @@ def validate_export_semantics(
     tokenizer: TokenizerManifest,
 ) -> ModelConfig:
     """Apply the exact value-independent merged-export semantic contract."""
-    model = _model_configuration(manifest.model, context="export")
+    model = _model_configuration(
+        manifest.model, context="export", allow_scaled_rope=True
+    )
     _tokenizer_matches_model(tokenizer, model, context="export")
     _precision_configuration(
         manifest.precision,
@@ -313,7 +320,9 @@ def validate_full_run_semantics(
     """Validate one retained run/checkpoint owner without reopening its path."""
     run = reader.resolved.run
     checkpoint = reader.resolved.checkpoint
-    model = _model_configuration(run.model, context="run")
+    model = _model_configuration(
+        run.model, context="run", allow_scaled_rope=isinstance(run, LoRARunManifest)
+    )
     _optimizer_configuration(run.optimizer, context="run")
     loader = _loader_configuration(run.loader, context="run")
     checkpoint_config = checkpoint_configuration(run.checkpoint, context="run")

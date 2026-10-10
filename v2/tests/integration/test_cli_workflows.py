@@ -194,6 +194,11 @@ def _assert_complete_evaluation(
     assert task.generation_config == {
         "generation_kwargs": {"temperature": 0.0},
         "provider_gen_kwargs": None,
+        "inference_runtime": {
+            "rope_scaling_factor": 8.0,
+            "original_context_length": 8,
+            "effective_context_length": 64,
+        },
     }
     assert task.metric_normalization_config == {
         "bootstrap_iters": 100000,

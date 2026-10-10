@@ -32,6 +32,7 @@ from sml.artifacts.manifest import (
 from sml.artifacts.npy import VerifiedNpyMapping
 from sml.errors import SMLArtifactError, SMLDataError
 from sml.inference import ResolvedModel
+from sml.model.config import DEFAULT_EXTENDED_ROPE_SCALING_FACTOR, ModelConfig
 
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
 _INT32 = np.dtype("<i4")
@@ -163,9 +164,10 @@ class SwagPreparationConfig:
     overlength_policy: Literal["drop-complete-row-v1"] = OVERLENGTH_POLICY_V1
     bos_policy: Literal["context-bos-v1"] = BOS_POLICY_V1
     eos_policy: Literal["scored-ending-eos-v1"] = EOS_POLICY_V1
-    maximum_length: int = 256
-    bucket_boundaries: tuple[int, ...] = (64, 128, 256)
+    maximum_length: int = 8_192
+    bucket_boundaries: tuple[int, ...] = (64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192)
     maximum_examples: int | None = None
+    rope_scaling_factor: float = DEFAULT_EXTENDED_ROPE_SCALING_FACTOR
 
     def __post_init__(self) -> None:
         if not callable(getattr(self.provider, "resolve", None)):
@@ -191,6 +193,13 @@ class SwagPreparationConfig:
             if getattr(self, name) != expected:
                 raise ValueError(f"unsupported SWAG {name}")
         _require_plain_int(self.maximum_length, "maximum_length", minimum=1)
+        object.__setattr__(
+            self,
+            "rope_scaling_factor",
+            ModelConfig(
+                rope_scaling_factor=self.rope_scaling_factor
+            ).rope_scaling_factor,
+        )
         if not isinstance(self.bucket_boundaries, tuple) or not self.bucket_boundaries:
             raise TypeError("bucket_boundaries must be a nonempty tuple")
         previous = 0
@@ -1604,9 +1613,10 @@ def prepare_swag_bundle(
     _require_full_base(base)
     _require_tokenizer_matches_model(base)
 
-    if config.maximum_length > base.model_config.effective_context_length:
+    model = replace(base.model_config, rope_scaling_factor=config.rope_scaling_factor)
+    if config.maximum_length > model.effective_context_length:
         raise SMLDataError(
-            "SWAG maximum_length exceeds the base model effective context length"
+            "SWAG maximum_length exceeds the fine-tuning model effective context length"
         )
     if config.bucket_boundaries[-1] < config.maximum_length:
         raise SMLDataError("bucket_boundaries must cover maximum_length")

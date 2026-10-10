@@ -32,6 +32,7 @@ from sml.data.pretraining import (
 from sml.data.tokenizer import TokenizerTrainingConfig, train_tokenizer_bundle
 from sml.errors import SMLArtifactError, SMLRuntimeError
 from sml.inference import (
+    GenerationKernelKey,
     GenerationRequest,
     InferenceSession,
     resolve_model_artifact,
@@ -519,7 +520,7 @@ def test_resolved_session_checkpoint_mappings_cannot_be_mutated(
 
 def test_session_prompt_overflow(tiny_session: InferenceSession) -> None:
     with pytest.raises(SMLRuntimeError, match="overflow"):
-        tiny_session.generate("alpha", GenerationRequest(max_new_tokens=32))
+        tiny_session.generate("alpha", GenerationRequest(max_new_tokens=256))
 
 
 def test_session_empty_text_without_usable_bos(
@@ -538,7 +539,107 @@ def test_session_empty_text_without_usable_bos(
 def test_session_length_buckets_are_powers_of_two_including_context(
     tiny_session: InferenceSession,
 ) -> None:
-    assert tiny_session.length_buckets == (1, 2, 4, 8, 16, 32)
+    assert tiny_session.length_buckets == (1, 2, 4, 8, 16, 32, 64, 128, 256)
+
+
+def test_scaled_prefill_and_final_position_decode_match_full_forward(
+    tiny_session: InferenceSession,
+) -> None:
+    config = tiny_session.resolved_model.model_config
+    capacity = config.effective_context_length
+    assert capacity == config.original_context_length * 8
+    tokens = mx.array(
+        [[config.bos_token_id, *(4 + index % 10 for index in range(capacity - 1))]],
+        dtype=mx.int32,
+    )
+    positions = mx.arange(capacity, dtype=mx.int32)[None, :]
+    prefill_mask = positions < capacity - 1
+    prefill_tokens = mx.where(prefill_mask, tokens, config.pad_token_id)
+    prefill_positions = mx.where(prefill_mask, positions, 0)
+    cache = inference.allocate_kv_state(config, 1, capacity, mx.bfloat16)
+    prefill, _decode = tiny_session._compiled_kernels(
+        capacity,
+        capacity,
+        1,
+        GenerationKernelKey.from_config(GenerationConfig()),
+    )
+    prefill_logits, cache = prefill(
+        tiny_session._parameters,
+        prefill_tokens,
+        prefill_mask,
+        prefill_positions,
+        cache,
+    )
+    mx.eval(prefill_logits, cache)
+    assert cache[2].tolist() == [capacity - 1]
+
+    decode = mx.compile(tiny_session._forward)
+    decode_logits, cache = decode(
+        tiny_session._parameters,
+        tokens[:, -1:],
+        mx.ones((1, 1), dtype=mx.bool_),
+        positions[:, -1:],
+        cache,
+    )
+    expected, _, _ = tiny_session._model.forward_arrays(
+        tiny_session._parameters,
+        tokens,
+        attention_mask=mx.ones(tokens.shape, dtype=mx.bool_),
+        positions=positions,
+        cache_state=None,
+        training=False,
+        key=None,
+        logits_positions=mx.array([[capacity - 2, capacity - 1]], dtype=mx.int32),
+    )
+    mx.eval(decode_logits, cache, expected)
+
+    assert cache[2].tolist() == [capacity]
+    assert bool(mx.allclose(prefill_logits, expected[:, :1], atol=0.02, rtol=0.02))
+    assert bool(mx.allclose(decode_logits, expected[:, -1:], atol=0.02, rtol=0.02))
+
+
+@pytest.mark.parametrize("padding", ("left", "right"))
+def test_scaled_scoring_accepts_capacity_and_rejects_overflow(
+    tiny_session: InferenceSession,
+    padding: str,
+) -> None:
+    config = tiny_session.resolved_model.model_config
+    capacity = config.effective_context_length
+    token_ids = (
+        config.bos_token_id,
+        *(4 + index % 10 for index in range(capacity - 1)),
+    )
+    continuation_start = capacity - 8
+    tokens = mx.array([token_ids], dtype=mx.int32)
+    logits, _, _ = tiny_session._model.forward_arrays(
+        tiny_session._parameters,
+        tokens,
+        attention_mask=mx.ones(tokens.shape, dtype=mx.bool_),
+        positions=mx.arange(capacity, dtype=mx.int32)[None, :],
+        cache_state=None,
+        training=False,
+        key=None,
+        logits_positions=mx.arange(
+            continuation_start - 1, capacity - 1, dtype=mx.int32
+        )[None, :],
+    )
+    log_probs = logits.astype(mx.float32) - mx.logsumexp(
+        logits.astype(mx.float32), axis=-1, keepdims=True
+    )
+    targets = tokens[:, continuation_start:]
+    expected = mx.sum(mx.take_along_axis(log_probs, targets[:, :, None], axis=-1))
+    expected_greedy = mx.all(mx.argmax(logits, axis=-1) == targets)
+    mx.eval(expected, expected_greedy)
+
+    result = tiny_session.score_encoded_loglikelihoods(
+        ((token_ids, continuation_start),), padding=padding
+    )[0]
+    assert result[0] == pytest.approx(float(expected.item()), abs=1e-5)
+    assert result[1] == bool(expected_greedy.item())
+    with pytest.raises(SMLRuntimeError, match="context length"):
+        tiny_session.score_encoded_loglikelihoods(
+            (((*token_ids, 4), continuation_start),), padding=padding
+        )
 
 
 def test_session_generate_batch_restores_caller_order(

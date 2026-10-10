@@ -1170,6 +1170,37 @@ def test_pretraining_run_manifest_rejects_noncanonical_rope_factor():
         )
 
 
+@pytest.mark.parametrize("rope_scaling_factor", (1.0, 2.0, 8.0))
+def test_lora_run_manifest_preserves_rope_factor(tmp_path, rope_scaling_factor):
+    manifest = next(
+        value for value in manifest_fixtures() if isinstance(value, LoRARunManifest)
+    )
+    scaled = replace(
+        manifest,
+        model={**dict(manifest.model), "rope_scaling_factor": rope_scaling_factor},
+    )
+    written = _write_manifest(tmp_path, scaled, "run.json")
+    restored = read_manifest(
+        tmp_path, LoRARunManifest, VerificationLevel.MANIFEST_TRUSTED
+    ).manifest
+    assert restored.identity == written.identity
+    assert restored.model["rope_scaling_factor"] == rope_scaling_factor
+    if rope_scaling_factor != 1.0:
+        assert restored.identity != manifest.recompute_identity()
+
+
+@pytest.mark.parametrize("rope_scaling_factor", (None, True, 8, "8.0", 0.0, 0.5))
+def test_lora_run_manifest_rejects_invalid_rope_factor(rope_scaling_factor):
+    manifest = next(
+        value for value in manifest_fixtures() if isinstance(value, LoRARunManifest)
+    )
+    with pytest.raises(ValueError, match="rope_scaling_factor"):
+        replace(
+            manifest,
+            model={**dict(manifest.model), "rope_scaling_factor": rope_scaling_factor},
+        )
+
+
 @pytest.mark.parametrize("dtype", ["<i4", ">i4", "int64", "uint32"])
 def test_row_blocks_preserve_identity_across_chunking_and_strides(dtype):
     rows = np.arange(84, dtype=dtype).reshape(7, 12)[:, ::2]

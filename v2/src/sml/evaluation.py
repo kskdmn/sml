@@ -31,6 +31,7 @@ from sml.inference import (
     InferenceRuntimeConfig,
     InferenceSession,
 )
+from sml.model.config import ModelConfig
 
 _ALLOWED_TASKS = frozenset({"hellaswag", "winogrande"})
 _PROVIDER_PACKAGES = ("datasets", "lm-eval", "mlx", "numpy", "sentencepiece")
@@ -745,6 +746,7 @@ def _metric_payload(
 
 def _resolve_task_record(
     *,
+    model_config: ModelConfig,
     task_name: str,
     task: object,
     provider: _LMEvalProvider,
@@ -794,6 +796,11 @@ def _resolve_task_record(
     generation_config = {
         "generation_kwargs": config.get("generation_kwargs"),
         "provider_gen_kwargs": None,
+        "inference_runtime": {
+            "rope_scaling_factor": model_config.rope_scaling_factor,
+            "original_context_length": model_config.original_context_length,
+            "effective_context_length": model_config.effective_context_length,
+        },
     }
     metric_normalization_config = {
         "metric_list": config.get("metric_list"),
@@ -1155,6 +1162,7 @@ def evaluate(config: EvaluationConfig) -> EvaluationResult:
     lm_eval_source_commit = _lm_eval_source_commit()
     task_records = tuple(
         _resolve_task_record(
+            model_config=session.resolved_model.model_config,
             task_name=task_name,
             task=task,
             provider=provider,

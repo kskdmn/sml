@@ -140,6 +140,64 @@ def test_integer_rope_scale_in_toml_produces_a_valid_run_manifest(tmp_path):
     assert manifest.identity == manifest.recompute_identity()
 
 
+def test_finetune_defaults_to_eightfold_context_and_preserves_batch_defaults():
+    domain = parse_command(
+        ["finetune", "--checkpoint", "base", "--data", "swag", "--output", "ft"]
+    ).to_domain()
+    assert domain.rope_scaling_factor == 8.0
+    assert domain.loader.microbatch_size == 1
+    assert domain.loader.gradient_accumulation_steps == 8
+
+
+@pytest.mark.parametrize("command", ["finetune", "prepare.swag", "infer", "evaluate"])
+def test_rope_scale_cli_overrides_toml(tmp_path, command):
+    required = {
+        "finetune": 'checkpoint = "base"\ndata = "swag"\noutput = "ft"\n',
+        "prepare.swag": 'checkpoint = "base"\nrevision = "main"\noutput = "swag"\n',
+        "infer": 'checkpoint = "base"\nprompt = "hello"\n',
+        "evaluate": 'checkpoint = "base"\ntasks = ["hellaswag"]\noutput = "eval.json"\n',
+    }
+    runtime = command in {"infer", "evaluate"}
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"[{command}]\n"
+        + required[command]
+        + (f"[{command}.runtime]\n" if runtime else "")
+        + "rope_scaling_factor = 2.0\n",
+        encoding="utf-8",
+    )
+    argv = command.split(".") + ["--config", str(config)]
+    configured = parse_command(argv).to_domain()
+    overridden = parse_command(argv + ["--rope-scaling-factor", "4"]).to_domain()
+    if runtime:
+        configured, overridden = configured.runtime, overridden.runtime
+    assert configured.rope_scaling_factor == 2.0
+    assert overridden.rope_scaling_factor == 4.0
+
+
+def test_finetune_resume_rejects_rope_override():
+    with pytest.raises(SMLConfigurationError, match="rope_scaling_factor"):
+        parse_command(["finetune", "--resume", "run", "--rope-scaling-factor", "1"])
+
+
+def test_prepare_swag_defaults_cover_extended_context():
+    domain = parse_command(
+        [
+            "prepare",
+            "swag",
+            "--checkpoint",
+            "base",
+            "--revision",
+            "main",
+            "--output",
+            "swag",
+        ]
+    ).to_domain()
+    assert domain.rope_scaling_factor == 8.0
+    assert domain.maximum_length == 8_192
+    assert domain.bucket_boundaries == (64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192)
+
+
 @pytest.mark.parametrize(
     ("argv", "module_name", "workflow"),
     [

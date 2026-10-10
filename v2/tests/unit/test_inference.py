@@ -4,7 +4,7 @@ import json
 import shutil
 import weakref
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -178,6 +178,79 @@ def test_session_runtime_config_rejects_non_positive_batch_buckets() -> None:
         InferenceRuntimeConfig(batch_size_buckets=(1, 0, 4))
 
 
+@pytest.mark.parametrize("factor", (0.0, 0.5, -1.0, float("inf"), float("nan")))
+def test_session_runtime_config_rejects_invalid_rope_scales(factor: float) -> None:
+    with pytest.raises(ValueError, match="rope_scaling_factor"):
+        InferenceRuntimeConfig(rope_scaling_factor=factor)
+
+
+@pytest.mark.parametrize("factor", (True, False, "8"))
+def test_session_runtime_config_rejects_non_numeric_rope_scales(factor: object) -> None:
+    with pytest.raises(TypeError, match="rope_scaling_factor"):
+        InferenceRuntimeConfig(rope_scaling_factor=factor)
+
+
+def test_session_extends_pretraining_context_without_changing_source_config(
+    tiny_pretraining_run: Path,
+) -> None:
+    resolved = resolve_model_artifact(tiny_pretraining_run, full_verify=False)
+    resolved = replace(
+        resolved,
+        model_config=replace(resolved.model_config, original_context_length=1_024),
+    )
+    session = InferenceSession(resolved, InferenceRuntimeConfig())
+
+    assert resolved.model_config.rope_scaling_factor == 1.0
+    assert resolved.model_config.effective_context_length == 1_024
+    assert session.resolved_model.model_config.rope_scaling_factor == 8.0
+    assert session.resolved_model.model_config.effective_context_length == 8_192
+    assert session.length_buckets[-1] == 8_192
+    assert session.model_identity == resolved.identity()
+    assert all(
+        session.resolved_model.model_arrays[name] is weight
+        for name, weight in resolved.model_arrays.items()
+    )
+
+
+@pytest.mark.parametrize("artifact_kind", ("pretraining-run", "lora-run", "export"))
+def test_session_explicit_unscaled_rope_override(
+    tiny_pretraining_run: Path,
+    artifact_kind: str,
+) -> None:
+    resolved = resolve_model_artifact(tiny_pretraining_run, full_verify=False)
+    resolved = replace(
+        resolved,
+        artifact_kind=artifact_kind,
+        model_config=replace(resolved.model_config, rope_scaling_factor=8.0),
+    )
+    session = InferenceSession(
+        resolved, InferenceRuntimeConfig(rope_scaling_factor=1.0)
+    )
+
+    assert resolved.model_config.rope_scaling_factor == 8.0
+    assert session.resolved_model.model_config.rope_scaling_factor == 1.0
+    assert session.resolved_model.model_config.effective_context_length == 32
+
+
+@pytest.mark.parametrize("artifact_kind", ("lora-run", "export"))
+@pytest.mark.parametrize("factor", (1.0, 4.0, 8.0))
+def test_session_preserves_saved_finetuned_rope_scale(
+    tiny_pretraining_run: Path,
+    artifact_kind: str,
+    factor: float,
+) -> None:
+    resolved = resolve_model_artifact(tiny_pretraining_run, full_verify=False)
+    resolved = replace(
+        resolved,
+        artifact_kind=artifact_kind,
+        model_config=replace(resolved.model_config, rope_scaling_factor=factor),
+    )
+    session = InferenceSession(resolved, InferenceRuntimeConfig())
+
+    assert session.resolved_model.model_config == resolved.model_config
+    assert session.length_buckets[-1] == int(32 * factor)
+
+
 def test_session_model_reuses_resolved_weights(tiny_session: InferenceSession) -> None:
     parameters = dict(tree_flatten(tiny_session._model.parameters()))
     resolved = tiny_session.resolved_model.model_arrays
@@ -261,7 +334,7 @@ def test_session_loads_latest_once_and_pins_identity(
     monkeypatch.setattr(inference, "open_latest_checkpoint_reader", counted_open_latest)
     session = InferenceSession.from_checkpoint(tiny_pretraining_run)
     first_identity = session.model_identity
-    assert session.resolved_model.model_config.rope_scaling_factor == 1.0
+    assert session.resolved_model.model_config.rope_scaling_factor == 8.0
     publish_new_valid_step(tiny_pretraining_run, step=4)
     assert session.model_identity == first_identity
     assert calls == 1

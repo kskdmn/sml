@@ -31,6 +31,7 @@ from sml.evaluation import (
 )
 from sml.evaluation_result import evaluation_result_identity
 from sml.inference import GenerationResult, InferenceSession
+from sml.model.config import ModelConfig
 from test_inference import (  # noqa: F401
     _tiny_run_template,
     publish_new_valid_step,
@@ -287,6 +288,7 @@ def _task_record(
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     return evaluation._resolve_task_record(
+        model_config=ModelConfig(),
         task_name="hellaswag",
         task=task,
         provider=fake_provider,
@@ -363,6 +365,7 @@ def test_task_provenance_prefers_effective_fewshot_config_split(fake_provider) -
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     record = evaluation._resolve_task_record(
+        model_config=ModelConfig(),
         task_name="hellaswag",
         task=task,
         provider=fake_provider,
@@ -441,6 +444,7 @@ def test_offline_provider_task4_invocation_records_effective_zero_shot_provenanc
     assert all(config["num_fewshot"] == 0 for config in raw_result["configs"].values())
     records = tuple(
         evaluation._resolve_task_record(
+            model_config=tiny_session.resolved_model.model_config,
             task_name=task_name,
             task=loaded[task_name],
             provider=fake_provider,
@@ -593,6 +597,11 @@ def test_task_provenance_hashes_yaml_include_config_and_dataset(fake_provider) -
     assert record.generation_config == {
         "generation_kwargs": {"temperature": 0.0},
         "provider_gen_kwargs": None,
+        "inference_runtime": {
+            "rope_scaling_factor": 1.0,
+            "original_context_length": 1_024,
+            "effective_context_length": 1_024,
+        },
     }
     assert record.metric_normalization_config == {
         "bootstrap_iters": 100000,
@@ -728,6 +737,7 @@ def test_task_provenance_preserves_explicit_provider_filter_pipeline(
     recorder.record("loglikelihood", task.instances)
 
     record = evaluation._resolve_task_record(
+        model_config=ModelConfig(),
         task_name="hellaswag",
         task=task,
         provider=fake_provider,
@@ -912,6 +922,7 @@ def test_provider_iteration_captures_first_effective_eval_dataset(
     first_iteration = tuple(task.doc_iterator())
     second_iteration = tuple(task.doc_iterator())
     record = evaluation._resolve_task_record(
+        model_config=tiny_session.resolved_model.model_config,
         task_name="hellaswag",
         task=task,
         provider=fake_provider,
@@ -1133,6 +1144,7 @@ def test_task_provenance_requires_selected_dataset_identities(
     recorder.record("loglikelihood", task.instances)
     with pytest.raises(SMLRuntimeError, match=message):
         evaluation._resolve_task_record(
+            model_config=ModelConfig(),
             task_name="hellaswag",
             task=task,
             provider=fake_provider,
@@ -1163,6 +1175,7 @@ def test_task_provenance_selects_test_when_validation_is_not_declared(
     recorder = evaluation._EvaluationRequestRecorder()
     recorder.record("loglikelihood", task.instances)
     record = evaluation._resolve_task_record(
+        model_config=ModelConfig(),
         task_name="hellaswag",
         task=task,
         provider=fake_provider,

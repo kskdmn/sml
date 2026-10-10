@@ -125,6 +125,7 @@ _SCHEMAS: dict[str, dict[str, object]] = {
         "maximum_length": None,
         "bucket_boundaries": None,
         "maximum_examples": None,
+        "rope_scaling_factor": None,
         "source": {
             "backend": None,
             "namespace": None,
@@ -228,6 +229,7 @@ _SCHEMAS: dict[str, dict[str, object]] = {
         "runtime": {
             "batch_size_buckets": None,
             "decode_chunk_size": None,
+            "rope_scaling_factor": None,
         },
     },
     "evaluate": {
@@ -240,11 +242,13 @@ _SCHEMAS: dict[str, dict[str, object]] = {
         "runtime": {
             "batch_size_buckets": None,
             "decode_chunk_size": None,
+            "rope_scaling_factor": None,
         },
     },
     "finetune": {
         **{name: None for name in _COMMON_TRAIN_FIELDS},
         "checkpoint": None,
+        "rope_scaling_factor": None,
         "lora": {
             "rank": None,
             "alpha": None,
@@ -413,6 +417,12 @@ def _build_parser() -> argparse.ArgumentParser:
     swag.add_argument("--output", type=Path, default=argparse.SUPPRESS)
     swag.add_argument("--maximum-length", type=int, default=argparse.SUPPRESS)
     swag.add_argument("--maximum-examples", type=int, default=argparse.SUPPRESS)
+    swag.add_argument(
+        "--rope-scaling-factor",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="YaRN context extension for fine-tuning (default: 8).",
+    )
     _add_config(swag)
 
     train_parser = subparsers.add_parser("train")
@@ -444,6 +454,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
     )
     infer_parser.add_argument("--seed", type=int, default=argparse.SUPPRESS)
+    infer_parser.add_argument(
+        "--rope-scaling-factor",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Override YaRN scaling (default: 8 for base runs, saved scale for LoRA/exports).",
+    )
     _add_bool(infer_parser, "full")
     _add_config(infer_parser)
 
@@ -467,6 +483,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
     )
     evaluate_parser.add_argument("--limit", type=int, default=argparse.SUPPRESS)
+    evaluate_parser.add_argument(
+        "--rope-scaling-factor",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Override inference YaRN scaling.",
+    )
     _add_bool(evaluate_parser, "full")
     _add_config(evaluate_parser)
 
@@ -477,6 +499,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
     )
     _add_training_arguments(finetune_parser)
+    finetune_parser.add_argument(
+        "--rope-scaling-factor",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="YaRN context extension for a fresh run (default: 8).",
+    )
 
     export_parser = subparsers.add_parser("export")
     export_parser.add_argument(
@@ -592,6 +620,10 @@ def _normalize_cli_values(
                     nested[field_name] = values.pop(flag)
             if nested:
                 configured[table] = nested
+    if command in {"infer", "evaluate"} and "rope_scaling_factor" in values:
+        runtime = dict(configured.get("runtime", {}))
+        runtime["rope_scaling_factor"] = values.pop("rope_scaling_factor")
+        configured["runtime"] = runtime
     configured.update(values)
     path_fields = {
         "tokenize": ("input", "output"),
@@ -1027,6 +1059,7 @@ class FinetuneCommand(_Command):
                 "log_interval",
                 "seed",
                 "compile",
+                "rope_scaling_factor",
             )
             if name in self.values
         }
@@ -1138,6 +1171,7 @@ def _validate_command(command: str, values: dict[str, object]) -> None:
         if "resume" in values:
             forbidden = set(values) & {
                 "checkpoint",
+                "rope_scaling_factor",
                 "output",
                 "lora",
                 "optimizer",

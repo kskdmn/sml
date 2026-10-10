@@ -35,13 +35,14 @@ dimensions differ:
 | Attention dropout | 0.005 | None |
 | Attention-output / feed-forward-output initialization std. dev. | 0.02 | `0.02 / sqrt(2 * num_layers)` |
 | Pretraining sequence length | 1,024 tokens | 1,024 tokens |
-| Default inference context | 2,048 tokens with 2× YaRN scaling | 1,024 tokens with unscaled RoPE |
+| Default inference context | 2,048 tokens with 2× YaRN scaling | 8,192 tokens with 8× YaRN scaling |
 | Reserved conversation symbols | None | `<\|system\|>`, `<\|user\|>`, `<\|assistant\|>` |
 
-V2's model code includes YaRN, but its training and artifact-loading workflows
-require a RoPE scaling factor of `1.0`; v1's automatic 2× inference extension does
-not carry over. The conversation symbols are tokenizer vocabulary entries; the
-fine-tuning workflow remains SWAG.
+V2 pretrains at 1,024 tokens with unscaled RoPE, then defaults to 8× YaRN scaling
+for SWAG fine-tuning and inference from a base run. Fine-tuning records its scale
+in the run; resume, export, and inference from LoRA runs or exports preserve that
+scale, including `1.0` for older runs. The conversation symbols are tokenizer
+vocabulary entries; the fine-tuning workflow remains SWAG.
 
 Defaults are defined in [v1's configuration](../v1/src/sml_config.py),
 [v1's tokenizer script](../v1/src/train_tokenizer.py),
@@ -248,6 +249,12 @@ uv run python -m sml infer --checkpoint v2/output/base-run --max-new-tokens 128 
 Add `--include-prompt` to include the prompt in rendered text and `--full` to
 rehash every consumed payload.
 
+Base-run inference defaults to an 8,192-token context (8× the original 1,024).
+LoRA runs and exports use their saved fine-tuning scale. Set
+`--rope-scaling-factor 1` to use the original context, or choose another factor
+of at least `1`. The equivalent TOML field is
+`rope_scaling_factor` under `[infer.runtime]` or `[evaluate.runtime]`.
+
 Inference requires a KV cache. Model configurations with `use_cache=false` are
 rejected instead of silently enabling caching. Persistent sessions retain a
 bounded set of recently used compiled functions and share prefill compilation
@@ -272,7 +279,9 @@ intentionally excluded from the artifact and its identity.
 
 Results use schema version 3 and bind each model to its complete artifact
 identity, so different exported weights remain distinguishable even when the
-tokenizer and source step match.
+tokenizer and source step match. Task records also include the effective RoPE
+scale and context lengths, so changing the inference scale produces a distinct
+evaluation identity.
 
 The request recorder hashes each request as it arrives, avoiding retention of the
 full request text corpus while preserving the existing ordered-request identity
@@ -295,6 +304,11 @@ The `main` revision is resolved to a commit SHA and recorded in the bundle. Pass
 an explicit commit SHA to reproduce that revision in a new output directory.
 
 Preparation fully verifies the selected base run before publication.
+By default it accepts candidates up to 8,192 tokens and groups them into buckets
+of 64, 128, 256, 512, 1,024, 2,048, 4,096, or 8,192 tokens; short candidates still
+use small buckets. `--rope-scaling-factor` controls the context capacity check
+(default `8`), and `--maximum-length` can lower the candidate limit. TOML also
+accepts `bucket_boundaries` under `[prepare.swag]`.
 Repeating the command with the same configuration, selected model checkpoint,
 and output reuses a matching, fully verified bundle without contacting the dataset
 provider. Advancing the base run changes the selected checkpoint and requires a new
@@ -307,6 +321,13 @@ Start a self-contained SWAG LoRA run:
 ```sh
 uv run python -m sml finetune --checkpoint v2/output/base-run --data v2/output/swag-data --output v2/output/swag-run
 ```
+
+Fresh runs default to `rope_scaling_factor = 8.0`, extending the original
+1,024-token context to 8,192 tokens with YaRN. Override it with
+`--rope-scaling-factor` or the same field under `[finetune]`; use a matching
+capacity when preparing SWAG data. The saved factor is retained on resume and
+in merged exports. Microbatch size and gradient accumulation defaults remain
+`1` and `8`.
 
 Resume uses the same override rules as base training. A moved SWAG bundle can be
 supplied through `--data` only when its identity matches the run:

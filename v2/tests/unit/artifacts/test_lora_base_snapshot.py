@@ -72,18 +72,44 @@ def _matching_snapshot_and_run() -> tuple[BaseSnapshotManifest, LoRARunManifest]
     return snapshot, run
 
 
-def test_require_lora_base_snapshot_accepts_matching_canonical_copy() -> None:
+@pytest.mark.parametrize("rope_scaling_factor", (1.0, 2.0, 8.0))
+def test_require_lora_base_snapshot_accepts_matching_canonical_copy(
+    rope_scaling_factor: float,
+) -> None:
     snapshot, run = _matching_snapshot_and_run()
+    run = replace(
+        run,
+        model={**dict(run.model), "rope_scaling_factor": rope_scaling_factor},
+    )
     require_lora_base_snapshot(snapshot, run)
+    assert snapshot.model["rope_scaling_factor"] == 1.0
+    assert run.model["rope_scaling_factor"] == rope_scaling_factor
 
 
-def test_require_lora_base_snapshot_rejects_model_mismatch() -> None:
+@pytest.mark.parametrize("rope_scaling_factor", (1.0, 8.0))
+def test_require_lora_base_snapshot_rejects_model_mismatch(
+    rope_scaling_factor: float,
+) -> None:
     snapshot, run = _matching_snapshot_and_run()
     snapshot = replace(snapshot, model={**dict(snapshot.model), "hidden_size": 16})
     snapshot = replace(snapshot, identity=snapshot.recompute_identity())
-    run = replace(run, base_identity=snapshot.identity)
+    run = replace(
+        run,
+        base_identity=snapshot.identity,
+        model={**dict(run.model), "rope_scaling_factor": rope_scaling_factor},
+    )
     run = replace(run, identity=run.recompute_identity())
     with pytest.raises(SMLArtifactError, match="model configuration"):
+        require_lora_base_snapshot(snapshot, run)
+
+
+def test_require_lora_base_snapshot_rejects_scaled_base() -> None:
+    snapshot, run = _matching_snapshot_and_run()
+    model = {**dict(snapshot.model), "rope_scaling_factor": 8.0}
+    snapshot = replace(snapshot, model=model)
+    snapshot = replace(snapshot, identity=snapshot.recompute_identity())
+    run = replace(run, base_identity=snapshot.identity, model=model)
+    with pytest.raises(SMLArtifactError, match="copied base rope_scaling_factor"):
         require_lora_base_snapshot(snapshot, run)
 
 

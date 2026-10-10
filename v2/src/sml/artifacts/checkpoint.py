@@ -1523,9 +1523,9 @@ def require_lora_base_snapshot(
         raise SMLArtifactError("run base tokenizer identity does not match run.json")
     if snapshot.model.get("rope_scaling_factor") != 1.0:
         raise SMLArtifactError("copied base rope_scaling_factor must be exactly 1.0")
-    if run.model.get("rope_scaling_factor") != 1.0:
-        raise SMLArtifactError("LoRA run rope_scaling_factor must be exactly 1.0")
-    if dict(snapshot.model) != dict(run.model):
+    base_model = dict(snapshot.model)
+    base_model["rope_scaling_factor"] = run.model["rope_scaling_factor"]
+    if base_model != dict(run.model):
         raise SMLArtifactError(
             "copied base model configuration does not match run.json"
         )

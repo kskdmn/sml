@@ -4,6 +4,8 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+DEFAULT_EXTENDED_ROPE_SCALING_FACTOR = 8.0
+
 
 def _require_positive_int(value: object, field_name: str) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:

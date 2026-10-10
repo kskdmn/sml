@@ -19,7 +19,7 @@ from sml.evaluation import (
     score_loglikelihood_batch,
 )
 from sml.evaluation_result import evaluation_result_identity
-from sml.inference import InferenceSession
+from sml.inference import InferenceRuntimeConfig, InferenceSession
 from test_evaluation import (  # noqa: F401
     fake_lm_eval,
     fake_provider,
@@ -53,6 +53,42 @@ def test_evaluation_result_pins_resolved_identity(
     assert persisted.tasks[0].metric_payload["acc,none"] == 0.5
     assert persisted.provider_result == result.provider_result
     assert persisted.identity == evaluation_result_identity(persisted)
+    assert persisted.tasks[0].generation_config["inference_runtime"] == {
+        "rope_scaling_factor": 8.0,
+        "original_context_length": 32,
+        "effective_context_length": 256,
+    }
+
+
+def test_evaluation_identity_distinguishes_inference_rope_scaling(
+    tiny_pretraining_run: Path,
+    fake_lm_eval,
+    tmp_path: Path,
+) -> None:
+    config = tiny_evaluation_config(tiny_pretraining_run, tmp_path)
+    extended = evaluate(config)
+    unscaled_config = replace(
+        config,
+        output=tmp_path / "evaluation-unscaled.json",
+        runtime=InferenceRuntimeConfig(rope_scaling_factor=1.0),
+    )
+    unscaled = evaluate(unscaled_config)
+
+    assert extended.model == unscaled.model
+    assert extended.provider_result == unscaled.provider_result
+    assert extended.tasks[0].ordered_request_identity == (
+        unscaled.tasks[0].ordered_request_identity
+    )
+    assert extended.tasks[0].task_identity != unscaled.tasks[0].task_identity
+    assert extended.identity != unscaled.identity
+    assert unscaled.tasks[0].generation_config["inference_runtime"] == {
+        "rope_scaling_factor": 1.0,
+        "original_context_length": 32,
+        "effective_context_length": 32,
+    }
+    assert read_evaluation_result(unscaled_config.output) == unscaled
+    with pytest.raises(SMLRuntimeError, match="collision"):
+        evaluate(replace(unscaled_config, output=config.output))
 
 
 def test_full_evaluation_persists_recovered_model_operational_state(

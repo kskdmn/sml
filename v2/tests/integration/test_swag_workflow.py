@@ -452,17 +452,41 @@ def tiny_lora_run(tiny_base_run: Path, tiny_swag_bundle, tmp_path: Path) -> Path
     return trained.run
 
 
+@pytest.mark.parametrize("rope_scaling_factor", (None, 1.0, 2.5))
 def test_lora_run_is_self_contained_after_source_run_removal(
-    tiny_base_run, tiny_swag_bundle, tmp_path
+    tiny_base_run, tiny_swag_bundle, tmp_path, rope_scaling_factor, monkeypatch
 ):
+    scaling_override = (
+        {}
+        if rope_scaling_factor is None
+        else {"rope_scaling_factor": rope_scaling_factor}
+    )
+    expected_factor = 8.0 if rope_scaling_factor is None else rope_scaling_factor
     trained = finetune(
         tiny_swag_training_config(
             tiny_base_run,
             tiny_swag_bundle,
             tmp_path / "lora-run",
             maximum_steps=1,
+            **scaling_override,
         )
     )
+    saved = read_manifest(trained.run, LoRARunManifest, VerificationLevel.FULL).manifest
+    copied_base = read_manifest(
+        trained.run / "base", BaseSnapshotManifest, VerificationLevel.FULL
+    ).manifest
+    assert saved.model["rope_scaling_factor"] == expected_factor
+    assert copied_base.model["rope_scaling_factor"] == 1.0
+    restored_factors = []
+    original_run_training = swag_module._run_training
+
+    def record_training(run, manifest, config, model, restored, bundle):
+        restored_factors.append(
+            (config.rope_scaling_factor, model.config.rope_scaling_factor)
+        )
+        return original_run_training(run, manifest, config, model, restored, bundle)
+
+    monkeypatch.setattr(swag_module, "_run_training", record_training)
     move_to_unavailable_location(tiny_base_run)
     resumed = resume_finetune(
         trained.run,
@@ -473,10 +497,115 @@ def test_lora_run_is_self_contained_after_source_run_removal(
     exported = export_merged(resumed.run, tmp_path / "export")
     export_session = InferenceSession.from_checkpoint(exported.path, full_verify=True)
     assert resumed.step == 2
+    assert restored_factors == [(expected_factor, expected_factor)]
     assert session.model_identity.artifact_kind == "lora-run"
-    assert session.resolved_model.model_config.rope_scaling_factor == 1.0
+    assert session.resolved_model.model_config.rope_scaling_factor == expected_factor
+    assert session.resolved_model.model_config.effective_context_length == int(
+        32 * expected_factor
+    )
     assert export_session.model_identity.artifact_kind == "export"
-    assert export_session.resolved_model.model_config.rope_scaling_factor == 1.0
+    assert (
+        export_session.resolved_model.model_config.rope_scaling_factor
+        == expected_factor
+    )
+
+
+def test_default_finetuning_trains_candidates_beyond_base_context(
+    tiny_base_run, tmp_path
+):
+    base = resolve_model_artifact(tiny_base_run, full_verify=True)
+    assert base.model_config.original_context_length == 32
+    context = next(
+        text
+        for count in range(1, 41)
+        if len(base.tokenizer.processor.encode(text := " ".join(["alpha"] * count)))
+        >= 40
+    )
+    row = {
+        "context": context,
+        "endings": ("beta", "gamma", "delta", "epsilon"),
+        "label": 1,
+    }
+    with prepare_swag_bundle(
+        SwagPreparationConfig(
+            provider=FakeSwagProvider((row,)),
+            source=SwagSourceConfig(revision="deadbeef" * 5),
+            maximum_length=64,
+            bucket_boundaries=(64,),
+        ),
+        base,
+        tmp_path / "extended-context-swag",
+    ) as bundle:
+        assert bundle.manifest.example_count == 1
+        with bundle.borrow_buckets() as buckets:
+            lengths = buckets[0].valid_token_mask.sum(axis=-1)
+            assert 40 <= lengths.min() <= lengths.max() <= 64
+        trained = finetune(
+            tiny_swag_training_config(
+                tiny_base_run, bundle, tmp_path / "extended-context-run"
+            )
+        )
+    assert trained.step == trained.examples == 1
+    checkpoint = resolve_latest_step(
+        trained.run, writable=False, verification=VerificationLevel.FULL
+    )
+    adapters = _load_group(checkpoint.step_directory, "adapters.safetensors")
+    assert adapters
+    assert all(bool(mx.all(mx.isfinite(array)).item()) for array in adapters.values())
+    resolved = resolve_model_artifact(trained.run, full_verify=True)
+    assert resolved.model_config.rope_scaling_factor == 8.0
+    assert resolved.model_config.effective_context_length == 256
+
+
+@pytest.mark.parametrize("resume", (False, True), ids=("fresh", "resume"))
+@pytest.mark.parametrize(
+    "maximum_length,message", ((64, "maximum_length"), (32, "bucket length"))
+)
+def test_finetune_rejects_prepared_data_exceeding_runtime_context(
+    tiny_base_run, tmp_path, monkeypatch, resume, maximum_length, message
+):
+    with prepare_swag_bundle(
+        SwagPreparationConfig(
+            provider=FakeSwagProvider(_swag_rows(2)),
+            source=SwagSourceConfig(revision="deadbeef" * 5),
+            maximum_length=maximum_length,
+            bucket_boundaries=(64,),
+        ),
+        resolve_model_artifact(tiny_base_run, full_verify=True),
+        tmp_path / "long-swag",
+    ) as bundle:
+        config = tiny_swag_training_config(
+            tiny_base_run,
+            bundle,
+            tmp_path / "short-context-run",
+            rope_scaling_factor=1.0,
+        )
+        if resume:
+            finetune(replace(config, rope_scaling_factor=2.0))
+            manifest = read_manifest(
+                config.output_run, LoRARunManifest, VerificationLevel.MANIFEST_TRUSTED
+            ).manifest
+            model = dict(manifest.model)
+            model["rope_scaling_factor"] = 1.0
+            manifest = replace(manifest, model=model)
+            manifest = replace(manifest, identity=manifest.recompute_identity())
+            _write_bound_lora_run(config.output_run, manifest)
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("invalid prepared data reached model construction")
+
+        monkeypatch.setattr(swag_module, "_wrap_copied_base", forbidden)
+        with pytest.raises(SMLArtifactError, match=message):
+            if resume:
+                resume_finetune(
+                    config.output_run,
+                    data=bundle.path,
+                    overrides=ResumeOverrides(maximum_steps=2),
+                )
+            else:
+                finetune(config)
+        if not resume:
+            assert not config.output_run.exists()
 
 
 def test_lora_checkpoint_omits_frozen_base(tiny_lora_run):
@@ -2114,8 +2243,9 @@ def test_resume_closes_reader_when_copied_base_load_fails(
     assert closed_descriptors == [-1, -1]
 
 
-def test_resolve_rejects_export_that_changes_copied_base_rope(
-    tiny_base_run, tiny_swag_bundle, tmp_path
+@pytest.mark.parametrize("full_verify", (False, True))
+def test_resolve_rejects_export_with_invalid_rope_scaling(
+    tiny_base_run, tiny_swag_bundle, tmp_path, full_verify
 ):
     trained = finetune(
         tiny_swag_training_config(
@@ -2132,12 +2262,12 @@ def test_resolve_rejects_export_that_changes_copied_base_rope(
         VerificationLevel.MANIFEST_TRUSTED,
     )
     model = dict(verified.manifest.model)
-    model["rope_scaling_factor"] = 2.0
+    model["rope_scaling_factor"] = 0.5
     tampered = replace(verified.manifest, model=model)
     tampered = replace(tampered, identity=tampered.recompute_identity())
     (exported.path / "manifest.json").write_bytes(canonical_json_bytes(tampered))
     with pytest.raises(SMLArtifactError):
-        InferenceSession.from_checkpoint(exported.path, full_verify=True)
+        InferenceSession.from_checkpoint(exported.path, full_verify=full_verify)
 
 
 def test_resolve_rejects_resigned_export_tokenizer_payload_mismatch(

@@ -207,6 +207,11 @@ def assert_complete_evaluation(
     assert task.generation_config == {
         "generation_kwargs": {"temperature": 0.0},
         "provider_gen_kwargs": None,
+        "inference_runtime": {
+            "rope_scaling_factor": 8.0,
+            "original_context_length": 32,
+            "effective_context_length": 256,
+        },
     }
     assert task.metric_normalization_config == {
         "bootstrap_iters": 100000,
@@ -373,4 +378,4 @@ def test_encoded_swag_to_exported_evaluation(
         run_identity=False,
         checkpoint=exported.path,
     )
-    assert read_export_manifest(exported.path).model_config.rope_scaling_factor == 1.0
+    assert read_export_manifest(exported.path).model_config.rope_scaling_factor == 8.0

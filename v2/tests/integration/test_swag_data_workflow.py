@@ -233,7 +233,9 @@ def test_cli_reuses_only_matching_fully_verified_swag_data(
     provider = FakeSwagProvider((VALID_ROW,))
     base = tiny_base_model()
     output = tmp_path / "swag"
-    config = tiny_swag_config(provider, bucket_boundaries=(64, 128, 256))
+    config = tiny_swag_config(
+        provider, bucket_boundaries=(64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192)
+    )
     with prepare_swag_bundle(config, base, output) as bundle:
         payload = output / bundle.manifest.buckets[0].payload.logical_path
     if existing == "corrupt":

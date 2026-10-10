@@ -688,10 +688,43 @@ def test_maximum_length_beyond_effective_context_is_rejected(tmp_path):
     provider = FakeSwagProvider((VALID_ROW,))
     with pytest.raises(SMLDataError, match="effective context"):
         prepare_swag_bundle(
-            tiny_swag_config(provider, maximum_length=64),
+            tiny_swag_config(provider, maximum_length=512),
             tiny_base_model(),
             tmp_path / "swag",
         )
+
+
+def test_default_preparation_keeps_candidates_beyond_pretraining_context(tmp_path):
+    from sml.data.swag import (
+        SwagPreparationConfig,
+        SwagSourceConfig,
+        prepare_swag_bundle,
+    )
+
+    provider = FakeSwagProvider(
+        (VALID_ROW, replace_row(context=" ".join(["word"] * 1_100)))
+    )
+    config = SwagPreparationConfig(provider, SwagSourceConfig(revision="main"))
+    base = tiny_base_model(model_overrides={"original_context_length": 1_024})
+
+    with prepare_swag_bundle(config, base, tmp_path / "extended") as bundle:
+        assert bundle.manifest.example_count == 2
+        assert bundle.manifest.preprocessing["maximum_length"] == 8_192
+        with bundle.borrow_buckets() as buckets:
+            assert tuple(bucket.length for bucket in buckets) == (64, 2_048)
+    assert base.model_config.effective_context_length == 1_024
+
+
+def test_preparation_honors_explicit_unscaled_context(tmp_path):
+    from sml.data.swag import prepare_swag_bundle
+
+    provider = FakeSwagProvider((VALID_ROW,))
+    config = tiny_swag_config(
+        provider, maximum_length=64, bucket_boundaries=(64,), rope_scaling_factor=1.0
+    )
+    with pytest.raises(SMLDataError, match="effective context"):
+        prepare_swag_bundle(config, tiny_base_model(), tmp_path / "unscaled")
+    assert provider.resolve_calls == 0
 
 
 def test_unavailable_uncached_provider_names_source_and_cache_key(tmp_path):
