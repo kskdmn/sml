@@ -522,8 +522,6 @@ class BaseParameterState:
         masters, working = tree
         if not isinstance(masters, dict) or not isinstance(working, dict):
             raise SMLConfigurationError("base parameter state tree must contain dicts")
-        _require_top_level_dict(masters, "master_parameters")
-        _require_top_level_dict(working, "working_parameters")
         _require_same_structure(
             masters,
             working,
@@ -594,8 +592,6 @@ class AdamState:
             raise SMLConfigurationError("Adam state tree must contain moment dicts")
         if not isinstance(step, mx.array) or step.dtype != mx.int32 or step.shape != ():
             raise SMLConfigurationError("Adam step must be an int32 scalar")
-        _require_top_level_dict(first_moments, "first_moments")
-        _require_top_level_dict(second_moments, "second_moments")
         _require_same_structure(
             first_moments,
             second_moments,
@@ -679,7 +675,6 @@ class TrainerState:
             raise SMLConfigurationError(
                 "trainer state tree must contain accumulator dicts"
             )
-        _require_top_level_dict(accumulators, "accumulators")
         _require_dtype(accumulators, "accumulators", mx.float32)
         if (
             not isinstance(accumulation_count, mx.array)
@@ -872,7 +867,7 @@ def _optimizer_scalars_are_finite(
 
 
 def _require_finite_optimizer_state(optimizer: AdamState) -> None:
-    """Establish finite moments once when restoring an older checkpoint."""
+    """Establish finite moments once when restoring a checkpoint."""
     if not bool(
         _parameters_are_finite(optimizer.first_moments)
         & _parameters_are_finite(optimizer.second_moments)
@@ -883,7 +878,7 @@ def _require_finite_optimizer_state(optimizer: AdamState) -> None:
 def _decay_coefficient(value: object, config: OptimizerConfig) -> float:
     if isinstance(value, bool):
         return config.weight_decay.other if value else 0.0
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, (int, float)):
         coefficient = float(value)
         if math.isfinite(coefficient) and coefficient >= 0.0:
             return coefficient
@@ -1094,10 +1089,9 @@ def _adamw_fp32_update_tree(
         parameter_name="parameters",
         allow_bf16_gradients=False,
     )
-    fp32_gradients = tree_map(lambda gradient: gradient.astype(mx.float32), gradients)
-    updated, next_tree = _adamw_fp32_formula(
+    return _adamw_fp32_formula(
         parameters,
-        fp32_gradients,
+        gradients,
         first_state,
         second_state,
         step,
@@ -1105,7 +1099,6 @@ def _adamw_fp32_update_tree(
         weight_decay_tree,
         can_increment,
     )
-    return updated, next_tree
 
 
 def adamw_fp32_update(
@@ -1125,8 +1118,6 @@ def adamw_fp32_update(
         weight_decay_tree,
     )
     _require_dtype(updated, "parameters", mx.float32)
-    _require_dtype(next_tree[1], "first_moments", mx.float32)
-    _require_dtype(next_tree[2], "second_moments", mx.float32)
     return updated, AdamState.from_tree(next_tree)
 
 

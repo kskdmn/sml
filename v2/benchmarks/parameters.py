@@ -1,7 +1,8 @@
 """Deterministic starting weights for comparisons between current revisions.
 
-This protocol belongs to the measurement harness. It does not change the production initializer. New harness identities require fresh
-baseline evidence when this protocol changes.
+This protocol belongs to the measurement harness. It does not change the
+production initializer. Changes require fresh baseline evidence under the
+updated harness identity.
 """
 
 from __future__ import annotations
@@ -20,15 +21,14 @@ def initialize_parameters(model, workload) -> str:
     leaves = dict(tree_flatten(model.parameters()))
     weights = []
     for name, previous in sorted(leaves.items()):
-        logical = name
-        base_name = logical.replace(".base.weight", ".weight")
+        base_name = name.replace(".base.weight", ".weight")
         key_bytes = hashlib.sha256(
             seed.to_bytes(4, "little") + base_name.encode("utf-8")
         ).digest()[:8]
         key = mx.array(np.frombuffer(key_bytes, dtype="<u4"), dtype=mx.uint32)
-        if logical.endswith(".lora_b"):
+        if name.endswith(".lora_b"):
             value = mx.zeros(previous.shape, dtype=mx.bfloat16)
-        elif logical.endswith(".lora_a"):
+        elif name.endswith(".lora_a"):
             value = mx.random.normal(shape=previous.shape, scale=0.01, key=key).astype(
                 mx.bfloat16
             )
@@ -58,10 +58,9 @@ def parameter_identity(model) -> str:
     digest = hashlib.sha256(b"sml-benchmark-canonical-parameters-v2\0")
     leaves = {}
     for name, value in tree_flatten(model.parameters()):
-        logical = name
-        if logical in leaves:
-            raise ValueError(f"duplicate canonical parameter: {logical}")
-        leaves[logical] = value
+        if name in leaves:
+            raise ValueError(f"duplicate canonical parameter: {name}")
+        leaves[name] = value
     for name, value in sorted(leaves.items()):
         encoded = name.encode("utf-8")
         digest.update(len(encoded).to_bytes(4, "little"))

@@ -1698,6 +1698,9 @@ def _payload_refs(value: object) -> Iterator[PayloadRef]:
     if isinstance(value, PayloadRef):
         yield value
         return
+    if isinstance(value, ArrayPayloadRef):
+        yield value.payload
+        return
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         for field in dataclasses.fields(value):
             yield from _payload_refs(getattr(value, field.name))

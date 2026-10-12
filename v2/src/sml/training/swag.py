@@ -319,13 +319,7 @@ class SwagTrainerState:
             loss_numerator,
             correct_count,
         ) = tree
-        instance = object.__new__(cls)
-        object.__setattr__(instance, "accumulators", accumulators)
-        object.__setattr__(instance, "valid_count", valid_count)
-        object.__setattr__(instance, "next_key", next_key)
-        object.__setattr__(instance, "loss_numerator", loss_numerator)
-        object.__setattr__(instance, "correct_count", correct_count)
-        return instance
+        return cls(accumulators, valid_count, next_key, loss_numerator, correct_count)
 
 
 def initial_swag_trainer_state(adapters: dict, *, key: mx.array) -> SwagTrainerState:

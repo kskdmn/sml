@@ -661,15 +661,6 @@ def _reject_existing_output(values: Mapping[str, object]) -> None:
         raise SMLConfigurationError(f"output already exists: {output}")
 
 
-def _tuple_values(values: dict[str, object], *names: str) -> dict[str, object]:
-    converted = values.copy()
-    for name in names:
-        value = converted.get(name)
-        if isinstance(value, list):
-            converted[name] = tuple(value)
-    return converted
-
-
 def _freeze_value(value: object) -> object:
     if isinstance(value, Mapping):
         return MappingProxyType(
@@ -791,7 +782,6 @@ class TokenizeCommand(_Command):
         values.pop("output")
         corpus = _build_corpus(input_root, values.pop("corpus", {}))
         sampling = CorpusSamplingConfig(**dict(values.pop("sampling", {})))
-        values = _tuple_values(values, "conversation_user_symbols")
         return TokenizerTrainingConfig(corpus=corpus, sampling=sampling, **values)
 
     def dispatch(self) -> object:
@@ -841,7 +831,6 @@ class PrepareSwagCommand(_Command):
         revision = values.pop("revision")
         source_values = dict(values.pop("source", {}))
         source = SwagSourceConfig(revision=revision, **source_values)
-        values = _tuple_values(values, "bucket_boundaries")
         return SwagPreparationConfig(
             provider=HuggingFaceDatasetsSwagProvider(),
             source=source,
@@ -960,11 +949,9 @@ class InferCommand(_Command):
             if name in self.values
         }
         generation = _replace_dataclass(generation, generation_cli)
-        runtime_values = _tuple_values(
-            dict(self.values.get("runtime", {})),
-            "batch_size_buckets",
+        runtime = _replace_dataclass(
+            InferenceRuntimeConfig(), self.values.get("runtime", {})
         )
-        runtime = _replace_dataclass(InferenceRuntimeConfig(), runtime_values)
         request = GenerationRequest(
             max_new_tokens=self.values.get(
                 "max_new_tokens",
@@ -998,11 +985,9 @@ class EvaluateCommand(_Command):
         from sml.evaluation import EvaluationConfig
         from sml.inference import InferenceRuntimeConfig
 
-        runtime_values = _tuple_values(
-            dict(self.values.get("runtime", {})),
-            "batch_size_buckets",
+        runtime = _replace_dataclass(
+            InferenceRuntimeConfig(), self.values.get("runtime", {})
         )
-        runtime = _replace_dataclass(InferenceRuntimeConfig(), runtime_values)
         values = {
             name: self.values[name]
             for name in ("padding", "limit")
@@ -1045,7 +1030,6 @@ class FinetuneCommand(_Command):
                 LoRAInitializerConfig(),
                 initializer_values,
             )
-        lora_values = _tuple_values(lora_values, "target_modules")
         lora = _replace_dataclass(LoRAConfig(), lora_values)
         precision = _replace_dataclass(
             LoRAPrecisionConfig(),
@@ -1228,9 +1212,8 @@ def parse_command(argv: Sequence[str]) -> _Command:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    parser = _build_parser()
     if arguments in (["--help"], ["-h"]):
-        parser.print_help()
+        _build_parser().print_help()
         return 0
     try:
         if not arguments:

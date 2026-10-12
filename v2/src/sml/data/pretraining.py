@@ -663,7 +663,6 @@ class PretrainingBatchStream(Iterator[BatchEnvelope]):
 
         self._batch_size = batch_size
         self._seed = seed
-        self._prefetch_depth = prefetch_depth
         self._shards: _PreparedShardStore | None = None
         self._manifest = bundle.manifest
         self._stop = threading.Event()

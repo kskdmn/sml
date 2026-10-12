@@ -461,21 +461,3 @@ class RawTrial:
             post_exit_recovery_samples=tuple(dict(item) for item in raw_samples),
             post_exit_recovery=evidence["post_exit_recovery"],
         )
-
-
-@dataclass(frozen=True, slots=True)
-class TrialPair:
-    pair_index: int
-    metric: MetricName
-    reference: RawTrial
-    candidate: RawTrial
-
-    def __post_init__(self) -> None:
-        if self.reference.side != "reference" or self.candidate.side != "candidate":
-            raise ValueError("trial pair sides are reversed")
-        if self.reference.pair_index != self.pair_index:
-            raise ValueError("reference pair index does not match")
-        if self.candidate.pair_index != self.pair_index:
-            raise ValueError("candidate pair index does not match")
-        if self.reference.metric != self.metric or self.candidate.metric != self.metric:
-            raise ValueError("trial pair metrics do not match")

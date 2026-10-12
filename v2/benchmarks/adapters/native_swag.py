@@ -317,10 +317,6 @@ class SwagRuntime:
             )
         return examples
 
-    @property
-    def measured_work_ids(self) -> list[int]:
-        return list(self.observed_execution_order())
-
     def close(self) -> None:
         self.bucket = None
         mappings, self._mappings = self._mappings, ()

@@ -1716,7 +1716,7 @@ def test_task_source_snapshot_rejects_mutation_during_provider_parse(
     provider = replace(provider, load_yaml=mutating_load_yaml)
 
     with pytest.raises(SMLRuntimeError, match="source|YAML|changed"):
-        evaluation._resolve_yaml_sources(provider, primary)
+        evaluation._snapshot_yaml_sources(provider, primary)
 
 
 def test_evaluate_preserves_complete_provider_result_and_task_metrics(

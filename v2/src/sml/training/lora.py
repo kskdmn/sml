@@ -13,6 +13,7 @@ from sml.artifacts.manifest import ArraySpec
 from sml.errors import SMLConfigurationError
 from sml.model.config import ModelConfig
 from sml.model.layers import LoRAAdapterSpec, LoRAForwardPolicy, _Linear, _linear
+from sml.training.common import _require_finite
 
 _ALLOWED_TARGET_MODULES = (
     "q_proj",
@@ -23,15 +24,6 @@ _ALLOWED_TARGET_MODULES = (
     "up_proj",
     "down_proj",
 )
-
-
-def _require_finite(value: object, field_name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise SMLConfigurationError(f"{field_name} must be a finite number")
-    normalized = float(value)
-    if not math.isfinite(normalized):
-        raise SMLConfigurationError(f"{field_name} must be finite")
-    return normalized
 
 
 @dataclass(frozen=True, slots=True)

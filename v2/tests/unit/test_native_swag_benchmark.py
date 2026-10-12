@@ -58,7 +58,7 @@ def test_native_swag_trains_adapters_and_counts_actual_canonical_examples(
         initial_identity = runtime.initial_parameter_identity
         assert initial_identity == parameter_identity(runtime.model)
         assert runtime.run(2) == 8.0
-        assert runtime.measured_work_ids == [0, 1, 2, 0, 1, 2, 0, 1]
+        assert runtime.observed_execution_order() == (0, 1, 2, 0, 1, 2, 0, 1)
         assert int(runtime.optimizer.step.item()) == 2
         assert runtime.microstep_index == 4
         assert int(runtime.trainer.valid_count.item()) == 0
@@ -75,7 +75,7 @@ def test_native_swag_trains_adapters_and_counts_actual_canonical_examples(
 
         runtime.reset_measured_order()
         assert runtime.run(1) == 4.0
-        assert runtime.measured_work_ids == [0, 1, 2, 0]
+        assert runtime.observed_execution_order() == (0, 1, 2, 0)
         assert int(runtime.optimizer.step.item()) == 3
         assert runtime.microstep_index == 6
     finally:

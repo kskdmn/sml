@@ -479,13 +479,6 @@ def _snapshot_yaml_sources(
     return _TaskSourceSnapshot(primary, tuple(closure))
 
 
-def _resolve_yaml_sources(
-    provider: _LMEvalProvider,
-    yaml_path: object,
-) -> tuple[EvaluationSourceIdentity, tuple[EvaluationSourceIdentity, ...]]:
-    return _snapshot_yaml_sources(provider, yaml_path).identities()
-
-
 def _requested_task_names(task_list: object) -> tuple[str, ...]:
     if not isinstance(task_list, Sequence) or isinstance(task_list, (str, bytes)):
         raise SMLRuntimeError("lm-eval requested task list is malformed")

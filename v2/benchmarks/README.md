@@ -42,14 +42,11 @@ fresh baseline and quality evidence under their updated content identities.
 Inference measures encoded model primitives; tokenization and
 public-session scheduling are outside its timing boundaries. Decode uses a fixed
 transition count without early EOS termination. Prefill projects only the final
-prompt position to vocabulary logits, matching production generation. These
-prefill and observed-order changes require fresh baseline measurements under the
-new harness content identity; they do not change the raw-trial schema.
-Each checkpoint publication
-follows a real optimizer update, which is outside the timed pause. Checkpoints
-carry the fixed benchmark tokenizer specification; this metric does not load
-SentencePiece. Prepared-data setup lives in `adapters/prepared_data.py` and calls
-the production stream.
+prompt position to vocabulary logits, matching production generation.
+Each checkpoint publication follows a real optimizer update, which is outside the
+timed pause. Checkpoints carry the fixed benchmark tokenizer specification; this
+metric does not load SentencePiece. Prepared-data setup lives in
+`adapters/prepared_data.py` and calls the production stream.
 
 Baseline manifests use version 3. Capture requires all nine metrics, five fresh
 processes per metric, and the counts above. Replace `FULL_GIT_COMMIT` with the

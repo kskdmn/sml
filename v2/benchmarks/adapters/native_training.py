@@ -90,7 +90,6 @@ class PretrainingRuntime:
         }
         if set(workload.loader) != expected_loader:
             raise ValueError("native training loader has unsupported fields")
-        self.workload = workload
         self.metric = metric
         self.bundle = _materialize_bundle(workload, directory / "data")
         self.native_representation_identity = self.bundle.manifest.identity
@@ -153,7 +152,6 @@ class PretrainingRuntime:
             ),
         )
         self.stream = None
-        self.epoch = 0
         self.row_index = 0
         self._observed_batches: list[ObservedBatch] = []
         self._completed_steps: list[mx.array] = []
@@ -192,7 +190,6 @@ class PretrainingRuntime:
             prefetch_depth=self.config.loader.prefetch_depth,
             cursor=cursor,
         )
-        self.epoch = cursor.epoch
 
     def _next_rows(self):
         if not self.include_loader:
@@ -237,7 +234,6 @@ class PretrainingRuntime:
             self.state.optimizer = updated.optimizer
             self.state.trainer = updated.trainer
             self.model.update(updated.parameters.working_parameters)
-            self.last_metrics = updated.metrics
             self._completed_steps.append(updated.optimizer.step)
             del updated
             self.state.scalar = ScalarTrainingState(

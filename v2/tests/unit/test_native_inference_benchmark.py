@@ -43,10 +43,10 @@ def test_native_inference_repeats_canonical_work_after_warmup(
     runtime.run(3)
     first = runtime.last_output
     runtime.reset_after_warmup()
-    assert runtime.ordered_request_ids == []
+    assert runtime.observed_execution_order() == ()
     work = runtime.run(3)
     assert work == 3 * (4 if metric == "inference-prefill" else 2)
-    assert runtime.ordered_request_ids == [0, 1, 0]
+    assert runtime.observed_execution_order() == (0, 1, 0)
     runtime.reset_measured_order()
     runtime.run(1)
     if metric == "inference-prefill":
@@ -95,7 +95,7 @@ def test_native_decode_matches_eager_fixed_chunk(penalty, ngram, workload, tmp_p
     logits = runtime.model(tokens, cache=cache).logits[:, -1, :]
     key = mx.random.key(runtime.generation.seed)
     # One initial selection belongs to prefill, then each measured step performs
-    # another forward and selection, matching the legacy benchmark boundary.
+    # another forward and selection.
     for step in range(runtime.chunk_size + 1):
         lengths = mx.array([tokens.shape[1]], dtype=mx.int32)
         scores = apply_repetition_penalty(logits, tokens, lengths, penalty)

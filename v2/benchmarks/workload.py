@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -812,11 +811,4 @@ def file_identity(path: Path) -> str:
     with path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
-    return f"sha256:{digest.hexdigest()}"
-
-
-def ordered_file_identity(paths: Iterable[Path]) -> str:
-    digest = hashlib.sha256()
-    for path in paths:
-        digest.update(path.read_bytes())
     return f"sha256:{digest.hexdigest()}"

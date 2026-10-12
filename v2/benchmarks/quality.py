@@ -1774,15 +1774,6 @@ def _empty_update_statistics(
     return tuple(statistics)
 
 
-def _changed_working_fraction(observations: Sequence[_LeafUpdateObservation]) -> float:
-    if not observations:
-        return 0.0
-    mx.eval(*(item.changed_working_count for item in observations))
-    changed = sum(int(item.changed_working_count.item()) for item in observations)
-    total = sum(item.value_count for item in observations)
-    return changed / total
-
-
 def _is_rms_norm_path(path: str) -> bool:
     return (
         ".input_norm." in path or ".post_attn_norm." in path or path.startswith("norm.")
@@ -3376,10 +3367,6 @@ def _json_object_no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, obj
             raise ValueError(f"duplicate JSON key: {key}")
         result[key] = value
     return result
-
-
-def _read_json(path: Path) -> dict[str, object]:
-    return _decode_json_object(path.read_bytes(), label=str(path))
 
 
 def _decode_json_object(payload: bytes, *, label: str) -> dict[str, object]:

@@ -94,10 +94,8 @@ class _InferenceRuntime:
         self._prefill = mx.compile(self._forward)
         self._decode = mx.compile(self._decode_arrays)
         self.request_index = 0
-        self.ordered_request_ids: list[int] = []
         self._observed_requests: list[tuple[int, object]] = []
-        # All measured decode requests start at the same logical boundary as the
-        # reference: a filled prompt cache and its already selected first token.
+        # Each decode request starts with a filled prompt cache and its first token.
         self._states = (
             [self._prepare_state(index) for index in self.request_ids]
             if metric == "inference-decode"
@@ -155,8 +153,7 @@ class _InferenceRuntime:
         return state
 
     def _decode_arrays(self, parameters, cache, selected, tokens, lengths, key):
-        # The benchmark counts a fixed number of forwards even if EOS appears.
-        # This matches the reference workload, whose stopping rule is its chunk.
+        # Count a fixed number of forwards even if EOS appears.
         for _ in range(self.chunk_size):
             logits, cache = self._forward(parameters, selected, cache)
             selected, key = self._select(logits[:, -1, :], tokens, lengths, key)
@@ -183,7 +180,6 @@ class _InferenceRuntime:
                 inputs = self._states[index]
                 self.last_output = self._decode(self.parameters, *inputs)
             mx.eval(self.last_output)
-            self.ordered_request_ids.append(self.request_ids[index])
             self._observed_requests.append((self.request_ids[index], inputs))
         tokens = (
             self.prompt_tokens
@@ -194,7 +190,6 @@ class _InferenceRuntime:
 
     def reset_measured_order(self) -> None:
         self.request_index = 0
-        self.ordered_request_ids.clear()
         self._observed_requests.clear()
 
     def observed_execution_order(self) -> tuple[int, ...]:

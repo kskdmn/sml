@@ -368,51 +368,16 @@ def evaluation_result_identity(result: EvaluationResult) -> str:
     )
 
 
-def _source_payload(source: EvaluationSourceIdentity) -> dict[str, str]:
-    return {
-        "logical_name": source.logical_name,
-        "content_identity": source.content_identity,
-    }
-
-
-def _provider_payload(provider: EvaluationProviderVersion) -> dict[str, str]:
-    return {"name": provider.name, "version": provider.version}
-
-
-def _task_payload(record: EvaluationTaskRecord) -> dict[str, object]:
-    return {
-        "task_name": record.task_name,
-        "task_identity": record.task_identity,
-        "task_yaml": _source_payload(record.task_yaml),
-        "include_template_closure": [
-            _source_payload(source) for source in record.include_template_closure
-        ],
-        "task_metadata_version": record.task_metadata_version,
-        "prompt_config": record.prompt_config,
-        "few_shot_config": record.few_shot_config,
-        "generation_config": record.generation_config,
-        "metric_normalization_config": record.metric_normalization_config,
-        "seeds": record.seeds,
-        "limit": record.limit,
-        "ordered_request_identity": record.ordered_request_identity,
-        "lm_eval_package_version": record.lm_eval_package_version,
-        "lm_eval_source_commit": record.lm_eval_source_commit,
-        "dataset_revision": record.dataset_revision,
-        "dataset_fingerprint": record.dataset_fingerprint,
-        "provider_versions": [
-            _provider_payload(provider) for provider in record.provider_versions
-        ],
-        "metric_payload": record.metric_payload,
-    }
-
-
 def _result_payload(result: EvaluationResult) -> dict[str, object]:
     return {
         "kind": result.kind,
         "version": result.version,
         "identity": result.identity,
         "model": _model_projection(result.model),
-        "tasks": [_task_payload(task) for task in result.tasks],
+        "tasks": [
+            _task_projection(task, include_identity=True, include_metrics=True)
+            for task in result.tasks
+        ],
         "provider_result": result.provider_result,
     }
 

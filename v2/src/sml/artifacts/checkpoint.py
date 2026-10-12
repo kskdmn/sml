@@ -57,6 +57,7 @@ from sml.artifacts.manifest import (
     _open_stable_payload,
     _open_verified_payload,
     _parse_manifest,
+    _payload_refs,
     _reject_json_constant,
     _same_stable_entry,
     _validated_payload_references,
@@ -889,24 +890,6 @@ def _cleanup_stale_temporaries(
             )
 
 
-def _payload_references(value: object) -> Iterator[PayloadRef]:
-    if isinstance(value, PayloadRef):
-        yield value
-        return
-    if isinstance(value, ArrayPayloadRef):
-        yield value.payload
-        return
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        for field in dataclasses.fields(value):
-            yield from _payload_references(getattr(value, field.name))
-    elif isinstance(value, Mapping):
-        for item in value.values():
-            yield from _payload_references(item)
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        for item in value:
-            yield from _payload_references(item)
-
-
 def checkpoint_array_payloads(
     manifest: CheckpointManifest,
 ) -> tuple[ArrayPayloadRef, ...]:
@@ -1119,7 +1102,7 @@ def _verify_closed_world(
 ) -> None:
     if not isinstance(verify_contents, bool):
         raise TypeError("verify_contents must be a bool")
-    references = tuple(_payload_references(manifest))
+    references = tuple(_payload_refs(manifest))
     expected_files, expected_directories = _expected_closed_world(references)
     if isinstance(manifest, (PretrainingDataManifest, ExportManifest)):
         _verify_pretraining_nested_tokenizer(fs, temporary_descriptor, manifest)
@@ -1989,7 +1972,7 @@ def _mlx_core() -> ModuleType:
 
 @dataclass(frozen=True, slots=True)
 class CheckpointReader:
-    """Own a FULL-proven checkpoint inode and its eagerly materialized contents."""
+    """Retain a checkpoint inode with the requested verification and contents."""
 
     resolved: ResolvedStep
     _owned_step: _OwnedStep

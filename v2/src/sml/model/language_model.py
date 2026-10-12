@@ -9,7 +9,7 @@ from mlx import nn
 from sml.artifacts.manifest import ArraySpec
 from sml.model.cache import KVArrayState, KVCache
 from sml.model.config import InitializerConfig, ModelConfig
-from sml.model.layers import LoRAForwardPolicy, RMSNorm, TransformerBlock
+from sml.model.layers import LoRAForwardPolicy, RMSNorm, TransformerBlock, _Linear
 from sml.model.rope import RotaryEmbedding
 
 
@@ -20,15 +20,6 @@ class _Embedding(nn.Module):
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         return self.weight[input_ids]
-
-
-class _VocabularyProjection(nn.Module):
-    def __init__(self, vocab_size: int, hidden_size: int) -> None:
-        super().__init__()
-        self.weight = mx.zeros((vocab_size, hidden_size), dtype=mx.bfloat16)
-
-    def __call__(self, hidden: mx.array) -> mx.array:
-        return hidden @ self.weight.T
 
 
 def model_parameter_specs(config: ModelConfig) -> tuple[ArraySpec, ...]:
@@ -125,7 +116,7 @@ class SMLLanguageModel(nn.Module):
         ]
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_epsilon)
         if not config.tie_word_embeddings:
-            self.lm_head = _VocabularyProjection(config.vocab_size, config.hidden_size)
+            self.lm_head = _Linear(config.hidden_size, config.vocab_size)
         self.initialize_state(key)
 
     def initialize_state(self, key: mx.array) -> None:

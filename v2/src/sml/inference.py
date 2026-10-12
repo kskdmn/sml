@@ -374,13 +374,10 @@ class BufferPool:
     def release(self, lease: _Lease) -> None:
         lease.discard()
 
-    def _reset_cache(self, cache_state: object) -> object:
-        return reset_kv_state(cache_state)
-
     def _return(self, lease: _Lease) -> None:
         self._active = max(0, self._active - 1)
         self._free.setdefault(lease._pool_key, []).append(
-            (lease.token_storage, self._reset_cache(lease.cache_state))
+            (lease.token_storage, reset_kv_state(lease.cache_state))
         )
 
 
@@ -826,7 +823,6 @@ class InferenceSession:
             )
 
         groups: dict[tuple[int, int, GenerationKernelKey], list[_PreparedRequest]] = {}
-        group_order: list[tuple[int, int, GenerationKernelKey]] = []
         for item in prepared:
             group_key = (
                 item.prefill_length_bucket,
@@ -835,13 +831,11 @@ class InferenceSession:
             )
             if group_key not in groups:
                 groups[group_key] = []
-                group_order.append(group_key)
             groups[group_key].append(item)
 
         max_batch = self._runtime.batch_size_buckets[-1]
         buckets: list[GenerationBucket] = []
-        for group_key in group_order:
-            members = groups[group_key]
+        for group_key, members in groups.items():
             for start in range(0, len(members), max_batch):
                 chunk = members[start : start + max_batch]
                 batch_size_bucket = self._select_batch_size_bucket(len(chunk))
@@ -963,17 +957,14 @@ class InferenceSession:
             )
 
         groups: dict[int, list[tuple[int, tuple[int, ...], int, int]]] = {}
-        group_order: list[int] = []
         for item in prepared:
             length_bucket = item[3]
             if length_bucket not in groups:
                 groups[length_bucket] = []
-                group_order.append(length_bucket)
             groups[length_bucket].append(item)
 
         max_batch = self._runtime.batch_size_buckets[-1]
-        for length_bucket in group_order:
-            members = groups[length_bucket]
+        for length_bucket, members in groups.items():
             for start in range(0, len(members), max_batch):
                 chunk = members[start : start + max_batch]
                 batch_size_bucket = self._select_batch_size_bucket(len(chunk))

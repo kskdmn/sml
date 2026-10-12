@@ -2230,11 +2230,11 @@ class SwagBatchStream:
         plan = self._plan
         if not plan:
             raise SMLDataError("SWAG bundle does not contain any examples")
-        _bucket_index, row_permutation = plan[cursor.bucket_order_position]
+        bucket_index, row_permutation = plan[cursor.bucket_order_position]
         remaining = len(row_permutation) - cursor.row_offset
         take = min(self._loader.microbatch_size, remaining)
         selected = row_permutation[cursor.row_offset : cursor.row_offset + take]
-        bucket = self._bundle._owned_buckets()[plan[cursor.bucket_order_position][0]]
+        bucket = self._bundle._owned_buckets()[bucket_index]
         arrays = _assemble_batch_arrays(
             bucket,
             selected,
