@@ -59,10 +59,11 @@ uv run python -m sml prepare pretraining \
 ```
 
 Both commands discover nonhidden matching files directly inside the input
-directory. By default, each scans up to **100 files** and the first **8,192 physical
-lines per file**, with seeded file selection and ordering. Text is normalized by
-replacing null characters and collapsing whitespace, then filtered to
-**100–16,384 UTF-8 bytes** per document.
+directory. By default, tokenizer training scans up to **80 files**, while
+pretraining preparation scans **all matching files**. Each scans the first
+**8,192 physical lines per file**, with seeded file selection and ordering. Text
+is normalized by replacing null characters and collapsing whitespace, then
+filtered to **100–16,384 UTF-8 bytes** per document.
 
 Tokenizer training takes a seeded sample of at most **100,000 unique normalized
 documents / 128 MiB** from all scanned prefixes. Whole documents are retained,
@@ -76,9 +77,9 @@ uv run python -m sml tokenize \
 ```
 
 **Pretraining has independent scan limits and does not inherit tokenizer sample
-caps or deduplication.** To prepare more text, save this as `pretraining.toml` and
-run `uv run python -m sml prepare pretraining --config pretraining.toml`, using a
-new output directory:
+caps or deduplication.** To customize scan limits, save this as `pretraining.toml`
+and run `uv run python -m sml prepare pretraining --config pretraining.toml`, using
+a new output directory:
 
 ```toml
 [prepare.pretraining]

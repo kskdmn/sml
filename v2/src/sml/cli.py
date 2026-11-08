@@ -16,6 +16,7 @@ from sml.errors import (
     SMLRuntimeError,
 )
 
+_DEFAULT_TOKENIZER_MAX_FILES = 80
 _DOMAIN_ERRORS = (
     SMLConfigurationError,
     SMLArtifactError,
@@ -378,7 +379,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "sampling_seed",
             "Seed for reproducible tokenizer document sampling (default: 42).",
         ),
-        ("max_files", "Maximum corpus files to sample (default: 100)."),
+        (
+            "max_files",
+            f"Maximum corpus files to sample (default: {_DEFAULT_TOKENIZER_MAX_FILES}).",
+        ),
         (
             "max_rows_per_file",
             "Maximum physical lines scanned per selected file (default: 8192).",
@@ -780,7 +784,9 @@ class TokenizeCommand(_Command):
         values = dict(self.values)
         input_root = values.pop("input")
         values.pop("output")
-        corpus = _build_corpus(input_root, values.pop("corpus", {}))
+        corpus_values = dict(values.pop("corpus", {}))
+        corpus_values.setdefault("max_files", _DEFAULT_TOKENIZER_MAX_FILES)
+        corpus = _build_corpus(input_root, corpus_values)
         sampling = CorpusSamplingConfig(**dict(values.pop("sampling", {})))
         return TokenizerTrainingConfig(corpus=corpus, sampling=sampling, **values)
 

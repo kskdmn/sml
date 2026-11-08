@@ -182,13 +182,13 @@ def test_corpus_row_limit_does_not_require_consuming_later_frames(tmp_path):
     assert list(iter_filtered_texts(config, (shard,))) == ["first"]
 
 
-def test_default_discovery_samples_all_shard_names_with_a_file_budget(tmp_path):
+def test_discovery_samples_all_shard_names_with_an_explicit_file_budget(tmp_path):
     for index in range(120):
         (tmp_path / f"data-{index:04d}.jsonl.zst").write_bytes(b"")
-    config = CorpusConfig(input_root=tmp_path, shuffle_files=False)
+    config = CorpusConfig(input_root=tmp_path, shuffle_files=False, max_files=100)
 
     selected = discover_corpus_files(config)
-    shuffled = discover_corpus_files(CorpusConfig(input_root=tmp_path))
+    shuffled = discover_corpus_files(CorpusConfig(input_root=tmp_path, max_files=100))
 
     assert len(selected) == 100
     assert list(selected) == sorted(selected)
@@ -196,12 +196,11 @@ def test_default_discovery_samples_all_shard_names_with_a_file_budget(tmp_path):
     assert any(path.name.startswith("data-01") for path in selected)
     assert selected == discover_corpus_files(config)
     assert set(selected) != set(
-        discover_corpus_files(CorpusConfig(input_root=tmp_path, file_order_seed=43))
+        discover_corpus_files(
+            CorpusConfig(input_root=tmp_path, file_order_seed=43, max_files=100)
+        )
     )
-    assert (
-        len(discover_corpus_files(CorpusConfig(input_root=tmp_path, max_files=None)))
-        == 120
-    )
+    assert len(discover_corpus_files(CorpusConfig(input_root=tmp_path))) == 120
 
 
 @pytest.mark.parametrize(

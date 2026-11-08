@@ -20,7 +20,6 @@ from sml.errors import SMLDataError
 
 DEFAULT_FILENAME_PATTERN = r".*\.jsonl\.zst\Z"
 DEFAULT_FILE_ORDER_SEED = 42
-DEFAULT_MAX_FILES = 100
 DEFAULT_TEXT_FIELD = "text"
 DEFAULT_MIN_TEXT_BYTES = 100
 DEFAULT_MAX_TEXT_BYTES = 16_384
@@ -61,7 +60,7 @@ class CorpusConfig:
     min_text_bytes: int = DEFAULT_MIN_TEXT_BYTES
     max_text_bytes: int | None = DEFAULT_MAX_TEXT_BYTES
     max_rows_per_file: int | None = DEFAULT_MAX_ROWS_PER_FILE
-    max_files: int | None = DEFAULT_MAX_FILES
+    max_files: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.input_root, Path):

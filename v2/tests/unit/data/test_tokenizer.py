@@ -423,7 +423,7 @@ def test_manifest_training_is_recursive_and_source_locator_is_diagnostic(
     assert manifest_json["training"]["corpus"] == {
         "filename_pattern": r".*\.jsonl\.zst\Z",
         "file_order_seed": 42,
-        "max_files": 100,
+        "max_files": None,
         "max_rows_per_file": 8192,
         "max_text_bytes": 16384,
         "min_text_bytes": 1,
