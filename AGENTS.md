@@ -1,6 +1,6 @@
 # Environment
 
-- Python 3.12.13
+- Python 3.12.16
 - Use `uv run` to run Python scripts.
 - Always run `uv run pytest` outside the sandbox so MLX/Metal can access the Apple GPU; request escalation/approval when the environment requires it.
 

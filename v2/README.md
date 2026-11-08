@@ -1,7 +1,7 @@
 # SML v2
 
 SML v2 trains and runs language models with MLX on Apple Silicon. Run commands
-from the repository root with Python 3.12.13 through `uv run`. Creating bundles
+from the repository root with Python 3.12.16 through `uv run`. Creating bundles
 and training or resuming runs require local APFS storage; reading a run's latest
 checkpoint requires a local filesystem.
 

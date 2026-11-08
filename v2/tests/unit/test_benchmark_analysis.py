@@ -132,7 +132,7 @@ def _recovery_collect(states):
             "memory_free_percentage": 60,
             "competing_gpu_workload": False,
         }
-        return {"chip": "Apple M5"}, status, {"python": "3.12.13"}
+        return {"chip": "Apple M5"}, status, {"python": "3.12.16"}
 
     return collect
 
@@ -266,7 +266,7 @@ def test_canonical_workload_round_trip_pins_complete_benchmark_contract():
         structured_identity(
             "sml-benchmark-protocol-neutral-workload-v1", protocol_neutral
         )
-        == "sha256:2cea29c2139acb0a443b37226136b0e951d4abdc1b606067259336598db7b94e"
+        == "sha256:6aee56e33d6ba7fd280f7512d843d2f45dd326fc66f5b3277bacb38669af853d"
     )
 
 
@@ -809,10 +809,10 @@ def _valid_observation(observed_at_utc):
             "competing_gpu_workload": False,
         },
         "software_versions": {
-            "python": "3.12.13",
-            "mlx": "0.32.0",
-            "numpy": "2.4.6",
-            "sentencepiece": "0.2.1",
+            "python": "3.12.16",
+            "mlx": "0.32.4",
+            "numpy": "2.5.4",
+            "sentencepiece": "0.2.2",
         },
     }
 
@@ -3691,7 +3691,7 @@ def _session_document(
         canonical_workload_identity=canonical_workload_identity(workload),
         protocol=protocol or {"pairs": 5, "warmup_units": 5, "measured_units": 20},
         hardware=hardware or {"chip": "Apple M5"},
-        software_versions=software_versions or {"python": "3.12.13", "mlx": "0.32.0"},
+        software_versions=software_versions or {"python": "3.12.16", "mlx": "0.32.4"},
         manifest_path=tmp_path / manifest_name,
         raw_output_path=tmp_path / raw_output_name,
     )
@@ -5541,7 +5541,7 @@ def test_thermal_episode_without_trigger_preserves_nonempty_malformed_evidence(
         {"protocol": {"pairs": 4, "warmup_units": 5, "measured_units": 20}},
         {"protocol": {"pairs": 5, "warmup_units": 20, "measured_units": 100}},
         {"hardware": {"chip": "Apple M4"}},
-        {"software_versions": {"python": "3.12.12", "mlx": "0.32.0"}},
+        {"software_versions": {"python": "3.12.12", "mlx": "0.32.4"}},
         {"manifest_name": "other.json"},
         {"raw_output_name": "other.jsonl"},
     ],
@@ -8567,7 +8567,7 @@ def test_thermal_recovery_requires_five_continuous_nominal_minutes():
     result = wait_for_nominal_thermal_window(
         collect=_recovery_collect(["nominal"] * 4 + ["fair"] + ["nominal"] * 20),
         expected_hardware={"chip": "Apple M5"},
-        expected_software_versions={"python": "3.12.13"},
+        expected_software_versions={"python": "3.12.16"},
         required_environment=build_canonical_workload().required_environment,
         record_sample=lambda index, sample: samples.append((index, sample)),
         deadline=clock() + 7_200,
@@ -8592,7 +8592,7 @@ def test_thermal_recovery_times_out_without_losing_samples():
         wait_for_nominal_thermal_window(
             collect=_recovery_collect(["fair"]),
             expected_hardware={"chip": "Apple M5"},
-            expected_software_versions={"python": "3.12.13"},
+            expected_software_versions={"python": "3.12.16"},
             required_environment=build_canonical_workload().required_environment,
             record_sample=lambda index, sample: samples.append((index, sample)),
             deadline=120.0,
@@ -8612,7 +8612,7 @@ def test_thermal_recovery_enforces_a_deadline_at_a_nominal_window_boundary():
         wait_for_nominal_thermal_window(
             collect=_recovery_collect(["nominal"]),
             expected_hardware={"chip": "Apple M5"},
-            expected_software_versions={"python": "3.12.13"},
+            expected_software_versions={"python": "3.12.16"},
             required_environment=build_canonical_workload().required_environment,
             record_sample=lambda index, sample: samples.append((index, sample)),
             deadline=324.0,
@@ -9043,7 +9043,7 @@ def test_thermal_recovery_stops_on_nonthermal_changes(target, field, value):
     clock = _RecoveryClock()
     hardware = {"chip": "Apple M5"}
     status = _recovery_collect(["fair"])()[1]
-    software = {"python": "3.12.13"}
+    software = {"python": "3.12.16"}
     if target == "hardware":
         hardware[field] = value
     elif target == "software":
@@ -9055,7 +9055,7 @@ def test_thermal_recovery_stops_on_nonthermal_changes(target, field, value):
         wait_for_nominal_thermal_window(
             collect=lambda: (hardware, status, software),
             expected_hardware={"chip": "Apple M5"},
-            expected_software_versions={"python": "3.12.13"},
+            expected_software_versions={"python": "3.12.16"},
             required_environment=build_canonical_workload().required_environment,
             record_sample=lambda index, sample: None,
             deadline=120.0,

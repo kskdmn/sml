@@ -218,7 +218,7 @@ def _assert_complete_evaluation(
     }
     assert task.limit is None
     assert task.ordered_request_identity.startswith("sha256:")
-    assert task.lm_eval_package_version == "0.4.12"
+    assert task.lm_eval_package_version == metadata.version("lm-eval")
     assert task.lm_eval_source_commit is None
     assert task.dataset_revision == "version:1.0.0"
     assert task.dataset_fingerprint.startswith("sha256:")

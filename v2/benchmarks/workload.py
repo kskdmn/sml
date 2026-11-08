@@ -651,10 +651,10 @@ def build_canonical_workload(
             "competing_gpu_workload": False,
         },
         software_requirements={
-            "python": "3.12.13",
-            "mlx": ">=0.32.0,<1.0.0",
-            "numpy": ">=2.4.6,<3.0.0",
-            "sentencepiece": ">=0.2.1,<1.0.0",
+            "python": "3.12.16",
+            "mlx": ">=0.32.4,<1.0.0",
+            "numpy": ">=2.5.4,<3.0.0",
+            "sentencepiece": ">=0.2.2,<1.0.0",
         },
     )
     swag = fixed_swag_examples(workload, rows)

@@ -802,11 +802,12 @@ def test_collision_validation_normalizes_destination_os_errors(
     def fail_collision_validation(*args: object, **kwargs: object) -> object:
         raise OSError("injected destination race")
 
-    monkeypatch.setattr(
-        evaluation_result_module.os, operation, fail_collision_validation
-    )
-    with pytest.raises(SMLRuntimeError) as error:
-        publish_evaluation_result(path, loser)
+    with monkeypatch.context() as collision_patch:
+        collision_patch.setattr(
+            evaluation_result_module.os, operation, fail_collision_validation
+        )
+        with pytest.raises(SMLRuntimeError) as error:
+            publish_evaluation_result(path, loser)
     assert str(error.value) == f"evaluation output collision: {path}"
 
 
