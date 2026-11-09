@@ -17,6 +17,7 @@ from sml.errors import (
 )
 
 _DEFAULT_TOKENIZER_MAX_FILES = 80
+_DEFAULT_TOKENIZER_MAX_ROWS_PER_FILE = 8_192
 _DOMAIN_ERRORS = (
     SMLConfigurationError,
     SMLArtifactError,
@@ -394,7 +395,10 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         (
             "max_rows_per_file",
-            "Maximum physical lines scanned per selected file (default: 8192).",
+            (
+                "Maximum physical lines scanned per selected file "
+                f"(default: {_DEFAULT_TOKENIZER_MAX_ROWS_PER_FILE})."
+            ),
         ),
     ):
         tokenize.add_argument(
@@ -795,6 +799,9 @@ class TokenizeCommand(_Command):
         values.pop("output")
         corpus_values = dict(values.pop("corpus", {}))
         corpus_values.setdefault("max_files", _DEFAULT_TOKENIZER_MAX_FILES)
+        corpus_values.setdefault(
+            "max_rows_per_file", _DEFAULT_TOKENIZER_MAX_ROWS_PER_FILE
+        )
         corpus = _build_corpus(input_root, corpus_values)
         sampling = CorpusSamplingConfig(**dict(values.pop("sampling", {})))
         return TokenizerTrainingConfig(corpus=corpus, sampling=sampling, **values)

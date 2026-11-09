@@ -424,7 +424,7 @@ def test_manifest_training_is_recursive_and_source_locator_is_diagnostic(
         "filename_pattern": r".*\.jsonl\.zst\Z",
         "file_order_seed": 42,
         "max_files": None,
-        "max_rows_per_file": 8192,
+        "max_rows_per_file": 49152,
         "max_text_bytes": 16384,
         "min_text_bytes": 1,
         "shuffle_files": True,

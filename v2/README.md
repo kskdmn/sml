@@ -59,11 +59,11 @@ uv run python -m sml prepare pretraining \
 ```
 
 Both commands discover nonhidden matching files directly inside the input
-directory. By default, tokenizer training scans up to **80 files**, while
-pretraining preparation scans **all matching files**. Each scans the first
-**8,192 physical lines per file**, with seeded file selection and ordering. Text
-is normalized by replacing null characters and collapsing whitespace, then
-filtered to **100–16,384 UTF-8 bytes** per document.
+directory. By default, tokenizer training scans up to **80 files** and the first
+**8,192 physical lines per file**. Pretraining preparation scans **all matching
+files** and the first **49,152 physical lines per file**. Both use seeded file
+selection and ordering. Text is normalized by replacing null characters and
+collapsing whitespace, then filtered to **100–16,384 UTF-8 bytes** per document.
 
 `prepare pretraining` reports each input file's `elapsed_seconds` to stderr after
 processing that file.
