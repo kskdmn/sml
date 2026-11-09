@@ -9,9 +9,10 @@ import itertools
 import json
 import random
 import re
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import BinaryIO
 
 import zstandard as zstd
@@ -186,18 +187,30 @@ class _CompleteZstdReader(io.RawIOBase):
 class FilteredTexts:
     """Single-pass-style lazy iterable with deterministic diagnostic counters."""
 
-    def __init__(self, config: CorpusConfig, files: Sequence[Path]) -> None:
+    def __init__(
+        self,
+        config: CorpusConfig,
+        files: Sequence[Path],
+        *,
+        on_file_complete: Callable[[Path, float], None] | None = None,
+    ) -> None:
         self.config = config
         self.files = tuple(files)
         if not all(isinstance(path, Path) for path in self.files):
             raise TypeError("files must contain Path values")
+        if on_file_complete is not None and not callable(on_file_complete):
+            raise TypeError("on_file_complete must be callable or None")
+        self._on_file_complete = on_file_complete
         self.physical_lines_read = 0
         self.object_rows_read = 0
         self.texts_used = 0
 
     def __iter__(self) -> Iterator[str]:
         config = self.config
+        on_file_complete = self._on_file_complete
         for path in self.files:
+            if on_file_complete is not None:
+                started_at = perf_counter()
             try:
                 with (
                     path.open("rb") as compressed_stream,
@@ -249,17 +262,24 @@ class FilteredTexts:
                 raise SMLDataError(
                     f"Could not read corpus file {path}: {error}"
                 ) from error
+            if on_file_complete is not None:
+                on_file_complete(path, perf_counter() - started_at)
 
 
 def iter_filtered_texts(
     config: CorpusConfig,
     files: Sequence[Path] | None = None,
+    *,
+    on_file_complete: Callable[[Path, float], None] | None = None,
 ) -> FilteredTexts:
-    """Build a lazy filtered-text iterable without reading corpus payloads."""
+    """Build a lazy iterable, optionally reporting fully consumed file times.
+
+    File elapsed time includes downstream processing between yielded texts.
+    """
     if not isinstance(config, CorpusConfig):
         raise TypeError("config must be a CorpusConfig")
     selected_files = discover_corpus_files(config) if files is None else tuple(files)
-    return FilteredTexts(config, selected_files)
+    return FilteredTexts(config, selected_files, on_file_complete=on_file_complete)
 
 
 def sample_texts(

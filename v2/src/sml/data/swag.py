@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import importlib.metadata
 import queue
+import sys
 import tempfile
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from time import perf_counter
 from traceback import clear_frames
 from typing import Literal, Protocol, Self
 
@@ -1598,6 +1600,19 @@ def _ingest_and_write_buckets(
             return result
 
 
+def _log_swag_preparation_elapsed(
+    config: SwagPreparationConfig, started_at: float, *, cache_hit: bool
+) -> None:
+    source = config.source
+    print(
+        f"prepare swag source={source.namespace}/{source.name} split={source.split} "
+        f"cache_hit={str(cache_hit).lower()} "
+        f"elapsed_seconds={perf_counter() - started_at:.3f}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def prepare_swag_bundle(
     config: SwagPreparationConfig,
     base: ResolvedModel,
@@ -1610,6 +1625,7 @@ def prepare_swag_bundle(
     if not isinstance(output, Path):
         raise TypeError("output must be a Path")
 
+    started_at = perf_counter()
     _require_full_base(base)
     _require_tokenizer_matches_model(base)
 
@@ -1634,6 +1650,7 @@ def prepare_swag_bundle(
             except BaseException as close_error:
                 raise error from close_error
             raise error
+        _log_swag_preparation_elapsed(config, started_at, cache_hit=True)
         return existing
 
     try:
@@ -1669,11 +1686,13 @@ def prepare_swag_bundle(
         return replace(manifest, identity=manifest.recompute_identity())
 
     published = publish_immutable_bundle(output, build)
-    return _load_swag_bundle(
+    bundle = _load_swag_bundle(
         published.path,
         published.verification,
         validate_projections=True,
     )
+    _log_swag_preparation_elapsed(config, started_at, cache_hit=False)
+    return bundle
 
 
 _EMPTY_INT = np.empty((0, 0, 0), dtype=_INT32)

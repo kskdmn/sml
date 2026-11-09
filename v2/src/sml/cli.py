@@ -325,7 +325,6 @@ def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
         "checkpoint_interval",
         "maximum_steps",
         "maximum_epochs",
-        "log_interval",
         "seed",
     ):
         parser.add_argument(
@@ -333,6 +332,16 @@ def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
             type=int,
             default=argparse.SUPPRESS,
         )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=argparse.SUPPRESS,
+        metavar="N",
+        help=(
+            "Report metrics and elapsed seconds every N optimizer steps "
+            "(default: 100; saved value on resume)."
+        ),
+    )
     parser.add_argument(
         "--learning-rate",
         type=float,

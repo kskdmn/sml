@@ -182,6 +182,59 @@ def test_corpus_row_limit_does_not_require_consuming_later_frames(tmp_path):
     assert list(iter_filtered_texts(config, (shard,))) == ["first"]
 
 
+def test_file_progress_measures_completed_files_including_consumer_work(
+    tmp_path, monkeypatch
+):
+    first = tmp_path / "first.jsonl.zst"
+    second = tmp_path / "second.jsonl.zst"
+    _write_zstd_jsonl(first, [b'{"text":"first"}'])
+    _write_zstd_jsonl(second, [b'{"text":"second"}'])
+    clock = [100.0]
+    monkeypatch.setattr("sml.data.corpus.perf_counter", lambda: clock[0])
+    completed = []
+    texts = iter_filtered_texts(
+        CorpusConfig(input_root=tmp_path, min_text_bytes=1),
+        (first, second),
+        on_file_complete=lambda path, elapsed: completed.append((path, elapsed)),
+    )
+
+    iterator = iter(texts)
+    assert completed == []
+    assert next(iterator) == "first"
+    clock[0] += 3.0
+    assert next(iterator) == "second"
+    assert completed == [(first, 3.0)]
+    clock[0] += 5.0
+    with pytest.raises(StopIteration):
+        next(iterator)
+    assert completed == [(first, 3.0), (second, 5.0)]
+
+
+@pytest.mark.parametrize("invalid_json", [False, True])
+def test_file_progress_does_not_report_failed_or_abandoned_files(
+    tmp_path, invalid_json
+):
+    shard = tmp_path / "partial.jsonl.zst"
+    _write_zstd_jsonl(shard, [b'{"text":"first"}', b"invalid JSON"])
+    completed = []
+    iterator = iter(
+        iter_filtered_texts(
+            CorpusConfig(input_root=tmp_path, min_text_bytes=1),
+            (shard,),
+            on_file_complete=lambda path, elapsed: completed.append((path, elapsed)),
+        )
+    )
+    assert next(iterator) == "first"
+
+    if invalid_json:
+        with pytest.raises(SMLDataError, match="Invalid JSON"):
+            next(iterator)
+    else:
+        iterator.close()
+
+    assert completed == []
+
+
 def test_discovery_samples_all_shard_names_with_an_explicit_file_budget(tmp_path):
     for index in range(120):
         (tmp_path / f"data-{index:04d}.jsonl.zst").write_bytes(b"")

@@ -353,6 +353,7 @@ def test_pretraining_logs_update_metrics_at_configured_interval(
     prepared_data, tmp_path, monkeypatch, capsys
 ) -> None:
     updates = []
+    timestamps = iter((100.0, 106.0, 115.0, 1_000.0, 1_004.0))
     original_step = pretrain.PretrainingKernels.optimizer_step
 
     def record_step(kernels, *args):
@@ -361,25 +362,43 @@ def test_pretraining_logs_update_metrics_at_configured_interval(
         return updated
 
     monkeypatch.setattr(pretrain.PretrainingKernels, "optimizer_step", record_step)
+    monkeypatch.setattr(pretrain, "perf_counter", lambda: next(timestamps))
     trained = pretrain.train(
         replace(
-            _config(prepared_data, tmp_path / "logs-run", maximum_steps=3),
+            _config(prepared_data, tmp_path / "logs-run", maximum_steps=5),
             log_interval=2,
         )
     )
     output = capsys.readouterr()
-    assert trained.step == 3
+    assert trained.step == 5
     lines = output.err.splitlines()
     assert output.out == ""
-    assert len(lines) == 1
+    assert len(lines) == 2
     assert lines[0].startswith("pretrain step=2 epoch=0 rows=4 ")
-    metrics = dict(field.split("=", 1) for field in lines[0].split()[1:])
-    assert float(metrics["loss"]) == pytest.approx(
-        float(updates[1]["loss"].item()), abs=1e-6
+    assert lines[1].startswith("pretrain step=4 epoch=1 rows=8 ")
+    for line, update, elapsed, interval in zip(
+        lines, (updates[1], updates[3]), (6.0, 15.0), (6.0, 9.0), strict=True
+    ):
+        metrics = dict(field.split("=", 1) for field in line.split()[1:])
+        assert float(metrics["loss"]) == pytest.approx(
+            float(update["loss"].item()), abs=1e-6
+        )
+        assert float(metrics["learning_rate"]) == pytest.approx(
+            float(update["learning_rate"].item()), rel=1e-5
+        )
+        assert float(metrics["elapsed_seconds"]) == elapsed
+        assert float(metrics["interval_seconds"]) == interval
+
+    resumed = pretrain.resume(
+        trained.run, data=prepared_data, overrides=_overrides(maximum_steps=6)
     )
-    assert float(metrics["learning_rate"]) == pytest.approx(
-        float(updates[1]["learning_rate"].item()), rel=1e-5
-    )
+    assert resumed.step == 6
+    resumed_lines = capsys.readouterr().err.splitlines()
+    assert len(resumed_lines) == 1
+    assert resumed_lines[0].startswith("pretrain step=6 ")
+    metrics = dict(field.split("=", 1) for field in resumed_lines[0].split()[1:])
+    assert float(metrics["elapsed_seconds"]) == 4.0
+    assert float(metrics["interval_seconds"]) == 4.0
 
 
 def _loaded_groups(run: Path) -> tuple[dict, dict, dict, dict]:

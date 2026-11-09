@@ -65,6 +65,9 @@ pretraining preparation scans **all matching files**. Each scans the first
 is normalized by replacing null characters and collapsing whitespace, then
 filtered to **100–16,384 UTF-8 bytes** per document.
 
+`prepare pretraining` reports each input file's `elapsed_seconds` to stderr after
+processing that file.
+
 Tokenizer training takes a seeded sample of at most **100,000 unique normalized
 documents / 128 MiB** from all scanned prefixes. Whole documents are retained,
 so the byte budget may not fill exactly. Adjust sample size and scan limits with:
@@ -107,7 +110,11 @@ uv run python -m sml train \
 Training defaults to microbatch size **1**, **8** gradient accumulation steps,
 and **one epoch with no step limit**. An incomplete microbatch is dropped at an
 epoch boundary; an incomplete accumulation window still produces an update.
-Progress reports loss, learning rate, and processed rows to stderr.
+Progress is written to stderr every **100 optimizer steps**. It includes loss,
+learning rate, processed rows, `elapsed_seconds` since the training loop started,
+and `interval_seconds` since the previous report. Use `--log-interval N` on
+`train` or `finetune` to change the interval. Timers restart on resume; the saved
+reporting interval is preserved unless overridden.
 
 A fresh run's learning-rate schedule follows its planned update budget, with
 1% warmup and cosine decay. Set `schedule_steps` and `warmup_steps` under
@@ -152,6 +159,8 @@ Preparation resolves `main` to a Hugging Face commit SHA; use that SHA to reprod
 the dataset revision. It writes reusable candidate arrays in length buckets from
 64 to 8,192 tokens. Repeating preparation with the same configuration, checkpoint,
 and output reuses a fully verified bundle without contacting the dataset provider.
+`prepare swag` reports split-level `elapsed_seconds` to stderr because the
+dataset provider exposes a split rather than individual source files.
 Prepare and fine-tune against the **same base checkpoint**: advancing the base run
 or changing preparation settings requires a new data output directory.
 
@@ -159,6 +168,8 @@ SWAG uses cross-entropy over four candidate scores, each the mean continuation
 token log-likelihood including EOS. Defaults are microbatch **1**, accumulation
 **8**, and stopping at **8,192 updates or 5 epochs**, whichever comes first. Its
 default learning-rate schedule is 8,192 updates with 81 warmup updates.
+Fine-tuning uses the same timing fields and reporting interval as base training,
+alongside loss, learning rate, accuracy, and processed examples.
 [LoRA defaults](src/sml/training/lora.py) are rank `16`, alpha `32`, dropout `0.05`,
 Q/K/V/O targets, and rank-stabilized scaling (`alpha / sqrt(rank)`).
 

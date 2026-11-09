@@ -144,12 +144,18 @@ def tiny_swag_config(provider, **overrides):
     return SwagPreparationConfig(**values)
 
 
-def test_prepare_swag_bundle_writes_mmap_npy_layout(tmp_path):
+def test_prepare_swag_bundle_writes_mmap_npy_layout(tmp_path, capsys):
     from sml.data.swag import load_swag_bundle, prepare_swag_bundle
 
     provider = FakeSwagProvider((VALID_ROW,))
     output = tmp_path / "swag"
     bundle = prepare_swag_bundle(tiny_swag_config(provider), tiny_base_model(), output)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith(
+        "prepare swag source=allenai/swag split=train cache_hit=false elapsed_seconds="
+    )
+    assert float(captured.err.rsplit("=", 1)[1]) >= 0.0
     reloaded = load_swag_bundle(output, VerificationLevel.FULL)
     try:
         with (
@@ -180,17 +186,24 @@ def test_prepare_swag_bundle_writes_mmap_npy_layout(tmp_path):
         bundle.close()
 
 
-def test_reopening_valid_bundle_does_not_call_provider(tmp_path):
+def test_reopening_valid_bundle_does_not_call_provider(tmp_path, capsys):
     from sml.data.swag import load_swag_bundle, prepare_swag_bundle
 
     provider = FakeSwagProvider((VALID_ROW,))
     output = tmp_path / "swag"
     first = prepare_swag_bundle(tiny_swag_config(provider), tiny_base_model(), output)
+    capsys.readouterr()
     provider.fail_resolve = True
     provider.resolve_calls = 0
     provider.iter_calls = 0
 
     second = prepare_swag_bundle(tiny_swag_config(provider), tiny_base_model(), output)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith(
+        "prepare swag source=allenai/swag split=train cache_hit=true elapsed_seconds="
+    )
+    assert float(captured.err.rsplit("=", 1)[1]) >= 0.0
     loaded = load_swag_bundle(output, VerificationLevel.FULL)
     try:
         assert provider.resolve_calls == 0

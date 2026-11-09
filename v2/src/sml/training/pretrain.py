@@ -7,6 +7,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
+from time import perf_counter
 
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
@@ -901,6 +902,7 @@ def _run_training(
     restored: _RestoredTrainingState,
     stream: PretrainingBatchStream,
 ) -> TrainingResult:
+    started_at = last_logged_at = perf_counter()
     parameters = restored.parameters
     optimizer = restored.optimizer
     trainer = restored.trainer
@@ -919,6 +921,7 @@ def _run_training(
     def complete_update() -> None:
         nonlocal parameters, optimizer, trainer, scalar
         nonlocal window_microsteps, pending_cursor, last_published_step
+        nonlocal last_logged_at
         if window_microsteps == 0 or pending_cursor is None:
             return
         updated = kernels.optimizer_step(parameters, optimizer, trainer)
@@ -938,15 +941,21 @@ def _run_training(
         restored.trainer = trainer
         restored.scalar = scalar
         if scalar.step % config.log_interval == 0:
+            loss = float(updated.metrics["loss"].item())
+            learning_rate = float(updated.metrics["learning_rate"].item())
+            logged_at = perf_counter()
             log_training_progress(
                 "pretrain",
                 step=scalar.step,
                 epoch=scalar.cursor.epoch,
                 units=scalar.rows,
                 unit_name="rows",
-                loss=float(updated.metrics["loss"].item()),
-                learning_rate=float(updated.metrics["learning_rate"].item()),
+                loss=loss,
+                learning_rate=learning_rate,
+                elapsed_seconds=logged_at - started_at,
+                interval_seconds=logged_at - last_logged_at,
             )
+            last_logged_at = logged_at
         window_microsteps = 0
         pending_cursor = None
         state = _RestoredTrainingState(parameters, optimizer, trainer, scalar)

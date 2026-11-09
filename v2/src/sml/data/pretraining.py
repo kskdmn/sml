@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import queue
+import sys
 import threading
 from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Iterator
@@ -1258,6 +1259,14 @@ def _saved_row_blocks(paths: Iterable[Path], *, row_width: int) -> Iterator[np.n
             yield array[start : start + _PREPARED_ROW_SCAN_SIZE]
 
 
+def _log_pretraining_file_elapsed(path: Path, elapsed_seconds: float) -> None:
+    print(
+        f"prepare pretraining file={str(path)!r} elapsed_seconds={elapsed_seconds:.3f}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def prepare_pretraining_bundle(
     config: PretrainingPreparationConfig,
     output: Path,
@@ -1282,7 +1291,9 @@ def prepare_pretraining_bundle(
             files = discover_corpus_files(config.corpus)
         except OSError as error:
             raise SMLDataError(f"Could not read pretraining corpus: {error}") from error
-        texts = iter_filtered_texts(config.corpus, files)
+        texts = iter_filtered_texts(
+            config.corpus, files, on_file_complete=_log_pretraining_file_elapsed
+        )
         packed = pack_token_ranges(
             _encoded_text_ranges(texts, tokenizer),
             sequence_length=config.sequence_length,

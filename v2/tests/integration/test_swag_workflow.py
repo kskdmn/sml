@@ -1185,6 +1185,7 @@ def test_swag_accumulates_microbatches_and_logs_tail_metrics(
     tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch, capsys
 ) -> None:
     updates = []
+    timestamps = iter((100.0, 106.0, 115.0, 1_000.0, 1_004.0))
     original_step = swag_module.SwagKernels.optimizer_step
 
     def record_step(kernels, adapters, optimizer, trainer):
@@ -1203,6 +1204,7 @@ def test_swag_accumulates_microbatches_and_logs_tail_metrics(
         return original_step(kernels, adapters, optimizer, trainer)
 
     monkeypatch.setattr(swag_module.SwagKernels, "optimizer_step", record_step)
+    monkeypatch.setattr(swag_module, "perf_counter", lambda: next(timestamps))
     capsys.readouterr()
     trained = finetune(
         tiny_swag_training_config(
@@ -1211,22 +1213,41 @@ def test_swag_accumulates_microbatches_and_logs_tail_metrics(
             tmp_path / "accumulation-logs-run",
             loader=LoaderConfig(microbatch_size=2, gradient_accumulation_steps=2),
             maximum_steps=None,
-            maximum_epochs=1,
+            maximum_epochs=2,
             log_interval=2,
         )
     )
     output = capsys.readouterr()
-    assert trained.step == 2
-    assert trained.examples == 5
-    assert [update[0] for update in updates] == [4, 1]
+    assert trained.step == 4
+    assert trained.examples == 10
+    assert [update[0] for update in updates] == [4, 1, 4, 1]
     lines = output.err.splitlines()
     assert output.out == ""
-    assert len(lines) == 1
+    assert len(lines) == 2
     assert lines[0].startswith("swag step=2 epoch=1 examples=5 ")
-    metrics = dict(field.split("=", 1) for field in lines[0].split()[1:])
-    assert float(metrics["loss"]) == pytest.approx(updates[-1][1], abs=1e-6)
-    assert float(metrics["accuracy"]) == pytest.approx(updates[-1][2], abs=1e-6)
-    assert float(metrics["learning_rate"]) == pytest.approx(updates[-1][3], rel=1e-5)
+    assert lines[1].startswith("swag step=4 epoch=2 examples=10 ")
+    for line, update, elapsed, interval in zip(
+        lines, (updates[1], updates[3]), (6.0, 15.0), (6.0, 9.0), strict=True
+    ):
+        metrics = dict(field.split("=", 1) for field in line.split()[1:])
+        assert float(metrics["loss"]) == pytest.approx(update[1], abs=1e-6)
+        assert float(metrics["accuracy"]) == pytest.approx(update[2], abs=1e-6)
+        assert float(metrics["learning_rate"]) == pytest.approx(update[3], rel=1e-5)
+        assert float(metrics["elapsed_seconds"]) == elapsed
+        assert float(metrics["interval_seconds"]) == interval
+
+    resumed = resume_finetune(
+        trained.run,
+        data=tiny_swag_bundle.path,
+        overrides=ResumeOverrides(maximum_epochs=3),
+    )
+    assert resumed.step == 6
+    resumed_lines = capsys.readouterr().err.splitlines()
+    assert len(resumed_lines) == 1
+    assert resumed_lines[0].startswith("swag step=6 ")
+    metrics = dict(field.split("=", 1) for field in resumed_lines[0].split()[1:])
+    assert float(metrics["elapsed_seconds"]) == 4.0
+    assert float(metrics["interval_seconds"]) == 4.0
 
 
 def test_resume_rejects_mismatches_before_allocation(

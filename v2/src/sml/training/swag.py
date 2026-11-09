@@ -7,6 +7,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from time import perf_counter
 
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
@@ -183,7 +184,7 @@ class SwagTrainingConfig:
     precision: LoRAPrecisionConfig = field(default_factory=LoRAPrecisionConfig)
     maximum_steps: int | None = 8_192
     maximum_epochs: int | None = 5
-    log_interval: int = 10
+    log_interval: int = 100
     seed: int = 42
     compile: bool = True
     rope_scaling_factor: float = DEFAULT_EXTENDED_ROPE_SCALING_FACTOR
@@ -1119,6 +1120,7 @@ def _run_training(
     restored: _RestoredSwagState,
     bundle: SwagDataBundle,
 ) -> SwagTrainingResult:
+    started_at = last_logged_at = perf_counter()
     adapters = restored.adapters
     frozen_base = restored.frozen_base
     optimizer = restored.optimizer
@@ -1139,6 +1141,7 @@ def _run_training(
     def complete_update(stream: SwagBatchStream) -> None:
         nonlocal adapters, optimizer, trainer, scalar, last_published_step
         nonlocal window_microsteps, window_examples, pending_cursor
+        nonlocal last_logged_at
         if window_microsteps == 0 or pending_cursor is None:
             return
         metrics = None
@@ -1168,6 +1171,7 @@ def _run_training(
         if metrics is not None:
             mx.eval(metrics)
             loss, learning_rate, accuracy = (float(metric.item()) for metric in metrics)
+            logged_at = perf_counter()
             log_training_progress(
                 "swag",
                 step=scalar.step,
@@ -1177,7 +1181,10 @@ def _run_training(
                 loss=loss,
                 learning_rate=learning_rate,
                 accuracy=accuracy,
+                elapsed_seconds=logged_at - started_at,
+                interval_seconds=logged_at - last_logged_at,
             )
+            last_logged_at = logged_at
         window_microsteps = 0
         window_examples = 0
         pending_cursor = None

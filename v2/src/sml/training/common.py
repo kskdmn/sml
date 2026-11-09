@@ -24,6 +24,8 @@ def log_training_progress(
     unit_name: str,
     loss: float,
     learning_rate: float,
+    elapsed_seconds: float,
+    interval_seconds: float,
     accuracy: float | None = None,
 ) -> None:
     message = (
@@ -32,6 +34,10 @@ def log_training_progress(
     )
     if accuracy is not None:
         message += f" accuracy={accuracy:.6f}"
+    message += (
+        f" elapsed_seconds={elapsed_seconds:.3f}"
+        f" interval_seconds={interval_seconds:.3f}"
+    )
     print(message, file=sys.stderr, flush=True)
 
 
@@ -385,7 +391,7 @@ class PretrainingConfig:
     precision: PrecisionConfig = field(default_factory=PrecisionConfig)
     maximum_steps: int | None = None
     maximum_epochs: int | None = 1
-    log_interval: int = 10
+    log_interval: int = 100
     seed: int = 42
     compile: bool = True
 
