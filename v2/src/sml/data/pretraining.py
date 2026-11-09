@@ -11,6 +11,7 @@ from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
+from time import perf_counter
 from traceback import clear_frames
 from typing import Self
 
@@ -1277,11 +1278,15 @@ def prepare_pretraining_bundle(
     if not isinstance(output, Path):
         raise TypeError("output must be a Path")
 
+    started_at = perf_counter()
     tokenizer = load_tokenizer_bundle(
         config.tokenizer_bundle,
         VerificationLevel.FULL,
     )
     row_width = config.sequence_length + 1
+
+    def report_file(path: Path, _file_elapsed_seconds: float) -> None:
+        _log_pretraining_file_elapsed(path, perf_counter() - started_at)
 
     def build(private_path: Path) -> PretrainingDataManifest:
         tokenizer_model, tokenizer_vocab = _copy_verified_tokenizer(
@@ -1291,9 +1296,7 @@ def prepare_pretraining_bundle(
             files = discover_corpus_files(config.corpus)
         except OSError as error:
             raise SMLDataError(f"Could not read pretraining corpus: {error}") from error
-        texts = iter_filtered_texts(
-            config.corpus, files, on_file_complete=_log_pretraining_file_elapsed
-        )
+        texts = iter_filtered_texts(config.corpus, files, on_file_complete=report_file)
         packed = pack_token_ranges(
             _encoded_text_ranges(texts, tokenizer),
             sequence_length=config.sequence_length,

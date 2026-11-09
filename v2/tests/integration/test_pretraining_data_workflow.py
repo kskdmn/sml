@@ -292,23 +292,28 @@ def _assert_constructor_fails_before_thread_start(
 
 
 def test_prepared_bundle_is_closed_self_describing_and_mmap_ready(
-    prepared_sources, tmp_path, capsys
+    prepared_sources, tmp_path, monkeypatch, capsys
 ):
     output = tmp_path / "prepared"
+    timestamps = iter((100.0, 104.0, 111.0))
+    monkeypatch.setattr(pretraining_module, "perf_counter", lambda: next(timestamps))
     capsys.readouterr()
     bundle = prepare_pretraining_bundle(_config(prepared_sources), output)
     captured = capsys.readouterr()
     progress = captured.err.splitlines()
     assert captured.out == ""
     assert len(progress) == 2
-    for line, name in zip(
-        progress, bundle.manifest.source_summary["ordered_files"], strict=True
+    for line, name, elapsed in zip(
+        progress,
+        bundle.manifest.source_summary["ordered_files"],
+        (4.0, 11.0),
+        strict=True,
     ):
         path = _config(prepared_sources).corpus.input_root / name
         assert line.startswith(
             f"prepare pretraining file={str(path)!r} elapsed_seconds="
         )
-        assert float(line.rsplit("=", 1)[1]) >= 0.0
+        assert float(line.rsplit("=", 1)[1]) == elapsed
 
     assert bundle.path == output
     assert bundle.verification is VerificationLevel.FULL

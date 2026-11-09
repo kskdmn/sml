@@ -65,8 +65,9 @@ files** and the first **49,152 physical lines per file**. Both use seeded file
 selection and ordering. Text is normalized by replacing null characters and
 collapsing whitespace, then filtered to **100–16,384 UTF-8 bytes** per document.
 
-`prepare pretraining` reports each input file's `elapsed_seconds` to stderr after
-processing that file.
+`prepare pretraining` reports `elapsed_seconds` to stderr after each input file.
+The timer starts before tokenizer loading and counts from the beginning of the
+entire preparation run, continuing across files without resetting.
 
 Tokenizer training takes a seeded sample of at most **100,000 unique normalized
 documents / 128 MiB** from all scanned prefixes. Whole documents are retained,
