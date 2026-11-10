@@ -46,6 +46,11 @@ from sml.artifacts.manifest import (
     structured_identity,
 )
 from sml.artifacts.semantics import validate_full_run_semantics
+from sml.artifacts.training_controls import (
+    TRAINING_CONTROL_FIELDS,
+    load_training_controls,
+    persist_training_controls,
+)
 from sml.data.swag import (
     SwagBatch,
     SwagBatchStream,
@@ -779,6 +784,16 @@ def _config_from_run(
             raise SMLArtifactError("saved checkpoint configuration has invalid fields")
         if saved.pop("rng_schedule") != TRAINING_RNG_SCHEDULE:
             raise SMLArtifactError("saved checkpoint rng_schedule is invalid")
+        persisted = load_training_controls(run, manifest.identity)
+        if persisted is not None:
+            saved.update(
+                {
+                    "maximum_steps": persisted["maximum_steps"],
+                    "maximum_epochs": persisted["maximum_epochs"],
+                    "log_interval": persisted["log_interval"],
+                    "interval": persisted["checkpoint_interval"],
+                }
+            )
         maximum_steps = (
             saved["maximum_steps"]
             if overrides.maximum_steps is None
@@ -1119,6 +1134,8 @@ def _run_training(
     model: SMLLanguageModel,
     restored: _RestoredSwagState,
     bundle: SwagDataBundle,
+    *,
+    session_steps: int | None = None,
 ) -> SwagTrainingResult:
     started_at = last_logged_at = perf_counter()
     adapters = restored.adapters
@@ -1137,6 +1154,12 @@ def _run_training(
     window_microsteps = 0
     window_examples = 0
     pending_cursor: SwagCursor | None = None
+    session_stop = None if session_steps is None else scalar.step + session_steps
+
+    def limit_reached() -> bool:
+        return _limit_reached(config, scalar) or (
+            session_stop is not None and scalar.step >= session_stop
+        )
 
     def complete_update(stream: SwagBatchStream) -> None:
         nonlocal adapters, optimizer, trainer, scalar, last_published_step
@@ -1193,7 +1216,7 @@ def _run_training(
             _publish_training_state(run, manifest, state)
             last_published_step = scalar.step
 
-    while not _limit_reached(config, scalar):
+    while not limit_reached():
         if (
             config.maximum_epochs is not None
             and scalar.cursor.epoch >= config.maximum_epochs
@@ -1204,7 +1227,7 @@ def _run_training(
             bundle, config.loader, cursor=scalar.cursor
         ) as stream:
             for envelope in stream:
-                if _limit_reached(config, scalar):
+                if limit_reached():
                     break
                 window_examples += int(envelope.example_mask.sum())
                 batch = SwagBatch.from_envelope(envelope)
@@ -1234,7 +1257,7 @@ def _run_training(
                 if not window_full:
                     continue
                 complete_update(stream)
-                if _limit_reached(config, scalar):
+                if limit_reached():
                     break
             complete_update(stream)
         if scalar.cursor == initial_cursor:
@@ -1287,9 +1310,13 @@ def _select_pretraining_base(run: Path) -> _SelectedPretrainingBase:
         )
 
 
-def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
+def finetune(
+    config: SwagTrainingConfig, *, session_steps: int | None = None
+) -> SwagTrainingResult:
     if not isinstance(config, SwagTrainingConfig):
         raise TypeError("config must be a SwagTrainingConfig")
+    if session_steps is not None:
+        _require_int32_counter(session_steps, "session_steps")
     config = _resolved_fresh_config(config)
     with run_writer_lock(config.output_run):
         if config.output_run.exists() or config.output_run.is_symlink():
@@ -1388,6 +1415,7 @@ def finetune(config: SwagTrainingConfig) -> SwagTrainingResult:
                 runtime[0],
                 runtime[1],
                 bundle,
+                session_steps=session_steps,
             )
 
 
@@ -1396,6 +1424,7 @@ def resume_finetune(
     *,
     data: Path | None,
     overrides: ResumeOverrides,
+    session_steps: int | None = None,
 ) -> SwagTrainingResult:
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
@@ -1403,6 +1432,8 @@ def resume_finetune(
         raise TypeError("data must be a Path or None")
     if not isinstance(overrides, ResumeOverrides):
         raise TypeError("overrides must be ResumeOverrides")
+    if session_steps is not None:
+        _require_int32_counter(session_steps, "session_steps")
     with run_writer_lock(run):
         with open_latest_checkpoint_reader(
             run, verification=VerificationLevel.MANIFEST_TRUSTED
@@ -1487,6 +1518,19 @@ def resume_finetune(
                 raise SMLArtifactError(
                     "latest checkpoint changed during writable recovery"
                 )
+            if any(
+                getattr(overrides, name) is not None for name in TRAINING_CONTROL_FIELDS
+            ):
+                persist_training_controls(
+                    run,
+                    run_manifest.identity,
+                    {
+                        "maximum_steps": config.maximum_steps,
+                        "maximum_epochs": config.maximum_epochs,
+                        "log_interval": config.log_interval,
+                        "checkpoint_interval": config.checkpoint.interval,
+                    },
+                )
             if limit_reached:
                 return _training_result(run, scalar)
             model_config = ModelConfig(**_mapping_dict(run_manifest.model, "model"))
@@ -1512,6 +1556,7 @@ def resume_finetune(
                 model,
                 restored,
                 bundle,
+                session_steps=session_steps,
             )
 
 

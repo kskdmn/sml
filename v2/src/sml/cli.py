@@ -56,6 +56,7 @@ _COMMON_TRAIN_FIELDS = {
     "resume",
     "seed",
     "compile",
+    "session_steps",
     *_TRAIN_FLAT,
 }
 _SCHEMAS: dict[str, dict[str, object]] = {
@@ -334,12 +335,22 @@ def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
             default=argparse.SUPPRESS,
         )
     parser.add_argument(
+        "--session-steps",
+        type=int,
+        default=argparse.SUPPRESS,
+        metavar="N",
+        help=(
+            "Save and stop after N additional optimizer steps in this invocation; "
+            "preserves the total training budget and learning-rate schedule."
+        ),
+    )
+    parser.add_argument(
         "--log-interval",
         type=int,
         default=argparse.SUPPRESS,
         metavar="N",
         help=(
-            "Report metrics and elapsed seconds every N optimizer steps "
+            "Report metrics and elapsed time (Xd HH:MM:SS) every N optimizer steps "
             "(default: 100; saved value on resume)."
         ),
     )
@@ -929,6 +940,11 @@ class TrainCommand(_Command):
         )
 
     def dispatch(self) -> object:
+        session_options = (
+            {"session_steps": self.values["session_steps"]}
+            if "session_steps" in self.values
+            else {}
+        )
         if "resume" in self.values:
             from sml.training.pretrain import resume
 
@@ -936,10 +952,11 @@ class TrainCommand(_Command):
                 self.values["resume"],
                 data=self.values.get("data"),
                 overrides=self.to_domain(),
+                **session_options,
             )
         from sml.training.pretrain import train
 
-        return train(self.to_domain())
+        return train(self.to_domain(), **session_options)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1082,6 +1099,11 @@ class FinetuneCommand(_Command):
         )
 
     def dispatch(self) -> object:
+        session_options = (
+            {"session_steps": self.values["session_steps"]}
+            if "session_steps" in self.values
+            else {}
+        )
         if "resume" in self.values:
             from sml.training.swag import resume_finetune
 
@@ -1089,10 +1111,11 @@ class FinetuneCommand(_Command):
                 self.values["resume"],
                 data=self.values.get("data"),
                 overrides=self.to_domain(),
+                **session_options,
             )
         from sml.training.swag import finetune
 
-        return finetune(self.to_domain())
+        return finetune(self.to_domain(), **session_options)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1139,6 +1162,16 @@ _DTO_TYPES: dict[str, type[_Command]] = {
 
 
 def _validate_command(command: str, values: dict[str, object]) -> None:
+    if command in {"train", "finetune"} and "session_steps" in values:
+        session_steps = values["session_steps"]
+        if (
+            isinstance(session_steps, bool)
+            or not isinstance(session_steps, int)
+            or not 1 <= session_steps <= 2**31 - 1
+        ):
+            raise SMLConfigurationError(
+                "session_steps must be a positive int32 counter"
+            )
     if "full" in values and not isinstance(values["full"], bool):
         raise SMLConfigurationError(f"{command}.full must be a boolean")
     required = {

@@ -534,6 +534,11 @@ def _rebind_run_checkpoint(
 
 
 def _rebind_checkpoint_owner_identity(run: Path, run_identity: str) -> None:
+    controls_path = run / "training-controls.json"
+    if controls_path.exists():
+        controls = json.loads(controls_path.read_bytes())
+        controls["owning_run_identity"] = run_identity
+        controls_path.write_bytes(canonical_json_bytes(controls))
     _latest, step, checkpoint = _latest_checkpoint(run)
     state_path = step / checkpoint.scalar_state.logical_path
     state = json.loads(state_path.read_text(encoding="utf-8"))

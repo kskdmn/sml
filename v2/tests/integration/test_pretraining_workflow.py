@@ -4,6 +4,7 @@ import gc
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import weakref
 from collections import Counter
@@ -18,6 +19,7 @@ import zstandard as zstd
 from mlx.utils import tree_flatten, tree_unflatten
 from sml.artifacts import checkpoint as checkpoint_module
 from sml.artifacts import manifest as manifest_module
+from sml.artifacts import training_controls as controls_module
 from sml.artifacts.checkpoint import (
     publish_immutable_bundle,
     resolve_latest_step,
@@ -211,6 +213,49 @@ def _config(data: Path, run: Path, *, maximum_steps: int = 2) -> PretrainingConf
     )
 
 
+@pytest.fixture
+def validated_training_config(tmp_path: Path) -> PretrainingConfig:
+    corpus = tmp_path / "controls-corpus"
+    corpus.mkdir()
+    payload = (
+        json.dumps(
+            {"text": "alpha beta gamma delta epsilon zeta eta theta " * 8}
+        ).encode("utf-8")
+        + b"\n"
+    )
+    (corpus / "tiny.jsonl.zst").write_bytes(zstd.ZstdCompressor().compress(payload))
+    corpus_config = CorpusConfig(
+        input_root=corpus,
+        shuffle_files=False,
+        min_text_bytes=1,
+        max_rows_per_file=None,
+    )
+    tokenizer = train_tokenizer_bundle(
+        TokenizerTrainingConfig(
+            corpus=corpus_config,
+            vocab_size=300,
+            hard_vocab_limit=False,
+            num_threads=1,
+        ),
+        tmp_path / "controls-tokenizer",
+    )
+    data = prepare_pretraining_bundle(
+        PretrainingPreparationConfig(
+            corpus=corpus_config,
+            tokenizer_bundle=tokenizer.path,
+            sequence_length=4,
+            shuffle_window_rows=4,
+            output_shard_rows=64,
+            seed=7,
+        ),
+        tmp_path / "controls-data",
+    )
+    config = _config(data.path, tmp_path / "controls-run", maximum_steps=1)
+    return replace(
+        config, model=replace(config.model, vocab_size=tokenizer.manifest.vocab_size)
+    )
+
+
 @pytest.mark.parametrize(
     ("maximum_steps", "maximum_epochs", "expected_steps"),
     ((None, 2, 4), (3, 2, 3), (8, 1, 2), (3, None, 3)),
@@ -268,6 +313,165 @@ def test_resuming_with_extended_limits_preserves_resolved_schedule(
     assert [rate for _step, rate in progress] == pytest.approx(
         [0.01, 0.0055, 0.001, 0.001]
     )
+
+
+def test_resume_controls_survive_failure_before_the_next_update(
+    validated_training_config, monkeypatch
+):
+    config = validated_training_config
+    prepared_data = config.data
+    trained = pretrain.train(config)
+    original_manifest = (trained.run / "run.json").read_bytes()
+    original_latest = (trained.run / "latest.json").read_bytes()
+    real_builder = pretrain.build_pretraining_kernels
+
+    def fail_build(*_args, **_kwargs):
+        raise InjectedFailure("before any resumed update")
+
+    monkeypatch.setattr(pretrain, "build_pretraining_kernels", fail_build)
+    with pytest.raises(InjectedFailure, match="before any resumed update"):
+        pretrain.resume(
+            trained.run,
+            data=prepared_data,
+            overrides=_overrides(
+                maximum_steps=5,
+                maximum_epochs=6,
+                log_interval=2,
+                checkpoint_interval=2,
+            ),
+        )
+    assert (trained.run / "run.json").read_bytes() == original_manifest
+    assert (trained.run / "latest.json").read_bytes() == original_latest
+    document = json.loads((trained.run / "training-controls.json").read_bytes())
+    assert document["controls"] == {
+        "maximum_steps": 5,
+        "maximum_epochs": 6,
+        "log_interval": 2,
+        "checkpoint_interval": 2,
+    }
+    monkeypatch.setattr(pretrain, "build_pretraining_kernels", real_builder)
+    first_session = pretrain.resume(
+        trained.run, data=prepared_data, overrides=_overrides(), session_steps=1
+    )
+    assert first_session.step == 2
+    completed = pretrain.resume(trained.run, data=prepared_data, overrides=_overrides())
+    assert completed.step == 5
+    assert (trained.run / "run.json").read_bytes() == original_manifest
+    verify_artifact(trained.run, full=True)
+
+
+def test_completed_resume_persists_controls_without_rewriting_checkpoint(
+    validated_training_config,
+):
+    prepared_data = validated_training_config.data
+    trained = pretrain.train(validated_training_config)
+    original_latest = (trained.run / "latest.json").read_bytes()
+    completed = pretrain.resume(
+        trained.run,
+        data=prepared_data,
+        overrides=_overrides(log_interval=7, checkpoint_interval=9),
+    )
+    assert completed == trained
+    assert (trained.run / "latest.json").read_bytes() == original_latest
+    controls = json.loads((trained.run / "training-controls.json").read_bytes())
+    assert controls["controls"]["log_interval"] == 7
+    assert controls["controls"]["checkpoint_interval"] == 9
+    manifest = read_manifest(
+        trained.run, PretrainingRunManifest, VerificationLevel.MANIFEST_TRUSTED
+    ).manifest
+    restored = pretrain._config_from_run(
+        trained.run, prepared_data, manifest, _overrides()
+    )
+    assert restored.log_interval == 7
+    assert restored.checkpoint.interval == 9
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong-owner",
+        "invalid-limit",
+        "no-limit",
+        "unknown-field",
+        "symlink",
+        "hardlink",
+    ),
+)
+def test_invalid_training_controls_fail_full_verification_and_resume_before_restore(
+    validated_training_config, tmp_path, monkeypatch, mutation
+):
+    prepared_data = validated_training_config.data
+    trained = pretrain.train(validated_training_config)
+    pretrain.resume(
+        trained.run, data=prepared_data, overrides=_overrides(log_interval=2)
+    )
+    verify_artifact(trained.run, full=True)
+    path = trained.run / "training-controls.json"
+    document = json.loads(path.read_bytes())
+    if mutation == "wrong-owner":
+        document["owning_run_identity"] = "sha256:" + "f" * 64
+    elif mutation == "invalid-limit":
+        document["controls"]["maximum_steps"] = True
+    elif mutation == "no-limit":
+        document["controls"]["maximum_steps"] = None
+        document["controls"]["maximum_epochs"] = None
+    elif mutation == "unknown-field":
+        document["controls"]["learning_rate"] = 1.0
+    else:
+        external = tmp_path / "external-controls.json"
+        path.rename(external)
+        if mutation == "symlink":
+            path.symlink_to(external)
+        else:
+            os.link(external, path)
+    if mutation not in {"symlink", "hardlink"}:
+        path.write_bytes(canonical_json_bytes(document))
+    expected_error = {
+        "wrong-owner": "training controls belong to another run",
+        "invalid-limit": "training control maximum_steps must be a positive int32",
+        "no-limit": "training controls require a termination limit",
+        "unknown-field": "training controls have invalid fields",
+        "symlink": "no-follow traversal failed for payload: training-controls.json",
+        "hardlink": "payload link count must be exactly one: training-controls.json",
+    }[mutation]
+    with pytest.raises(SMLArtifactError, match=expected_error):
+        verify_artifact(trained.run, full=True)
+
+    def forbidden_restore(*_args, **_kwargs):
+        raise AssertionError("invalid controls reached checkpoint restoration")
+
+    monkeypatch.setattr(pretrain, "_restore_checkpoint", forbidden_restore)
+    with pytest.raises(SMLArtifactError, match=expected_error):
+        pretrain.resume(
+            trained.run, data=prepared_data, overrides=_overrides(maximum_steps=2)
+        )
+
+
+def test_failed_training_control_publication_preserves_previous_controls(
+    validated_training_config, monkeypatch
+):
+    prepared_data = validated_training_config.data
+    trained = pretrain.train(validated_training_config)
+    pretrain.resume(
+        trained.run, data=prepared_data, overrides=_overrides(log_interval=2)
+    )
+    path = trained.run / "training-controls.json"
+    original = path.read_bytes()
+    real_replace = controls_module.OS_FILESYSTEM.replace
+
+    def fail_controls_replace(source, destination, **kwargs):
+        if destination == "training-controls.json":
+            raise OSError("injected controls replacement failure")
+        return real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr(controls_module.OS_FILESYSTEM, "replace", fail_controls_replace)
+    with pytest.raises(SMLArtifactError, match="durably publish training controls"):
+        pretrain.resume(
+            trained.run, data=prepared_data, overrides=_overrides(log_interval=3)
+        )
+    assert path.read_bytes() == original
+    assert not list(trained.run.glob(".sml-tmp-training-controls-*"))
+    verify_artifact(trained.run, full=True)
 
 
 @pytest.mark.parametrize(
@@ -353,7 +557,7 @@ def test_pretraining_logs_update_metrics_at_configured_interval(
     prepared_data, tmp_path, monkeypatch, capsys
 ) -> None:
     updates = []
-    timestamps = iter((100.0, 106.0, 115.0, 1_000.0, 1_004.0))
+    timestamps = iter((100.0, 106.9, 187_645.9, 200_000.0, 200_004.9))
     original_step = pretrain.PretrainingKernels.optimizer_step
 
     def record_step(kernels, *args):
@@ -377,16 +581,20 @@ def test_pretraining_logs_update_metrics_at_configured_interval(
     assert lines[0].startswith("pretrain step=2 epoch=0 rows=4 ")
     assert lines[1].startswith("pretrain step=4 epoch=1 rows=8 ")
     for line, update, elapsed, interval in zip(
-        lines, (updates[1], updates[3]), (6.0, 15.0), (6.0, 9.0), strict=True
+        lines,
+        (updates[1], updates[3]),
+        ("0d 00:00:06", "2d 04:05:45"),
+        (6.9, 187_539.0),
+        strict=True,
     ):
-        metrics = dict(field.split("=", 1) for field in line.split()[1:])
+        metrics = dict(field.split("=", 1) for field in shlex.split(line)[1:])
         assert float(metrics["loss"]) == pytest.approx(
             float(update["loss"].item()), abs=1e-6
         )
         assert float(metrics["learning_rate"]) == pytest.approx(
             float(update["learning_rate"].item()), rel=1e-5
         )
-        assert float(metrics["elapsed_seconds"]) == elapsed
+        assert metrics["elapsed"] == elapsed
         assert float(metrics["interval_seconds"]) == interval
 
     resumed = pretrain.resume(
@@ -396,9 +604,9 @@ def test_pretraining_logs_update_metrics_at_configured_interval(
     resumed_lines = capsys.readouterr().err.splitlines()
     assert len(resumed_lines) == 1
     assert resumed_lines[0].startswith("pretrain step=6 ")
-    metrics = dict(field.split("=", 1) for field in resumed_lines[0].split()[1:])
-    assert float(metrics["elapsed_seconds"]) == 4.0
-    assert float(metrics["interval_seconds"]) == 4.0
+    metrics = dict(field.split("=", 1) for field in shlex.split(resumed_lines[0])[1:])
+    assert metrics["elapsed"] == "0d 00:00:04"
+    assert float(metrics["interval_seconds"]) == 4.9
 
 
 def _loaded_groups(run: Path) -> tuple[dict, dict, dict, dict]:
@@ -587,6 +795,11 @@ def _bind_run_to_token_invalid_data(
     )
     run_manifest = replace(run_manifest, identity=run_manifest.recompute_identity())
     (run / "run.json").write_bytes(canonical_json_bytes(run_manifest))
+    controls_path = run / "training-controls.json"
+    if controls_path.exists():
+        controls = json.loads(controls_path.read_bytes())
+        controls["owning_run_identity"] = run_manifest.identity
+        controls_path.write_bytes(canonical_json_bytes(controls))
 
     state_path = resolved.step_directory / "state.json"
     scalar = json.loads(state_path.read_bytes())

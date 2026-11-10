@@ -7,7 +7,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from mlx.utils import tree_flatten
+from mlx.utils import tree_flatten, tree_unflatten
 from sml.errors import SMLConfigurationError
 from sml.model.config import ModelConfig
 from sml.training.common import (
@@ -210,6 +210,35 @@ def test_accumulation_normalization_and_clipping_use_fp32_once():
         atol=1e-6,
         rtol=1e-6,
     )
+
+
+@pytest.mark.parametrize("compiled", (False, True), ids=("eager", "compiled"))
+def test_gradient_clipping_is_exactly_invariant_to_checkpoint_tree_order(compiled):
+    """Large and small norm contributions must survive a checkpoint tree reorder."""
+    fresh = {
+        "z": {"weight": mx.array([10_000.0], dtype=mx.float32)},
+        "a": {
+            f"p{index}": mx.array([2.0], dtype=mx.float32)
+            for index in reversed(range(16))
+        },
+    }
+    restored = tree_unflatten(sorted(tree_flatten(fresh), key=lambda item: item[0]))
+
+    def clip(gradients):
+        return normalize_and_clip(
+            gradients,
+            mx.array(1, dtype=mx.int32),
+            gradient_clip_norm=1.0,
+        )
+
+    clip_fn = mx.compile(clip) if compiled else clip
+    fresh_clipped = dict(tree_flatten(clip_fn(fresh)))
+    restored_clipped = dict(tree_flatten(clip_fn(restored)))
+    mx.eval(fresh_clipped, restored_clipped)
+
+    assert float(fresh_clipped["z.weight"].item()) < 1.0
+    for path, gradient in fresh_clipped.items():
+        assert bool(mx.array_equal(gradient, restored_clipped[path])), path
 
 
 def test_compiled_invalid_normalization_count_fails_closed_with_zero_gradients():

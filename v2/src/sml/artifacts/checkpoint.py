@@ -1980,6 +1980,15 @@ class CheckpointReader:
     _checkpoints_descriptor: int
     _fs: FilesystemOps
 
+    def open_run_root(self) -> ArtifactRoot:
+        """Return an independently owned root for this reader's retained run inode."""
+        if self._owned_step.descriptor < 0 or self._run_descriptor < 0:
+            raise SMLArtifactError("checkpoint reader is closed")
+        return ArtifactRoot(
+            os.dup(self._run_descriptor),
+            local_apfs=_descriptor_is_local_apfs(self._run_descriptor),
+        )
+
     def open_run_child(
         self,
         logical_path: str,
@@ -1996,12 +2005,7 @@ class CheckpointReader:
 
     def open_run_child_root(self, logical_path: str) -> ArtifactRoot:
         """Open a raw run child root for retained-root candidate dispatch."""
-        if self._owned_step.descriptor < 0 or self._run_descriptor < 0:
-            raise SMLArtifactError("checkpoint reader is closed")
-        root = ArtifactRoot(
-            os.dup(self._run_descriptor),
-            local_apfs=_descriptor_is_local_apfs(self._run_descriptor),
-        )
+        root = self.open_run_root()
         try:
             child_root = root.open_child(logical_path)
         except BaseException as error:

@@ -35,6 +35,7 @@ from sml.artifacts.npy import VerifiedNpyMapping
 from sml.errors import SMLArtifactError, SMLDataError
 from sml.inference import ResolvedModel
 from sml.model.config import DEFAULT_EXTENDED_ROPE_SCALING_FACTOR, ModelConfig
+from sml.timing import format_elapsed
 
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
 _INT32 = np.dtype("<i4")
@@ -1607,7 +1608,7 @@ def _log_swag_preparation_elapsed(
     print(
         f"prepare swag source={source.namespace}/{source.name} split={source.split} "
         f"cache_hit={str(cache_hit).lower()} "
-        f"elapsed_seconds={perf_counter() - started_at:.3f}",
+        f"elapsed={format_elapsed(perf_counter() - started_at)!r}",
         file=sys.stderr,
         flush=True,
     )

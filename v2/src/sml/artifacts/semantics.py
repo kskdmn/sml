@@ -19,6 +19,7 @@ from sml.artifacts.manifest import (
     PretrainingRunManifest,
     TokenizerManifest,
 )
+from sml.artifacts.training_controls import read_training_controls
 from sml.errors import SMLArtifactError, SMLConfigurationError
 from sml.model.config import ModelConfig
 from sml.model.language_model import model_parameter_specs
@@ -326,6 +327,8 @@ def validate_full_run_semantics(
     _optimizer_configuration(run.optimizer, context="run")
     loader = _loader_configuration(run.loader, context="run")
     checkpoint_config = checkpoint_configuration(run.checkpoint, context="run")
+    with reader.open_run_root() as run_root:
+        read_training_controls(run_root, run.identity)
     _tokenizer_matches_model(tokenizer, model, context="run")
     contents = reader.read_contents()
     if isinstance(run, PretrainingRunManifest):

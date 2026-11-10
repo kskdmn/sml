@@ -61,11 +61,14 @@ uv run python -m sml prepare pretraining \
 Both commands discover nonhidden matching files directly inside the input
 directory. By default, tokenizer training scans up to **80 files** and the first
 **8,192 physical lines per file**. Pretraining preparation scans **all matching
-files** and the first **49,152 physical lines per file**. Both use seeded file
+files** and the first **40,960 physical lines per file**. Both use seeded file
 selection and ordering. Text is normalized by replacing null characters and
 collapsing whitespace, then filtered to **100–16,384 UTF-8 bytes** per document.
 
-`prepare pretraining` reports `elapsed_seconds` to stderr after each input file.
+`prepare pretraining` reports `elapsed` to stderr after each input file, formatted
+as `Xd HH:MM:SS` (for example, `elapsed='2d 04:04:05'`). All task elapsed-time
+reports use this format, including `0d` for runs shorter than one day; fractional
+seconds are discarded.
 The timer starts before tokenizer loading and counts from the beginning of the
 entire preparation run, continuing across files without resetting.
 
@@ -112,7 +115,7 @@ Training defaults to microbatch size **1**, **8** gradient accumulation steps,
 and **one epoch with no step limit**. An incomplete microbatch is dropped at an
 epoch boundary; an incomplete accumulation window still produces an update.
 Progress is written to stderr every **100 optimizer steps**. It includes loss,
-learning rate, processed rows, `elapsed_seconds` since the training loop started,
+learning rate, processed rows, `elapsed` since the training loop started,
 and `interval_seconds` since the previous report. Use `--log-interval N` on
 `train` or `finetune` to change the interval. Timers restart on resume; the saved
 reporting interval is preserved unless overridden.
@@ -121,6 +124,10 @@ A fresh run's learning-rate schedule follows its planned update budget, with
 1% warmup and cosine decay. Set `schedule_steps` and `warmup_steps` under
 `[train.optimizer]` to override it. The resolved schedule is saved and preserved
 on resume, even when extending the run.
+
+Set the full budget before starting. Use `--session-steps N` on `train` or
+`finetune` to save and stop after N additional updates without changing that
+budget or schedule. The session limit applies only to the current invocation.
 
 Step and epoch limits are absolute totals; training stops when either is reached.
 For 100,000 updates, set `--maximum-steps 100000` **and** an epoch limit large
@@ -137,10 +144,11 @@ uv run python -m sml train --resume v2/output/base-run \
 ```
 
 Allowed overrides are `maximum_steps`, `maximum_epochs`, `log_interval`, and
-`checkpoint_interval`. Use `--data` to relocate a prepared bundle only if its
-identity matches. Model, optimizer, precision, loader, seed, compile, and output
-settings cannot change. To continue a completed run, raise every reached stopping
-limit beyond the saved progress. These rules also apply to `finetune`.
+`checkpoint_interval`; they persist across resumes. Use `--data` to relocate a
+prepared bundle only if its identity matches. Model, optimizer, precision, loader,
+seed, compile, and output settings cannot change. To continue a completed run,
+raise every reached stopping limit beyond the saved progress. These rules also
+apply to `finetune`.
 
 ### SWAG LoRA fine-tuning and export
 
@@ -160,7 +168,7 @@ Preparation resolves `main` to a Hugging Face commit SHA; use that SHA to reprod
 the dataset revision. It writes reusable candidate arrays in length buckets from
 64 to 8,192 tokens. Repeating preparation with the same configuration, checkpoint,
 and output reuses a fully verified bundle without contacting the dataset provider.
-`prepare swag` reports split-level `elapsed_seconds` to stderr because the
+`prepare swag` reports split-level `elapsed` to stderr because the
 dataset provider exposes a split rather than individual source files.
 Prepare and fine-tune against the **same base checkpoint**: advancing the base run
 or changing preparation settings requires a new data output directory.

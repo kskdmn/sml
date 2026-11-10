@@ -144,18 +144,20 @@ def tiny_swag_config(provider, **overrides):
     return SwagPreparationConfig(**values)
 
 
-def test_prepare_swag_bundle_writes_mmap_npy_layout(tmp_path, capsys):
+def test_prepare_swag_bundle_writes_mmap_npy_layout(tmp_path, monkeypatch, capsys):
     from sml.data.swag import load_swag_bundle, prepare_swag_bundle
 
+    timestamps = iter((100.0, 187_545.9))
+    monkeypatch.setattr("sml.data.swag.perf_counter", lambda: next(timestamps))
     provider = FakeSwagProvider((VALID_ROW,))
     output = tmp_path / "swag"
     bundle = prepare_swag_bundle(tiny_swag_config(provider), tiny_base_model(), output)
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err.startswith(
-        "prepare swag source=allenai/swag split=train cache_hit=false elapsed_seconds="
+    assert captured.err == (
+        "prepare swag source=allenai/swag split=train cache_hit=false "
+        "elapsed='2d 04:04:05'\n"
     )
-    assert float(captured.err.rsplit("=", 1)[1]) >= 0.0
     reloaded = load_swag_bundle(output, VerificationLevel.FULL)
     try:
         with (
@@ -186,7 +188,7 @@ def test_prepare_swag_bundle_writes_mmap_npy_layout(tmp_path, capsys):
         bundle.close()
 
 
-def test_reopening_valid_bundle_does_not_call_provider(tmp_path, capsys):
+def test_reopening_valid_bundle_does_not_call_provider(tmp_path, monkeypatch, capsys):
     from sml.data.swag import load_swag_bundle, prepare_swag_bundle
 
     provider = FakeSwagProvider((VALID_ROW,))
@@ -197,13 +199,15 @@ def test_reopening_valid_bundle_does_not_call_provider(tmp_path, capsys):
     provider.resolve_calls = 0
     provider.iter_calls = 0
 
+    timestamps = iter((100.0, 86_500.9))
+    monkeypatch.setattr("sml.data.swag.perf_counter", lambda: next(timestamps))
     second = prepare_swag_bundle(tiny_swag_config(provider), tiny_base_model(), output)
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err.startswith(
-        "prepare swag source=allenai/swag split=train cache_hit=true elapsed_seconds="
+    assert captured.err == (
+        "prepare swag source=allenai/swag split=train cache_hit=true "
+        "elapsed='1d 00:00:00'\n"
     )
-    assert float(captured.err.rsplit("=", 1)[1]) >= 0.0
     loaded = load_swag_bundle(output, VerificationLevel.FULL)
     try:
         assert provider.resolve_calls == 0

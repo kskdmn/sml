@@ -421,6 +421,87 @@ def test_resume_pretraining_uses_only_semantic_overrides(monkeypatch):
     assert kwargs["overrides"].checkpoint_interval == 2
 
 
+@pytest.mark.parametrize("command", ("train", "finetune"))
+@pytest.mark.parametrize("resuming", (False, True), ids=("fresh", "resume"))
+def test_session_steps_dispatches_without_changing_saved_training_budget(
+    tmp_path, monkeypatch, command, resuming
+):
+    module_name = "sml.training.pretrain" if command == "train" else "sml.training.swag"
+    workflow = {
+        ("train", False): "train",
+        ("train", True): "resume",
+        ("finetune", False): "finetune",
+        ("finetune", True): "resume_finetune",
+    }[command, resuming]
+    module = __import__(module_name, fromlist=[workflow])
+    calls = []
+    monkeypatch.setattr(
+        module,
+        workflow,
+        lambda *args, **kwargs: calls.append((args, kwargs)) or "paused",
+    )
+    argv = [command, "--maximum-steps", "100", "--session-steps", "7"]
+    if resuming:
+        argv += ["--resume", str(tmp_path / "run")]
+    else:
+        argv += ["--data", str(tmp_path / "data"), "--output", str(tmp_path / "run")]
+        if command == "finetune":
+            argv += ["--checkpoint", str(tmp_path / "base")]
+
+    parsed = parse_command(argv)
+    domain = parsed.to_domain()
+    assert domain.maximum_steps == 100
+    assert not hasattr(domain, "session_steps")
+    assert parsed.dispatch() == "paused"
+    assert calls[0][1]["session_steps"] == 7
+
+
+@pytest.mark.parametrize("command", ("train", "finetune"))
+def test_toml_session_steps_can_be_overridden_without_changing_total_budget(
+    tmp_path, monkeypatch, command
+):
+    config = tmp_path / "session.toml"
+    config.write_text(
+        f'[{command}]\nresume = "run"\nmaximum_steps = 100\nsession_steps = 3\n',
+        encoding="utf-8",
+    )
+    module_name = "sml.training.pretrain" if command == "train" else "sml.training.swag"
+    workflow = "resume" if command == "train" else "resume_finetune"
+    module = __import__(module_name, fromlist=[workflow])
+    calls = []
+    monkeypatch.setattr(
+        module,
+        workflow,
+        lambda *args, **kwargs: calls.append((args, kwargs)) or "paused",
+    )
+    assert (
+        parse_command(
+            [command, "--config", str(config), "--session-steps", "7"]
+        ).dispatch()
+        == "paused"
+    )
+    assert calls[0][1]["session_steps"] == 7
+    assert calls[0][1]["overrides"].maximum_steps == 100
+
+
+@pytest.mark.parametrize("command", ("train", "finetune"))
+@pytest.mark.parametrize("session_steps", ("0", "-1", str(2**31)))
+def test_invalid_session_steps_fail_before_dispatch(command, session_steps):
+    with pytest.raises(SMLConfigurationError, match="session_steps"):
+        parse_command([command, "--resume", "run", "--session-steps", session_steps])
+
+
+@pytest.mark.parametrize("session_steps", ("true", "1.5", '"2"'))
+def test_toml_session_steps_requires_a_positive_integer(tmp_path, session_steps):
+    config = tmp_path / "session.toml"
+    config.write_text(
+        f'[train]\nresume = "run"\nsession_steps = {session_steps}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(SMLConfigurationError, match="session_steps"):
+        parse_command(["train", "--config", str(config)])
+
+
 @pytest.mark.parametrize(
     ("extra_args", "expected_data"),
     [

@@ -11,6 +11,7 @@ from mlx.utils import tree_flatten, tree_map, tree_map_with_path
 
 from sml.errors import SMLConfigurationError
 from sml.model.config import ModelConfig
+from sml.timing import format_elapsed
 
 _INT32_MAX = 2**31 - 1
 
@@ -35,7 +36,7 @@ def log_training_progress(
     if accuracy is not None:
         message += f" accuracy={accuracy:.6f}"
     message += (
-        f" elapsed_seconds={elapsed_seconds:.3f}"
+        f" elapsed={format_elapsed(elapsed_seconds)!r}"
         f" interval_seconds={interval_seconds:.3f}"
     )
     print(message, file=sys.stderr, flush=True)
@@ -805,10 +806,14 @@ def _normalize_and_clip_with_health(
         lambda gradient: gradient / safe_count,
         accumulated_gradients,
     )
+    # Checkpoint restores reorder dictionaries. Fix the addition order while
+    # tracing so compiled updates use the same clipping scale after a restart.
     squared_norm = sum(
         (
             mx.sum(mx.square(gradient.astype(mx.float32)))
-            for gradient in _array_leaves(normalized, "normalized_gradients")
+            for _path, gradient in sorted(
+                tree_flatten(normalized), key=lambda item: item[0]
+            )
         ),
         mx.array(0.0, dtype=mx.float32),
     )

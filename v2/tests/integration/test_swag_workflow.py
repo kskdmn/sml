@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import shlex
 import shutil
 import weakref
 from collections.abc import Iterator, Mapping
@@ -328,6 +329,11 @@ def _write_bound_lora_run(run: Path, run_manifest: LoRARunManifest) -> None:
     (run / LoRARunManifest.MANIFEST_FILENAME).write_bytes(
         canonical_json_bytes(run_manifest)
     )
+    controls_path = run / "training-controls.json"
+    if controls_path.exists():
+        controls = json.loads(controls_path.read_bytes())
+        controls["owning_run_identity"] = run_manifest.identity
+        controls_path.write_bytes(canonical_json_bytes(controls))
     rebound_latest: LoRACheckpointManifest | None = None
     latest = read_manifest(
         run, LatestIndex, VerificationLevel.MANIFEST_TRUSTED
@@ -480,11 +486,15 @@ def test_lora_run_is_self_contained_after_source_run_removal(
     restored_factors = []
     original_run_training = swag_module._run_training
 
-    def record_training(run, manifest, config, model, restored, bundle):
+    def record_training(
+        run, manifest, config, model, restored, bundle, *, session_steps=None
+    ):
         restored_factors.append(
             (config.rope_scaling_factor, model.config.rope_scaling_factor)
         )
-        return original_run_training(run, manifest, config, model, restored, bundle)
+        return original_run_training(
+            run, manifest, config, model, restored, bundle, session_steps=session_steps
+        )
 
     monkeypatch.setattr(swag_module, "_run_training", record_training)
     move_to_unavailable_location(tiny_base_run)
@@ -1185,7 +1195,7 @@ def test_swag_accumulates_microbatches_and_logs_tail_metrics(
     tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch, capsys
 ) -> None:
     updates = []
-    timestamps = iter((100.0, 106.0, 115.0, 1_000.0, 1_004.0))
+    timestamps = iter((100.0, 106.9, 187_645.9, 200_000.0, 200_004.9))
     original_step = swag_module.SwagKernels.optimizer_step
 
     def record_step(kernels, adapters, optimizer, trainer):
@@ -1227,13 +1237,17 @@ def test_swag_accumulates_microbatches_and_logs_tail_metrics(
     assert lines[0].startswith("swag step=2 epoch=1 examples=5 ")
     assert lines[1].startswith("swag step=4 epoch=2 examples=10 ")
     for line, update, elapsed, interval in zip(
-        lines, (updates[1], updates[3]), (6.0, 15.0), (6.0, 9.0), strict=True
+        lines,
+        (updates[1], updates[3]),
+        ("0d 00:00:06", "2d 04:05:45"),
+        (6.9, 187_539.0),
+        strict=True,
     ):
-        metrics = dict(field.split("=", 1) for field in line.split()[1:])
+        metrics = dict(field.split("=", 1) for field in shlex.split(line)[1:])
         assert float(metrics["loss"]) == pytest.approx(update[1], abs=1e-6)
         assert float(metrics["accuracy"]) == pytest.approx(update[2], abs=1e-6)
         assert float(metrics["learning_rate"]) == pytest.approx(update[3], rel=1e-5)
-        assert float(metrics["elapsed_seconds"]) == elapsed
+        assert metrics["elapsed"] == elapsed
         assert float(metrics["interval_seconds"]) == interval
 
     resumed = resume_finetune(
@@ -1245,9 +1259,64 @@ def test_swag_accumulates_microbatches_and_logs_tail_metrics(
     resumed_lines = capsys.readouterr().err.splitlines()
     assert len(resumed_lines) == 1
     assert resumed_lines[0].startswith("swag step=6 ")
-    metrics = dict(field.split("=", 1) for field in resumed_lines[0].split()[1:])
-    assert float(metrics["elapsed_seconds"]) == 4.0
-    assert float(metrics["interval_seconds"]) == 4.0
+    metrics = dict(field.split("=", 1) for field in shlex.split(resumed_lines[0])[1:])
+    assert metrics["elapsed"] == "0d 00:00:04"
+    assert float(metrics["interval_seconds"]) == 4.9
+
+
+def test_swag_resume_controls_survive_failure_before_the_next_update(
+    tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
+):
+    trained = finetune(
+        tiny_swag_training_config(
+            tiny_base_run,
+            tiny_swag_bundle,
+            tmp_path / "persistent-controls",
+            maximum_steps=1,
+        )
+    )
+    original_manifest = (trained.run / "run.json").read_bytes()
+    original_latest = (trained.run / "latest.json").read_bytes()
+    real_builder = swag_module.build_swag_kernels
+
+    def fail_build(*_args, **_kwargs):
+        raise RuntimeError("before any resumed update")
+
+    monkeypatch.setattr(swag_module, "build_swag_kernels", fail_build)
+    with pytest.raises(RuntimeError, match="before any resumed update"):
+        resume_finetune(
+            trained.run,
+            data=tiny_swag_bundle.path,
+            overrides=ResumeOverrides(
+                maximum_steps=4,
+                maximum_epochs=6,
+                log_interval=2,
+                checkpoint_interval=2,
+            ),
+        )
+    assert (trained.run / "run.json").read_bytes() == original_manifest
+    assert (trained.run / "latest.json").read_bytes() == original_latest
+    document = json.loads((trained.run / "training-controls.json").read_bytes())
+    assert document["controls"] == {
+        "maximum_steps": 4,
+        "maximum_epochs": 6,
+        "log_interval": 2,
+        "checkpoint_interval": 2,
+    }
+    monkeypatch.setattr(swag_module, "build_swag_kernels", real_builder)
+    first_session = resume_finetune(
+        trained.run,
+        data=tiny_swag_bundle.path,
+        overrides=ResumeOverrides(),
+        session_steps=1,
+    )
+    assert first_session.step == 2
+    completed = resume_finetune(
+        trained.run, data=tiny_swag_bundle.path, overrides=ResumeOverrides()
+    )
+    assert completed.step == 4
+    assert (trained.run / "run.json").read_bytes() == original_manifest
+    verify_artifact(trained.run, full=True)
 
 
 def test_resume_rejects_mismatches_before_allocation(
@@ -1619,12 +1688,16 @@ def test_swag_releases_superseded_device_arrays_after_update(
         track_arrays(adapters)
         return model, adapters, frozen
 
-    def track_training(run, manifest, config, model, restored, bundle):
+    def track_training(
+        run, manifest, config, model, restored, bundle, *, session_steps=None
+    ):
         track_arrays(restored.adapters)
         track_arrays(restored.optimizer.first_moments)
         track_arrays(restored.optimizer.second_moments)
         track_arrays(restored.trainer.accumulators)
-        return real_run(run, manifest, config, model, restored, bundle)
+        return real_run(
+            run, manifest, config, model, restored, bundle, session_steps=session_steps
+        )
 
     def check_publication(run, manifest, state):
         gc.collect()

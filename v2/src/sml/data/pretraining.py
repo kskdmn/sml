@@ -44,6 +44,7 @@ from sml.data.corpus import (
 )
 from sml.data.tokenizer import LoadedTokenizer, load_tokenizer_bundle
 from sml.errors import SMLArtifactError, SMLDataError
+from sml.timing import format_elapsed
 
 WINDOWED_ROW_SHUFFLE_V1 = "windowed-row-shuffle-v1"
 
@@ -1262,7 +1263,8 @@ def _saved_row_blocks(paths: Iterable[Path], *, row_width: int) -> Iterator[np.n
 
 def _log_pretraining_file_elapsed(path: Path, elapsed_seconds: float) -> None:
     print(
-        f"prepare pretraining file={str(path)!r} elapsed_seconds={elapsed_seconds:.3f}",
+        f"prepare pretraining file={str(path)!r} "
+        f"elapsed={format_elapsed(elapsed_seconds)!r}",
         file=sys.stderr,
         flush=True,
     )

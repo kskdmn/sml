@@ -40,6 +40,11 @@ from sml.artifacts.manifest import (
     read_manifest,
 )
 from sml.artifacts.semantics import validate_full_run_semantics
+from sml.artifacts.training_controls import (
+    TRAINING_CONTROL_FIELDS,
+    load_training_controls,
+    persist_training_controls,
+)
 from sml.data.pretraining import (
     PreparedDataBundle,
     PretrainingBatchStream,
@@ -71,6 +76,7 @@ from sml.training.common import (
     _optimizer_scalars_are_finite,
     _parameters_are_finite,
     _require_finite_optimizer_state,
+    _require_int32_counter,
     accumulate_fp32,
     adamw_mixed_precision_update_tree,
     build_weight_decay_tree,
@@ -809,6 +815,16 @@ def _config_from_run(
             raise SMLArtifactError("saved checkpoint configuration has invalid fields")
         if saved.pop("rng_schedule") != TRAINING_RNG_SCHEDULE:
             raise SMLArtifactError("saved checkpoint rng_schedule is invalid")
+        persisted = load_training_controls(run, manifest.identity)
+        if persisted is not None:
+            saved.update(
+                {
+                    "maximum_steps": persisted["maximum_steps"],
+                    "maximum_epochs": persisted["maximum_epochs"],
+                    "log_interval": persisted["log_interval"],
+                    "interval": persisted["checkpoint_interval"],
+                }
+            )
         maximum_steps = (
             saved["maximum_steps"]
             if overrides.maximum_steps is None
@@ -901,6 +917,8 @@ def _run_training(
     model: SMLLanguageModel,
     restored: _RestoredTrainingState,
     stream: PretrainingBatchStream,
+    *,
+    session_steps: int | None = None,
 ) -> TrainingResult:
     started_at = last_logged_at = perf_counter()
     parameters = restored.parameters
@@ -917,6 +935,12 @@ def _run_training(
     window_microsteps = 0
     pending_cursor: PretrainingCursor | None = None
     current_epoch = scalar.cursor.epoch
+    session_stop = None if session_steps is None else scalar.step + session_steps
+
+    def limit_reached() -> bool:
+        return _limit_reached(config, scalar) or (
+            session_stop is not None and scalar.step >= session_stop
+        )
 
     def complete_update() -> None:
         nonlocal parameters, optimizer, trainer, scalar
@@ -963,11 +987,11 @@ def _run_training(
             _publish_training_state(run, manifest, state)
             last_published_step = scalar.step
 
-    while not _limit_reached(config, scalar):
+    while not limit_reached():
         if config.maximum_epochs is not None and current_epoch >= config.maximum_epochs:
             break
         for envelope in stream.iter_epoch(current_epoch):
-            if _limit_reached(config, scalar):
+            if limit_reached():
                 break
             with envelope:
                 microstep_index = scalar.microsteps + window_microsteps
@@ -992,7 +1016,7 @@ def _run_training(
             window_microsteps += 1
             if window_microsteps == config.loader.gradient_accumulation_steps:
                 complete_update()
-                if _limit_reached(config, scalar):
+                if limit_reached():
                     break
         if window_microsteps:
             complete_update()
@@ -1004,9 +1028,13 @@ def _run_training(
     return _training_result(run, scalar)
 
 
-def train(config: PretrainingConfig) -> TrainingResult:
+def train(
+    config: PretrainingConfig, *, session_steps: int | None = None
+) -> TrainingResult:
     if not isinstance(config, PretrainingConfig):
         raise TypeError("config must be a PretrainingConfig")
+    if session_steps is not None:
+        _require_int32_counter(session_steps, "session_steps")
     runtime: tuple[SMLLanguageModel, _RestoredTrainingState] | None = None
     with run_writer_lock(config.output_run), ExitStack() as resources:
         if config.output_run.exists() or config.output_run.is_symlink():
@@ -1062,6 +1090,7 @@ def train(config: PretrainingConfig) -> TrainingResult:
             runtime[0],
             runtime[1],
             stream,
+            session_steps=session_steps,
         )
 
 
@@ -1070,6 +1099,7 @@ def resume(
     *,
     data: Path | None,
     overrides: ResumeOverrides,
+    session_steps: int | None = None,
 ) -> TrainingResult:
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
@@ -1077,6 +1107,8 @@ def resume(
         raise TypeError("data must be a Path or None")
     if not isinstance(overrides, ResumeOverrides):
         raise TypeError("overrides must be ResumeOverrides")
+    if session_steps is not None:
+        _require_int32_counter(session_steps, "session_steps")
     with run_writer_lock(run), ExitStack() as resources:
         resolved = resolve_latest_step(
             run,
@@ -1143,6 +1175,19 @@ def resume(
         if retained.checkpoint.identity != resolved.checkpoint.identity:
             raise SMLArtifactError("latest checkpoint changed during writable recovery")
         resolved = retained
+        if any(
+            getattr(overrides, name) is not None for name in TRAINING_CONTROL_FIELDS
+        ):
+            persist_training_controls(
+                run,
+                resolved.run.identity,
+                {
+                    "maximum_steps": config.maximum_steps,
+                    "maximum_epochs": config.maximum_epochs,
+                    "log_interval": config.log_interval,
+                    "checkpoint_interval": config.checkpoint.interval,
+                },
+            )
         if _limit_reached(config, scalar):
             return _training_result(run, scalar)
 
@@ -1164,6 +1209,7 @@ def resume(
             model,
             restored,
             stream,
+            session_steps=session_steps,
         )
 
 
