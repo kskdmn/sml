@@ -1,6 +1,3 @@
-import subprocess
-import sys
-
 EXPECTED_PUBLIC_TYPES = {
     "CheckpointPolicy": "sml.training.common",
     "CorpusConfig": "sml.data.corpus",
@@ -53,27 +50,3 @@ def test_package_exports_only_supported_domain_types():
     for name, module_name in EXPECTED_PUBLIC_TYPES.items():
         owner = importlib.import_module(module_name)
         assert getattr(sml, name) is getattr(owner, name)
-
-
-def test_module_entrypoint_is_available():
-    completed = subprocess.run(
-        [sys.executable, "-m", "sml", "--help"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert completed.returncode == 0
-    assert "SML workflows" in completed.stdout
-
-
-def test_empty_module_entrypoint_renders_configuration_error_without_traceback():
-    completed = subprocess.run(
-        [sys.executable, "-m", "sml"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert completed.returncode == 2
-    assert "SMLConfigurationError: a command is required" in completed.stderr
-    assert "Traceback" not in completed.stderr

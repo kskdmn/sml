@@ -72,7 +72,12 @@ CANONICAL_STEPS = 256
 QUALITY_WALL_TIME_BUDGET_SECONDS = 4 * 60 * 60
 HARNESS_COMPONENTS = (
     Path("v2/benchmarks/swag_quality.py"),
-    Path("v2/tests/unit/test_swag_quality.py"),
+    Path("v2/tests/unit/benchmarks/swag_quality/__init__.py"),
+    Path("v2/tests/unit/benchmarks/swag_quality/conftest.py"),
+    Path("v2/tests/unit/benchmarks/swag_quality/test_workload.py"),
+    Path("v2/tests/unit/benchmarks/swag_quality/test_runtime.py"),
+    Path("v2/tests/unit/benchmarks/swag_quality/test_publication.py"),
+    Path("v2/tests/unit/benchmarks/swag_quality/test_evidence.py"),
     Path("v2/benchmarks/journal.py"),
     Path("v2/benchmarks/evidence.py"),
     Path("v2/benchmarks/recovery.py"),

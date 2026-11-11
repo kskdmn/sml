@@ -1,15 +1,10 @@
 # ruff: noqa: F811
 from __future__ import annotations
 
-import sys
 from dataclasses import replace
 from importlib import metadata
 from pathlib import Path
 from types import SimpleNamespace
-
-_UNIT_DIR = Path(__file__).resolve().parents[1] / "unit"
-if str(_UNIT_DIR) not in sys.path:
-    sys.path.insert(0, str(_UNIT_DIR))
 
 import pytest
 from sml.artifacts.manifest import (
@@ -31,11 +26,7 @@ from sml.inference import (
 )
 from sml.model.config import ModelConfig
 from sml.training.swag import export_merged, finetune, resume_finetune
-from test_evaluation import (  # noqa: F401
-    fake_lm_eval,
-    fake_provider,
-    tiny_evaluation_config,
-)
+from sml_test_support.evaluation import tiny_evaluation_config
 from test_swag_workflow import (  # noqa: F401
     FakeSwagProvider,
     _swag_rows,

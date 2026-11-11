@@ -18,18 +18,17 @@ from sml.artifacts.checkpoint import (
     resolve_exact_step,
 )
 from sml.artifacts.manifest import (
-    ArrayPayloadRef,
     ArraySpec,
     ArtifactRoot,
-    PayloadRef,
     PretrainingCheckpointManifest,
     PretrainingRunManifest,
     VerificationLevel,
     canonical_json_bytes,
-    file_identity,
 )
 from sml.artifacts.verify import verify_artifact
 from sml.errors import SMLArtifactError
+
+from ._payloads import _array_ref, _payload_ref
 
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
 
@@ -42,12 +41,6 @@ class _RecordingBytesIO(io.BytesIO):
     def read(self, size: int = -1) -> bytes:
         self.read_requests.append(size)
         return super().read(size)
-
-
-def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
-    with path.open("rb") as payload:
-        identity = file_identity(payload)
-    return PayloadRef(logical_path, identity, path.stat().st_size)
 
 
 def test_model_master_comparison_uses_fixed_256k_element_chunks() -> None:
@@ -92,31 +85,6 @@ def test_trainer_zero_reduction_uses_fixed_one_mib_chunks() -> None:
 
     assert checkpoint_module._tensor_is_zero(stream, tensor) is True
     assert stream.read_requests == [1024 * 1024] * 3
-
-
-def _array_ref(
-    path: Path,
-    logical_path: str,
-    arrays: dict[str, mx.array],
-    *,
-    declared_shape: tuple[int, ...] | None = None,
-) -> ArrayPayloadRef:
-    return ArrayPayloadRef(
-        _payload_ref(path, logical_path),
-        tuple(
-            ArraySpec(
-                name,
-                declared_shape if declared_shape is not None else tuple(array.shape),
-                {
-                    mx.bfloat16: "bfloat16",
-                    mx.float32: "float32",
-                    mx.int32: "int32",
-                    mx.uint32: "uint32",
-                }[array.dtype],
-            )
-            for name, array in sorted(arrays.items())
-        ),
-    )
 
 
 def _write_valid_checkpoint_run(

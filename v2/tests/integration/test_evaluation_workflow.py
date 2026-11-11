@@ -1,14 +1,8 @@
-# ruff: noqa: F811
 from __future__ import annotations
 
 import math
-import sys
 from dataclasses import replace
 from pathlib import Path
-
-_UNIT_DIR = Path(__file__).resolve().parents[1] / "unit"
-if str(_UNIT_DIR) not in sys.path:
-    sys.path.insert(0, str(_UNIT_DIR))
 
 import pytest
 from sml.errors import SMLRuntimeError
@@ -20,17 +14,8 @@ from sml.evaluation import (
 )
 from sml.evaluation_result import evaluation_result_identity
 from sml.inference import InferenceRuntimeConfig, InferenceSession
-from test_evaluation import (  # noqa: F401
-    fake_lm_eval,
-    fake_provider,
-    tiny_evaluation_config,
-)
-from test_inference import (  # noqa: F401
-    _tiny_run_template,
-    publish_new_valid_step,
-    tiny_pretraining_run,
-    tiny_session,
-)
+from sml_test_support.evaluation import tiny_evaluation_config
+from sml_test_support.inference import publish_new_valid_step
 
 
 def test_evaluation_result_pins_resolved_identity(
@@ -220,3 +205,20 @@ def test_score_loglikelihood_batch_returns_finite_boolean_scores_for_both_paddin
     for result in results:
         assert math.isfinite(result.log_likelihood)
         assert isinstance(result.greedy_match, bool)
+
+
+@pytest.mark.parametrize("task_name", ["hellaswag", "winogrande"])
+def test_installed_task_config_keeps_numeric_metadata_and_nested_callables(
+    task_name: str,
+) -> None:
+    import lm_eval
+    from lm_eval.config.task import TaskConfig
+    from lm_eval.tasks._yaml_loader import load_yaml
+
+    task_directory = Path(lm_eval.__file__).resolve().parent / "tasks" / task_name
+    filename = "hellaswag.yaml" if task_name == "hellaswag" else "default.yaml"
+    config = TaskConfig(**load_yaml(task_directory / filename))
+    values = config.to_dict()
+    assert values["metadata"]["version"] == 1.0
+    assert any(callable(value) for value in values["fewshot_config"].values())
+    assert "filter_list" not in values

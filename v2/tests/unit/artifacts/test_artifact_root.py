@@ -111,35 +111,23 @@ def test_logical_path_components_are_nfkc_normalized():
     )
 
 
-def test_unicode_normalized_paths_collide(tmp_path):
-    """Dropping normalized collision checks would make one payload have two names."""
+@pytest.mark.parametrize(
+    ("first", "second", "message"),
+    [
+        ("model.bin", "ｍodel.bin", "normalized path collision"),
+        ("Model.bin", "model.bin", "case-folded path collision"),
+    ],
+    ids=["unicode-normalization", "case-folding"],
+)
+def test_equivalent_logical_paths_collide(tmp_path, first, second, message):
     data = b"weights"
-    (tmp_path / "model.bin").write_bytes(data)
-    references = (
-        _payload_ref("model.bin", data),
-        _payload_ref("ｍodel.bin", data),
-    )
+    (tmp_path / first).write_bytes(data)
+    (tmp_path / second).write_bytes(data)
+    references = (_payload_ref(first, data), _payload_ref(second, data))
 
     with (
         artifacts.ArtifactRoot.open(tmp_path, writable=False) as root,
-        pytest.raises(SMLArtifactError, match="normalized path collision"),
-    ):
-        root.verify_payloads(references, full=False)
-
-
-def test_casefolded_paths_collide(tmp_path):
-    """Omitting case-fold collision checks would make artifacts host-dependent."""
-    data = b"weights"
-    (tmp_path / "Model.bin").write_bytes(data)
-    (tmp_path / "model.bin").write_bytes(data)
-    references = (
-        _payload_ref("Model.bin", data),
-        _payload_ref("model.bin", data),
-    )
-
-    with (
-        artifacts.ArtifactRoot.open(tmp_path, writable=False) as root,
-        pytest.raises(SMLArtifactError, match="case-folded path collision"),
+        pytest.raises(SMLArtifactError, match=message),
     ):
         root.verify_payloads(references, full=False)
 

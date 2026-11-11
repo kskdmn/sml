@@ -511,20 +511,12 @@ def test_consecutive_eager_and_compiled_transitions_match_every_state_tree(
     assert not bool(mx.array_equal(compiled[3][2], runtime.trainer.next_key))
 
 
-def test_disabled_dropout_preserves_explicit_prng_key(tiny_runtime):
-    """Advancing a disabled dropout key would break deterministic resume state."""
-    state = tiny_runtime.microstep(
-        tiny_runtime.parameters, tiny_runtime.trainer, tiny_runtime.rows
-    )
-
-    mx.eval(state.trainer.next_key, tiny_runtime.trainer.next_key)
-    assert bool(mx.array_equal(state.trainer.next_key, tiny_runtime.trainer.next_key))
-
-
-def test_enabled_dropout_advances_explicit_prng_key(tmp_path: Path):
-    """Enabled dropout preserves the terminal key returned by the forward."""
-    runtime = build_tiny_runtime(tmp_path, dropout=0.2)
-    expected, _unused = mx.random.split(runtime.trainer.next_key)
+@pytest.mark.parametrize("dropout", [0.0, 0.2], ids=["disabled", "enabled"])
+def test_microstep_preserves_exact_terminal_dropout_key(tmp_path, dropout):
+    runtime = build_tiny_runtime(tmp_path, dropout=dropout)
+    expected = runtime.trainer.next_key
+    if dropout:
+        expected, _unused = mx.random.split(expected)
 
     state = runtime.microstep(runtime.parameters, runtime.trainer, runtime.rows)
 

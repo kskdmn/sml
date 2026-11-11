@@ -10,6 +10,12 @@ from mlx.utils import tree_flatten
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_DIR / "src"
+TESTS_DIR = PROJECT_DIR / "tests"
+
+if str(TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(TESTS_DIR))
+
+pytest_plugins = ("sml_test_support.inference", "sml_test_support.evaluation")
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))

@@ -263,26 +263,6 @@ def test_compiled_cache_core_carries_returned_lengths_and_payload_forward():
     )
 
 
-def test_cache_reset_clears_logical_lengths_without_changing_capacity():
-    config = _cache_config()
-    cache = KVCache.allocate(config, 1, 3, mx.bfloat16)
-    updated, _view = append_kv_state(
-        cache.state,
-        0,
-        mx.ones((1, 1, 1, 4), dtype=mx.bfloat16),
-        mx.ones((1, 1, 1, 4), dtype=mx.bfloat16),
-        mx.array([[0]], dtype=mx.int32),
-        mx.array([[True]]),
-    )
-    mx.eval(updated)
-    cache.replace_state(updated)
-
-    cache.reset()
-
-    assert cache.state[0][0].shape == (1, 1, 3, 4)
-    _assert_array_equal(cache.state[2], mx.zeros((1,), dtype=mx.int32))
-
-
 def test_cache_reset_is_equivalent_to_fresh_allocation_before_contiguous_write():
     config = _cache_config()
     reused = KVCache.allocate(config, 1, 4, mx.bfloat16)
@@ -298,6 +278,8 @@ def test_cache_reset_is_equivalent_to_fresh_allocation_before_contiguous_write()
         mx.eval(populated)
         reused.replace_state(populated)
     reused.reset()
+    assert reused.state[0][0].shape == (1, 1, 4, 4)
+    _assert_array_equal(reused.state[2], mx.zeros((1,), dtype=mx.int32))
 
     appended_keys = mx.full((1, 1, 1, 4), 9.0, dtype=mx.bfloat16)
     appended_values = mx.full((1, 1, 1, 4), 19.0, dtype=mx.bfloat16)

@@ -62,7 +62,12 @@ CHECKPOINT_STEPS = (0, 10, 100, CANONICAL_STEPS)
 QUALITY_WALL_TIME_BUDGET_SECONDS = 12 * 60 * 60
 HARNESS_COMPONENTS = (
     Path("v2/benchmarks/quality.py"),
-    Path("v2/tests/unit/test_pretraining_quality.py"),
+    Path("v2/tests/unit/benchmarks/pretraining_quality/__init__.py"),
+    Path("v2/tests/unit/benchmarks/pretraining_quality/conftest.py"),
+    Path("v2/tests/unit/benchmarks/pretraining_quality/test_workload.py"),
+    Path("v2/tests/unit/benchmarks/pretraining_quality/test_runtime.py"),
+    Path("v2/tests/unit/benchmarks/pretraining_quality/test_publication.py"),
+    Path("v2/tests/unit/benchmarks/pretraining_quality/test_evidence.py"),
     Path("v2/benchmarks/journal.py"),
     Path("v2/benchmarks/evidence.py"),
     Path("v2/benchmarks/recovery.py"),

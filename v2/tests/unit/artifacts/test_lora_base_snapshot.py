@@ -113,23 +113,27 @@ def test_require_lora_base_snapshot_rejects_scaled_base() -> None:
         require_lora_base_snapshot(snapshot, run)
 
 
-def test_require_lora_base_snapshot_rejects_noncanonical_precision() -> None:
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {
+                "precision": {
+                    **_CANONICAL_PRECISION,
+                    "working_parameter_dtype": "float32",
+                }
+            },
+            "canonical pretraining precision",
+        ),
+        ({"tokenizer_identity": IDENTITY_A}, "tokenizer identity"),
+    ],
+    ids=["precision", "tokenizer"],
+)
+def test_require_lora_base_snapshot_rejects_incompatible_metadata(overrides, message):
     snapshot, run = _matching_snapshot_and_run()
-    precision = dict(snapshot.precision)
-    precision["working_parameter_dtype"] = "float32"
-    snapshot = replace(snapshot, precision=precision)
+    snapshot = replace(snapshot, **overrides)
     snapshot = replace(snapshot, identity=snapshot.recompute_identity())
     run = replace(run, base_identity=snapshot.identity)
     run = replace(run, identity=run.recompute_identity())
-    with pytest.raises(SMLArtifactError, match="canonical pretraining precision"):
-        require_lora_base_snapshot(snapshot, run)
-
-
-def test_require_lora_base_snapshot_rejects_tokenizer_mismatch() -> None:
-    snapshot, run = _matching_snapshot_and_run()
-    snapshot = replace(snapshot, tokenizer_identity=IDENTITY_A)
-    snapshot = replace(snapshot, identity=snapshot.recompute_identity())
-    run = replace(run, base_identity=snapshot.identity)
-    run = replace(run, identity=run.recompute_identity())
-    with pytest.raises(SMLArtifactError, match="tokenizer identity"):
+    with pytest.raises(SMLArtifactError, match=message):
         require_lora_base_snapshot(snapshot, run)

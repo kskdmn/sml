@@ -181,28 +181,18 @@ def test_lora_config_reconstructs_canonical_zero_dropout_for_static_policy(
     )
 
 
-def test_lora_linear_uses_configured_static_scaling_modes():
-    linear = _Linear(8, 4)
-    linear.weight = mx.ones((4, 8), dtype=mx.bfloat16)
-    lora = LoRALinear(
-        linear,
-        tiny_lora_config(rank=4),
-        module_path="test.lora",
-        spec=LoRAAdapterSpec(module_path="test.lora", scale=2.0, dropout=0.0),
-        key=mx.random.key(1),
-    )
-    rslora = LoRALinear(
-        _Linear(8, 4),
-        tiny_lora_config(rank=4),
-        module_path="test.rslora",
-        spec=LoRAAdapterSpec(module_path="test.rslora", scale=4.0, dropout=0.0),
-        key=mx.random.key(2),
-    )
+@pytest.mark.parametrize("mode,expected_scale", [("lora", 2.0), ("rslora", 4.0)])
+def test_apply_lora_derives_static_scale_from_rank_and_mode(
+    tiny_model, mode, expected_scale
+):
+    config = tiny_lora_config(rank=4, alpha=8.0, scaling_mode=mode)
+    adapted = apply_lora(tiny_model, config, key=mx.random.key(1))
 
-    assert lora.spec.scale == 2.0
-    assert rslora.spec.scale == 4.0
-    assert lora.module_path == "test.lora"
-    assert rslora.module_path == "test.rslora"
+    assert adapted.lora_forward_policy is not None
+    assert all(
+        spec.scale == expected_scale for spec in adapted.lora_forward_policy.adapters
+    )
+    assert adapted.layers[0].self_attn.q_proj.spec.scale == expected_scale
 
 
 def test_lora_dtype_boundaries_and_live_formula(tiny_model):
