@@ -30,7 +30,6 @@ from sml.inference import (
     resolve_model_artifact,
 )
 from sml.model.config import ModelConfig
-from sml.training.common import ResumeOverrides
 from sml.training.swag import export_merged, finetune, resume_finetune
 from test_evaluation import (  # noqa: F401
     fake_lm_eval,
@@ -340,12 +339,11 @@ def test_encoded_swag_to_exported_evaluation(
     )
     tuned = finetune(
         tiny_swag_training_config(
-            tiny_base_run, data, tmp_path / "run", maximum_steps=1
-        )
+            tiny_base_run, data, tmp_path / "run", maximum_steps=2
+        ),
+        session_steps=1,
     )
-    resumed = resume_finetune(
-        tuned.run, data=data.path, overrides=ResumeOverrides(maximum_steps=2)
-    )
+    resumed = resume_finetune(tuned.run, data=data.path)
     lora_path = tmp_path / "lora-evaluation.json"
     lora_evaluation = evaluate(
         replace(

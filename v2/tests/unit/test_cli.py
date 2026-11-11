@@ -390,49 +390,29 @@ name = "dataset"
     assert domain.source.namespace == "example"
 
 
-def test_resume_pretraining_uses_only_semantic_overrides(monkeypatch):
-    import sml.training.pretrain
-
+@pytest.mark.parametrize("command", ("train", "finetune"))
+def test_resume_dispatches_only_the_run_path(command, monkeypatch, capsys):
+    module_name = "sml.training.pretrain" if command == "train" else "sml.training.swag"
+    workflow = "resume" if command == "train" else "resume_finetune"
+    module = __import__(module_name, fromlist=[workflow])
     calls = []
     monkeypatch.setattr(
-        sml.training.pretrain,
-        "resume",
+        module,
+        workflow,
         lambda *args, **kwargs: calls.append((args, kwargs)) or "resumed",
     )
 
-    assert (
-        main(
-            [
-                "train",
-                "--resume",
-                "run",
-                "--maximum-steps",
-                "9",
-                "--checkpoint-interval",
-                "2",
-            ]
-        )
-        == 0
-    )
-    args, kwargs = calls[0]
-    assert args == (Path("run"),)
-    assert kwargs["data"] is None
-    assert kwargs["overrides"].maximum_steps == 9
-    assert kwargs["overrides"].checkpoint_interval == 2
+    assert main([command, "--resume", "run"]) == 0
+    assert calls == [((Path("run"),), {})]
+    assert "resumed" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("command", ("train", "finetune"))
-@pytest.mark.parametrize("resuming", (False, True), ids=("fresh", "resume"))
 def test_session_steps_dispatches_without_changing_saved_training_budget(
-    tmp_path, monkeypatch, command, resuming
+    tmp_path, monkeypatch, command
 ):
     module_name = "sml.training.pretrain" if command == "train" else "sml.training.swag"
-    workflow = {
-        ("train", False): "train",
-        ("train", True): "resume",
-        ("finetune", False): "finetune",
-        ("finetune", True): "resume_finetune",
-    }[command, resuming]
+    workflow = "train" if command == "train" else "finetune"
     module = __import__(module_name, fromlist=[workflow])
     calls = []
     monkeypatch.setattr(
@@ -441,12 +421,9 @@ def test_session_steps_dispatches_without_changing_saved_training_budget(
         lambda *args, **kwargs: calls.append((args, kwargs)) or "paused",
     )
     argv = [command, "--maximum-steps", "100", "--session-steps", "7"]
-    if resuming:
-        argv += ["--resume", str(tmp_path / "run")]
-    else:
-        argv += ["--data", str(tmp_path / "data"), "--output", str(tmp_path / "run")]
-        if command == "finetune":
-            argv += ["--checkpoint", str(tmp_path / "base")]
+    argv += ["--data", str(tmp_path / "data"), "--output", str(tmp_path / "run")]
+    if command == "finetune":
+        argv += ["--checkpoint", str(tmp_path / "base")]
 
     parsed = parse_command(argv)
     domain = parsed.to_domain()
@@ -462,11 +439,13 @@ def test_toml_session_steps_can_be_overridden_without_changing_total_budget(
 ):
     config = tmp_path / "session.toml"
     config.write_text(
-        f'[{command}]\nresume = "run"\nmaximum_steps = 100\nsession_steps = 3\n',
+        f'[{command}]\ndata = "data"\noutput = "run"\n'
+        + ('checkpoint = "base"\n' if command == "finetune" else "")
+        + "maximum_steps = 100\nsession_steps = 3\n",
         encoding="utf-8",
     )
     module_name = "sml.training.pretrain" if command == "train" else "sml.training.swag"
-    workflow = "resume" if command == "train" else "resume_finetune"
+    workflow = "train" if command == "train" else "finetune"
     module = __import__(module_name, fromlist=[workflow])
     calls = []
     monkeypatch.setattr(
@@ -481,57 +460,80 @@ def test_toml_session_steps_can_be_overridden_without_changing_total_budget(
         == "paused"
     )
     assert calls[0][1]["session_steps"] == 7
-    assert calls[0][1]["overrides"].maximum_steps == 100
+    assert calls[0][0][0].maximum_steps == 100
 
 
 @pytest.mark.parametrize("command", ("train", "finetune"))
 @pytest.mark.parametrize("session_steps", ("0", "-1", str(2**31)))
 def test_invalid_session_steps_fail_before_dispatch(command, session_steps):
     with pytest.raises(SMLConfigurationError, match="session_steps"):
-        parse_command([command, "--resume", "run", "--session-steps", session_steps])
+        parse_command(
+            [
+                command,
+                "--data",
+                "data",
+                "--output",
+                "run",
+                "--session-steps",
+                session_steps,
+            ]
+        )
 
 
 @pytest.mark.parametrize("session_steps", ("true", "1.5", '"2"'))
 def test_toml_session_steps_requires_a_positive_integer(tmp_path, session_steps):
     config = tmp_path / "session.toml"
     config.write_text(
-        f'[train]\nresume = "run"\nsession_steps = {session_steps}\n',
+        f'[train]\ndata = "data"\noutput = "run"\nsession_steps = {session_steps}\n',
         encoding="utf-8",
     )
     with pytest.raises(SMLConfigurationError, match="session_steps"):
         parse_command(["train", "--config", str(config)])
 
 
+@pytest.mark.parametrize("command", ("train", "finetune"))
+@pytest.mark.parametrize("before_resume", (False, True))
 @pytest.mark.parametrize(
-    ("extra_args", "expected_data"),
+    "extra_args",
     [
-        ([], None),
-        (["--data", "swag"], Path("swag")),
+        ["--maximum-steps", "9"],
+        ["--maximum-epochs", "2"],
+        ["--log-interval", "1"],
+        ["--checkpoint-interval", "2"],
+        ["--data", "data"],
+        ["--output", "other"],
+        ["--session-steps", "7"],
+        ["--microbatch-size", "1"],
+        ["--gradient-accumulation-steps", "8"],
+        ["--prefetch-depth", "2"],
+        ["--learning-rate", "0.001"],
+        ["--seed", "0"],
+        ["--compile"],
+        ["--no-compile"],
+        ["--config", "missing.toml"],
+        ["--maximum-steps=9"],
     ],
 )
-def test_resume_finetune_dispatches_optional_data(
-    extra_args, expected_data, monkeypatch, capsys
-):
-    import sml.training.swag
+def test_resume_rejects_every_other_option(command, before_resume, extra_args):
+    options = ["--resume", "run"]
+    options = extra_args + options if before_resume else options + extra_args
+    with pytest.raises(SMLConfigurationError, match="resume.*other options"):
+        parse_command([command, *options])
 
-    calls = []
-    monkeypatch.setattr(
-        sml.training.swag,
-        "resume_finetune",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or "resumed",
+
+@pytest.mark.parametrize("command", ("train", "finetune"))
+@pytest.mark.parametrize(
+    "settings", ("", "maximum_steps = 9\n", "[{command}.optimizer]\nbeta1 = 0.9\n")
+)
+def test_resume_rejects_configuration_files(tmp_path, command, settings):
+    config = tmp_path / "resume.toml"
+    config.write_text(
+        f'[{command}]\nresume = "run"\n' + settings.format(command=command),
+        encoding="utf-8",
     )
 
-    assert main(["finetune", "--resume", "run", *extra_args]) == 0
-    args, kwargs = calls[0]
-    assert args == (Path("run"),)
-    assert kwargs["data"] == expected_data
-    assert "resumed" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("command", ["train", "finetune"])
-def test_resume_rejects_fresh_only_configuration(command):
-    with pytest.raises(SMLConfigurationError, match="resume"):
-        parse_command([command, "--resume", "run", "--output", "other"])
+    with pytest.raises(SMLConfigurationError, match="resume.*config"):
+        parse_command([command, "--config", str(config)])
 
 
 @pytest.mark.parametrize(

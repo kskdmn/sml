@@ -19,7 +19,7 @@ from sml.errors import SMLConfigurationError
 from sml.inference import resolve_model_artifact
 from sml.training import pretrain
 from sml.training import swag as swag_module
-from sml.training.common import CheckpointPolicy, LoaderConfig, ResumeOverrides
+from sml.training.common import CheckpointPolicy, LoaderConfig
 from sml.training.lora import LoRAConfig, LoRAInitializerConfig
 from sml.training.swag import SwagTrainingConfig
 from test_pretraining_workflow import (
@@ -115,10 +115,10 @@ def test_pretraining_multiple_checkpoint_resumes_match_uninterrupted_training(
             _interrupt_after_checkpoint(pretrain, step),
             pytest.raises(CheckpointInterruption, match=f"checkpoint {step}"),
         ):
-            pretrain.resume(interrupted_run, data=data, overrides=ResumeOverrides())
+            pretrain.resume(interrupted_run, data=data)
         _assert_checkpoint_step(interrupted_run, step)
 
-    resumed = pretrain.resume(interrupted_run, data=data, overrides=ResumeOverrides())
+    resumed = pretrain.resume(interrupted_run, data=data)
 
     assert resumed.step == uninterrupted.step == 12
     assert resumed.epoch == uninterrupted.epoch == 6
@@ -148,7 +148,6 @@ def test_pretraining_multiple_fresh_process_resumes_match_uninterrupted_training
         from pathlib import Path
         from unittest.mock import patch
         from sml.training import pretrain
-        from sml.training.common import ResumeOverrides
 
         run, data = Path(sys.argv[1]), Path(sys.argv[2])
         stop_at = int(sys.argv[3])
@@ -165,7 +164,7 @@ def test_pretraining_multiple_fresh_process_resumes_match_uninterrupted_training
 
         with patch.object(pretrain, "_publish_training_state", interrupt):
             try:
-                result = pretrain.resume(run, data=data, overrides=ResumeOverrides())
+                result = pretrain.resume(run, data=data)
             except CheckpointInterruption as error:
                 assert error.args == (stop_at,)
             else:
@@ -294,13 +293,9 @@ def test_swag_multiple_checkpoint_resumes_match_uninterrupted_training(
                 _interrupt_after_checkpoint(swag_module, step),
                 pytest.raises(CheckpointInterruption, match=f"checkpoint {step}"),
             ):
-                swag_module.resume_finetune(
-                    interrupted_run, data=bundle.path, overrides=ResumeOverrides()
-                )
+                swag_module.resume_finetune(interrupted_run, data=bundle.path)
             _assert_checkpoint_step(interrupted_run, step)
-        resumed = swag_module.resume_finetune(
-            interrupted_run, data=bundle.path, overrides=ResumeOverrides()
-        )
+        resumed = swag_module.resume_finetune(interrupted_run, data=bundle.path)
     finally:
         bundle.close()
 
@@ -332,7 +327,7 @@ def test_pretraining_session_limits_preserve_planned_schedule_and_exact_state(
     # the same step-3 checkpoint must complete all nine remaining updates.
     uncapped_run = tmp_path / "uncapped"
     shutil.copytree(segmented.run, uncapped_run)
-    uncapped = pretrain.resume(uncapped_run, data=data, overrides=ResumeOverrides())
+    uncapped = pretrain.resume(uncapped_run, data=data)
     assert uncapped.step == 12
     _assert_run_states_equal(uncapped.run, uninterrupted.run)
 
@@ -340,12 +335,11 @@ def test_pretraining_session_limits_preserve_planned_schedule_and_exact_state(
         segmented = pretrain.resume(
             segmented.run,
             data=data,
-            overrides=ResumeOverrides(),
             session_steps=3,
         )
         assert segmented.step == expected_step
         _assert_checkpoint_step(segmented.run, expected_step)
-    segmented = pretrain.resume(segmented.run, data=data, overrides=ResumeOverrides())
+    segmented = pretrain.resume(segmented.run, data=data)
 
     assert segmented.step == uninterrupted.step == 12
     _assert_run_states_equal(segmented.run, uninterrupted.run)
@@ -369,9 +363,7 @@ def test_swag_session_limits_preserve_planned_schedule_and_exact_state(
 
         uncapped_run = tmp_path / "uncapped"
         shutil.copytree(segmented.run, uncapped_run)
-        uncapped = swag_module.resume_finetune(
-            uncapped_run, data=bundle.path, overrides=ResumeOverrides()
-        )
+        uncapped = swag_module.resume_finetune(uncapped_run, data=bundle.path)
         assert uncapped.step == 12
         _assert_swag_states_equal(uncapped.run, uninterrupted.run)
 
@@ -379,14 +371,11 @@ def test_swag_session_limits_preserve_planned_schedule_and_exact_state(
             segmented = swag_module.resume_finetune(
                 segmented.run,
                 data=bundle.path,
-                overrides=ResumeOverrides(),
                 session_steps=3,
             )
             assert segmented.step == expected_step
             _assert_checkpoint_step(segmented.run, expected_step)
-        segmented = swag_module.resume_finetune(
-            segmented.run, data=bundle.path, overrides=ResumeOverrides()
-        )
+        segmented = swag_module.resume_finetune(segmented.run, data=bundle.path)
     finally:
         bundle.close()
 
@@ -420,14 +409,12 @@ def test_invalid_session_limits_fail_before_artifact_access(
             pretrain.resume(
                 run,
                 data=data,
-                overrides=ResumeOverrides(),
                 session_steps=session_steps,
             )
         else:
             swag_module.resume_finetune(
                 run,
                 data=data,
-                overrides=ResumeOverrides(),
                 session_steps=session_steps,
             )
     assert not run.exists()

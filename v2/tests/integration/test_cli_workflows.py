@@ -375,8 +375,9 @@ def cli_workspace(tmp_path_factory: pytest.TempPathFactory) -> CLIWorkspace:
             gradient_accumulation_steps = 1
             prefetch_depth = 2
             checkpoint_interval = 1
-            maximum_steps = 1
+            maximum_steps = 2
             maximum_epochs = 4
+            session_steps = 1
             log_interval = 1
             seed = 19
             compile = false
@@ -415,8 +416,9 @@ def cli_workspace(tmp_path_factory: pytest.TempPathFactory) -> CLIWorkspace:
             gradient_accumulation_steps = 1
             prefetch_depth = 2
             checkpoint_interval = 1
-            maximum_steps = 1
+            maximum_steps = 2
             maximum_epochs = 4
+            session_steps = 1
             log_interval = 1
             seed = 23
             compile = false
@@ -673,23 +675,11 @@ def completed_cli_workspace(cli_workspace: CLIWorkspace) -> CLIWorkspace:
         "train",
         "--resume",
         workspace.base_run,
-        "--maximum-steps",
-        2,
-        "--checkpoint-interval",
-        1,
-        "--log-interval",
-        1,
     )
     workspace.results["finetune_resume"] = workspace.run(
         "finetune",
         "--resume",
         workspace.lora_run,
-        "--maximum-steps",
-        2,
-        "--checkpoint-interval",
-        1,
-        "--log-interval",
-        1,
     )
     return workspace
 
@@ -1234,60 +1224,36 @@ def test_full_lora_run_rejects_resigned_checkpoint_current_state_corruption(
         verify_artifact(run, full=True)
 
 
-def test_cli_resume_accepts_relocated_identity_matching_data(
+@pytest.mark.parametrize(
+    ("command", "run_attribute", "data_attribute"),
+    (
+        ("train", "base_run", "pretraining_data"),
+        ("finetune", "lora_run", "swag_data"),
+    ),
+)
+def test_cli_resume_rejects_data_override(
     completed_cli_workspace: CLIWorkspace,
+    command: str,
+    run_attribute: str,
+    data_attribute: str,
 ) -> None:
     workspace = completed_cli_workspace
-    relocated_root = workspace.root / "relocated"
-    relocated_root.mkdir()
+    run = getattr(workspace, run_attribute)
+    original_latest = (run / "latest.json").read_bytes()
 
-    moved_base_run = relocated_root / "base-run"
-    shutil.copytree(workspace.base_run, moved_base_run)
-    relocated_pretraining = relocated_root / "pretraining-data"
-    workspace.pretraining_data.rename(relocated_pretraining)
-    assert not workspace.pretraining_data.exists()
+    result = workspace.run(
+        command,
+        "--resume",
+        run,
+        "--data",
+        getattr(workspace, data_attribute),
+        check=False,
+    )
 
-    try:
-        workspace.run(
-            "train",
-            "--resume",
-            moved_base_run,
-            "--data",
-            relocated_pretraining,
-            "--maximum-steps",
-            3,
-            "--checkpoint-interval",
-            1,
-            "--log-interval",
-            1,
-        )
-    finally:
-        relocated_pretraining.rename(workspace.pretraining_data)
-    assert _latest_step(moved_base_run) == 3
-
-    moved_lora_run = relocated_root / "lora-run"
-    shutil.copytree(workspace.lora_run, moved_lora_run)
-    relocated_swag = relocated_root / "swag-data"
-    workspace.swag_data.rename(relocated_swag)
-    assert not workspace.swag_data.exists()
-
-    try:
-        workspace.run(
-            "finetune",
-            "--resume",
-            moved_lora_run,
-            "--data",
-            relocated_swag,
-            "--maximum-steps",
-            3,
-            "--checkpoint-interval",
-            1,
-            "--log-interval",
-            1,
-        )
-    finally:
-        relocated_swag.rename(workspace.swag_data)
-    assert _latest_step(moved_lora_run) == 3
+    assert result.returncode == 2
+    assert result.stderr.startswith("SMLConfigurationError:")
+    assert "data" in result.stderr
+    assert (run / "latest.json").read_bytes() == original_latest
 
 
 def test_cli_accepts_complete_run_with_step_prefixed_name(

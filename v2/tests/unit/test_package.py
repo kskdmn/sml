@@ -27,7 +27,6 @@ EXPECTED_PUBLIC_TYPES = {
     "PreparedDataBundle": "sml.data.pretraining",
     "PretrainingConfig": "sml.training.common",
     "PretrainingPreparationConfig": "sml.data.pretraining",
-    "ResumeOverrides": "sml.training.common",
     "SMLArtifactError": "sml.errors",
     "SMLConfigurationError": "sml.errors",
     "SMLDataError": "sml.errors",

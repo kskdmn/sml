@@ -118,16 +118,16 @@ Progress is written to stderr every **100 optimizer steps**. It includes loss,
 learning rate, processed rows, `elapsed` since the training loop started,
 and `interval_seconds` since the previous report. Use `--log-interval N` on
 `train` or `finetune` to change the interval. Timers restart on resume; the saved
-reporting interval is preserved unless overridden.
+reporting interval is preserved.
 
 A fresh run's learning-rate schedule follows its planned update budget, with
 1% warmup and cosine decay. Set `schedule_steps` and `warmup_steps` under
 `[train.optimizer]` to override it. The resolved schedule is saved and preserved
-on resume, even when extending the run.
+on resume.
 
-Set the full budget before starting. Use `--session-steps N` on `train` or
-`finetune` to save and stop after N additional updates without changing that
-budget or schedule. The session limit applies only to the current invocation.
+Set the full budget before starting. Use `--session-steps N` on a fresh `train`
+or `finetune` invocation to save and stop after N updates without changing that
+budget or schedule. Resume then continues to the original budget.
 
 Step and epoch limits are absolute totals; training stops when either is reached.
 For 100,000 updates, set `--maximum-steps 100000` **and** an epoch limit large
@@ -136,19 +136,15 @@ checkpoints support recovery, with no validation-based selection or early stoppi
 Nonfinite updates stop training before commit, preserving the last published
 checkpoint.
 
-Resume with operational overrides only:
+Resume using the original run parameters:
 
 ```sh
-uv run python -m sml train --resume v2/output/base-run \
-  --maximum-epochs 2 --checkpoint-interval 100
+uv run python -m sml train --resume v2/output/base-run
 ```
 
-Allowed overrides are `maximum_steps`, `maximum_epochs`, `log_interval`, and
-`checkpoint_interval`; they persist across resumes. Use `--data` to relocate a
-prepared bundle only if its identity matches. Model, optimizer, precision, loader,
-seed, compile, and output settings cannot change. To continue a completed run,
-raise every reached stopping limit beyond the saved progress. These rules also
-apply to `finetune`.
+`--resume` cannot be combined with any other option. It preserves all original
+settings, including step and epoch limits, logging, and checkpoint intervals.
+These rules also apply to `finetune`.
 
 ### SWAG LoRA fine-tuning and export
 
@@ -189,8 +185,7 @@ for another capacity. Lowering the factor also requires lowering preparation's
 The saved scale is preserved on resume and export.
 
 ```sh
-uv run python -m sml finetune --resume v2/output/swag-run \
-  --maximum-steps 16000 --maximum-epochs 6
+uv run python -m sml finetune --resume v2/output/swag-run
 ```
 
 A LoRA run contains its frozen base snapshot, tokenizer, and adapter checkpoints.

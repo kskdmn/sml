@@ -46,11 +46,6 @@ from sml.artifacts.manifest import (
     structured_identity,
 )
 from sml.artifacts.semantics import validate_full_run_semantics
-from sml.artifacts.training_controls import (
-    TRAINING_CONTROL_FIELDS,
-    load_training_controls,
-    persist_training_controls,
-)
 from sml.data.swag import (
     SwagBatch,
     SwagBatchStream,
@@ -73,7 +68,6 @@ from sml.training.common import (
     CheckpointPolicy,
     LoaderConfig,
     OptimizerConfig,
-    ResumeOverrides,
     WeightDecayPolicy,
     _adamw_fp32_update_tree,
     _normalize_and_clip_with_health,
@@ -767,7 +761,6 @@ def _config_from_run(
     run: Path,
     data: Path,
     manifest: LoRARunManifest,
-    overrides: ResumeOverrides,
 ) -> SwagTrainingConfig:
     try:
         model = ModelConfig(**_mapping_dict(manifest.model, "model"))
@@ -784,36 +777,6 @@ def _config_from_run(
             raise SMLArtifactError("saved checkpoint configuration has invalid fields")
         if saved.pop("rng_schedule") != TRAINING_RNG_SCHEDULE:
             raise SMLArtifactError("saved checkpoint rng_schedule is invalid")
-        persisted = load_training_controls(run, manifest.identity)
-        if persisted is not None:
-            saved.update(
-                {
-                    "maximum_steps": persisted["maximum_steps"],
-                    "maximum_epochs": persisted["maximum_epochs"],
-                    "log_interval": persisted["log_interval"],
-                    "interval": persisted["checkpoint_interval"],
-                }
-            )
-        maximum_steps = (
-            saved["maximum_steps"]
-            if overrides.maximum_steps is None
-            else overrides.maximum_steps
-        )
-        maximum_epochs = (
-            saved["maximum_epochs"]
-            if overrides.maximum_epochs is None
-            else overrides.maximum_epochs
-        )
-        log_interval = (
-            saved["log_interval"]
-            if overrides.log_interval is None
-            else overrides.log_interval
-        )
-        interval = (
-            saved["interval"]
-            if overrides.checkpoint_interval is None
-            else overrides.checkpoint_interval
-        )
         return SwagTrainingConfig(
             base_checkpoint=run,
             data=data,
@@ -822,11 +785,11 @@ def _config_from_run(
             lora=lora,
             optimizer=optimizer,
             loader=loader,
-            checkpoint=CheckpointPolicy(interval=interval),
+            checkpoint=CheckpointPolicy(interval=saved["interval"]),
             precision=precision,
-            maximum_steps=maximum_steps,
-            maximum_epochs=maximum_epochs,
-            log_interval=log_interval,
+            maximum_steps=saved["maximum_steps"],
+            maximum_epochs=saved["maximum_epochs"],
+            log_interval=saved["log_interval"],
             seed=saved["seed"],
             compile=saved["compile"],
         )
@@ -1422,16 +1385,13 @@ def finetune(
 def resume_finetune(
     run: Path,
     *,
-    data: Path | None,
-    overrides: ResumeOverrides,
+    data: Path | None = None,
     session_steps: int | None = None,
 ) -> SwagTrainingResult:
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
     if data is not None and not isinstance(data, Path):
         raise TypeError("data must be a Path or None")
-    if not isinstance(overrides, ResumeOverrides):
-        raise TypeError("overrides must be ResumeOverrides")
     if session_steps is not None:
         _require_int32_counter(session_steps, "session_steps")
     with run_writer_lock(run):
@@ -1449,7 +1409,7 @@ def resume_finetune(
                 raise SMLArtifactError(
                     "resume requires a prepared-data bundle location"
                 )
-            config = _config_from_run(run, data_path, resolved.run, overrides)
+            config = _config_from_run(run, data_path, resolved.run)
             model_config = ModelConfig(**_mapping_dict(resolved.run.model, "model"))
             preliminary_checkpoint_identity = resolved.checkpoint.identity
         bundle = _verified_swag(
@@ -1517,19 +1477,6 @@ def resume_finetune(
             if retained.checkpoint.identity != checkpoint_identity:
                 raise SMLArtifactError(
                     "latest checkpoint changed during writable recovery"
-                )
-            if any(
-                getattr(overrides, name) is not None for name in TRAINING_CONTROL_FIELDS
-            ):
-                persist_training_controls(
-                    run,
-                    run_manifest.identity,
-                    {
-                        "maximum_steps": config.maximum_steps,
-                        "maximum_epochs": config.maximum_epochs,
-                        "log_interval": config.log_interval,
-                        "checkpoint_interval": config.checkpoint.interval,
-                    },
                 )
             if limit_reached:
                 return _training_result(run, scalar)

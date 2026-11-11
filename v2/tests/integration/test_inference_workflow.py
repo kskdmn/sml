@@ -43,7 +43,6 @@ from sml.training.common import (
     LoaderConfig,
     OptimizerConfig,
     PretrainingConfig,
-    ResumeOverrides,
 )
 from sml.training.pretrain import resume, train
 
@@ -129,7 +128,7 @@ def _tiny_pretraining_config(data_path: Path, output_run: Path, vocab_size: int)
             epoch_seed=13,
         ),
         checkpoint=CheckpointPolicy(interval=1),
-        maximum_steps=2,
+        maximum_steps=4,
         maximum_epochs=2,
         log_interval=1,
         seed=19,
@@ -146,7 +145,8 @@ def _tiny_run_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
             data.path,
             root / "run",
             tokenizer.manifest.vocab_size,
-        )
+        ),
+        session_steps=2,
     )
     return result.run
 
@@ -164,7 +164,9 @@ def tiny_session(tiny_pretraining_run: Path) -> InferenceSession:
 
 
 def publish_new_valid_step(run: Path, step: int) -> None:
-    resume(run, data=None, overrides=ResumeOverrides(maximum_steps=step))
+    current_step = json.loads((run / "latest.json").read_bytes())["step"]
+    resumed = resume(run, session_steps=step - current_step)
+    assert resumed.step == step
 
 
 def _latest_step_directory(run: Path) -> Path:

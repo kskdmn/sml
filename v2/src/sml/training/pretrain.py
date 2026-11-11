@@ -40,11 +40,6 @@ from sml.artifacts.manifest import (
     read_manifest,
 )
 from sml.artifacts.semantics import validate_full_run_semantics
-from sml.artifacts.training_controls import (
-    TRAINING_CONTROL_FIELDS,
-    load_training_controls,
-    persist_training_controls,
-)
 from sml.data.pretraining import (
     PreparedDataBundle,
     PretrainingBatchStream,
@@ -69,7 +64,6 @@ from sml.training.common import (
     OptimizerConfig,
     PrecisionConfig,
     PretrainingConfig,
-    ResumeOverrides,
     TrainerState,
     WeightDecayPolicy,
     _normalize_and_clip_with_health,
@@ -799,7 +793,6 @@ def _config_from_run(
     run: Path,
     data: Path,
     manifest: PretrainingRunManifest,
-    overrides: ResumeOverrides,
 ) -> PretrainingConfig:
     try:
         model = ModelConfig(**_mapping_dict(manifest.model, "model"))
@@ -815,47 +808,17 @@ def _config_from_run(
             raise SMLArtifactError("saved checkpoint configuration has invalid fields")
         if saved.pop("rng_schedule") != TRAINING_RNG_SCHEDULE:
             raise SMLArtifactError("saved checkpoint rng_schedule is invalid")
-        persisted = load_training_controls(run, manifest.identity)
-        if persisted is not None:
-            saved.update(
-                {
-                    "maximum_steps": persisted["maximum_steps"],
-                    "maximum_epochs": persisted["maximum_epochs"],
-                    "log_interval": persisted["log_interval"],
-                    "interval": persisted["checkpoint_interval"],
-                }
-            )
-        maximum_steps = (
-            saved["maximum_steps"]
-            if overrides.maximum_steps is None
-            else overrides.maximum_steps
-        )
-        maximum_epochs = (
-            saved["maximum_epochs"]
-            if overrides.maximum_epochs is None
-            else overrides.maximum_epochs
-        )
-        log_interval = (
-            saved["log_interval"]
-            if overrides.log_interval is None
-            else overrides.log_interval
-        )
-        interval = (
-            saved["interval"]
-            if overrides.checkpoint_interval is None
-            else overrides.checkpoint_interval
-        )
         return PretrainingConfig(
             data=data,
             output_run=run,
             model=model,
             optimizer=optimizer,
             loader=loader,
-            checkpoint=CheckpointPolicy(interval=interval),
+            checkpoint=CheckpointPolicy(interval=saved["interval"]),
             precision=precision,
-            maximum_steps=maximum_steps,
-            maximum_epochs=maximum_epochs,
-            log_interval=log_interval,
+            maximum_steps=saved["maximum_steps"],
+            maximum_epochs=saved["maximum_epochs"],
+            log_interval=saved["log_interval"],
             seed=saved["seed"],
             compile=saved["compile"],
         )
@@ -1097,16 +1060,13 @@ def train(
 def resume(
     run: Path,
     *,
-    data: Path | None,
-    overrides: ResumeOverrides,
+    data: Path | None = None,
     session_steps: int | None = None,
 ) -> TrainingResult:
     if not isinstance(run, Path):
         raise TypeError("run must be a Path")
     if data is not None and not isinstance(data, Path):
         raise TypeError("data must be a Path or None")
-    if not isinstance(overrides, ResumeOverrides):
-        raise TypeError("overrides must be ResumeOverrides")
     if session_steps is not None:
         _require_int32_counter(session_steps, "session_steps")
     with run_writer_lock(run), ExitStack() as resources:
@@ -1123,7 +1083,7 @@ def resume(
         )
         if data_path is None:
             raise SMLArtifactError("resume requires a prepared-data bundle location")
-        config = _config_from_run(run, data_path, resolved.run, overrides)
+        config = _config_from_run(run, data_path, resolved.run)
         prepared, shards = resources.enter_context(
             _verified_data(
                 data_path,
@@ -1175,19 +1135,6 @@ def resume(
         if retained.checkpoint.identity != resolved.checkpoint.identity:
             raise SMLArtifactError("latest checkpoint changed during writable recovery")
         resolved = retained
-        if any(
-            getattr(overrides, name) is not None for name in TRAINING_CONTROL_FIELDS
-        ):
-            persist_training_controls(
-                run,
-                resolved.run.identity,
-                {
-                    "maximum_steps": config.maximum_steps,
-                    "maximum_epochs": config.maximum_epochs,
-                    "log_interval": config.log_interval,
-                    "checkpoint_interval": config.checkpoint.interval,
-                },
-            )
         if _limit_reached(config, scalar):
             return _training_result(run, scalar)
 

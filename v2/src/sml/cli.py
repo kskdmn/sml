@@ -319,7 +319,12 @@ def _add_bool(parser: argparse.ArgumentParser, name: str) -> None:
 def _add_training_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--data", type=Path, default=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path, default=argparse.SUPPRESS)
-    parser.add_argument("--resume", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="Resume with the original run parameters; cannot combine with other options.",
+    )
     for name in (
         "microbatch_size",
         "gradient_accumulation_steps",
@@ -623,10 +628,14 @@ def _normalize_cli_values(
     command = _command_key(values)
     values.pop("_command", None)
     values.pop("_prepare_command", None)
+    if command in {"train", "finetune"}:
+        _validate_resume_options(values)
     config = values.pop("config", None)
     configured = (
         _load_command_table(config, command) if isinstance(config, Path) else {}
     )
+    if command in {"train", "finetune"} and config is not None:
+        _validate_resume_options({**configured, "config": config})
     if command == "tokenize":
         for table, names in (
             (
@@ -679,6 +688,16 @@ def _require(values: Mapping[str, object], *names: str) -> None:
     missing = [name for name in names if name not in values]
     if missing:
         raise SMLConfigurationError(f"{', '.join(missing)} is required")
+
+
+def _validate_resume_options(values: Mapping[str, object]) -> None:
+    if "resume" in values:
+        forbidden = set(values) - {"resume"}
+        if forbidden:
+            raise SMLConfigurationError(
+                "resume cannot be combined with other options: "
+                + ", ".join(sorted(forbidden))
+            )
 
 
 def _reject_existing_output(values: Mapping[str, object]) -> None:
@@ -763,23 +782,6 @@ def _build_checkpoint(values: Mapping[str, object], *, finetune: bool) -> Any:
     default_interval = 500 if finetune else 1_000
     interval = values.get("checkpoint_interval", default_interval)
     return CheckpointPolicy(interval=interval)
-
-
-def _resume_overrides(values: Mapping[str, object]) -> Any:
-    from sml.training.common import ResumeOverrides
-
-    return ResumeOverrides(
-        **{
-            name: values[name]
-            for name in (
-                "maximum_steps",
-                "maximum_epochs",
-                "log_interval",
-                "checkpoint_interval",
-            )
-            if name in values
-        }
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -891,7 +893,7 @@ class TrainCommand(_Command):
 
     def to_domain(self) -> Any:
         if "resume" in self.values:
-            return _resume_overrides(self.values)
+            return self.values["resume"]
         from sml.model.config import InitializerConfig, ModelConfig
         from sml.training.common import PrecisionConfig, PretrainingConfig
 
@@ -948,12 +950,7 @@ class TrainCommand(_Command):
         if "resume" in self.values:
             from sml.training.pretrain import resume
 
-            return resume(
-                self.values["resume"],
-                data=self.values.get("data"),
-                overrides=self.to_domain(),
-                **session_options,
-            )
+            return resume(self.to_domain())
         from sml.training.pretrain import train
 
         return train(self.to_domain(), **session_options)
@@ -1054,7 +1051,7 @@ class FinetuneCommand(_Command):
 
     def to_domain(self) -> Any:
         if "resume" in self.values:
-            return _resume_overrides(self.values)
+            return self.values["resume"]
         from sml.training.lora import (
             LoRAConfig,
             LoRAInitializerConfig,
@@ -1107,12 +1104,7 @@ class FinetuneCommand(_Command):
         if "resume" in self.values:
             from sml.training.swag import resume_finetune
 
-            return resume_finetune(
-                self.values["resume"],
-                data=self.values.get("data"),
-                overrides=self.to_domain(),
-                **session_options,
-            )
+            return resume_finetune(self.to_domain())
         from sml.training.swag import finetune
 
         return finetune(self.to_domain(), **session_options)
@@ -1162,6 +1154,8 @@ _DTO_TYPES: dict[str, type[_Command]] = {
 
 
 def _validate_command(command: str, values: dict[str, object]) -> None:
+    if command in {"train", "finetune"}:
+        _validate_resume_options(values)
     if command in {"train", "finetune"} and "session_steps" in values:
         session_steps = values["session_steps"]
         if (
@@ -1185,50 +1179,10 @@ def _validate_command(command: str, values: dict[str, object]) -> None:
     }
     if command in required:
         _require(values, *required[command])
-    if command == "train":
-        if "resume" in values:
-            forbidden = set(values) & {
-                "output",
-                "model",
-                "optimizer",
-                "precision",
-                "microbatch_size",
-                "gradient_accumulation_steps",
-                "prefetch_depth",
-                "learning_rate",
-                "seed",
-                "compile",
-            }
-            if forbidden:
-                raise SMLConfigurationError(
-                    "resume rejects fresh-run configuration: "
-                    + ", ".join(sorted(forbidden))
-                )
-        else:
-            _require(values, "data", "output")
-    if command == "finetune":
-        if "resume" in values:
-            forbidden = set(values) & {
-                "checkpoint",
-                "rope_scaling_factor",
-                "output",
-                "lora",
-                "optimizer",
-                "precision",
-                "microbatch_size",
-                "gradient_accumulation_steps",
-                "prefetch_depth",
-                "learning_rate",
-                "seed",
-                "compile",
-            }
-            if forbidden:
-                raise SMLConfigurationError(
-                    "resume rejects fresh-run configuration: "
-                    + ", ".join(sorted(forbidden))
-                )
-        else:
-            _require(values, "checkpoint", "data", "output")
+    if command == "train" and "resume" not in values:
+        _require(values, "data", "output")
+    if command == "finetune" and "resume" not in values:
+        _require(values, "checkpoint", "data", "output")
     if command in {
         "tokenize",
         "prepare.pretraining",

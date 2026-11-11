@@ -337,25 +337,6 @@ class CheckpointPolicy:
 
 
 @dataclass(frozen=True, slots=True)
-class ResumeOverrides:
-    maximum_steps: int | None = None
-    maximum_epochs: int | None = None
-    log_interval: int | None = None
-    checkpoint_interval: int | None = None
-
-    def __post_init__(self) -> None:
-        for field_name in (
-            "maximum_steps",
-            "maximum_epochs",
-            "log_interval",
-            "checkpoint_interval",
-        ):
-            value = getattr(self, field_name)
-            if value is not None:
-                _require_int32_counter(value, field_name)
-
-
-@dataclass(frozen=True, slots=True)
 class PrecisionConfig:
     master_parameter_dtype: Literal["float32"] = "float32"
     working_parameter_dtype: Literal["bfloat16"] = "bfloat16"
@@ -1159,7 +1140,6 @@ __all__ = (
     "OptimizerConfig",
     "PrecisionConfig",
     "PretrainingConfig",
-    "ResumeOverrides",
     "TrainerState",
     "WeightDecayPolicy",
     "accumulate_fp32",

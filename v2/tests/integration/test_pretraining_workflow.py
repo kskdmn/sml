@@ -19,7 +19,6 @@ import zstandard as zstd
 from mlx.utils import tree_flatten, tree_unflatten
 from sml.artifacts import checkpoint as checkpoint_module
 from sml.artifacts import manifest as manifest_module
-from sml.artifacts import training_controls as controls_module
 from sml.artifacts.checkpoint import (
     publish_immutable_bundle,
     resolve_latest_step,
@@ -67,10 +66,6 @@ from sml.training.common import (
 
 class InjectedFailure(RuntimeError):
     pass
-
-
-def _overrides(**values):
-    return training_common.ResumeOverrides(**values)
 
 
 def _payload_ref(path: Path, logical_path: str) -> PayloadRef:
@@ -284,11 +279,11 @@ def test_auto_schedule_persists_actual_training_budget(
         result.run, PretrainingRunManifest, VerificationLevel.MANIFEST_TRUSTED
     ).manifest
     assert manifest.optimizer["schedule_steps"] == result.step
-    restored = pretrain._config_from_run(result.run, data, manifest, _overrides())
+    restored = pretrain._config_from_run(result.run, data, manifest)
     assert training_common.resolved_warmup_steps(restored.optimizer) == 0
 
 
-def test_resuming_with_extended_limits_preserves_resolved_schedule(
+def test_resuming_preserves_original_budget_and_resolved_schedule(
     prepared_data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     progress: list[tuple[int, float]] = []
@@ -297,30 +292,35 @@ def test_resuming_with_extended_limits_preserves_resolved_schedule(
         progress.append((step, learning_rate))
 
     monkeypatch.setattr(pretrain, "log_training_progress", record_progress)
-    config = _config(prepared_data, tmp_path / "resumed", maximum_steps=2)
+    config = _config(prepared_data, tmp_path / "resumed", maximum_steps=4)
     config = replace(config, optimizer=replace(config.optimizer, schedule_steps=None))
-    first = pretrain.train(config)
+    first = pretrain.train(config, session_steps=2)
     original_manifest = (first.run / "run.json").read_bytes()
 
-    resumed = pretrain.resume(
-        first.run, data=prepared_data, overrides=_overrides(maximum_steps=4)
-    )
+    resumed = pretrain.resume(first.run, data=prepared_data)
     assert first.step == 2
     assert resumed.step == 4
     assert (first.run / "run.json").read_bytes() == original_manifest
-    assert json.loads(original_manifest)["optimizer"]["schedule_steps"] == 2
+    assert json.loads(original_manifest)["optimizer"]["schedule_steps"] == 4
     assert [step for step, _rate in progress] == [1, 2, 3, 4]
     assert [rate for _step, rate in progress] == pytest.approx(
-        [0.01, 0.0055, 0.001, 0.001]
+        [0.01, 0.008681980515339464, 0.0055, 0.0023180194846605367]
     )
+    assert not (first.run / "training-controls.json").exists()
 
 
-def test_resume_controls_survive_failure_before_the_next_update(
+def test_original_parameters_survive_failure_before_the_next_resumed_update(
     validated_training_config, monkeypatch
 ):
-    config = validated_training_config
+    config = replace(
+        validated_training_config,
+        maximum_steps=5,
+        maximum_epochs=6,
+        log_interval=2,
+        checkpoint=CheckpointPolicy(interval=2),
+    )
     prepared_data = config.data
-    trained = pretrain.train(config)
+    trained = pretrain.train(config, session_steps=1)
     original_manifest = (trained.run / "run.json").read_bytes()
     original_latest = (trained.run / "latest.json").read_bytes()
     real_builder = pretrain.build_pretraining_kernels
@@ -330,60 +330,83 @@ def test_resume_controls_survive_failure_before_the_next_update(
 
     monkeypatch.setattr(pretrain, "build_pretraining_kernels", fail_build)
     with pytest.raises(InjectedFailure, match="before any resumed update"):
-        pretrain.resume(
-            trained.run,
-            data=prepared_data,
-            overrides=_overrides(
-                maximum_steps=5,
-                maximum_epochs=6,
-                log_interval=2,
-                checkpoint_interval=2,
-            ),
-        )
+        pretrain.resume(trained.run, data=prepared_data)
     assert (trained.run / "run.json").read_bytes() == original_manifest
     assert (trained.run / "latest.json").read_bytes() == original_latest
-    document = json.loads((trained.run / "training-controls.json").read_bytes())
-    assert document["controls"] == {
-        "maximum_steps": 5,
-        "maximum_epochs": 6,
-        "log_interval": 2,
-        "checkpoint_interval": 2,
-    }
+    manifest = read_manifest(
+        trained.run, PretrainingRunManifest, VerificationLevel.MANIFEST_TRUSTED
+    ).manifest
+    restored = pretrain._config_from_run(trained.run, prepared_data, manifest)
+    assert restored.maximum_steps == 5
+    assert restored.maximum_epochs == 6
+    assert restored.log_interval == 2
+    assert restored.checkpoint.interval == 2
+    assert not (trained.run / "training-controls.json").exists()
     monkeypatch.setattr(pretrain, "build_pretraining_kernels", real_builder)
-    first_session = pretrain.resume(
-        trained.run, data=prepared_data, overrides=_overrides(), session_steps=1
-    )
+    first_session = pretrain.resume(trained.run, data=prepared_data, session_steps=1)
     assert first_session.step == 2
-    completed = pretrain.resume(trained.run, data=prepared_data, overrides=_overrides())
+    completed = pretrain.resume(trained.run, data=prepared_data)
     assert completed.step == 5
     assert (trained.run / "run.json").read_bytes() == original_manifest
     verify_artifact(trained.run, full=True)
 
 
-def test_completed_resume_persists_controls_without_rewriting_checkpoint(
+def test_completed_resume_preserves_original_configuration_and_checkpoint(
     validated_training_config,
 ):
     prepared_data = validated_training_config.data
     trained = pretrain.train(validated_training_config)
     original_latest = (trained.run / "latest.json").read_bytes()
-    completed = pretrain.resume(
-        trained.run,
-        data=prepared_data,
-        overrides=_overrides(log_interval=7, checkpoint_interval=9),
-    )
+    original_manifest = (trained.run / "run.json").read_bytes()
+    completed = pretrain.resume(trained.run, data=prepared_data)
     assert completed == trained
     assert (trained.run / "latest.json").read_bytes() == original_latest
-    controls = json.loads((trained.run / "training-controls.json").read_bytes())
-    assert controls["controls"]["log_interval"] == 7
-    assert controls["controls"]["checkpoint_interval"] == 9
+    assert (trained.run / "run.json").read_bytes() == original_manifest
+    assert not (trained.run / "training-controls.json").exists()
+
+
+def _write_legacy_training_controls(run: Path) -> Path:
+    manifest = read_manifest(
+        run, PretrainingRunManifest, VerificationLevel.MANIFEST_TRUSTED
+    ).manifest
+    path = run / "training-controls.json"
+    path.write_bytes(
+        canonical_json_bytes(
+            {
+                "kind": "training-controls",
+                "version": 1,
+                "owning_run_identity": manifest.identity,
+                "controls": {
+                    "maximum_steps": 5,
+                    "maximum_epochs": 6,
+                    "log_interval": 7,
+                    "checkpoint_interval": 9,
+                },
+            }
+        )
+    )
+    return path
+
+
+def test_resume_uses_original_parameters_instead_of_legacy_training_controls(
+    validated_training_config,
+):
+    config = replace(validated_training_config, maximum_steps=3)
+    trained = pretrain.train(config, session_steps=1)
+    path = _write_legacy_training_controls(trained.run)
+    original_controls = path.read_bytes()
     manifest = read_manifest(
         trained.run, PretrainingRunManifest, VerificationLevel.MANIFEST_TRUSTED
     ).manifest
-    restored = pretrain._config_from_run(
-        trained.run, prepared_data, manifest, _overrides()
-    )
-    assert restored.log_interval == 7
-    assert restored.checkpoint.interval == 9
+    restored = pretrain._config_from_run(trained.run, config.data, manifest)
+    assert restored.maximum_steps == config.maximum_steps
+    assert restored.maximum_epochs == config.maximum_epochs
+    assert restored.log_interval == config.log_interval
+    assert restored.checkpoint == config.checkpoint
+    resumed = pretrain.resume(trained.run, data=config.data)
+    assert resumed.step == 3
+    assert path.read_bytes() == original_controls
+    verify_artifact(trained.run, full=True)
 
 
 @pytest.mark.parametrize(
@@ -402,11 +425,8 @@ def test_invalid_training_controls_fail_full_verification_and_resume_before_rest
 ):
     prepared_data = validated_training_config.data
     trained = pretrain.train(validated_training_config)
-    pretrain.resume(
-        trained.run, data=prepared_data, overrides=_overrides(log_interval=2)
-    )
+    path = _write_legacy_training_controls(trained.run)
     verify_artifact(trained.run, full=True)
-    path = trained.run / "training-controls.json"
     document = json.loads(path.read_bytes())
     if mutation == "wrong-owner":
         document["owning_run_identity"] = "sha256:" + "f" * 64
@@ -442,36 +462,7 @@ def test_invalid_training_controls_fail_full_verification_and_resume_before_rest
 
     monkeypatch.setattr(pretrain, "_restore_checkpoint", forbidden_restore)
     with pytest.raises(SMLArtifactError, match=expected_error):
-        pretrain.resume(
-            trained.run, data=prepared_data, overrides=_overrides(maximum_steps=2)
-        )
-
-
-def test_failed_training_control_publication_preserves_previous_controls(
-    validated_training_config, monkeypatch
-):
-    prepared_data = validated_training_config.data
-    trained = pretrain.train(validated_training_config)
-    pretrain.resume(
-        trained.run, data=prepared_data, overrides=_overrides(log_interval=2)
-    )
-    path = trained.run / "training-controls.json"
-    original = path.read_bytes()
-    real_replace = controls_module.OS_FILESYSTEM.replace
-
-    def fail_controls_replace(source, destination, **kwargs):
-        if destination == "training-controls.json":
-            raise OSError("injected controls replacement failure")
-        return real_replace(source, destination, **kwargs)
-
-    monkeypatch.setattr(controls_module.OS_FILESYSTEM, "replace", fail_controls_replace)
-    with pytest.raises(SMLArtifactError, match="durably publish training controls"):
-        pretrain.resume(
-            trained.run, data=prepared_data, overrides=_overrides(log_interval=3)
-        )
-    assert path.read_bytes() == original
-    assert not list(trained.run.glob(".sml-tmp-training-controls-*"))
-    verify_artifact(trained.run, full=True)
+        pretrain.resume(trained.run, data=prepared_data)
 
 
 @pytest.mark.parametrize(
@@ -486,7 +477,8 @@ def test_training_retains_one_full_data_proof_and_closes_it(
     )
     run = tmp_path / "run"
     if mode not in {"fresh", "initial-state-failure"}:
-        pretrain.train(_config(data, run, maximum_steps=1))
+        total_steps = 1 if mode == "complete" else 2
+        pretrain.train(_config(data, run, maximum_steps=total_steps), session_steps=1)
 
     hashes = Counter()
     scans = 0
@@ -533,17 +525,12 @@ def test_training_retains_one_full_data_proof_and_closes_it(
     elif mode == "restore-failure":
         monkeypatch.setattr(pretrain, "_restore_checkpoint", fail_restore)
         with pytest.raises(InjectedFailure, match="restore failed"):
-            pretrain.resume(run, data=data, overrides=_overrides(maximum_steps=2))
+            pretrain.resume(run, data=data)
     elif mode == "fresh":
         assert pretrain.train(_config(data, run)).step == 2
     else:
         limit = 1 if mode == "complete" else 2
-        assert (
-            pretrain.resume(
-                run, data=data, overrides=_overrides(maximum_steps=limit)
-            ).step
-            == limit
-        )
+        assert pretrain.resume(run, data=data).step == limit
 
     assert hashes == {f"shards/train-{index:06d}.npy": 1 for index in range(6)}
     assert scans == 1
@@ -569,9 +556,10 @@ def test_pretraining_logs_update_metrics_at_configured_interval(
     monkeypatch.setattr(pretrain, "perf_counter", lambda: next(timestamps))
     trained = pretrain.train(
         replace(
-            _config(prepared_data, tmp_path / "logs-run", maximum_steps=5),
+            _config(prepared_data, tmp_path / "logs-run", maximum_steps=6),
             log_interval=2,
-        )
+        ),
+        session_steps=5,
     )
     output = capsys.readouterr()
     assert trained.step == 5
@@ -597,9 +585,7 @@ def test_pretraining_logs_update_metrics_at_configured_interval(
         assert metrics["elapsed"] == elapsed
         assert float(metrics["interval_seconds"]) == interval
 
-    resumed = pretrain.resume(
-        trained.run, data=prepared_data, overrides=_overrides(maximum_steps=6)
-    )
+    resumed = pretrain.resume(trained.run, data=prepared_data)
     assert resumed.step == 6
     resumed_lines = capsys.readouterr().err.splitlines()
     assert len(resumed_lines) == 1
@@ -710,6 +696,8 @@ def _run_with_unpruned_latest(
     data: Path,
     run: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    maximum_steps: int = 1,
 ):
     real_retention = checkpoint_module._prune_to_latest
 
@@ -720,7 +708,7 @@ def _run_with_unpruned_latest(
     with pytest.raises(InjectedFailure, match="before retention"):
         pretrain.train(
             replace(
-                _config(data, run, maximum_steps=1),
+                _config(data, run, maximum_steps=maximum_steps),
                 checkpoint=CheckpointPolicy(interval=1),
             )
         )
@@ -933,9 +921,9 @@ def test_training_failure_remains_primary_when_stream_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
     resume: bool,
 ) -> None:
-    config = _config(prepared_data, tmp_path / "run", maximum_steps=1)
+    config = _config(prepared_data, tmp_path / "run", maximum_steps=2)
     if resume:
-        pretrain.train(config)
+        pretrain.train(config, session_steps=1)
 
     training_error = InjectedFailure("training failed")
     cleanup_error = OSError("stream cleanup failed")
@@ -958,7 +946,6 @@ def test_training_failure_remains_primary_when_stream_cleanup_fails(
             pretrain.resume(
                 config.output_run,
                 data=prepared_data,
-                overrides=_overrides(maximum_steps=2),
             )
         else:
             pretrain.train(config)
@@ -1003,7 +990,6 @@ def test_interrupted_accumulation_replays_the_complete_window(
     resumed = pretrain.resume(
         crashed,
         data=prepared_data,
-        overrides=_overrides(maximum_steps=uninterrupted.step),
     )
 
     assert resumed.step == uninterrupted.step == 2
@@ -1014,9 +1000,9 @@ def test_interrupted_accumulation_replays_the_complete_window(
 def test_legacy_checkpoint_resumes_identically_and_publishes_compact_state(
     prepared_data: Path, tmp_path: Path, hidden_dropout: float
 ) -> None:
-    config = _config(prepared_data, tmp_path / "compact", maximum_steps=1)
+    config = _config(prepared_data, tmp_path / "compact", maximum_steps=2)
     config = replace(config, model=replace(config.model, hidden_dropout=hidden_dropout))
-    compact = pretrain.train(config)
+    compact = pretrain.train(config, session_steps=1)
     legacy_run = tmp_path / "legacy"
     shutil.copytree(compact.run, legacy_run)
     resolved = resolve_latest_step(
@@ -1056,12 +1042,7 @@ def test_legacy_checkpoint_resumes_identically_and_publishes_compact_state(
     (legacy_run / "latest.json").write_bytes(canonical_json_bytes(latest))
 
     for run in (compact.run, legacy_run):
-        assert (
-            pretrain.resume(
-                run, data=prepared_data, overrides=_overrides(maximum_steps=2)
-            ).step
-            == 2
-        )
+        assert pretrain.resume(run, data=prepared_data).step == 2
         final = resolve_latest_step(
             run, writable=False, verification=VerificationLevel.FULL
         )
@@ -1113,7 +1094,9 @@ def test_resume_rejects_invalid_tokenizer_before_restore_or_retention(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = tmp_path / "invalid-tokenizer-run"
-    _run_with_unpruned_latest(prepared_data, run, monkeypatch)
+    _run_with_unpruned_latest(
+        prepared_data, run, monkeypatch, maximum_steps=maximum_steps
+    )
     tokenizer_path = run / "tokenizer"
     if mutation == "manifest":
         manifest = read_manifest(
@@ -1142,7 +1125,6 @@ def test_resume_rejects_invalid_tokenizer_before_restore_or_retention(
         pretrain.resume(
             run,
             data=prepared_data,
-            overrides=_overrides(maximum_steps=maximum_steps),
         )
 
     assert {
@@ -1186,7 +1168,6 @@ def test_resume_rejects_wrong_key_before_runtime_or_retention(
         pretrain.resume(
             trained.run,
             data=prepared_data,
-            overrides=_overrides(maximum_steps=2),
         )
     assert reached == []
 
@@ -1241,14 +1222,15 @@ def test_partial_window_progress_supports_full_verify_inference_and_resume(
         ).manifest.shard_row_counts
     )
     data_path = data.path
-    config = _config(data_path, tmp_path / "partial-window-run", maximum_steps=1)
+    config = _config(data_path, tmp_path / "partial-window-run", maximum_steps=2)
     trained = pretrain.train(
         replace(
             config,
             model=replace(config.model, vocab_size=tokenizer.manifest.vocab_size),
             loader=replace(config.loader, microbatch_size=row_count),
-            maximum_epochs=1,
-        )
+            maximum_epochs=2,
+        ),
+        session_steps=1,
     )
 
     resolved = resolve_latest_step(
@@ -1265,7 +1247,6 @@ def test_partial_window_progress_supports_full_verify_inference_and_resume(
     resumed = pretrain.resume(
         trained.run,
         data=data_path,
-        overrides=_overrides(maximum_steps=2, maximum_epochs=2),
     )
 
     assert resumed.step == 2
@@ -1275,7 +1256,13 @@ def test_resume_accepts_relocation_rejects_resharding_and_prunes_to_latest(
     prepared_data: Path,
     tmp_path: Path,
 ) -> None:
-    first = pretrain.train(_config(prepared_data, tmp_path / "source", maximum_steps=1))
+    first = pretrain.train(
+        replace(
+            _config(prepared_data, tmp_path / "source", maximum_steps=2),
+            checkpoint=CheckpointPolicy(interval=1),
+        ),
+        session_steps=1,
+    )
     moved_run = tmp_path / "moved-run"
     first.run.rename(moved_run)
     immutable_run_bytes = (moved_run / "run.json").read_bytes()
@@ -1285,7 +1272,6 @@ def test_resume_accepts_relocation_rejects_resharding_and_prunes_to_latest(
     resumed = pretrain.resume(
         moved_run,
         data=relocated,
-        overrides=_overrides(maximum_steps=2, checkpoint_interval=1),
     )
 
     assert resumed.step == 2
@@ -1343,7 +1329,6 @@ def test_resume_accepts_relocation_rejects_resharding_and_prunes_to_latest(
         pretrain.resume(
             moved_run,
             data=resharded,
-            overrides=_overrides(maximum_steps=3),
         )
 
 
@@ -1366,7 +1351,6 @@ def test_completed_limit_returns_before_stream_model_or_kernel_construction(
     result = pretrain.resume(
         completed.run,
         data=prepared_data,
-        overrides=_overrides(maximum_steps=1),
     )
 
     assert result == completed
@@ -1408,7 +1392,6 @@ def test_resume_semantic_data_preflight_precedes_restore_prune_and_early_return(
         pretrain.resume(
             completed.run,
             data=invalid_data,
-            overrides=_overrides(maximum_steps=1),
         )
 
     assert reached == []
@@ -1464,7 +1447,6 @@ def test_resume_reader_rejects_named_step_swap_before_retention(
         pretrain.resume(
             completed.run,
             data=prepared_data,
-            overrides=_overrides(maximum_steps=1),
         )
 
     assert swapped is True
@@ -1520,7 +1502,6 @@ def test_corrupt_inputs_fail_before_model_allocation(
         pretrain.resume(
             completed.run,
             data=prepared_data,
-            overrides=_overrides(maximum_steps=2),
         )
     assert allocations == 0
 
@@ -1557,7 +1538,6 @@ def test_latest_is_recovered_before_completed_resume_returns(
     result = pretrain.resume(
         completed.run,
         data=prepared_data,
-        overrides=_overrides(maximum_steps=1),
     )
 
     assert result.step == 1
@@ -1695,7 +1675,6 @@ def test_structural_checkpoint_corruption_fails_before_allocation_or_retention(
         pretrain.resume(
             completed.run,
             data=prepared_data,
-            overrides=_overrides(maximum_steps=2),
         )
     assert allocations == 0
     assert retentions == 0
@@ -1813,7 +1792,6 @@ def test_restored_state_corruption_fails_before_pruning_stream_or_model(
         pretrain.resume(
             run,
             data=prepared_data,
-            overrides=_overrides(maximum_steps=2),
         )
     assert allocations == 0
     assert retentions == 0
@@ -1864,7 +1842,7 @@ def test_dropped_epoch_tail_does_not_publish_duplicate_progress_checkpoint(
         raise AssertionError("completed epochs must return before allocating a runtime")
 
     monkeypatch.setattr(pretrain, "_run_training", forbid_completed_runtime)
-    resumed = pretrain.resume(result.run, data=data, overrides=_overrides())
+    resumed = pretrain.resume(result.run, data=data)
     assert resumed == result
     assert published == [0, 1]
 
@@ -1919,11 +1897,11 @@ def test_resume_releases_restored_device_arrays_after_update(
 ):
     data = _prepared_bundle(tmp_path / "prepared")
     config = replace(
-        _config(data, tmp_path / "run", maximum_steps=1),
+        _config(data, tmp_path / "run", maximum_steps=2),
         compile=compile,
         checkpoint=CheckpointPolicy(interval=1),
     )
-    pretrain.train(config)
+    pretrain.train(config, session_steps=1)
     restored_arrays = []
     real_restore = pretrain._restore_checkpoint
     real_publish = pretrain._publish_training_state
@@ -1951,9 +1929,7 @@ def test_resume_releases_restored_device_arrays_after_update(
     monkeypatch.setattr(pretrain, "_restore_checkpoint", track_restore)
     monkeypatch.setattr(pretrain, "_publish_training_state", check_published_state)
 
-    result = pretrain.resume(
-        config.output_run, data=data, overrides=_overrides(maximum_steps=2)
-    )
+    result = pretrain.resume(config.output_run, data=data)
     assert result.step == 2
 
 

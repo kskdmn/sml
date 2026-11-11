@@ -32,7 +32,6 @@ from sml.training.common import (
     OptimizerConfig,
     PrecisionConfig,
     PretrainingConfig,
-    ResumeOverrides,
     WeightDecayPolicy,
 )
 from sml.training.lora import LoRAConfig, LoRAInitializerConfig, LoRAPrecisionConfig
@@ -65,7 +64,6 @@ __all__ = (
     "PreparedDataBundle",
     "PretrainingConfig",
     "PretrainingPreparationConfig",
-    "ResumeOverrides",
     "SMLArtifactError",
     "SMLConfigurationError",
     "SMLDataError",

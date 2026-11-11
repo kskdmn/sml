@@ -23,7 +23,6 @@ from sml.training.common import (
     LoaderConfig,
     OptimizerConfig,
     PretrainingConfig,
-    ResumeOverrides,
 )
 from sml.training.pretrain import resume, train
 
@@ -123,17 +122,17 @@ def test_part1_tokenizer_to_resumed_pretraining(tmp_path: Path) -> None:
                 epoch_seed=13,
             ),
             checkpoint=CheckpointPolicy(interval=1),
-            maximum_steps=2,
+            maximum_steps=3,
             maximum_epochs=2,
             log_interval=1,
             seed=19,
             compile=False,
-        )
+        ),
+        session_steps=2,
     )
     resumed = resume(
         first.run,
         data=None,
-        overrides=ResumeOverrides(maximum_steps=3),
     )
     exact = resolve_exact_step(
         resumed.run,

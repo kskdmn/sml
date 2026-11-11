@@ -57,7 +57,6 @@ from sml.training.common import (
     LoaderConfig,
     OptimizerConfig,
     PretrainingConfig,
-    ResumeOverrides,
 )
 from sml.training.lora import (
     LoRAConfig,
@@ -446,14 +445,17 @@ def tiny_swag_bundle(tiny_base_run: Path, tmp_path: Path) -> Iterator[SwagDataBu
 
 
 @pytest.fixture
-def tiny_lora_run(tiny_base_run: Path, tiny_swag_bundle, tmp_path: Path) -> Path:
+def tiny_lora_run(
+    tiny_base_run: Path, tiny_swag_bundle, tmp_path: Path, request
+) -> Path:
     trained = finetune(
         tiny_swag_training_config(
             tiny_base_run,
             tiny_swag_bundle,
             tmp_path / "tiny-lora-run",
-            maximum_steps=1,
-        )
+            maximum_steps=getattr(request, "param", 2),
+        ),
+        session_steps=1,
     )
     return trained.run
 
@@ -473,9 +475,10 @@ def test_lora_run_is_self_contained_after_source_run_removal(
             tiny_base_run,
             tiny_swag_bundle,
             tmp_path / "lora-run",
-            maximum_steps=1,
+            maximum_steps=2,
             **scaling_override,
-        )
+        ),
+        session_steps=1,
     )
     saved = read_manifest(trained.run, LoRARunManifest, VerificationLevel.FULL).manifest
     copied_base = read_manifest(
@@ -501,7 +504,6 @@ def test_lora_run_is_self_contained_after_source_run_removal(
     resumed = resume_finetune(
         trained.run,
         data=tiny_swag_bundle.path,
-        overrides=ResumeOverrides(maximum_steps=2),
     )
     session = InferenceSession.from_checkpoint(resumed.run, full_verify=True)
     exported = export_merged(resumed.run, tmp_path / "export")
@@ -610,7 +612,6 @@ def test_finetune_rejects_prepared_data_exceeding_runtime_context(
                 resume_finetune(
                     config.output_run,
                     data=bundle.path,
-                    overrides=ResumeOverrides(maximum_steps=2),
                 )
             else:
                 finetune(config)
@@ -694,7 +695,6 @@ def test_legacy_lora_checkpoint_resumes_identically_and_saves_compact_state(
         resumed = resume_finetune(
             run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=resolved.step + 1),
         )
         assert resumed.step == resolved.step + 1
         latest = resolve_latest_step(
@@ -939,14 +939,14 @@ def test_uninterrupted_and_interrupted_adapter_state_match(
                 bundle,
                 tmp_path / "interrupted",
                 lora=lora,
-                maximum_steps=1,
+                maximum_steps=2,
                 compile=True,
-            )
+            ),
+            session_steps=1,
         )
         resumed = resume_finetune(
             first.run,
             data=bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     finally:
         bundle.close()
@@ -991,6 +991,7 @@ def test_resume_rejects_invalid_tokenizer_before_restore_or_retention(
         tiny_swag_bundle,
         tmp_path / "invalid-tokenizer-run",
         monkeypatch,
+        maximum_steps=maximum_steps,
     )
     tokenizer_path = run / "tokenizer"
     if mutation == "manifest":
@@ -1020,7 +1021,6 @@ def test_resume_rejects_invalid_tokenizer_before_restore_or_retention(
         resume_finetune(
             run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=maximum_steps),
         )
 
     assert {
@@ -1074,15 +1074,14 @@ def test_resume_rejects_wrong_key_before_runtime_or_retention(
         resume_finetune(
             trained.run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     assert reached == []
 
 
 @pytest.mark.parametrize("cursor", [(0, 99, 0), (0, 0, 99)])
-@pytest.mark.parametrize("maximum_steps", [1, 2])
+@pytest.mark.parametrize("tiny_lora_run", (1, 2), indirect=True)
 def test_resume_rejects_resigned_invalid_cursor_before_restore_or_retention(
-    tiny_lora_run, tiny_swag_bundle, monkeypatch, cursor, maximum_steps
+    tiny_lora_run, tiny_swag_bundle, monkeypatch, cursor
 ):
     resolved = resolve_latest_step(
         tiny_lora_run, writable=False, verification=VerificationLevel.FULL
@@ -1117,7 +1116,6 @@ def test_resume_rejects_resigned_invalid_cursor_before_restore_or_retention(
         resume_finetune(
             tiny_lora_run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=maximum_steps),
         )
 
 
@@ -1135,7 +1133,6 @@ def test_resume_stops_if_a_training_stream_produces_no_progress(
         resume_finetune(
             tiny_lora_run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
 
 
@@ -1156,8 +1153,9 @@ def test_lora_microbatch_progress_supports_full_checkpoint_consumers(
                 prefetch_depth=1,
                 epoch_seed=13,
             ),
-            maximum_steps=1,
-        )
+            maximum_steps=2,
+        ),
+        session_steps=1,
     )
 
     resolved = resolve_latest_step(
@@ -1175,7 +1173,6 @@ def test_lora_microbatch_progress_supports_full_checkpoint_consumers(
     resumed = resume_finetune(
         trained.run,
         data=tiny_swag_bundle.path,
-        overrides=ResumeOverrides(maximum_steps=2),
     )
     assert resumed.run == trained.run
     assert resumed.step == 2
@@ -1223,9 +1220,10 @@ def test_swag_accumulates_microbatches_and_logs_tail_metrics(
             tmp_path / "accumulation-logs-run",
             loader=LoaderConfig(microbatch_size=2, gradient_accumulation_steps=2),
             maximum_steps=None,
-            maximum_epochs=2,
+            maximum_epochs=3,
             log_interval=2,
-        )
+        ),
+        session_steps=4,
     )
     output = capsys.readouterr()
     assert trained.step == 4
@@ -1253,7 +1251,6 @@ def test_swag_accumulates_microbatches_and_logs_tail_metrics(
     resumed = resume_finetune(
         trained.run,
         data=tiny_swag_bundle.path,
-        overrides=ResumeOverrides(maximum_epochs=3),
     )
     assert resumed.step == 6
     resumed_lines = capsys.readouterr().err.splitlines()
@@ -1264,22 +1261,27 @@ def test_swag_accumulates_microbatches_and_logs_tail_metrics(
     assert float(metrics["interval_seconds"]) == 4.9
 
 
-def test_swag_resume_controls_survive_failure_before_the_next_update(
+def test_swag_resume_preserves_original_parameters_after_failure(
     tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch
 ):
-    trained = finetune(
-        tiny_swag_training_config(
-            tiny_base_run,
-            tiny_swag_bundle,
-            tmp_path / "persistent-controls",
-            maximum_steps=1,
-        )
+    config = tiny_swag_training_config(
+        tiny_base_run,
+        tiny_swag_bundle,
+        tmp_path / "original-parameters",
+        maximum_steps=4,
+        maximum_epochs=6,
+        log_interval=2,
+        checkpoint=CheckpointPolicy(interval=2),
     )
+    trained = finetune(config, session_steps=1)
     original_manifest = (trained.run / "run.json").read_bytes()
     original_latest = (trained.run / "latest.json").read_bytes()
     real_builder = swag_module.build_swag_kernels
 
-    def fail_build(*_args, **_kwargs):
+    def fail_build(_model, restored_config, _weight_decay_tree):
+        assert (
+            replace(restored_config, base_checkpoint=config.base_checkpoint) == config
+        )
         raise RuntimeError("before any resumed update")
 
     monkeypatch.setattr(swag_module, "build_swag_kernels", fail_build)
@@ -1287,33 +1289,18 @@ def test_swag_resume_controls_survive_failure_before_the_next_update(
         resume_finetune(
             trained.run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(
-                maximum_steps=4,
-                maximum_epochs=6,
-                log_interval=2,
-                checkpoint_interval=2,
-            ),
         )
     assert (trained.run / "run.json").read_bytes() == original_manifest
     assert (trained.run / "latest.json").read_bytes() == original_latest
-    document = json.loads((trained.run / "training-controls.json").read_bytes())
-    assert document["controls"] == {
-        "maximum_steps": 4,
-        "maximum_epochs": 6,
-        "log_interval": 2,
-        "checkpoint_interval": 2,
-    }
+    assert not (trained.run / "training-controls.json").exists()
     monkeypatch.setattr(swag_module, "build_swag_kernels", real_builder)
     first_session = resume_finetune(
         trained.run,
         data=tiny_swag_bundle.path,
-        overrides=ResumeOverrides(),
         session_steps=1,
     )
     assert first_session.step == 2
-    completed = resume_finetune(
-        trained.run, data=tiny_swag_bundle.path, overrides=ResumeOverrides()
-    )
+    completed = resume_finetune(trained.run, data=tiny_swag_bundle.path)
     assert completed.step == 4
     assert (trained.run / "run.json").read_bytes() == original_manifest
     verify_artifact(trained.run, full=True)
@@ -1365,7 +1352,6 @@ def test_resume_rejects_mismatches_before_allocation(
         resume_finetune(
             trained.run,
             data=other_bundle_path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     assert allocated == []
 
@@ -1384,7 +1370,6 @@ def test_resume_rejects_mismatches_before_allocation(
         resume_finetune(
             model_run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     assert allocated == []
 
@@ -1403,7 +1388,6 @@ def test_resume_rejects_mismatches_before_allocation(
         resume_finetune(
             precision_run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     assert allocated == []
 
@@ -1417,7 +1401,6 @@ def test_resume_rejects_mismatches_before_allocation(
         resume_finetune(
             tokenizer_run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     assert allocated == []
 
@@ -1435,7 +1418,6 @@ def test_resume_rejects_mismatches_before_allocation(
         resume_finetune(
             trained.run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     assert allocated == []
 
@@ -1462,7 +1444,6 @@ def test_limit_satisfied_resume_returns_before_iterator_or_kernel_construction(
     result = resume_finetune(
         completed.run,
         data=tiny_swag_bundle.path,
-        overrides=ResumeOverrides(maximum_steps=1),
     )
     assert result.step == completed.step == 1
     assert result.run == completed.run
@@ -1473,6 +1454,8 @@ def _run_with_unpruned_lora_history(
     tiny_swag_bundle: SwagDataBundle,
     run: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    maximum_steps: int = 1,
 ) -> Path:
     def interrupt_retention(*_args, **_kwargs):
         raise RuntimeError("retention interrupted")
@@ -1487,7 +1470,7 @@ def _run_with_unpruned_lora_history(
                 tiny_base_run,
                 tiny_swag_bundle,
                 run,
-                maximum_steps=1,
+                maximum_steps=maximum_steps,
             )
         )
     assert sorted(path.name for path in (run / "checkpoints").iterdir()) == [
@@ -1559,7 +1542,6 @@ def test_limit_satisfied_resume_prunes_stale_history_after_full_reader_closes(
     result = resume_finetune(
         run,
         data=tiny_swag_bundle.path,
-        overrides=ResumeOverrides(maximum_steps=1),
     )
 
     assert result.step == 1
@@ -1580,6 +1562,7 @@ def test_resume_prunes_stale_history_before_continuing_model_failure(
         tiny_swag_bundle,
         tmp_path / "stale-continuing-run",
         monkeypatch,
+        maximum_steps=2,
     )
     real_open = swag_module.open_latest_checkpoint_reader
     real_prune = swag_module.prune_to_latest
@@ -1612,7 +1595,6 @@ def test_resume_prunes_stale_history_before_continuing_model_failure(
         resume_finetune(
             run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
 
     assert order == ["retention", "model"]
@@ -1672,7 +1654,7 @@ def test_swag_releases_superseded_device_arrays_after_update(
     )
     config = replace(config, lora=replace(config.lora, dropout=0.2))
     if resume:
-        finetune(replace(config, maximum_steps=1))
+        finetune(config, session_steps=1)
 
     real_wrap = swag_module._wrap_copied_base
     real_run = swag_module._run_training
@@ -1714,7 +1696,6 @@ def test_swag_releases_superseded_device_arrays_after_update(
         result = resume_finetune(
             config.output_run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     else:
         result = finetune(config)
@@ -1829,7 +1810,6 @@ def test_limit_satisfied_resume_closes_swag_bundle(
     result = resume_finetune(
         completed.run,
         data=tiny_swag_bundle.path,
-        overrides=ResumeOverrides(maximum_steps=1),
     )
 
     assert result == completed
@@ -1853,7 +1833,6 @@ def test_resume_uses_manifest_data_locator_when_data_is_omitted(
     result = resume_finetune(
         completed.run,
         data=None,
-        overrides=ResumeOverrides(maximum_steps=1),
     )
 
     assert result == completed
@@ -2291,7 +2270,6 @@ def test_resume_closes_run_and_children_when_checkpoint_restore_fails(
         resume_finetune(
             completed.run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     assert closed_descriptors == [-1, -1]
 
@@ -2332,7 +2310,6 @@ def test_resume_closes_reader_when_copied_base_load_fails(
         resume_finetune(
             completed.run,
             data=tiny_swag_bundle.path,
-            overrides=ResumeOverrides(maximum_steps=2),
         )
     assert closed_descriptors == [-1, -1]
 
