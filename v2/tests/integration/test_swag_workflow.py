@@ -1188,6 +1188,35 @@ def test_lora_microbatch_progress_supports_full_checkpoint_consumers(
     verify_artifact(resumed.run, full=True)
 
 
+@pytest.mark.parametrize("interrupted", (False, True))
+def test_swag_defaults_complete_three_epochs_with_saved_schedule(
+    tiny_base_run, tiny_swag_bundle, tmp_path, interrupted
+):
+    tiny_config = tiny_swag_training_config(
+        tiny_base_run, tiny_swag_bundle, tmp_path / "default-epochs"
+    )
+    config = SwagTrainingConfig(
+        base_checkpoint=tiny_base_run,
+        data=tiny_swag_bundle.path,
+        output_run=tiny_config.output_run,
+        lora=tiny_config.lora,
+        compile=False,
+    )
+    result = finetune(config, session_steps=1 if interrupted else None)
+    original_manifest = (result.run / "run.json").read_bytes()
+    saved = json.loads(original_manifest)
+    assert saved["checkpoint"]["maximum_steps"] is None
+    assert saved["checkpoint"]["maximum_epochs"] == 3
+    assert saved["optimizer"]["schedule_steps"] == 3
+
+    if interrupted:
+        assert (result.step, result.epoch, result.examples) == (1, 1, 5)
+        result = resume_finetune(result.run, data=tiny_swag_bundle.path)
+        assert (result.run / "run.json").read_bytes() == original_manifest
+
+    assert (result.step, result.epoch, result.examples) == (3, 3, 15)
+
+
 def test_swag_accumulates_microbatches_and_logs_tail_metrics(
     tiny_base_run, tiny_swag_bundle, tmp_path, monkeypatch, capsys
 ) -> None:

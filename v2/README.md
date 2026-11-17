@@ -171,8 +171,9 @@ or changing preparation settings requires a new data output directory.
 
 SWAG uses cross-entropy over four candidate scores, each the mean continuation
 token log-likelihood including EOS. Defaults are microbatch **1**, accumulation
-**8**, and stopping at **8,192 updates or 5 epochs**, whichever comes first. Its
-default learning-rate schedule is 8,192 updates with 81 warmup updates.
+**8**, and **3 epochs** with no update limit. The default learning-rate schedule
+matches the planned updates, with 1% warmup and cosine decay. Set `--maximum-steps`
+to add an update limit; training stops at whichever limit comes first.
 Fine-tuning uses the same timing fields and reporting interval as base training,
 alongside loss, learning rate, accuracy, and processed examples.
 [LoRA defaults](src/sml/training/lora.py) are rank `16`, alpha `32`, dropout `0.05`,

@@ -99,6 +99,9 @@ def test_finetune_defaults_to_eightfold_context_and_preserves_batch_defaults():
     assert domain.rope_scaling_factor == 8.0
     assert domain.loader.microbatch_size == 1
     assert domain.loader.gradient_accumulation_steps == 8
+    assert domain.maximum_steps is None
+    assert domain.maximum_epochs == 3
+    assert domain.optimizer.schedule_steps is None
 
 
 @pytest.mark.parametrize("command", ["finetune", "prepare.swag", "infer", "evaluate"])

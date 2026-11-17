@@ -146,7 +146,7 @@ def score_candidates(
 
 
 def default_swag_optimizer_config() -> OptimizerConfig:
-    return OptimizerConfig(learning_rate=1e-4, schedule_steps=8_192)
+    return OptimizerConfig(learning_rate=1e-4)
 
 
 _PLACEHOLDER_IDENTITY = "sha256:" + "0" * 64
@@ -181,8 +181,8 @@ class SwagTrainingConfig:
         default_factory=lambda: CheckpointPolicy(interval=500),
     )
     precision: LoRAPrecisionConfig = field(default_factory=LoRAPrecisionConfig)
-    maximum_steps: int | None = 8_192
-    maximum_epochs: int | None = 5
+    maximum_steps: int | None = None
+    maximum_epochs: int | None = 3
     log_interval: int = 100
     seed: int = 42
     compile: bool = True
@@ -710,13 +710,30 @@ def _verified_swag(
         raise
 
 
-def _resolved_fresh_config(config: SwagTrainingConfig) -> SwagTrainingConfig:
-    if config.optimizer.schedule_steps is None and config.maximum_steps is not None:
+def _resolved_fresh_config(
+    config: SwagTrainingConfig, bundle: SwagDataBundle
+) -> SwagTrainingConfig:
+    if config.optimizer.schedule_steps is None:
+        # SWAG pads the final microbatch in each bucket and flushes partial
+        # accumulation windows at each epoch boundary.
+        microbatch = config.loader.microbatch_size
+        with bundle.borrow_buckets() as buckets:
+            microsteps_per_epoch = sum(
+                (bucket.input_ids.shape[0] + microbatch - 1) // microbatch
+                for bucket in buckets
+            )
+        accumulation = config.loader.gradient_accumulation_steps
+        updates_per_epoch = (microsteps_per_epoch + accumulation - 1) // accumulation
+        limits = []
+        if config.maximum_steps is not None:
+            limits.append(config.maximum_steps)
+        if config.maximum_epochs is not None:
+            limits.append(config.maximum_epochs * updates_per_epoch)
         return replace(
             config,
             optimizer=replace(
                 config.optimizer,
-                schedule_steps=config.maximum_steps,
+                schedule_steps=min(limits),
             ),
         )
     return config
@@ -1280,7 +1297,6 @@ def finetune(
         raise TypeError("config must be a SwagTrainingConfig")
     if session_steps is not None:
         _require_int32_counter(session_steps, "session_steps")
-    config = _resolved_fresh_config(config)
     with run_writer_lock(config.output_run):
         if config.output_run.exists() or config.output_run.is_symlink():
             raise SMLArtifactError(
@@ -1298,6 +1314,7 @@ def finetune(
             context_length=model_config.effective_context_length,
         )
         with bundle:
+            config = _resolved_fresh_config(config, bundle)
             runtime: tuple[SMLLanguageModel, _RestoredSwagState] | None = None
 
             def build(private_run: Path) -> LoRARunManifest:

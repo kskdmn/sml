@@ -8,9 +8,10 @@
 
 ### v1
 
-- MPS
+- PyTorch (MPS)
 - 50M model
 
 ### v2 (under development)
 
-- 100M model?
+- MLX
+- 100M model
